@@ -1,0 +1,16 @@
+load("@rules_uv//uv:pip.bzl", "pip_compile")
+
+# Regenerate with: bazel run //:requirements
+# Check in CI with:  bazel test //:requirements_test
+pip_compile(
+    name = "requirements",
+    requirements_in = "requirements.in",
+    requirements_txt = "requirements.txt",
+    # No args= here on purpose. It *replaces* rules_uv's defaults, which are
+    # --generate-hashes, --emit-index-url and --no-strip-extras; losing the
+    # last of those strips the extras from the lock. Use extra_args to add a
+    # flag.
+    # Resolve one lock that holds for every platform, with environment markers
+    # where they diverge, rather than one that describes this machine.
+    universal = True,
+)

@@ -1,0 +1,30 @@
+From: Philipp Schrader <philipp.schrader@bluerivertech.com>
+Date: Wed, 16 Jul 2025 10:46:07 -0700
+Subject: [PATCH] Remove superfluous copies of the runtime
+
+Astral decided to statically link libpython into the interpreter for
+performance reasons. This means that we now have 4 copies of the runtime
+(libpython + 3 Python binaries). This patch reduces that to 2 copies of
+the runtime (libpython + 1 Python binary). I hope that this doesn't
+break anything.
+
+See the upstream pull request for more information.
+https://github.com/astral-sh/python-build-standalone/pull/592
+---
+ python/private/hermetic_runtime_repo_setup.bzl | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/python/private/hermetic_runtime_repo_setup.bzl b/python/private/hermetic_runtime_repo_setup.bzl
+--- a/python/private/hermetic_runtime_repo_setup.bzl
++++ b/python/private/hermetic_runtime_repo_setup.bzl
+@@ -67,6 +67,10 @@
+     ]
+     files_include += extra_files_glob_include
+     files_exclude = [
++        # Superfluous copies of the interpreter. `python_bin` (bin/python3) is
++        # the one that is kept; the *-config scripts don't match these names.
++        "bin/python",
++        "bin/python{major}.{minor}".format(**version_dict),
+         # Unused shared libraries. `python` executable and the `:libpython` target
+         # depend on `libpython{python_version}.so.1.0`.
+         "lib/libpython{major}.{minor}*.so".format(**version_dict),

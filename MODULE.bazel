@@ -1,0 +1,40 @@
+module(
+    name = "grenadine",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "bazel_lib", version = "3.7.2")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_python", version = "2.3.2")
+
+bazel_dep(name = "rules_uv", version = "0.89.2")
+
+# rules_python ships the interpreter three times over in every py_binary's
+# runfiles: bin/python, bin/python3 and bin/python3.13 are all the same 110MB
+# statically-linked CPython. The patch keeps bin/python3, the one the toolchain
+# points at.
+single_version_override(
+    module_name = "rules_python",
+    patch_strip = 1,
+    patches = ["//third_party/rules_python:0001-Remove-superfluous-copies-of-the-runtime.patch"],
+)
+
+# Opt out of the deprecated implicit __init__.py creation. Every package that
+# needs one must list it explicitly in srcs/deps.
+# See https://github.com/bazel-contrib/rules_python/issues/2945
+rules_python_config = use_extension("@rules_python//python/extensions:config.bzl", "config")
+rules_python_config.explicit_init_py(default = True)
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.13",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "grenadine_pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements.txt",
+)
+use_repo(pip, "grenadine_pypi")
