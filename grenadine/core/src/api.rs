@@ -1,0 +1,189 @@
+//! Types exchanged as JSON between the server and the web UI.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// A named GitHub search filter whose matching PRs are listed together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Inbox {
+    pub id: i64,
+    pub name: String,
+    /// The GitHub search filter as the user wrote it. The server appends
+    /// `is:pr` and a `repo:` qualifier per configured repository.
+    pub filter: String,
+    pub position: i64,
+}
+
+/// The body of a request that creates or edits an inbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxEdit {
+    pub name: String,
+    pub filter: String,
+    pub position: Option<i64>,
+}
+
+/// Identifies a PR across the configured repositories.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PrKey {
+    /// `owner/name`.
+    pub repo: String,
+    pub number: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrSummary {
+    pub key: PrKey,
+    pub title: String,
+    pub author: String,
+    /// OPEN, CLOSED or MERGED.
+    pub state: String,
+    pub is_draft: bool,
+    pub updated_at: String,
+    pub url: String,
+    pub version_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboxWithPrs {
+    pub inbox: Inbox,
+    pub prs: Vec<PrSummary>,
+    /// Set when the inbox's last search failed, e.g. because of a typo in
+    /// the filter.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionKind {
+    /// The PR's head when it was opened.
+    Initial,
+    /// One commit that a fast-forward push added.
+    Push,
+    /// The new head after a force push.
+    ForcePush,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    /// 1-based. Version 0 is the implicit "Base".
+    pub number: u32,
+    pub sha: String,
+    /// The merge-base of `sha` and the tip of the PR's target branch. `None`
+    /// when the commit is missing.
+    pub merge_base: Option<String>,
+    pub kind: VersionKind,
+    /// When the push that created this version happened, if known.
+    pub pushed_at: Option<String>,
+    /// The commit could not be fetched; the version can't be selected.
+    pub missing: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// A review comment on a line (or a file) of the PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub in_reply_to: Option<u64>,
+    pub author: String,
+    pub body: String,
+    pub path: String,
+    /// The commit the comment was made on.
+    pub original_commit: String,
+    /// The line in `original_commit` (or its parent for the left side).
+    pub original_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    /// The line mapped onto the PR's current head by GitHub; `None` when the
+    /// comment is outdated.
+    pub line: Option<u32>,
+    pub start_line: Option<u32>,
+    pub side: Side,
+    /// True for a comment on the whole file rather than on lines.
+    pub on_file: bool,
+    pub created_at: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDetail {
+    pub summary: PrSummary,
+    pub body: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub versions: Vec<Version>,
+    pub comments: Vec<ReviewComment>,
+    /// The push history couldn't be read from GitHub's activity log, so the
+    /// versions were reconstructed heuristically.
+    pub approximate: bool,
+    /// Set when the latest recomputation disagreed with the versions stored
+    /// before it.
+    pub drift: Option<String>,
+    /// Set when the last sync of this PR failed.
+    pub sync_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeStatus {
+    Added,
+    Deleted,
+    Modified,
+    Renamed,
+    Copied,
+    TypeChanged,
+}
+
+/// One file that differs between two trees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub status: ChangeStatus,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub old_blob: Option<String>,
+    pub new_blob: Option<String>,
+}
+
+impl FileChange {
+    /// The path to show and to match comments against.
+    pub fn path(&self) -> &str {
+        self.new_path
+            .as_deref()
+            .or(self.old_path.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changes {
+    pub files: Vec<FileChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobsRequest {
+    pub repo: String,
+    pub ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blob {
+    /// `None` for binary content.
+    pub text: Option<String>,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobsResponse {
+    pub blobs: BTreeMap<String, Blob>,
+}
+
+/// Pushed to the page over server-sent events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerEvent {
+    /// The inbox list or the PRs in an inbox changed.
+    InboxesChanged,
+    /// A PR's metadata, versions or comments changed.
+    PrChanged(PrKey),
+}

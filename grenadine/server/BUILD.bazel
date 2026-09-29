@@ -1,0 +1,28 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+WEB_FILES = {
+    "GRENADINE_INDEX_HTML": "//grenadine/web:static/index.html",
+    "GRENADINE_STYLE_CSS": "//grenadine/web:static/style.css",
+    "GRENADINE_WEB_JS": "//grenadine/web:grenadine_web.js",
+    "GRENADINE_WEB_WASM": "//grenadine/web:grenadine_web_bg.wasm",
+}
+
+rust_binary(
+    name = "server",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = WEB_FILES.values(),
+    crate_name = "grenadine",
+    # rules_rust makes these absolute, which include_bytes! needs.
+    rustc_env = {k: "$(execpath %s)" % v for k, v in WEB_FILES.items()},
+    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+)
+
+rust_test(
+    name = "server_test",
+    size = "small",
+    crate = ":server",
+    deps = all_crate_deps(normal_dev = True),
+)

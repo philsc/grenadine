@@ -1,0 +1,58 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
+
+exports_files(["Cargo.toml"])
+
+rust_shared_library(
+    name = "web_lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "grenadine_web",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    target_compatible_with = ["@platforms//cpu:wasm32"],
+    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+)
+
+# The UI's logic, tested on the host.
+rust_test(
+    name = "web_test",
+    size = "small",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "grenadine_web",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+)
+
+rust_wasm_bindgen(
+    name = "web_bindgen",
+    out_name = "grenadine_web",
+    target = "web",
+    wasm_file = ":web_lib",
+)
+
+# Gives the two files the server embeds fixed labels.
+genrule(
+    name = "web_files",
+    srcs = [":web_bindgen"],
+    outs = [
+        "grenadine_web.js",
+        "grenadine_web_bg.wasm",
+    ],
+    cmd = """
+        for f in $(SRCS); do
+            case "$$f" in
+                */grenadine_web.js) cp "$$f" $(location grenadine_web.js) ;;
+                */grenadine_web_bg.wasm) cp "$$f" $(location grenadine_web_bg.wasm) ;;
+            esac
+        done
+    """,
+    visibility = ["//grenadine/server:__pkg__"],
+)
+
+exports_files(
+    [
+        "static/index.html",
+        "static/style.css",
+    ],
+    visibility = ["//grenadine/server:__pkg__"],
+)

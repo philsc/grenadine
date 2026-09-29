@@ -1,1 +1,5 @@
 build --incompatible_default_to_explicit_init_py
+
+# The web UI does its diffing and highlighting in WebAssembly; unoptimized it
+# is both huge (~30MB) and slow.
+build --compilation_mode=opt

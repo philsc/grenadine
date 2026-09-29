@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "grenadine/core",
+    "grenadine/server",
+    "grenadine/web",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+publish = false
+
+[workspace.dependencies]
+ammonia = "4.2"
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+clap = { version = "4.6", features = ["derive"] }
+console_error_panic_hook = "0.1"
+futures = "0.3"
+gloo-net = { version = "0.7", default-features = false, features = ["http", "json", "eventsource"] }
+js-sys = "0.3"
+leptos = { version = "0.8", features = ["csr"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+similar = "3.2"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Must match the wasm-bindgen CLI that rules_rust_wasm_bindgen 0.74.0 ships
+# (rrwbd__wasm-bindgen-cli-0.2.121); the CLI rejects any other version.
+wasm-bindgen = "=0.2.121"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"

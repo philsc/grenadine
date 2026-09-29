@@ -1,0 +1,25 @@
+[package]
+name = "grenadine_web"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+ammonia.workspace = true
+console_error_panic_hook.workspace = true
+gloo-net.workspace = true
+grenadine_core = { path = "../core" }
+js-sys.workspace = true
+leptos.workspace = true
+pulldown-cmark.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+syntect.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = ["Element", "HtmlElement", "Window", "Document", "EventSource", "MessageEvent", "MediaQueryList", "IntersectionObserver", "IntersectionObserverEntry", "Storage"] }

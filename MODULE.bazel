@@ -7,6 +7,7 @@ bazel_dep(name = "bazel_lib", version = "3.7.2")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.74.0")
 
 bazel_dep(name = "rules_uv", version = "0.89.2")
 
@@ -43,6 +44,8 @@ use_repo(pip, "grenadine_pypi")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
+    # The web UI is compiled to WebAssembly.
+    extra_target_triples = ["wasm32-unknown-unknown"],
     # rules_rust 0.74.0 predates 1.98.1 and has no hashes for it, so pin the
     # host's archives here. Without them the download goes unverified. Another
     # exec platform needs its own entries; get them from
@@ -51,6 +54,7 @@ rust.toolchain(
         "cargo-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "ea1de9f9e23107d97ee2b41a72c552f34064a593da503789218387aee59f3ba4",
         "clippy-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "e167f333be24e1d5eea56ea563c7def0aa0bd613f5ce3445976c93b0288799d1",
         "llvm-tools-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "56d58ca2dfa848359ab23c872791509c6f592448d2f6c146ed530ec50ee45371",
+        "rust-std-1.98.1-wasm32-unknown-unknown.tar.xz": "cf1fcf68880d8b2b90128cede7416cfb82ad3584357ce9fb668f2b6244c26e55",
         "rust-std-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "fa3ff450172a16c026944030230c5069947af93c728d9179971d44e5e0cfb561",
         "rustc-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "e974f036b28565f37c0f3bd92ddefa809bee16c04f9dcf07b9ed96e05aaaf7c4",
         "rustfmt-1.98.1-x86_64-unknown-linux-gnu.tar.xz": "b29a1addcbf2aa8f5785075605700e63cbe131b08c8334b50c09cfca8bbc51dc",
@@ -60,3 +64,28 @@ rust.toolchain(
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")
+
+# Third-party crates come from the Cargo workspace so that cargo and
+# rust-analyzer see the same dependencies as Bazel. After editing a
+# Cargo.toml, run:
+#   bazel run @rules_rust//tools/upstream_wrapper:cargo -- update --workspace --manifest-path=$PWD/Cargo.toml
+#   CARGO_BAZEL_REPIN=1 bazel mod tidy
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:cargo-bazel-lock.json",
+    manifests = ["//:Cargo.toml"],
+    supported_platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "wasm32-unknown-unknown",
+    ],
+)
+
+# wasm_split_macros (via leptos) reads CARGO_MANIFEST_PATH, which cargo sets
+# and Bazel doesn't, to name a symbol uniquely per crate.
+crate.annotation(
+    crate = "wasm_split_helpers",
+    rustc_env = {"CARGO_MANIFEST_PATH": "wasm_split_helpers/Cargo.toml"},
+)
+use_repo(crate, "crates")
