@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -68,6 +69,9 @@ impl Repo {
         c.arg("-C").arg(&self.path);
         // Never prompt for credentials; a fetch that needs them should fail.
         c.env("GIT_TERMINAL_PROMPT", "0");
+        // Ctrl-C in a terminal signals the whole foreground process group;
+        // a separate group lets an in-flight sync finish during shutdown.
+        c.process_group(0);
         c
     }
 

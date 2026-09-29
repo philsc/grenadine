@@ -169,11 +169,34 @@ async fn blobs(AxState(state): St, Json(req): Json<BlobsRequest>) -> ApiResult<R
     Ok(Json(BlobsResponse { blobs }).into_response())
 }
 
+/// The SSE stream of server events; it ends on shutdown so that open
+/// connections don't block the server's graceful shutdown.
+fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
+    let shutdown = state.shutdown.clone();
+    futures::StreamExt::take_until(
+        BroadcastStream::new(state.events.subscribe()).filter_map(|e| {
+            // A lagging receiver misses events; tell it to refetch everything.
+            let e = e.unwrap_or(grenadine_core::api::ServerEvent::InboxesChanged);
+            Event::default().json_data(e).ok().map(Ok)
+        }),
+        shutdown.cancelled_owned(),
+    )
+}
+
 async fn events(AxState(state): St) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|e| {
-        // A lagging receiver misses events; tell it to refetch everything.
-        let e = e.unwrap_or(grenadine_core::api::ServerEvent::InboxesChanged);
-        Event::default().json_data(e).ok().map(Ok)
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(event_stream(&state)).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn events_stream_ends_on_shutdown() {
+        let state = crate::sync::test_state();
+        let mut stream = std::pin::pin!(event_stream(&state));
+        state.shutdown.cancel();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await;
+        assert!(matches!(next, Ok(None)));
+    }
 }

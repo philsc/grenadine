@@ -15,7 +15,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, Notify, broadcast};
+
+/// How long shutdown may take before the process exits anyway.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(about = "Review the versions of your GitHub PRs")]
@@ -68,6 +72,29 @@ fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<Mutex<git::Repo>>
     Ok(repos)
 }
 
+/// Listens for SIGINT and SIGTERM; both listeners are created up front so
+/// that repeated signals are still caught by `wait`.
+struct Signals {
+    int: Signal,
+    term: Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Signals> {
+        Ok(Signals {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.int.recv() => {}
+            _ = self.term.recv() => {}
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -88,14 +115,17 @@ async fn main() -> Result<()> {
     tracing::info!("database: {}", db_path.display());
     let github = github::GitHub::new(&github::gh_token()?)?;
 
+    let mut signals = Signals::new()?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(sync::State {
         db,
         github,
         repos,
         events: broadcast::channel(256).0,
         poke: Notify::new(),
+        shutdown: shutdown.clone(),
     });
-    tokio::spawn(sync::run(
+    let sync_task = tokio::spawn(sync::run(
         state.clone(),
         Duration::from_secs(args.poll_interval.max(1)),
     ));
@@ -105,6 +135,34 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("can't listen on {addr}"))?;
     tracing::info!("serving on http://{addr}/");
-    axum::serve(listener, api::router(state)).await?;
+    let serve_shutdown = shutdown.clone();
+    let mut server_task = tokio::spawn(async move {
+        axum::serve(listener, api::router(state))
+            .with_graceful_shutdown(serve_shutdown.cancelled_owned())
+            .await
+    });
+
+    tokio::select! {
+        _ = signals.wait() => {}
+        r = &mut server_task => return r.context("server task panicked")?.context("can't serve"),
+    }
+    tracing::info!("shutting down");
+    shutdown.cancel();
+    tokio::select! {
+        r = async {
+            server_task.await.context("server task panicked")??;
+            sync_task.await.context("sync task panicked")
+        } => r?,
+        // Dropping the runtime would wait forever on spawn_blocking git
+        // work, so timeouts and repeated signals exit the process directly.
+        _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
+            tracing::warn!("shutdown timed out");
+            std::process::exit(1);
+        }
+        _ = signals.wait() => {
+            tracing::warn!("forced shutdown");
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }

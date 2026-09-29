@@ -33,6 +33,7 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Must match the wasm-bindgen CLI that rules_rust_wasm_bindgen 0.74.0 ships

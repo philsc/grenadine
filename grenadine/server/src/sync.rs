@@ -30,6 +30,9 @@ pub struct State {
     pub events: broadcast::Sender<ServerEvent>,
     /// Wakes the poller early, e.g. after an inbox was edited.
     pub poke: Notify,
+    /// Cancelled on shutdown. The poller then starts no new syncs and the
+    /// event streams end.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl State {
@@ -47,6 +50,9 @@ impl State {
 pub async fn run(state: Arc<State>, interval: Duration) {
     let mut first = true;
     loop {
+        if state.shutdown.is_cancelled() {
+            break;
+        }
         if let Err(e) = poll(&state, first).await {
             tracing::warn!("poll failed: {e:#}");
         }
@@ -54,8 +60,10 @@ pub async fn run(state: Arc<State>, interval: Duration) {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = state.poke.notified() => {}
+            _ = state.shutdown.cancelled() => break,
         }
     }
+    tracing::info!("sync loop stopped");
 }
 
 async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
@@ -65,7 +73,10 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         .iter()
         .map(|i| github::search_query(&i.filter, &slugs))
         .collect();
-    let results = state.github.search(&queries).await?;
+    let results = tokio::select! {
+        r = state.github.search(&queries) => r?,
+        _ = state.shutdown.cancelled() => return Ok(()),
+    };
 
     let mut hits = BTreeMap::new();
     for (inbox, result) in inboxes.iter().zip(results) {
@@ -103,6 +114,7 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         tracing::info!("syncing {} PRs", stale.len());
     }
     futures::stream::iter(stale)
+        .take_until(state.shutdown.cancelled())
         .for_each_concurrent(CONCURRENCY, |key| async move {
             if let Err(e) = sync_pr(state, &key).await {
                 tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
@@ -287,4 +299,34 @@ fn compute_and_store(
         .collect();
     repo.update_refs(&set, &delete)?;
     Ok((computed, versions))
+}
+
+#[cfg(test)]
+pub fn test_state() -> Arc<State> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(State {
+        db: Db::in_memory(),
+        github: GitHub::new("dummy").unwrap(),
+        repos: BTreeMap::new(),
+        events: broadcast::channel(1).0,
+        poke: Notify::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_token_stops_the_loop() {
+        let state = test_state();
+        state.shutdown.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            run(state, Duration::from_secs(3600)),
+        )
+        .await
+        .expect("run did not stop after shutdown");
+    }
 }
