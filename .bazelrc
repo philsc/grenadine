@@ -1,5 +1,29 @@
+# Allow the automatic use of :linux, :macos, and :windows configs in this file.
+# https://bazel.build/run/bazelrc#enable_platform_specific_config
+common --enable_platform_specific_config
+
+# Use remote execution when available. Force sandboxing for local builds.
+build:linux --spawn_strategy=remote,linux-sandbox
+
+# Try to prevent actions from accessing the user's home directory.
+build --sandbox_fake_hostname=true
+build --sandbox_fake_username=true
+
+# Disable the network sandbox by default so we can't leak out to the internet
+build --nosandbox_default_allow_network
+
+# Prevent "exclusive" tests from disabling the sandbox by default. They can
+# still break the sandbox with additional tags like all the other tests.
+build --incompatible_exclusive_test_sandboxed=true
+
+build --incompatible_strict_action_env=true
+
+# Don't auto-generate __init__.py files.
 build --incompatible_default_to_explicit_init_py
 
 # The web UI does its diffing and highlighting in WebAssembly; unoptimized it
 # is both huge (~30MB) and slow.
 build --compilation_mode=opt
+
+# User-specific settings
+try-import %workspace%/.bazelrc.user
