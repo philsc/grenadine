@@ -12,6 +12,8 @@ use std::ops::Range;
 
 use similar::{Algorithm, DiffOp, TextDiff};
 
+use crate::api::FileChange;
+
 /// A run of changed lines: the lines `old` of the old text were replaced by
 /// the lines `new` of the new text. Either range may be empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,9 +76,40 @@ pub fn from_upstream(
         .collect()
 }
 
+/// Splits the files of the diff between two versions into those the PR
+/// changed in at least one of them (`pr_a` and `pr_b` are each version's diff
+/// against its own base) and the number of the rest, which only differ
+/// because of the rebase.
+pub fn touched_by_pr(
+    interdiff: &[FileChange],
+    pr_a: &[FileChange],
+    pr_b: &[FileChange],
+) -> (Vec<FileChange>, usize) {
+    let mut touched: HashSet<&str> = HashSet::new();
+    for f in pr_a.iter().chain(pr_b) {
+        touched.extend(f.old_path.iter().chain(&f.new_path).map(String::as_str));
+    }
+    let mut kept = Vec::new();
+    let mut hidden = 0;
+    for f in interdiff {
+        if f
+            .old_path
+            .iter()
+            .chain(&f.new_path)
+            .any(|p| touched.contains(p.as_str()))
+        {
+            kept.push(f.clone());
+        } else {
+            hidden += 1;
+        }
+    }
+    (kept, hidden)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ChangeStatus;
 
     #[test]
     fn blocks_merge_deletes_and_inserts() {
@@ -125,5 +158,66 @@ mod tests {
             from_upstream(&["x "], &["y"], &blocks, &["x"], &["y"]),
             [true]
         );
+    }
+
+    fn file(old_path: Option<&str>, new_path: Option<&str>) -> FileChange {
+        FileChange {
+            status: ChangeStatus::Modified,
+            old_path: old_path.map(String::from),
+            new_path: new_path.map(String::from),
+            old_blob: None,
+            new_blob: None,
+        }
+    }
+
+    #[test]
+    fn upstream_only_files_are_hidden() {
+        let interdiff = [file(None, Some("upstream.rs")), file(None, Some("pr.rs"))];
+        let pr_a = [file(None, Some("pr.rs"))];
+        let (kept, hidden) = touched_by_pr(&interdiff, &pr_a, &pr_a);
+        assert_eq!(kept, [file(None, Some("pr.rs"))]);
+        assert_eq!(hidden, 1);
+    }
+
+    #[test]
+    fn file_touched_only_in_version_a_is_kept() {
+        let interdiff = [file(None, Some("a_only.rs"))];
+        let (kept, hidden) = touched_by_pr(&interdiff, &[file(None, Some("a_only.rs"))], &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn file_touched_only_in_version_b_is_kept() {
+        let interdiff = [file(None, Some("b_only.rs"))];
+        let (kept, hidden) = touched_by_pr(&interdiff, &[], &[file(None, Some("b_only.rs"))]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn interdiff_rename_matches_either_side() {
+        // Version A renamed old.rs to shared.rs; version B kept old.rs.
+        // Version B renamed shared.rs to new.rs; version A kept new.rs.
+        let interdiff = [
+            file(Some("old.rs"), Some("shared.rs")),
+            file(Some("shared.rs"), Some("new.rs")),
+        ];
+        let pr_a = [file(Some("old.rs"), Some("shared.rs")), file(None, Some("new.rs"))];
+        let pr_b = [file(None, Some("old.rs")), file(Some("shared.rs"), Some("new.rs"))];
+        let (kept, hidden) = touched_by_pr(&interdiff, &pr_a, &pr_b);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(hidden, 0);
+
+        // pr_a has only the old path of an interdiff rename.
+        let interdiff = [file(Some("gone.rs"), Some("here.rs"))];
+        let (kept, hidden) = touched_by_pr(&interdiff, &[file(None, Some("gone.rs"))], &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden, 0);
+
+        // pr_b has only the new path of an interdiff rename.
+        let (kept, hidden) = touched_by_pr(&interdiff, &[], &[file(None, Some("here.rs"))]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(hidden, 0);
     }
 }

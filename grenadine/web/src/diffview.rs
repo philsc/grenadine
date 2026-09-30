@@ -37,7 +37,7 @@ async fn load(
     left: String,
     right: String,
     upstream: Option<(String, String)>,
-) -> api::Result<Vec<Arc<FileData>>> {
+) -> api::Result<(Vec<Arc<FileData>>, usize)> {
     let changes = api::changes(&repo, &left, &right).await?;
     let up_changes = match &upstream {
         Some((a, b)) => Some(api::changes(&repo, a, b).await?),
@@ -51,8 +51,20 @@ async fn load(
         }
     }
 
+    // Between two different bases the interdiff also shows every file upstream
+    // changed; only the files the PR itself touched in either version are
+    // interesting.
+    let (files, hidden) = match &upstream {
+        Some((a, b)) => {
+            let pr_a = api::changes(&repo, a, &left).await?;
+            let pr_b = api::changes(&repo, b, &right).await?;
+            rebase::touched_by_pr(&changes.files, &pr_a.files, &pr_b.files)
+        }
+        None => (changes.files.clone(), 0),
+    };
+
     let mut ids = Vec::new();
-    for f in &changes.files {
+    for f in &files {
         ids.extend(f.old_blob.iter().chain(&f.new_blob).cloned());
         if let Some(u) = up_by_path.get(f.path()) {
             ids.extend(u.old_blob.iter().chain(&u.new_blob).cloned());
@@ -60,9 +72,9 @@ async fn load(
     }
     api::load_blobs(&repo, ids).await?;
 
-    Ok(changes
-        .files
-        .iter()
+    Ok((
+        files
+            .iter()
         .map(|f| {
             Arc::new(FileData {
                 change: f.clone(),
@@ -73,7 +85,9 @@ async fn load(
                     .map(|u| (blob(&u.old_blob), blob(&u.new_blob))),
             })
         })
-        .collect())
+        .collect(),
+        hidden,
+    ))
 }
 
 #[component]
@@ -95,14 +109,21 @@ pub fn DiffView(
         Some(Err(e)) => {
             view! { <p class="empty error">{format!("Can't load the diff: {e}")}</p> }.into_any()
         }
-        Some(Ok(files)) if files.is_empty() => {
-            view! { <p class="empty">"No changes."</p> }.into_any()
+        Some(Ok((files, hidden))) if files.is_empty() => {
+            view! { <p class="empty">{format!("No changes.{}", if hidden > 0 {
+                format!(" {hidden} files changed only by the rebase are hidden.")
+            } else {
+                String::new()
+            })}</p> }.into_any()
         }
-        Some(Ok(files)) => {
+        Some(Ok((files, hidden))) => {
             let comments = comments.clone();
             view! {
                 <div class="diff-summary muted">
                     {format!("{} files changed", files.len())}
+                    {(hidden > 0).then(|| view! {
+                        <span>{format!(" · {hidden} files changed only by the rebase are hidden")}</span>
+                    })}
                     {has_upstream.then(|| view! {
                         <span class="legend"><span class="upstream-swatch"></span>" changes brought in by the rebase"</span>
                     })}
