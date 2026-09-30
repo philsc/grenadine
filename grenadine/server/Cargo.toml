@@ -8,6 +8,10 @@ publish.workspace = true
 name = "grenadine"
 path = "src/main.rs"
 
+[[bin]]
+name = "validate_inboxes"
+path = "src/bin/validate_inboxes.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

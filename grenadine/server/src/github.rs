@@ -79,17 +79,32 @@ pub fn unix(ts: &str) -> Result<i64> {
         .timestamp())
 }
 
-/// Builds the GitHub search query for an inbox filter: `is:pr` plus one
-/// `repo:` qualifier per configured repository.
+/// Builds the GitHub search query for an inbox filter: `is:pr`, the
+/// filter parenthesised because AND binds tighter than OR, the
+/// repositories OR'd into one `repo:` group because space-separated
+/// `repo:` qualifiers would AND, and any `sort:` tokens moved to the
+/// end. A group is omitted when it would be empty.
 pub fn search_query(filter: &str, repos: &[String]) -> String {
-    let mut q = format!("is:pr {}", filter.trim());
-    for r in repos {
-        q += &format!(" repo:{r}");
+    let (sorts, terms): (Vec<&str>, Vec<&str>) = filter
+        .split_whitespace()
+        .partition(|t| t.starts_with("sort:"));
+    let mut parts = vec!["is:pr".to_owned()];
+    if !terms.is_empty() {
+        parts.push(format!("({})", terms.join(" ")));
     }
-    q
+    if !repos.is_empty() {
+        let group = repos
+            .iter()
+            .map(|r| format!("repo:{r}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        parts.push(format!("({group})"));
+    }
+    parts.extend(sorts.iter().map(|s| s.to_string()));
+    parts.join(" ")
 }
 
-const SEARCH_LIMIT: usize = 100;
+pub const SEARCH_LIMIT: usize = 100;
 
 const PR_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!) {
@@ -222,6 +237,8 @@ impl GitHub {
 
     /// Runs several searches in one GraphQL request. Each result is either
     /// the PRs found, in GitHub's order, or the error for that search.
+    /// `ISSUE_ADVANCED` is what makes AND, OR and parentheses work; plain
+    /// `ISSUE` finds nothing for a query with parentheses.
     pub async fn search(
         &self,
         queries: &[String],
@@ -238,7 +255,7 @@ impl GitHub {
         let mut vars = serde_json::Map::new();
         for (i, q) in queries.iter().enumerate() {
             gql += &format!(
-                "s{i}: search(type: ISSUE, query: $q{i}, first: {SEARCH_LIMIT}) {{
+                "s{i}: search(type: ISSUE_ADVANCED, query: $q{i}, first: {SEARCH_LIMIT}) {{
                    nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner }} }} }}
                  }}\n"
             );
@@ -477,8 +494,24 @@ mod tests {
     fn queries_are_scoped_to_the_repos() {
         assert_eq!(
             search_query(" is:open author:@me ", &["a/b".into(), "c/d".into()]),
-            "is:pr is:open author:@me repo:a/b repo:c/d"
+            "is:pr (is:open author:@me) (repo:a/b OR repo:c/d)"
         );
+        // An OR in the filter stays inside its parentheses; `sort:`
+        // tokens move to the end, in order.
+        assert_eq!(
+            search_query(
+                "author:@me (x:y OR z:w) sort:updated-desc sort:comments",
+                &["a/b".into(), "c/d".into()]
+            ),
+            "is:pr (author:@me (x:y OR z:w)) (repo:a/b OR repo:c/d) sort:updated-desc sort:comments"
+        );
+        assert_eq!(
+            search_query("is:open", &["a/b".into()]),
+            "is:pr (is:open) (repo:a/b)"
+        );
+        assert_eq!(search_query("is:open", &[]), "is:pr (is:open)");
+        assert_eq!(search_query(" ", &["a/b".into()]), "is:pr (repo:a/b)");
+        assert_eq!(search_query("", &[]), "is:pr");
     }
 
     #[test]

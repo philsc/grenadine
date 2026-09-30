@@ -12,11 +12,25 @@ WEB_FILES = {
 
 rust_binary(
     name = "server",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
     compile_data = WEB_FILES.values(),
     crate_name = "grenadine",
     # rules_rust makes these absolute, which include_bytes! needs.
     rustc_env = {k: "$(execpath %s)" % v for k, v in WEB_FILES.items()},
+    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+)
+
+rust_binary(
+    name = "validate_inboxes",
+    srcs = [
+        "src/bin/validate_inboxes.rs",
+        "src/github.rs",
+        "src/inboxes.rs",
+    ],
+    crate_root = "src/bin/validate_inboxes.rs",
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],
 )
 

@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct Inbox {
     pub id: i64,
     pub name: String,
-    /// The GitHub search filter as the user wrote it. The server appends
-    /// `is:pr` and a `repo:` qualifier per configured repository.
+    /// The GitHub search filter as the user wrote it. The server wraps
+    /// it in `is:pr (...)`, ORs the configured repositories into a
+    /// `repo:` group and moves any `sort:` tokens to the end.
     pub filter: String,
     pub position: i64,
 }

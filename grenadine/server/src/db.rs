@@ -10,8 +10,14 @@ use grenadine_core::api::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
+enum Migration {
+    Sql(&'static str),
+    /// Replaces every inbox with the defaults.
+    ResetInboxes,
+}
+
 /// Each entry upgrades the schema by one version.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
     CREATE TABLE inboxes (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -87,8 +93,8 @@ const MIGRATIONS: &[&str] = &[r#"
         old TEXT NOT NULL,
         new TEXT NOT NULL
     );
-"#,
-    r#"
+"#),
+    Migration::Sql(r#"
     -- The search's metadata, so a PR shows in its inbox before it has
     -- synced. sync_error holds the error of a PR that has never synced
     -- successfully, because such a PR has no prs row to carry it.
@@ -99,8 +105,8 @@ const MIGRATIONS: &[&str] = &[r#"
     ALTER TABLE inbox_prs ADD COLUMN url TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN sync_error TEXT;
-"#,
-    r#"
+"#),
+    Migration::Sql(r#"
     -- Sync errors of PRs that have neither a prs row nor an inbox_prs
     -- row, e.g. PRs synced on demand that no inbox covers.
     CREATE TABLE sync_errors (
@@ -109,7 +115,40 @@ const MIGRATIONS: &[&str] = &[r#"
         error TEXT NOT NULL,
         PRIMARY KEY (repo, number)
     );
-"#];
+"#),
+    Migration::ResetInboxes,
+];
+
+/// Applies migrations up to `target` (a schema version); each runs in
+/// its own transaction.
+fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
+    let current: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    for (i, m) in MIGRATIONS
+        .iter()
+        .enumerate()
+        .skip(current)
+        .take(target.saturating_sub(current))
+    {
+        let tx = conn.transaction()?;
+        match m {
+            Migration::Sql(sql) => tx.execute_batch(sql)?,
+            Migration::ResetInboxes => {
+                tx.execute("DELETE FROM inboxes", [])?;
+                for (position, (name, filter)) in
+                    crate::inboxes::DEFAULT_INBOXES.iter().enumerate()
+                {
+                    tx.execute(
+                        "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
+                        params![name, filter, position as i64],
+                    )?;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", i + 1)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -173,13 +212,7 @@ impl Db {
     fn init(mut conn: Connection) -> Result<Db> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let current: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", i + 1)?;
-            tx.commit()?;
-        }
+        migrate(&mut conn, MIGRATIONS.len())?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -617,22 +650,16 @@ mod tests {
     #[test]
     fn default_inboxes() {
         let db = Db::in_memory();
-        let names: Vec<_> = db
-            .inboxes()
-            .unwrap()
-            .into_iter()
-            .map(|i| i.filter)
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "is:open author:@me draft:false",
-                "is:open author:@me draft:true",
-                "is:open review-requested:@me draft:false",
-                "is:open reviewed-by:@me draft:false",
-                "is:open involves:@me draft:false"
-            ]
-        );
+        let inboxes = db.inboxes().unwrap();
+        assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
+        for (position, (inbox, (name, filter))) in inboxes
+            .iter()
+            .zip(crate::inboxes::DEFAULT_INBOXES.iter())
+            .enumerate()
+        {
+            assert_eq!((inbox.name.as_str(), inbox.filter.as_str()), (*name, *filter));
+            assert_eq!(inbox.position, position as i64);
+        }
     }
 
     #[test]
@@ -645,7 +672,7 @@ mod tests {
         };
         let id = db.create_inbox(&edit).unwrap();
         let inbox = db.inboxes().unwrap().pop().unwrap();
-        assert_eq!((inbox.id, inbox.position), (id, 5));
+        assert_eq!((inbox.id, inbox.position), (id, 9));
         assert!(
             db.update_inbox(
                 id,
@@ -800,8 +827,12 @@ mod tests {
 
     #[test]
     fn migrates_a_v1_database() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let Migration::Sql(sql) = MIGRATIONS[0] else {
+            panic!("migration 1 is SQL")
+        };
+        conn.execute_batch(sql).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         conn.execute(
             "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
@@ -815,12 +846,48 @@ mod tests {
             [],
         )
         .unwrap();
-        let db = Db::init(conn).unwrap();
+        // Stop before migration 4, which would replace the inboxes and
+        // cascade away the inbox_prs row.
+        migrate(&mut conn, 3).unwrap();
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
         // Until the next poll rewrites the row, the listing takes the
         // fields from prs.
         let pr = &db.inbox_prs(1).unwrap()[0];
         assert_eq!(pr.title, "old title");
         assert_eq!(pr.author, "au");
         assert!(pr.synced);
+    }
+
+    #[test]
+    fn migration_4_replaces_inboxes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, 3).unwrap();
+        conn.execute(
+            "INSERT INTO inboxes (name, filter, position) VALUES ('Custom', 'label:x', 9)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_prs (inbox_id, repo, number, rank) VALUES (1, 'o/n', 7, 0)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let inboxes = db.inboxes().unwrap();
+        assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
+        for (inbox, (name, filter)) in inboxes
+            .iter()
+            .zip(crate::inboxes::DEFAULT_INBOXES.iter())
+        {
+            assert_eq!((inbox.name.as_str(), inbox.filter.as_str()), (*name, *filter));
+        }
+        let listed: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM inbox_prs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(listed, 0);
     }
 }

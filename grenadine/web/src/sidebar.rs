@@ -37,7 +37,7 @@ pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
             {move || if adding.get() {
                 view! {
                     <InboxForm
-                        initial=InboxEdit { name: String::new(), filter: "is:open draft:false ".into(), position: None }
+                        initial=InboxEdit { name: String::new(), filter: "state:open archived:false draft:false ".into(), position: None }
                         on_done=Callback::new(move |_| adding.set(false))
                         id=None
                     />
