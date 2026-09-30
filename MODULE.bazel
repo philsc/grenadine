@@ -8,7 +8,6 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.74.0")
-
 bazel_dep(name = "rules_uv", version = "0.89.2")
 
 # rules_python ships the interpreter three times over in every py_binary's
