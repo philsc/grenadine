@@ -25,5 +25,15 @@ build --incompatible_default_to_explicit_init_py
 # is both huge (~30MB) and slow.
 build --compilation_mode=opt
 
+# Lint with clippy: bazel build --config=clippy //...
+# Warnings are errors so that a cached run can't hide them.
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+build:clippy --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+
+# Check formatting without rewriting any files: bazel build --config=rustfmt //...
+build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:rustfmt --output_groups=+rustfmt_checks
+
 # User-specific settings
 try-import %workspace%/.bazelrc.user
