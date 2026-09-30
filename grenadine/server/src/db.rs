@@ -87,6 +87,18 @@ const MIGRATIONS: &[&str] = &[r#"
         old TEXT NOT NULL,
         new TEXT NOT NULL
     );
+"#,
+    r#"
+    -- The search's metadata, so a PR shows in its inbox before it has
+    -- synced. sync_error holds the error of a PR that has never synced
+    -- successfully, because such a PR has no prs row to carry it.
+    ALTER TABLE inbox_prs ADD COLUMN title TEXT NOT NULL DEFAULT '';
+    ALTER TABLE inbox_prs ADD COLUMN author TEXT NOT NULL DEFAULT '';
+    ALTER TABLE inbox_prs ADD COLUMN state TEXT NOT NULL DEFAULT '';
+    ALTER TABLE inbox_prs ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE inbox_prs ADD COLUMN url TEXT NOT NULL DEFAULT '';
+    ALTER TABLE inbox_prs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+    ALTER TABLE inbox_prs ADD COLUMN sync_error TEXT;
 "#];
 
 pub struct Db {
@@ -223,23 +235,55 @@ impl Db {
             > 0)
     }
 
-    /// Records the outcome of an inbox's search.
+    /// Records the outcome of an inbox's search. The rows reflect exactly
+    /// the latest search, in rank order; a PR that is listed again keeps
+    /// its sync_error.
     pub fn set_inbox_results(
         &self,
         id: i64,
-        result: std::result::Result<&[PrKey], &str>,
+        result: std::result::Result<&[crate::github::Hit], &str>,
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         match result {
-            Ok(keys) => {
-                tx.execute("DELETE FROM inbox_prs WHERE inbox_id = ?", [id])?;
-                for (rank, k) in keys.iter().enumerate() {
+            Ok(hits) => {
+                for (rank, h) in hits.iter().enumerate() {
                     tx.execute(
-                        "INSERT OR IGNORE INTO inbox_prs (inbox_id, repo, number, rank) VALUES (?, ?, ?, ?)",
-                        params![id, k.repo, k.number, rank],
+                        "INSERT INTO inbox_prs
+                            (inbox_id, repo, number, rank, title, author, state, is_draft, url, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (inbox_id, repo, number) DO UPDATE SET
+                            rank = excluded.rank, title = excluded.title, author = excluded.author,
+                            state = excluded.state, is_draft = excluded.is_draft, url = excluded.url,
+                            updated_at = excluded.updated_at",
+                        params![
+                            id,
+                            h.key.repo,
+                            h.key.number,
+                            rank,
+                            h.title,
+                            h.author,
+                            h.state,
+                            h.is_draft,
+                            h.url,
+                            h.updated_at
+                        ],
                     )?;
                 }
+                // Rows for PRs the search no longer reports go away.
+                let mut sql =
+                    String::from("DELETE FROM inbox_prs WHERE inbox_id = ?");
+                if !hits.is_empty() {
+                    sql += " AND (repo, number) NOT IN (VALUES ";
+                    sql += &vec!["(?, ?)"; hits.len()].join(",");
+                    sql += ")";
+                }
+                let mut args: Vec<&dyn rusqlite::ToSql> = vec![&id];
+                for h in hits {
+                    args.push(&h.key.repo);
+                    args.push(&h.key.number);
+                }
+                tx.execute(&sql, rusqlite::params_from_iter(args))?;
                 tx.execute("UPDATE inboxes SET error = NULL WHERE id = ?", [id])?;
             }
             // Keep the previous results; a transient error shouldn't empty
@@ -254,13 +298,25 @@ impl Db {
 
     pub fn inbox_prs(&self, id: i64) -> Result<Vec<PrSummary>> {
         let conn = self.conn();
+        // Rows that still have the migration's empty defaults take their
+        // fields from prs until the next poll rewrites them.
         let mut stmt = conn.prepare(
-            "SELECT p.repo, p.number, p.title, p.author, p.state, p.is_draft, p.updated_at, p.url,
-                    (SELECT COUNT(*) FROM versions v WHERE v.repo = p.repo AND v.number = p.number)
-             FROM inbox_prs i JOIN prs p ON p.repo = i.repo AND p.number = i.number
+            "SELECT i.repo, i.number,
+                    CASE WHEN i.title = '' THEN COALESCE(p.title, '') ELSE i.title END,
+                    CASE WHEN i.title = '' THEN COALESCE(p.author, '') ELSE i.author END,
+                    CASE WHEN i.title = '' THEN COALESCE(p.state, '') ELSE i.state END,
+                    CASE WHEN i.title = '' THEN COALESCE(p.is_draft, 0) ELSE i.is_draft END,
+                    CASE WHEN i.title = '' THEN COALESCE(p.updated_at, '') ELSE i.updated_at END,
+                    CASE WHEN i.title = '' THEN COALESCE(p.url, '') ELSE i.url END,
+                    (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
+                    p.repo IS NOT NULL,
+                    CASE WHEN p.repo IS NULL THEN i.sync_error END
+             FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
-        let rows = stmt.query_map([id], summary_from_row)?;
+        let rows = stmt.query_map([id], |r| {
+            summary_from_row(r, r.get(9)?, r.get(10)?)
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -343,6 +399,11 @@ impl Db {
                 drift_text,
             ],
         )?;
+        // The error a not-yet-synced listing carried is now obsolete.
+        tx.execute(
+            "UPDATE inbox_prs SET sync_error = NULL WHERE repo = ? AND number = ?",
+            params![key.repo, key.number],
+        )?;
         if let Some((old, new)) = drift {
             tx.execute(
                 "INSERT INTO drift_log (repo, number, at, old, new) VALUES (?, ?, datetime('now'), ?, ?)",
@@ -386,10 +447,16 @@ impl Db {
             .optional()?)
     }
 
-    /// Records a failed sync. Only an already-known PR can carry the error.
+    /// Records a failed sync. A PR that has never synced has no prs row,
+    /// so the error also goes on its inbox_prs rows.
     pub fn store_sync_error(&self, key: &PrKey, error: &str) -> Result<()> {
-        self.conn().execute(
+        let conn = self.conn();
+        conn.execute(
             "UPDATE prs SET sync_error = ? WHERE repo = ? AND number = ?",
+            params![error, key.repo, key.number],
+        )?;
+        conn.execute(
+            "UPDATE inbox_prs SET sync_error = ? WHERE repo = ? AND number = ?",
             params![error, key.repo, key.number],
         )?;
         Ok(())
@@ -406,7 +473,7 @@ impl Db {
                 params![key.repo, key.number],
                 |r| {
                     Ok((
-                        summary_from_row(r)?,
+                        summary_from_row(r, true, None)?,
                         r.get::<_, String>(9)?,
                         r.get::<_, String>(10)?,
                         r.get::<_, String>(11)?,
@@ -443,7 +510,11 @@ impl Db {
     }
 }
 
-fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<PrSummary> {
+fn summary_from_row(
+    r: &rusqlite::Row,
+    synced: bool,
+    sync_error: Option<String>,
+) -> rusqlite::Result<PrSummary> {
     Ok(PrSummary {
         key: PrKey {
             repo: r.get(0)?,
@@ -456,6 +527,8 @@ fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<PrSummary> {
         updated_at: r.get(6)?,
         url: r.get(7)?,
         version_count: r.get(8)?,
+        synced,
+        sync_error,
     })
 }
 
@@ -464,6 +537,19 @@ mod tests {
     use grenadine_core::api::Side;
 
     use super::*;
+
+    fn hit(key: &PrKey) -> crate::github::Hit {
+        crate::github::Hit {
+            key: key.clone(),
+            title: "hit title".into(),
+            author: "ha".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "hu".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
+            head_oid: "h".into(),
+        }
+    }
 
     fn meta(key: &PrKey) -> PrMeta {
         PrMeta {
@@ -536,10 +622,14 @@ mod tests {
             repo: "o/n".into(),
             number: 7,
         };
-        db.set_inbox_results(1, Ok(std::slice::from_ref(&key)))
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
             .unwrap();
-        // Listed, but not synced yet.
-        assert!(db.inbox_prs(1).unwrap().is_empty());
+        // Listed, but not synced yet: the search's metadata shows.
+        let prs = db.inbox_prs(1).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert!(!prs[0].synced);
+        assert_eq!(prs[0].title, "hit title");
+        assert_eq!(prs[0].version_count, 0);
 
         let versions = vec![Version {
             number: 1,
@@ -572,7 +662,7 @@ mod tests {
         assert_eq!(pr.comments, comments);
         assert_eq!(pr.summary.version_count, 1);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));
-        assert_eq!(db.inbox_prs(1).unwrap().len(), 1);
+        assert!(db.inbox_prs(1).unwrap()[0].synced);
         assert_eq!(
             db.sync_mark(&key).unwrap(),
             Some(SyncMark {
@@ -596,5 +686,60 @@ mod tests {
         db.set_inbox_results(1, Err("bad filter")).unwrap();
         assert_eq!(db.inbox_error(1).unwrap().as_deref(), Some("bad filter"));
         assert_eq!(db.inbox_prs(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_error_shows_on_a_never_synced_pr() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+            .unwrap();
+        db.store_sync_error(&key, "boom").unwrap();
+        assert_eq!(
+            db.inbox_prs(1).unwrap()[0].sync_error.as_deref(),
+            Some("boom")
+        );
+
+        // Re-listing the same PR keeps the error.
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+            .unwrap();
+        assert_eq!(
+            db.inbox_prs(1).unwrap()[0].sync_error.as_deref(),
+            Some("boom")
+        );
+
+        db.store_sync(&meta(&key), &[], &[], false, None).unwrap();
+        let pr = db.inbox_prs(1).unwrap().remove(0);
+        assert!(pr.synced);
+        assert_eq!(pr.sync_error, None);
+    }
+
+    #[test]
+    fn migrates_a_v1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
+                              created_at, updated_at, base_ref, head_ref, head_oid)
+             VALUES ('o/n', 7, 'old title', 'b', 'au', 'OPEN', 0, 'u', 'c', 'u', 'main', 'pr', 'h')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_prs (inbox_id, repo, number, rank) VALUES (1, 'o/n', 7, 0)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        // Until the next poll rewrites the row, the listing takes the
+        // fields from prs.
+        let pr = &db.inbox_prs(1).unwrap()[0];
+        assert_eq!(pr.title, "old title");
+        assert_eq!(pr.author, "au");
+        assert!(pr.synced);
     }
 }

@@ -42,6 +42,12 @@ pub struct PrSummary {
     pub updated_at: String,
     pub url: String,
     pub version_count: u32,
+    /// Whether the PR's full metadata has been synced into the database;
+    /// an unsynced entry only carries the search's metadata.
+    pub synced: bool,
+    /// Set when the last sync failed before the PR ever synced. After a
+    /// successful sync the error lives on `PrDetail` instead.
+    pub sync_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

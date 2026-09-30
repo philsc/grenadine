@@ -38,6 +38,12 @@ pub struct GitHub {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
     pub key: PrKey,
+    pub title: String,
+    pub author: String,
+    /// OPEN, CLOSED or MERGED.
+    pub state: String,
+    pub is_draft: bool,
+    pub url: String,
     pub updated_at: String,
     pub head_oid: String,
 }
@@ -218,7 +224,7 @@ impl GitHub {
         for (i, q) in queries.iter().enumerate() {
             gql += &format!(
                 "s{i}: search(type: ISSUE, query: $q{i}, first: {SEARCH_LIMIT}) {{
-                   nodes {{ ... on PullRequest {{ number updatedAt headRefOid repository {{ nameWithOwner }} }} }}
+                   nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner }} }} }}
                  }}\n"
             );
             vars.insert(format!("q{i}"), json!(q));
@@ -260,6 +266,14 @@ impl GitHub {
                             repo: str_at(n, "/repository/nameWithOwner").to_owned(),
                             number: n["number"].as_u64().unwrap_or_default(),
                         },
+                        title: str_at(n, "/title").to_owned(),
+                        author: Some(str_at(n, "/author/login"))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("ghost")
+                            .to_owned(),
+                        state: str_at(n, "/state").to_owned(),
+                        is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+                        url: str_at(n, "/url").to_owned(),
                         updated_at: str_at(n, "/updatedAt").to_owned(),
                         head_oid: str_at(n, "/headRefOid").to_owned(),
                     })

@@ -151,8 +151,7 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                     .into_iter()
                     .filter(|h| state.repos.contains_key(&h.key.repo))
                     .collect();
-                let keys: Vec<PrKey> = found.iter().map(|h| h.key.clone()).collect();
-                state.db.set_inbox_results(inbox.id, Ok(&keys))?;
+                state.db.set_inbox_results(inbox.id, Ok(&found))?;
                 hits.extend(found.into_iter().map(|h| (h.key.clone(), h)));
             }
             Err(e) => {
@@ -190,12 +189,10 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                 let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
             }
             state.send(ServerEvent::PrChanged(key));
+            // A synced or failed PR shows up differently in the inboxes.
+            state.send(ServerEvent::InboxesChanged);
         })
         .await;
-    if sync_all {
-        // Now that the PRs exist in the database, the inboxes can list them.
-        state.send(ServerEvent::InboxesChanged);
-    }
     Ok(())
 }
 
