@@ -157,7 +157,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         match pr.get() {
         None => view! { <div class="empty">"Loading…"</div> }.into_any(),
         Some(Err(e)) => view! { <div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div> }.into_any(),
-        Some(Ok(pr)) => {
+        Some(Ok(None)) => view! { <div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div> }.into_any(),
+        Some(Ok(Some(pr))) => {
             let pr = Arc::new(pr);
             prefetch(&pr);
             view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side /> }.into_any()

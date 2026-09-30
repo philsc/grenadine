@@ -56,16 +56,20 @@ pub async fn delete_inbox(id: i64) -> Result<()> {
         .map(|_| ())
 }
 
-pub async fn pr(key: &PrKey) -> Result<PrDetail> {
-    check(
-        Request::get(&format!("/api/pr/{}/{}", key.repo, key.number))
-            .send()
-            .await,
-    )
-    .await?
-    .json()
-    .await
-    .map_err(|e| e.to_string())
+/// `Ok(None)` when the PR hasn't synced yet.
+pub async fn pr(key: &PrKey) -> Result<Option<PrDetail>> {
+    let resp = Request::get(&format!("/api/pr/{}/{}", key.repo, key.number))
+        .send()
+        .await;
+    if resp.as_ref().is_ok_and(|r| r.status() == 404) {
+        return Ok(None);
+    }
+    check(resp)
+        .await?
+        .json()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 pub async fn sync_status() -> Result<SyncStatus> {

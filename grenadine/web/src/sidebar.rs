@@ -161,8 +161,15 @@ fn InboxSection(
                                         {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
                                         {pr.title.clone()}
                                     </span>
-                                    <span class="pr-meta muted">
-                                        {format!("{}#{} · {} · {} versions", pr.key.repo, pr.key.number, pr.author, pr.version_count)}
+                                    <span class="pr-meta muted" title=pr.sync_error.clone()>
+                                        {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
+                                        {if pr.synced {
+                                            format!("{} versions", pr.version_count).into_any()
+                                        } else if pr.sync_error.is_some() {
+                                            view! { <span class="error">"sync failed"</span> }.into_any()
+                                        } else {
+                                            view! { <span>"syncing…"</span> }.into_any()
+                                        }}
                                     </span>
                                 </a>
                             </li>
