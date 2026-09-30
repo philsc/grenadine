@@ -248,7 +248,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
     }
 }
 
-fn storage() -> Option<web_sys::Storage> {
+pub(crate) fn storage() -> Option<web_sys::Storage> {
     window().local_storage().ok().flatten()
 }
 

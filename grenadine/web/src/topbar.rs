@@ -1,12 +1,13 @@
-//! The top bar: the wordmark on the left, the poller's sync status on the
-//! right. Hovering the status shows what is syncing or what went wrong.
+//! The top bar: the wordmark on the left, a theme picker and the poller's
+//! sync status on the right. Hovering the status shows what is syncing or
+//! what went wrong.
 
 use std::time::Duration;
 
 use grenadine_core::api::{SyncPhase, SyncStatus, SyncingPr};
 use leptos::prelude::*;
 
-use crate::Updates;
+use crate::{Updates, theme::{self, Theme}};
 
 /// A relative timestamp like "5m ago" for the status line.
 fn ago(now: i64, then: i64) -> String {
@@ -51,6 +52,7 @@ fn pr_line(pr: &SyncingPr) -> String {
 #[component]
 pub fn Topbar() -> impl IntoView {
     let updates = expect_context::<Updates>();
+    let theme = theme::signal();
 
     let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
     let handle =
@@ -64,6 +66,17 @@ pub fn Topbar() -> impl IntoView {
     view! {
         <header class="topbar">
             <span class="topbar-brand">"grenadine"</span>
+            <span class="topbar-right">
+                <select
+                    class="theme-picker"
+                    aria-label="Theme"
+                    prop:value=move || theme.get().as_str()
+                    on:change=move |ev| theme.set(Theme::parse(&event_target_value(&ev)))
+                >
+                    <option value="auto">"Auto"</option>
+                    <option value="light">"Light"</option>
+                    <option value="dark">"Dark"</option>
+                </select>
             {move || {
                 let status = updates.sync.get();
                 let at = now.get();
@@ -88,6 +101,7 @@ pub fn Topbar() -> impl IntoView {
                     </span>
                 }
             }}
+            </span>
         </header>
     }
 }

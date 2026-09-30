@@ -1,5 +1,10 @@
 :root {
-  color-scheme: light dark;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
   --bg: #ffffff;
   --bg-subtle: #f6f8fa;
   --bg-hover: #eef1f4;
@@ -21,34 +26,31 @@
   --error-fg: #cf222e;
   --error-bg: #ffebe9;
   --upstream-stripe: rgba(128, 128, 128, 0.12);
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117;
-    --bg-subtle: #161b22;
-    --bg-hover: #1f2630;
-    --fg: #e6edf3;
-    --fg-muted: #8d96a0;
-    --border: #30363d;
-    --accent: #4493f8;
-    --accent-bg: #121d2f;
-    --add-bg: rgba(46, 160, 67, 0.15);
-    --add-ln: rgba(63, 185, 80, 0.3);
-    --add-fg: #3fb950;
-    --add-word: rgba(46, 160, 67, 0.4);
-    --del-bg: rgba(248, 81, 73, 0.1);
-    --del-ln: rgba(248, 81, 73, 0.3);
-    --del-fg: #f85149;
-    --del-word: rgba(248, 81, 73, 0.4);
-    --warn-bg: rgba(187, 128, 9, 0.15);
-    --warn-border: #9e6a03;
-    --error-fg: #f85149;
-    --error-bg: rgba(248, 81, 73, 0.1);
-    --upstream-stripe: rgba(200, 200, 200, 0.08);
-  }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0d1117;
+  --bg-subtle: #161b22;
+  --bg-hover: #1f2630;
+  --fg: #e6edf3;
+  --fg-muted: #8d96a0;
+  --border: #30363d;
+  --accent: #4493f8;
+  --accent-bg: #121d2f;
+  --add-bg: rgba(46, 160, 67, 0.15);
+  --add-ln: rgba(63, 185, 80, 0.3);
+  --add-fg: #3fb950;
+  --add-word: rgba(46, 160, 67, 0.4);
+  --del-bg: rgba(248, 81, 73, 0.1);
+  --del-ln: rgba(248, 81, 73, 0.3);
+  --del-fg: #f85149;
+  --del-word: rgba(248, 81, 73, 0.4);
+  --warn-bg: rgba(187, 128, 9, 0.15);
+  --warn-border: #9e6a03;
+  --error-fg: #f85149;
+  --error-bg: rgba(248, 81, 73, 0.1);
+  --upstream-stripe: rgba(200, 200, 200, 0.08);
 }
 
 * { box-sizing: border-box; }
@@ -126,6 +128,15 @@ input[type="text"] {
   color: var(--fg-muted);
 }
 .topbar-brand { font-weight: 600; color: var(--fg); }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.theme-picker {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 4px;
+}
 
 .sync-status { position: relative; cursor: default; }
 .sync-status.error { color: var(--error-fg); }

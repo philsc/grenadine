@@ -7,6 +7,7 @@ mod highlight;
 mod markdown;
 mod pr;
 mod sidebar;
+mod theme;
 mod topbar;
 
 use grenadine_core::api::{PrKey, ServerEvent, SyncStatus};

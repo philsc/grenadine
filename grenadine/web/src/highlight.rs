@@ -22,8 +22,10 @@ fn with_syntaxes<R>(f: impl FnOnce(&SyntaxSet) -> R) -> R {
     SYNTAXES.with(|cell| f(cell.get_or_init(SyntaxSet::load_defaults_newlines)))
 }
 
-/// The stylesheet for both themes; the dark one applies when the browser
-/// prefers a dark color scheme.
+/// The stylesheet for both themes. Every rule is scoped to
+/// `:root[data-theme="light"]` or `:root[data-theme="dark"]` so that only
+/// one theme's rules can ever match; the light theme's more specific
+/// selectors would otherwise win over the dark theme's plainer ones.
 pub fn stylesheet() -> String {
     let themes = ThemeSet::load_defaults();
     let light = css_for_theme_with_class_style(&themes.themes["InspiredGitHub"], CLASS_STYLE)
@@ -38,10 +40,31 @@ pub fn stylesheet() -> String {
             .join("\n")
     };
     format!(
-        "{}\n@media (prefers-color-scheme: dark) {{\n{}\n}}\n",
-        strip(light),
-        strip(dark)
+        "{}\n{}\n",
+        scope(&strip(light), ":root[data-theme=\"light\"]"),
+        scope(&strip(dark), ":root[data-theme=\"dark\"]")
     )
+}
+
+/// Prepends `prefix` to every selector in `css`. Rule lines end in `{` and
+/// carry a comma-separated selector list; comments and closing braces pass
+/// through untouched.
+fn scope(css: &str, prefix: &str) -> String {
+    css.lines()
+        .map(|line| {
+            let trimmed = line.trim_end();
+            let Some(selectors) = trimmed.strip_suffix('{') else {
+                return line.to_owned();
+            };
+            selectors
+                .split(',')
+                .map(|s| format!("{prefix} {}", s.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+                + " {"
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn syntax_for<'a>(set: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
@@ -210,6 +233,44 @@ fn split_lines(html: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stylesheet_scopes_every_rule_to_a_theme() {
+        const LIGHT: &str = ":root[data-theme=\"light\"]";
+        const DARK: &str = ":root[data-theme=\"dark\"]";
+        let css = stylesheet();
+        assert!(!css.contains("@media"));
+        let mut saw_light = false;
+        let mut saw_dark = false;
+        let mut json_string_selectors = Vec::new();
+        for line in css.lines() {
+            let Some(selectors) = line.trim_end().strip_suffix('{') else {
+                continue;
+            };
+            for selector in selectors.split(',').map(str::trim) {
+                if let Some(rest) = selector.strip_prefix(LIGHT) {
+                    assert!(rest.starts_with(' '), "{selector}");
+                    saw_light = true;
+                } else if let Some(rest) = selector.strip_prefix(DARK) {
+                    assert!(rest.starts_with(' '), "{selector}");
+                    saw_dark = true;
+                } else {
+                    panic!("unscoped selector: {selector}");
+                }
+                if selector.contains(".sy-json") && selector.contains(".sy-string") {
+                    json_string_selectors.push(selector.to_owned());
+                }
+            }
+        }
+        assert!(saw_light && saw_dark);
+        assert!(!json_string_selectors.is_empty());
+        assert!(
+            json_string_selectors
+                .iter()
+                .all(|s| s.starts_with(LIGHT)),
+            "{json_string_selectors:?}"
+        );
+    }
 
     #[test]
     fn mark_counts_entities_as_one_char() {
