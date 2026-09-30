@@ -152,7 +152,7 @@ async fn changes(AxState(state): St, Query(q): Query<ChangesQuery>) -> ApiResult
         )
             .into_response());
     }
-    let Some(repo) = state.repo(&q.repo).await else {
+    let Some(repo) = state.repo(&q.repo) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let files = tokio::task::spawn_blocking(move || repo.changed_files(&q.from, &q.to)).await??;
@@ -163,7 +163,7 @@ async fn blobs(AxState(state): St, Json(req): Json<BlobsRequest>) -> ApiResult<R
     if !req.ids.iter().all(|id| is_sha(id)) {
         return Ok((StatusCode::BAD_REQUEST, "ids must be full blob SHAs").into_response());
     }
-    let Some(repo) = state.repo(&req.repo).await else {
+    let Some(repo) = state.repo(&req.repo) else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let blobs = tokio::task::spawn_blocking(move || repo.blobs(&req.ids)).await??;
@@ -212,5 +212,38 @@ mod tests {
         let state = crate::sync::test_state();
         let Json(s) = sync_status(AxState(state)).await;
         assert_eq!(s, grenadine_core::api::SyncStatus::default());
+    }
+
+    #[tokio::test]
+    async fn diffs_do_not_wait_for_syncs() {
+        let fx = crate::git::tests::fixture();
+        let to = crate::git::tests::commit(&fx.clone.path, "b", "2\n");
+        let from = crate::git::tests::run(&fx.clone.path, &["rev-parse", "HEAD~1"]);
+
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned.clone())].into_iter().collect(),
+        );
+
+        let _guard = cloned.git_lock.lock().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            changes(
+                AxState(state),
+                Query(ChangesQuery {
+                    repo: "owner/name".to_owned(),
+                    from,
+                    to,
+                }),
+            ),
+        )
+        .await
+        .expect("changes blocked behind the sync lock")
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

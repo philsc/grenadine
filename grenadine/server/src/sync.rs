@@ -21,12 +21,21 @@ use crate::github::{self, GitHub, PrData};
 /// How many PRs sync at the same time.
 const CONCURRENCY: usize = 4;
 
+/// A configured clone and the lock that serializes sync's writes to it.
+pub struct ClonedRepo {
+    pub repo: Repo,
+    /// Keeps sync's mutating git work (fetches, ref updates) on one clone
+    /// from overlapping. Reads don't take it because git serves objects
+    /// safely while a fetch is in progress.
+    pub git_lock: Mutex<()>,
+}
+
 pub struct State {
     pub db: Db,
     pub github: GitHub,
-    /// The configured clones by `owner/name`. The mutex keeps git operations
-    /// on one clone from running concurrently.
-    pub repos: BTreeMap<String, Arc<Mutex<Repo>>>,
+    /// The configured clones by `owner/name`. Readers clone the `Repo`
+    /// without locking; sync serializes its writes through `git_lock`.
+    pub repos: BTreeMap<String, Arc<ClonedRepo>>,
     pub events: broadcast::Sender<ServerEvent>,
     /// The current poll's progress, shown in the UI's top bar.
     pub sync_status: std::sync::Mutex<SyncStatus>,
@@ -44,8 +53,8 @@ impl State {
     }
 
     /// The clone for `owner/name`, for callers that only read from it.
-    pub async fn repo(&self, slug: &str) -> Option<Repo> {
-        Some(self.repos.get(slug)?.lock().await.clone())
+    pub fn repo(&self, slug: &str) -> Option<Repo> {
+        Some(self.repos.get(slug)?.repo.clone())
     }
 
     /// Mutates the sync status and broadcasts the new snapshot. Pages get
@@ -235,7 +244,8 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
     let number = key.number;
     let base_ref = data.base_ref.clone();
     let (computed, versions) = {
-        let repo = repo.lock_owned().await;
+        let _guard = repo.git_lock.lock().await;
+        let repo = repo.repo.clone();
         let old = old.clone();
         tokio::task::spawn_blocking(move || {
             compute_and_store(&repo, number, &base_ref, &history, &old)
@@ -363,11 +373,16 @@ fn compute_and_store(
 
 #[cfg(test)]
 pub fn test_state() -> Arc<State> {
+    test_state_with(BTreeMap::new())
+}
+
+#[cfg(test)]
+pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(State {
         db: Db::in_memory(),
         github: GitHub::new("dummy").unwrap(),
-        repos: BTreeMap::new(),
+        repos,
         events: broadcast::channel(1).0,
         sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),

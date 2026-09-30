@@ -336,7 +336,7 @@ fn parse_raw_diff(out: &str) -> Result<Vec<FileChange>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -360,13 +360,13 @@ mod tests {
         assert_eq!(github_slug("https://gitlab.com/a/b"), None);
     }
 
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        upstream: PathBuf,
-        clone: Repo,
+    pub(crate) struct Fixture {
+        pub(crate) _dir: tempfile::TempDir,
+        pub(crate) upstream: PathBuf,
+        pub(crate) clone: Repo,
     }
 
-    fn run(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn run(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -385,7 +385,7 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
-    fn commit(dir: &Path, file: &str, contents: &str) -> String {
+    pub(crate) fn commit(dir: &Path, file: &str, contents: &str) -> String {
         std::fs::write(dir.join(file), contents).unwrap();
         run(dir, &["add", file]);
         run(dir, &["commit", "-q", "-m", file]);
@@ -394,7 +394,7 @@ mod tests {
 
     /// An "upstream" repository and a clone of it whose remote is renamed to
     /// look like GitHub, with fetches redirected to the upstream directory.
-    fn fixture() -> Fixture {
+    pub(crate) fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let upstream = dir.path().join("upstream");
         let clone = dir.path().join("clone");

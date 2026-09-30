@@ -53,7 +53,7 @@ fn default_db() -> Result<PathBuf> {
     Ok(data.join("grenadine/grenadine.db"))
 }
 
-fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<Mutex<git::Repo>>>> {
+fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<sync::ClonedRepo>>> {
     let mut repos = BTreeMap::new();
     for spec in specs {
         // Only split off a remote when what follows the last colon looks
@@ -67,7 +67,13 @@ fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<Mutex<git::Repo>>
         if repos.contains_key(&repo.slug) {
             bail!("{} is configured twice", repo.slug);
         }
-        repos.insert(repo.slug.clone(), Arc::new(Mutex::new(repo)));
+        repos.insert(
+            repo.slug.clone(),
+            Arc::new(sync::ClonedRepo {
+                repo,
+                git_lock: Mutex::new(()),
+            }),
+        );
     }
     Ok(repos)
 }
