@@ -20,10 +20,11 @@ const MIGRATIONS: &[&str] = &[r#"
         error TEXT
     );
     INSERT INTO inboxes (name, filter, position) VALUES
-        ('Authored', 'is:open author:@me', 0),
-        ('Review requested', 'is:open review-requested:@me', 1),
-        ('Reviewed', 'is:open reviewed-by:@me', 2),
-        ('Involved', 'is:open involves:@me', 3);
+        ('Authored', 'is:open author:@me draft:false', 0),
+        ('Drafts', 'is:open author:@me draft:true', 1),
+        ('Review requested', 'is:open review-requested:@me draft:false', 2),
+        ('Reviewed', 'is:open reviewed-by:@me draft:false', 3),
+        ('Involved', 'is:open involves:@me draft:false', 4);
 
     -- The PRs an inbox's last search found, in GitHub's order.
     CREATE TABLE inbox_prs (
@@ -493,10 +494,11 @@ mod tests {
         assert_eq!(
             names,
             [
-                "is:open author:@me",
-                "is:open review-requested:@me",
-                "is:open reviewed-by:@me",
-                "is:open involves:@me"
+                "is:open author:@me draft:false",
+                "is:open author:@me draft:true",
+                "is:open review-requested:@me draft:false",
+                "is:open reviewed-by:@me draft:false",
+                "is:open involves:@me draft:false"
             ]
         );
     }
@@ -511,7 +513,7 @@ mod tests {
         };
         let id = db.create_inbox(&edit).unwrap();
         let inbox = db.inboxes().unwrap().pop().unwrap();
-        assert_eq!((inbox.id, inbox.position), (id, 4));
+        assert_eq!((inbox.id, inbox.position), (id, 5));
         assert!(
             db.update_inbox(
                 id,
