@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey,
+    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, SyncStatus,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -66,6 +66,14 @@ pub async fn pr(key: &PrKey) -> Result<PrDetail> {
     .json()
     .await
     .map_err(|e| e.to_string())
+}
+
+pub async fn sync_status() -> Result<SyncStatus> {
+    check(Request::get("/api/sync").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The files that differ between two commits.

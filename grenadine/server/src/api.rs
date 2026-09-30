@@ -47,6 +47,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/pr/{owner}/{name}/{number}", get(pr))
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
+        .route("/api/sync", get(sync_status))
         .route("/api/events", get(events))
         .fallback(get(assets::serve))
         .with_state(state)
@@ -169,6 +170,12 @@ async fn blobs(AxState(state): St, Json(req): Json<BlobsRequest>) -> ApiResult<R
     Ok(Json(BlobsResponse { blobs }).into_response())
 }
 
+/// The poller's current progress; pages fetch it once and then follow the
+/// SyncStatus events.
+async fn sync_status(AxState(state): St) -> Json<grenadine_core::api::SyncStatus> {
+    Json(state.sync_status.lock().unwrap().clone())
+}
+
 /// The SSE stream of server events; it ends on shutdown so that open
 /// connections don't block the server's graceful shutdown.
 fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
@@ -198,5 +205,12 @@ mod tests {
         state.shutdown.cancel();
         let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await;
         assert!(matches!(next, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn sync_status_returns_the_snapshot() {
+        let state = crate::sync::test_state();
+        let Json(s) = sync_status(AxState(state)).await;
+        assert_eq!(s, grenadine_core::api::SyncStatus::default());
     }
 }

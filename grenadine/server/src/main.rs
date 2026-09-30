@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         github,
         repos,
         events: broadcast::channel(256).0,
+        sync_status: std::sync::Mutex::default(),
         poke: Notify::new(),
         shutdown: shutdown.clone(),
     });

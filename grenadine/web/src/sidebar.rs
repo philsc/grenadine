@@ -18,7 +18,6 @@ pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
 
     view! {
         <nav class="sidebar">
-            <header class="brand">"grenadine"</header>
             {move || match inboxes.get() {
                 None => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),

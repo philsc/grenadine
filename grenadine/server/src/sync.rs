@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
-use grenadine_core::api::{PrKey, ServerEvent, Version};
+use grenadine_core::api::{PrKey, ServerEvent, SyncPhase, SyncStatus, SyncingPr, Version};
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
 
@@ -28,6 +28,8 @@ pub struct State {
     /// on one clone from running concurrently.
     pub repos: BTreeMap<String, Arc<Mutex<Repo>>>,
     pub events: broadcast::Sender<ServerEvent>,
+    /// The current poll's progress, shown in the UI's top bar.
+    pub sync_status: std::sync::Mutex<SyncStatus>,
     /// Wakes the poller early, e.g. after an inbox was edited.
     pub poke: Notify,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
@@ -45,6 +47,57 @@ impl State {
     pub async fn repo(&self, slug: &str) -> Option<Repo> {
         Some(self.repos.get(slug)?.lock().await.clone())
     }
+
+    /// Mutates the sync status and broadcasts the new snapshot. Pages get
+    /// the whole status every time so a missed event self-heals.
+    fn update_status(&self, f: impl FnOnce(&mut SyncStatus)) {
+        let snapshot = {
+            let mut status = self.sync_status.lock().unwrap();
+            f(&mut status);
+            status.clone()
+        };
+        self.send(ServerEvent::SyncStatus(snapshot));
+    }
+
+    fn status_searching(&self) {
+        self.update_status(|s| s.phase = SyncPhase::Searching);
+    }
+
+    fn status_stale(&self, n: usize) {
+        self.update_status(|s| {
+            s.remaining = n;
+            if n > 0 {
+                s.phase = SyncPhase::Syncing;
+            }
+        });
+    }
+
+    /// Marks `key` as in flight; its title may not be in the database yet.
+    fn status_started(&self, key: &PrKey) {
+        let pr = SyncingPr {
+            key: key.clone(),
+            title: self.db.pr_title(key).ok().flatten(),
+        };
+        self.update_status(|s| s.in_flight.push(pr));
+    }
+
+    fn status_finished(&self, key: &PrKey) {
+        self.update_status(|s| {
+            s.in_flight.retain(|p| &p.key != key);
+            s.remaining = s.remaining.saturating_sub(1);
+        });
+    }
+
+    /// Ends the poll and records its outcome.
+    fn status_idle(&self, result: &Result<()>) {
+        self.update_status(|s| {
+            s.phase = SyncPhase::Idle;
+            s.remaining = 0;
+            s.in_flight.clear();
+            s.last_finished = Some(chrono::Utc::now().timestamp());
+            s.last_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        });
+    }
 }
 
 pub async fn run(state: Arc<State>, interval: Duration) {
@@ -53,7 +106,9 @@ pub async fn run(state: Arc<State>, interval: Duration) {
         if state.shutdown.is_cancelled() {
             break;
         }
-        if let Err(e) = poll(&state, first).await {
+        let result = poll(&state, first).await;
+        state.status_idle(&result);
+        if let Err(e) = result {
             tracing::warn!("poll failed: {e:#}");
         }
         first = false;
@@ -67,6 +122,7 @@ pub async fn run(state: Arc<State>, interval: Duration) {
 }
 
 async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
+    state.status_searching();
     let inboxes = state.db.inboxes()?;
     let slugs: Vec<String> = state.repos.keys().cloned().collect();
     let queries: Vec<String> = inboxes
@@ -110,13 +166,17 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         })
         .map(|h| h.key)
         .collect();
+    state.status_stale(stale.len());
     if !stale.is_empty() {
         tracing::info!("syncing {} PRs", stale.len());
     }
     futures::stream::iter(stale)
         .take_until(state.shutdown.cancelled())
         .for_each_concurrent(CONCURRENCY, |key| async move {
-            if let Err(e) = sync_pr(state, &key).await {
+            state.status_started(&key);
+            let result = sync_pr(state, &key).await;
+            state.status_finished(&key);
+            if let Err(e) = result {
                 tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
                 let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
             }
@@ -309,6 +369,7 @@ pub fn test_state() -> Arc<State> {
         github: GitHub::new("dummy").unwrap(),
         repos: BTreeMap::new(),
         events: broadcast::channel(1).0,
+        sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
@@ -328,5 +389,62 @@ mod tests {
         )
         .await
         .expect("run did not stop after shutdown");
+    }
+
+    fn status(state: &State) -> SyncStatus {
+        state.sync_status.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn sync_status_transitions() {
+        let state = test_state();
+        let a = PrKey {
+            repo: "o/n".into(),
+            number: 1,
+        };
+        let b = PrKey {
+            repo: "o/n".into(),
+            number: 2,
+        };
+
+        state.status_searching();
+        assert_eq!(status(&state).phase, SyncPhase::Searching);
+
+        state.status_stale(3);
+        assert_eq!(status(&state).phase, SyncPhase::Syncing);
+        assert_eq!(status(&state).remaining, 3);
+
+        state.status_started(&a);
+        state.status_started(&b);
+        state.status_finished(&a);
+        let s = status(&state);
+        assert_eq!(s.remaining, 2);
+        assert_eq!(s.in_flight, [SyncingPr { key: b.clone(), title: None }]);
+
+        state.status_idle(&Ok(()));
+        let s = status(&state);
+        assert_eq!(s.phase, SyncPhase::Idle);
+        assert_eq!(s.remaining, 0);
+        assert!(s.in_flight.is_empty());
+        assert!(s.last_finished.is_some());
+        assert_eq!(s.last_error, None);
+
+        let err: Result<()> = Err(anyhow!("boom"));
+        state.status_idle(&err);
+        assert_eq!(status(&state).last_error.as_deref(), Some("boom"));
+        state.status_idle(&Ok(()));
+        assert_eq!(status(&state).last_error, None);
+    }
+
+    #[test]
+    fn sync_status_updates_broadcast() {
+        let state = test_state();
+        let mut rx = state.events.subscribe();
+        state.status_searching();
+        let event = rx.try_recv().unwrap();
+        let ServerEvent::SyncStatus(s) = event else {
+            panic!("expected a SyncStatus event, got {event:?}");
+        };
+        assert_eq!(s.phase, SyncPhase::Searching);
     }
 }

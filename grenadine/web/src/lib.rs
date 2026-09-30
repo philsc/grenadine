@@ -7,8 +7,9 @@ mod highlight;
 mod markdown;
 mod pr;
 mod sidebar;
+mod topbar;
 
-use grenadine_core::api::{PrKey, ServerEvent};
+use grenadine_core::api::{PrKey, ServerEvent, SyncStatus};
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 
@@ -19,6 +20,8 @@ pub struct Updates {
     /// The PR that changed last, with a counter so that the same PR changing
     /// twice still notifies.
     pub pr: RwSignal<(Option<PrKey>, u64)>,
+    /// The poller's status, shown in the top bar.
+    pub sync: RwSignal<SyncStatus>,
 }
 
 /// Parses `#/owner/name/number`.
@@ -42,6 +45,16 @@ fn current_hash() -> String {
     window().location().hash().unwrap_or_default()
 }
 
+/// Fetches the sync status; the server's lag fallback sends InboxesChanged,
+/// so this also covers a dropped SyncStatus event.
+fn refetch_sync(updates: Updates) {
+    leptos::task::spawn_local(async move {
+        if let Ok(s) = api::sync_status().await {
+            updates.sync.set(s);
+        }
+    });
+}
+
 /// Subscribes to the server's events for the life of the page.
 fn listen(updates: Updates) {
     let Ok(source) = web_sys::EventSource::new("/api/events") else {
@@ -53,18 +66,25 @@ fn listen(updates: Updates) {
                 return;
             };
             match serde_json::from_str::<ServerEvent>(&data) {
-                Ok(ServerEvent::InboxesChanged) => updates.inboxes.update(|n| *n += 1),
+                Ok(ServerEvent::InboxesChanged) => {
+                    updates.inboxes.update(|n| *n += 1);
+                    refetch_sync(updates);
+                }
                 Ok(ServerEvent::PrChanged(key)) => updates.pr.update(|(k, n)| {
                     *k = Some(key);
                     *n += 1;
                 }),
+                Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
                 Err(_) => {}
             }
         });
     source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
     // After a reconnect (e.g. the server restarted) refetch everything.
-    let on_open = Closure::<dyn FnMut()>::new(move || updates.inboxes.update(|n| *n += 1));
+    let on_open = Closure::<dyn FnMut()>::new(move || {
+        updates.inboxes.update(|n| *n += 1);
+        refetch_sync(updates);
+    });
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     on_open.forget();
     std::mem::forget(source);
@@ -75,6 +95,7 @@ fn App() -> impl IntoView {
     let updates = Updates {
         inboxes: RwSignal::new(0),
         pr: RwSignal::new((None, 0)),
+        sync: RwSignal::new(SyncStatus::default()),
     };
     provide_context(updates);
     listen(updates);
@@ -86,16 +107,19 @@ fn App() -> impl IntoView {
     on_cleanup(move || handle.remove());
 
     view! {
-        <div class="app">
-            <sidebar::Sidebar selected=selected />
-            <main class="main">
-                {move || match selected.get() {
-                    Some(key) => view! { <pr::PrView key=key /> }.into_any(),
-                    None => view! {
-                        <div class="empty">"Pick a PR from an inbox on the left."</div>
-                    }.into_any(),
-                }}
-            </main>
+        <div class="page">
+            <topbar::Topbar />
+            <div class="app">
+                <sidebar::Sidebar selected=selected />
+                <main class="main">
+                    {move || match selected.get() {
+                        Some(key) => view! { <pr::PrView key=key /> }.into_any(),
+                        None => view! {
+                            <div class="empty">"Pick a PR from an inbox on the left."</div>
+                        }.into_any(),
+                    }}
+                </main>
+            </div>
         </div>
     }
 }

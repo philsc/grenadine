@@ -179,6 +179,35 @@ pub struct BlobsResponse {
     pub blobs: BTreeMap<String, Blob>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncPhase {
+    #[default]
+    Searching,
+    Syncing,
+    Idle,
+}
+
+/// A PR whose sync is running right now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncingPr {
+    pub key: PrKey,
+    /// `None` until the PR's first sync stored it.
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub phase: SyncPhase,
+    /// PRs of the current poll that haven't finished syncing, including the
+    /// ones in flight.
+    pub remaining: usize,
+    pub in_flight: Vec<SyncingPr>,
+    /// Unix seconds when the last poll ended.
+    pub last_finished: Option<i64>,
+    /// Set when the last poll failed as a whole.
+    pub last_error: Option<String>,
+}
+
 /// Pushed to the page over server-sent events.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerEvent {
@@ -186,4 +215,7 @@ pub enum ServerEvent {
     InboxesChanged,
     /// A PR's metadata, versions or comments changed.
     PrChanged(PrKey),
+    /// The whole sync status, sent on every change so a missed event
+    /// self-heals.
+    SyncStatus(SyncStatus),
 }

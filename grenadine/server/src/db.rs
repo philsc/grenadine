@@ -373,6 +373,18 @@ impl Db {
         Ok(())
     }
 
+    /// The stored title, `None` before the PR's first sync.
+    pub fn pr_title(&self, key: &PrKey) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT title FROM prs WHERE repo = ? AND number = ?",
+                params![key.repo, key.number],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Records a failed sync. Only an already-known PR can carry the error.
     pub fn store_sync_error(&self, key: &PrKey, error: &str) -> Result<()> {
         self.conn().execute(
@@ -557,6 +569,7 @@ mod tests {
         assert_eq!(pr.versions, versions);
         assert_eq!(pr.comments, comments);
         assert_eq!(pr.summary.version_count, 1);
+        assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));
         assert_eq!(db.inbox_prs(1).unwrap().len(), 1);
         assert_eq!(
             db.sync_mark(&key).unwrap(),
