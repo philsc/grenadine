@@ -87,7 +87,7 @@ fn InboxSection(
     next: Option<Inbox>,
 ) -> impl IntoView {
     let collapsed_key = format!("inbox-collapsed-{}", inbox.inbox.id);
-    let collapsed = RwSignal::new(load_flag(&collapsed_key));
+    let collapsed = RwSignal::new(load_flag(&collapsed_key, false));
     let editing = RwSignal::new(false);
     let InboxWithPrs { inbox, prs, error } = inbox;
     let count = prs.len();
@@ -252,11 +252,10 @@ fn storage() -> Option<web_sys::Storage> {
     window().local_storage().ok().flatten()
 }
 
-pub fn load_flag(key: &str) -> bool {
+pub fn load_flag(key: &str, default: bool) -> bool {
     storage()
         .and_then(|s| s.get_item(key).ok().flatten())
-        .as_deref()
-        == Some("1")
+        .map_or(default, |v| v == "1")
 }
 
 pub fn save_flag(key: &str, value: bool) {

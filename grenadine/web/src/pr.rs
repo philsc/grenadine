@@ -151,7 +151,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     };
     // `None` until the user picks versions: Base against the latest.
     let chosen = RwSignal::new(None::<Selection>);
-    let side_by_side = RwSignal::new(load_flag("side-by-side"));
+    let side_by_side = RwSignal::new(load_flag("side-by-side", true));
 
     move || {
         match pr.get() {
