@@ -11,10 +11,12 @@ path = "src/lib.rs"
 [dependencies]
 ammonia.workspace = true
 console_error_panic_hook.workspace = true
+emojis.workspace = true
 gloo-net.workspace = true
 grenadine_core = { path = "../core" }
 js-sys.workspace = true
 leptos.workspace = true
+linkify.workspace = true
 pulldown-cmark.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,4 +24,4 @@ similar.workspace = true
 syntect.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["Element", "HtmlElement", "Window", "Document", "EventSource", "MessageEvent", "MediaQueryList", "IntersectionObserver", "IntersectionObserverEntry", "Storage"] }
+web-sys = { workspace = true, features = ["Element", "HtmlElement", "Window", "Document", "Event", "EventTarget", "EventSource", "MessageEvent", "MouseEvent", "Location", "MediaQueryList", "IntersectionObserver", "IntersectionObserverEntry", "Storage"] }

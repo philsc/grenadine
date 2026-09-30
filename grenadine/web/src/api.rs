@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, SyncStatus,
+    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, PrMissing,
+    SyncStatus,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -56,19 +57,39 @@ pub async fn delete_inbox(id: i64) -> Result<()> {
         .map(|_| ())
 }
 
-/// `Ok(None)` when the PR hasn't synced yet.
-pub async fn pr(key: &PrKey) -> Result<Option<PrDetail>> {
+/// What `/api/pr` answered for a PR that isn't synced.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrResponse {
+    Ready(Box<PrDetail>),
+    /// The repository isn't one of the server's configured repos.
+    NotConfigured,
+    /// Known but not synced yet; a sync may be in flight.
+    Pending,
+    /// The last sync attempt failed; carries its error.
+    Failed(String),
+}
+
+pub async fn pr(key: &PrKey) -> Result<PrResponse> {
     let resp = Request::get(&format!("/api/pr/{}/{}", key.repo, key.number))
         .send()
-        .await;
-    if resp.as_ref().is_ok_and(|r| r.status() == 404) {
-        return Ok(None);
-    }
-    check(resp)
-        .await?
-        .json()
         .await
-        .map(Some)
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        let missing: PrMissing = resp.json().await.unwrap_or(PrMissing::NotSynced);
+        return Ok(match missing {
+            PrMissing::NotConfigured => PrResponse::NotConfigured,
+            PrMissing::NotSynced => PrResponse::Pending,
+            PrMissing::SyncFailed(e) => PrResponse::Failed(e),
+        });
+    }
+    if !resp.ok() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{status}: {text}"));
+    }
+    resp.json()
+        .await
+        .map(|d| PrResponse::Ready(Box::new(d)))
         .map_err(|e| e.to_string())
 }
 

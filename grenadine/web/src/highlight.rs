@@ -96,6 +96,28 @@ pub fn highlight_lines(path: &str, text: &str) -> Vec<String> {
     })
 }
 
+/// Highlights a fenced code block's `code`; `None` when the language token
+/// is unknown or the block is too big. Markdown info strings name the
+/// language ("rust") rather than a file extension, so the token is tried
+/// both ways.
+pub fn highlight_code(lang: &str, code: &str) -> Option<String> {
+    if lang.is_empty() || code.lines().count() > MAX_LINES {
+        return None;
+    }
+    with_syntaxes(|set| {
+        let syntax = set
+            .find_syntax_by_token(lang)
+            .or_else(|| syntax_for(set, &format!("x.{lang}")))?;
+        let mut generator = ClassedHTMLGenerator::new_with_class_style(syntax, set, CLASS_STYLE);
+        for line in LinesWithEndings::from(code) {
+            generator
+                .parse_html_for_line_which_includes_newline(line)
+                .ok()?;
+        }
+        Some(generator.finalize())
+    })
+}
+
 /// Wraps the chars of a highlighted line that fall in `ranges` (char
 /// indexes into the line's text) in `<span class="{class}">`.
 pub fn mark(html: &str, ranges: &[Range<usize>], class: &str) -> String {

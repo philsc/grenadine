@@ -99,6 +99,16 @@ const MIGRATIONS: &[&str] = &[r#"
     ALTER TABLE inbox_prs ADD COLUMN url TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN sync_error TEXT;
+"#,
+    r#"
+    -- Sync errors of PRs that have neither a prs row nor an inbox_prs
+    -- row, e.g. PRs synced on demand that no inbox covers.
+    CREATE TABLE sync_errors (
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        error TEXT NOT NULL,
+        PRIMARY KEY (repo, number)
+    );
 "#];
 
 pub struct Db {
@@ -404,6 +414,10 @@ impl Db {
             "UPDATE inbox_prs SET sync_error = NULL WHERE repo = ? AND number = ?",
             params![key.repo, key.number],
         )?;
+        tx.execute(
+            "DELETE FROM sync_errors WHERE repo = ? AND number = ?",
+            params![key.repo, key.number],
+        )?;
         if let Some((old, new)) = drift {
             tx.execute(
                 "INSERT INTO drift_log (repo, number, at, old, new) VALUES (?, ?, datetime('now'), ?, ?)",
@@ -447,8 +461,9 @@ impl Db {
             .optional()?)
     }
 
-    /// Records a failed sync. A PR that has never synced has no prs row,
-    /// so the error also goes on its inbox_prs rows.
+    /// Records a failed sync. The error goes wherever the PR is known; a
+    /// PR that has never synced and isn't in any inbox only has its
+    /// sync_errors row.
     pub fn store_sync_error(&self, key: &PrKey, error: &str) -> Result<()> {
         let conn = self.conn();
         conn.execute(
@@ -459,7 +474,38 @@ impl Db {
             "UPDATE inbox_prs SET sync_error = ? WHERE repo = ? AND number = ?",
             params![error, key.repo, key.number],
         )?;
+        conn.execute(
+            "INSERT INTO sync_errors (repo, number, error) VALUES (?, ?, ?)
+             ON CONFLICT (repo, number) DO UPDATE SET error = excluded.error",
+            params![key.repo, key.number, error],
+        )?;
         Ok(())
+    }
+
+    /// The last sync error of a PR, wherever it was recorded.
+    pub fn pr_sync_error(&self, key: &PrKey) -> Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT COALESCE(
+                     (SELECT sync_error FROM prs WHERE repo = ? AND number = ?),
+                     (SELECT error FROM sync_errors WHERE repo = ? AND number = ?),
+                     (SELECT sync_error FROM inbox_prs
+                      WHERE repo = ? AND number = ? AND sync_error IS NOT NULL LIMIT 1))",
+                params![key.repo, key.number, key.repo, key.number, key.repo, key.number],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Whether a PR is in some inbox's latest results.
+    pub fn in_any_inbox(&self, key: &PrKey) -> Result<bool> {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM inbox_prs WHERE repo = ? AND number = ?)",
+                params![key.repo, key.number],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn pr(&self, key: &PrKey) -> Result<Option<PrDetail>> {
@@ -715,6 +761,41 @@ mod tests {
         let pr = db.inbox_prs(1).unwrap().remove(0);
         assert!(pr.synced);
         assert_eq!(pr.sync_error, None);
+        assert_eq!(db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn sync_error_works_without_any_pr_row() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        // A PR that was requested directly and failed to sync is in no
+        // inbox and has no prs row; its error is still kept.
+        db.store_sync_error(&key, "boom").unwrap();
+        assert_eq!(db.pr_sync_error(&key).unwrap().as_deref(), Some("boom"));
+        db.store_sync_error(&key, "boom 2").unwrap();
+        assert_eq!(db.pr_sync_error(&key).unwrap().as_deref(), Some("boom 2"));
+
+        db.store_sync(&meta(&key), &[], &[], false, None).unwrap();
+        assert_eq!(db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn in_any_inbox_covers_all_inboxes() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        assert!(!db.in_any_inbox(&key).unwrap());
+        db.set_inbox_results(2, Ok(std::slice::from_ref(&hit(&key))))
+            .unwrap();
+        assert!(db.in_any_inbox(&key).unwrap());
+        // A search that no longer reports the PR uncovers it again.
+        db.set_inbox_results(2, Ok(&[])).unwrap();
+        assert!(!db.in_any_inbox(&key).unwrap());
     }
 
     #[test]

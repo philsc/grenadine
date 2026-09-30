@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use grenadine_core::api::{PrDetail, PrKey, ReviewComment, Side, Version, VersionKind};
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::diffview::DiffView;
 use crate::sidebar::{load_flag, save_flag};
@@ -153,18 +154,65 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
+    let pr_links = RwSignal::new(load_flag("pr-links-in-app", false));
+    let github = format!(
+        "https://github.com/{}/pull/{}",
+        key.repo, key.number
+    );
 
     move || {
         match pr.get() {
         None => view! { <div class="empty">"Loading…"</div> }.into_any(),
         Some(Err(e)) => view! { <div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div> }.into_any(),
-        Some(Ok(None)) => view! { <div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div> }.into_any(),
-        Some(Ok(Some(pr))) => {
-            let pr = Arc::new(pr);
+        Some(Ok(api::PrResponse::Pending)) => view! { <div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div> }.into_any(),
+        Some(Ok(api::PrResponse::NotConfigured)) => view! {
+            <div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+        }.into_any(),
+        Some(Ok(api::PrResponse::Failed(e))) => view! {
+            <div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+        }.into_any(),
+        Some(Ok(api::PrResponse::Ready(pr))) => {
+            let pr = Arc::new(*pr);
             prefetch(&pr);
-            view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /> }.into_any()
+            view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side inline_changes=inline_changes pr_links=pr_links /> }.into_any()
         }
     }
+    }
+}
+
+/// What the markdown of one PR needs: its repo for links, and whether PR
+/// links open in grenadine (inverting Shift+click's meaning).
+#[derive(Clone)]
+struct PrLinks {
+    repo: String,
+    invert: RwSignal<bool>,
+}
+
+/// Routes clicks on the `data-grenadine` links that markdown rendering
+/// put on PR references. Shift+click — or a plain click when the invert
+/// flag is on — navigates in-app; anything else opens GitHub in a tab.
+fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
+    if ev.button() != 0 || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+        return;
+    }
+    let Some(a) = ev
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|t| t.closest("a[data-grenadine]").ok().flatten())
+    else {
+        return;
+    };
+    if ev.shift_key() != invert {
+        ev.prevent_default();
+        if let Some(hash) = a.get_attribute("data-grenadine") {
+            let _ = window().location().set_hash(&hash);
+        }
+    } else if ev.shift_key() {
+        // Shift+click alone would open a window; open a tab instead.
+        ev.prevent_default();
+        if let Some(href) = a.get_attribute("href") {
+            let _ = window().open_with_url_and_target(&href, "_blank");
+        }
     }
 }
 
@@ -201,7 +249,12 @@ fn PrBody(
     chosen: RwSignal<Option<Selection>>,
     side_by_side: RwSignal<bool>,
     inline_changes: RwSignal<bool>,
+    pr_links: RwSignal<bool>,
 ) -> impl IntoView {
+    provide_context(PrLinks {
+        repo: pr.summary.key.repo.clone(),
+        invert: pr_links,
+    });
     let latest = pr.versions.len() as u32;
     let selection = {
         let pr = pr.clone();
@@ -229,7 +282,7 @@ fn PrBody(
     let body_html = if pr.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_owned()
     } else {
-        markdown::to_html(&pr.body)
+        markdown::to_html(&pr.body, &s.key.repo)
     };
 
     let diff = {
@@ -291,7 +344,8 @@ fn PrBody(
                 {pr.drift.clone().map(|d| view! { <p class="banner warn">{d}</p> })}
                 {pr.sync_error.clone().map(|e| view! { <p class="banner error">{format!("The last sync failed: {e}")}</p> })}
             </header>
-            <section class="description markdown" inner_html=body_html></section>
+            <section class="description markdown" inner_html=body_html
+                on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
             <div class="toolbar">
                 <VersionPicker versions=pr.versions.clone() chosen=chosen selection=selection />
                 <label class="toggle">
@@ -317,6 +371,18 @@ fn PrBody(
                         }
                     />
                     " Inline changes"
+                </label>
+                <label class="toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || pr_links.get()
+                        on:change=move |ev| {
+                            let on = event_target_checked(&ev);
+                            pr_links.set(on);
+                            save_flag("pr-links-in-app", on);
+                        }
+                    />
+                    " Open PR links in grenadine"
                 </label>
             </div>
             {diff}
@@ -422,6 +488,7 @@ fn VersionPicker(
 
 #[component]
 pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
+    let links = expect_context::<PrLinks>();
     view! {
         <div class="comment">
             <div class="comment-meta">
@@ -429,7 +496,8 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
                 " "
                 <a class="muted" href=comment.url.clone() target="_blank" rel="noopener">{comment.created_at.replace('T', " ").trim_end_matches('Z').to_owned()}</a>
             </div>
-            <div class="markdown" inner_html=markdown::to_html(&comment.body)></div>
+            <div class="markdown" inner_html=markdown::to_html(&comment.body, &links.repo)
+                on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
         </div>
     }
 }

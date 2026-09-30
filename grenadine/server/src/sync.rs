@@ -41,6 +41,9 @@ pub struct State {
     pub sync_status: std::sync::Mutex<SyncStatus>,
     /// Wakes the poller early, e.g. after an inbox was edited.
     pub poke: Notify,
+    /// PRs a page requested a sync for that are being synced on demand
+    /// right now, so a second request doesn't start the same sync again.
+    pub on_demand: std::sync::Mutex<BTreeSet<PrKey>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
     pub shutdown: tokio_util::sync::CancellationToken,
@@ -94,6 +97,33 @@ impl State {
         self.update_status(|s| {
             s.in_flight.retain(|p| &p.key != key);
             s.remaining = s.remaining.saturating_sub(1);
+        });
+    }
+
+    /// Starts a background sync for a PR no inbox covers, unless a sync
+    /// for it is already running — either the poller's (read from the
+    /// status's `in_flight`) or a previous on-demand request's (tracked in
+    /// `on_demand`). Unlike the poller it doesn't touch the sync status:
+    /// `remaining` counts only the current poll's PRs.
+    pub fn sync_once(self: &Arc<State>, key: PrKey) {
+        {
+            let status = self.sync_status.lock().unwrap();
+            if status.in_flight.iter().any(|p| p.key == key) {
+                return;
+            }
+        }
+        if !self.on_demand.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            let result = sync_pr(&state, &key).await;
+            state.on_demand.lock().unwrap().remove(&key);
+            if let Err(e) = result {
+                tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
+                let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
+            }
+            state.send(ServerEvent::PrChanged(key));
         });
     }
 
@@ -378,11 +408,12 @@ pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(State {
         db: Db::in_memory(),
-        github: GitHub::new("dummy").unwrap(),
+        github: GitHub::with_api("dummy", "http://127.0.0.1:9").unwrap(),
         repos,
         events: broadcast::channel(1).0,
         sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),
+        on_demand: std::sync::Mutex::new(BTreeSet::new()),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }

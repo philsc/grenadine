@@ -7,7 +7,7 @@ mod git;
 mod github;
 mod sync;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -137,6 +137,7 @@ async fn main() -> Result<()> {
         events: broadcast::channel(256).0,
         sync_status: std::sync::Mutex::default(),
         poke: Notify::new(),
+        on_demand: std::sync::Mutex::new(BTreeSet::new()),
         shutdown: shutdown.clone(),
     });
     let sync_task = tokio::spawn(sync::run(

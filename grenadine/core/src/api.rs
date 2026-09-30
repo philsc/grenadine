@@ -114,6 +114,19 @@ pub struct ReviewComment {
     pub url: String,
 }
 
+/// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMissing {
+    /// The repository isn't one of the server's `--repo`s.
+    NotConfigured,
+    /// Configured, but not synced yet. An on-demand sync was kicked off
+    /// for PRs no inbox covers.
+    NotSynced,
+    /// The sync attempt failed; carries its error.
+    SyncFailed(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrDetail {
     pub summary: PrSummary,

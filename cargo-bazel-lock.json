@@ -1,5 +1,5 @@
 {
-  "checksum": "0aded76c4e8f7ce2669bfb60d964aba655bfa2ef324aaf51c3d5799b3e32019f",
+  "checksum": "3960fe9384f600fea4394a84f8d5ea51c6fe7d58819d22aa37ec5f13460e94c2",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -2900,6 +2900,42 @@
       ],
       "version": "0.1.9"
     },
+    "emojis 0.9.0": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "phf 0.13.1",
+            "target": "phf"
+          }
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "emojis",
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT",
+        "Unicode-3.0"
+      ],
+      "name": "emojis",
+      "package_url": "https://github.com/rossmacarthur/emojis",
+      "repository": {
+        "Http": {
+          "sha256": "0b1514ced566c94991ed9563258ecf61e311fd773bf0a3f20606830386bf66e3",
+          "url": "https://static.crates.io/crates/emojis/0.9.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "emojis",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.9.0"
+    },
     "encoding_rs 0.8.42": {
       "build_script_attrs": {
         "proc_macro_deps": [
@@ -4555,6 +4591,10 @@
             "target": "console_error_panic_hook"
           },
           {
+            "id": "emojis 0.9.0",
+            "target": "emojis"
+          },
+          {
             "id": "gloo-net 0.7.0",
             "target": "gloo_net"
           },
@@ -4565,6 +4605,10 @@
           {
             "id": "leptos 0.8.21",
             "target": "leptos"
+          },
+          {
+            "id": "linkify 0.11.0",
+            "target": "linkify"
           },
           {
             "id": "pulldown-cmark 0.13.4",
@@ -7316,6 +7360,41 @@
       ],
       "version": "0.5.6"
     },
+    "linkify 0.11.0": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "memchr 2.8.3",
+            "target": "memchr"
+          }
+        ],
+        "edition": "2018"
+      },
+      "library_target_name": "linkify",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "linkify",
+      "package_url": "https://github.com/robinst/linkify",
+      "repository": {
+        "Http": {
+          "sha256": "92f9ae2f3d31697697311f016320fe984127e636b45cf5eb5c175b7eb103dadb",
+          "url": "https://static.crates.io/crates/linkify/0.11.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "linkify",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.11.0"
+    },
     "linux-raw-sys 0.12.1": {
       "common_attrs": {
         "crate_features": [
@@ -8460,6 +8539,40 @@
       ],
       "version": "2.3.2"
     },
+    "phf 0.13.1": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "phf_shared 0.13.1",
+            "target": "phf_shared"
+          }
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "phf",
+      "license": "MIT",
+      "license_file": "LICENSE",
+      "license_ids": [
+        "MIT"
+      ],
+      "name": "phf",
+      "package_url": "https://github.com/rust-phf/rust-phf",
+      "repository": {
+        "Http": {
+          "sha256": "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf",
+          "url": "https://static.crates.io/crates/phf/0.13.1/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "phf",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.13.1"
+    },
     "phf 0.14.0": {
       "common_attrs": {
         "crate_features": [
@@ -8573,6 +8686,40 @@
         }
       ],
       "version": "0.14.0"
+    },
+    "phf_shared 0.13.1": {
+      "common_attrs": {
+        "deps": [
+          {
+            "id": "siphasher 1.0.4",
+            "target": "siphasher"
+          }
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "phf_shared",
+      "license": "MIT",
+      "license_file": "LICENSE",
+      "license_ids": [
+        "MIT"
+      ],
+      "name": "phf_shared",
+      "package_url": "https://github.com/rust-phf/rust-phf",
+      "repository": {
+        "Http": {
+          "sha256": "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266",
+          "url": "https://static.crates.io/crates/phf_shared/0.13.1/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "phf_shared",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.13.1"
     },
     "phf_shared 0.14.0": {
       "common_attrs": {
@@ -17222,11 +17369,13 @@
     "chrono 0.4.45",
     "clap 4.6.7",
     "console_error_panic_hook 0.1.7",
+    "emojis 0.9.0",
     "futures 0.3.34",
     "gloo-net 0.7.0",
     "js-sys 0.3.98",
     "leptos 0.8.21",
     "libc 0.2.189",
+    "linkify 0.11.0",
     "pulldown-cmark 0.13.4",
     "reqwest 0.13.5",
     "rusqlite 0.40.2",

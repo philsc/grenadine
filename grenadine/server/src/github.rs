@@ -32,6 +32,7 @@ pub fn gh_token() -> Result<String> {
 #[derive(Clone)]
 pub struct GitHub {
     http: reqwest::Client,
+    api: String,
 }
 
 /// One PR that a search found.
@@ -166,6 +167,17 @@ fn next_link(headers: &header::HeaderMap) -> Option<String> {
 
 impl GitHub {
     pub fn new(token: &str) -> Result<GitHub> {
+        Self::build(token, API)
+    }
+
+    /// A client for a different API base; tests point it at a dead port so
+    /// requests fail fast instead of reaching api.github.com.
+    #[cfg(test)]
+    pub fn with_api(token: &str, api: &str) -> Result<GitHub> {
+        Self::build(token, api)
+    }
+
+    fn build(token: &str, api: &str) -> Result<GitHub> {
         let mut headers = header::HeaderMap::new();
         let mut auth = header::HeaderValue::from_str(&format!("Bearer {token}"))?;
         auth.set_sensitive(true);
@@ -183,14 +195,17 @@ impl GitHub {
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
-        Ok(GitHub { http })
+        Ok(GitHub {
+            http,
+            api: api.to_owned(),
+        })
     }
 
     /// Runs a GraphQL query. Returns `data` and the `errors`, if any.
     async fn graphql(&self, query: &str, variables: Value) -> Result<(Value, Vec<Value>)> {
         let resp: Value = self
             .http
-            .post(format!("{API}/graphql"))
+            .post(format!("{}/graphql", self.api))
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?
@@ -383,7 +398,8 @@ impl GitHub {
     /// log for it, e.g. because the repository is gone.
     pub async fn activity(&self, repo: &str, branch: &str) -> Result<Vec<Activity>> {
         let url = format!(
-            "{API}/repos/{repo}/activity?ref=refs/heads/{branch}&direction=asc&per_page=100"
+            "{}/repos/{repo}/activity?ref=refs/heads/{branch}&direction=asc&per_page=100",
+            self.api
         );
         let raw: Vec<RestActivity> = match self.get_all(url).await {
             Ok(raw) => raw,
@@ -420,8 +436,8 @@ impl GitHub {
 
     pub async fn review_comments(&self, key: &PrKey) -> Result<Vec<ReviewComment>> {
         let url = format!(
-            "{API}/repos/{}/pulls/{}/comments?per_page=100",
-            key.repo, key.number
+            "{}/repos/{}/pulls/{}/comments?per_page=100",
+            self.api, key.repo, key.number
         );
         let raw: Vec<RestComment> = self.get_all(url).await?;
         Ok(raw

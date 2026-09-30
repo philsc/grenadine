@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey,
+    BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, PrMissing,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -110,6 +110,13 @@ async fn delete_inbox(AxState(state): St, Path(id): Path<i64>) -> ApiResult<Stat
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn missing(what: PrMissing) -> Response {
+    (StatusCode::NOT_FOUND, Json(what)).into_response()
+}
+
+/// The PR's detail, or why there is none. A configured repository's PR
+/// that no inbox covers is synced on demand: asking for it kicks off a
+/// background sync and the page refetches on the PrChanged event.
 async fn pr(
     AxState(state): St,
     Path((owner, name, number)): Path<(String, String, u64)>,
@@ -118,10 +125,22 @@ async fn pr(
         repo: format!("{owner}/{name}"),
         number,
     };
-    Ok(match state.db.pr(&key)? {
-        Some(pr) => Json::<PrDetail>(pr).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    })
+    if !state.repos.contains_key(&key.repo) {
+        return Ok(missing(PrMissing::NotConfigured));
+    }
+    // A PR no inbox covers gets a sync on every request, cached or not;
+    // `sync_once` dedupes while one is already running.
+    if !state.db.in_any_inbox(&key)? {
+        state.sync_once(key.clone());
+    }
+    if let Some(pr) = state.db.pr(&key)? {
+        return Ok(Json::<PrDetail>(pr).into_response());
+    }
+    let what = match state.db.pr_sync_error(&key)? {
+        Some(e) => PrMissing::SyncFailed(e),
+        None => PrMissing::NotSynced,
+    };
+    Ok(missing(what))
 }
 
 fn is_sha(s: &str) -> bool {
@@ -245,5 +264,164 @@ mod tests {
         .map_err(|e| e.0)
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    async fn body(response: Response) -> String {
+        String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unconfigured_repo_is_not_configured() {
+        let state = crate::sync::test_state();
+        let response = pr(AxState(state), Path(("o".into(), "n".into(), 7)))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(response).await, r#""not_configured""#);
+    }
+
+    /// A configured PR that no inbox covers gets an on-demand sync; the
+    /// dummy GitHub client makes it fail and the error is then reported.
+    #[tokio::test]
+    async fn non_inbox_pr_syncs_on_demand() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+        );
+        let response = pr(
+            AxState(state.clone()),
+            Path(("owner".into(), "name".into(), 7)),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(response).await, r#""not_synced""#);
+
+        let key = PrKey {
+            repo: "owner/name".into(),
+            number: 7,
+        };
+        for _ in 0..50 {
+            if state.db.pr_sync_error(&key).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(state.db.pr_sync_error(&key).unwrap().is_some());
+        let response = pr(AxState(state), Path(("owner".into(), "name".into(), 7)))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert!(body(response).await.contains("sync_failed"));
+    }
+
+    /// Even a cached PR gets a fresh on-demand sync when no inbox covers
+    /// it: the dead test API makes the background sync fail and the error
+    /// lands on the PR.
+    #[tokio::test]
+    async fn cached_non_inbox_pr_resyncs_on_demand() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+        );
+        let key = PrKey {
+            repo: "owner/name".into(),
+            number: 7,
+        };
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: key.clone(),
+                    title: "t".into(),
+                    body: "b".into(),
+                    author: "a".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    created_at: "c".into(),
+                    updated_at: "u".into(),
+                    base_ref: "main".into(),
+                    head_ref: "pr".into(),
+                    head_oid: "h".into(),
+                },
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .unwrap();
+        let response = pr(
+            AxState(state.clone()),
+            Path(("owner".into(), "name".into(), 7)),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if state.db.pr_sync_error(&key).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(state.db.pr_sync_error(&key).unwrap().is_some());
+    }
+
+    /// An inbox PR is the poller's: no on-demand sync starts for it.
+    #[tokio::test]
+    async fn inbox_pr_is_not_synced_on_demand() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+        );
+        let key = PrKey {
+            repo: "owner/name".into(),
+            number: 7,
+        };
+        state
+            .db
+            .set_inbox_results(1, Ok(&[crate::github::Hit {
+                key: key.clone(),
+                title: "t".into(),
+                author: "a".into(),
+                state: "OPEN".into(),
+                is_draft: false,
+                url: "u".into(),
+                updated_at: "u".into(),
+                head_oid: "h".into(),
+            }]))
+            .unwrap();
+        let response = pr(
+            AxState(state.clone()),
+            Path(("owner".into(), "name".into(), 7)),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(response).await, r#""not_synced""#);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(state.on_demand.lock().unwrap().is_empty());
     }
 }
