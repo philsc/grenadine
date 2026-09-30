@@ -8,7 +8,7 @@ mod github;
 mod sync;
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,12 @@ struct Args {
     #[arg(long = "repo", required = true, value_name = "PATH[:REMOTE]")]
     repos: Vec<String>,
 
-    /// The port to serve the UI on, on 127.0.0.1.
+    /// The IP address to serve the UI on, e.g. 0.0.0.0 or :: for all
+    /// interfaces.
+    #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
+    bind: IpAddr,
+
+    /// The port to serve the UI on.
     #[arg(long, default_value_t = 8765)]
     port: u16,
 
@@ -137,7 +142,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.poll_interval.max(1)),
     ));
 
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
+    let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("can't listen on {addr}"))?;
