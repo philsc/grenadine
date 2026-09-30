@@ -26,7 +26,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 struct Args {
     /// A local clone of a GitHub repository whose PRs to show, as PATH or
     /// PATH:REMOTE. REMOTE, `origin` by default, must point at the GitHub
-    /// repository. Repeat for several repositories.
+    /// repository; it only identifies the repository, fetches go over
+    /// HTTPS. Repeat for several repositories.
     #[arg(long = "repo", required = true, value_name = "PATH[:REMOTE]")]
     repos: Vec<String>,
 
@@ -58,7 +59,7 @@ fn default_db() -> Result<PathBuf> {
     Ok(data.join("grenadine/grenadine.db"))
 }
 
-fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<sync::ClonedRepo>>> {
+fn open_repos(specs: &[String], token: &str) -> Result<BTreeMap<String, Arc<sync::ClonedRepo>>> {
     let mut repos = BTreeMap::new();
     for spec in specs {
         // Only split off a remote when what follows the last colon looks
@@ -67,7 +68,7 @@ fn open_repos(specs: &[String]) -> Result<BTreeMap<String, Arc<sync::ClonedRepo>
             Some((p, r)) if !r.is_empty() && !r.contains('/') => (p, r),
             _ => (spec.as_str(), "origin"),
         };
-        let repo = git::Repo::open(path.as_ref(), remote)?;
+        let repo = git::Repo::open(path.as_ref(), remote)?.with_token(token);
         tracing::info!("{} is {}", repo.path.display(), repo.slug);
         if repos.contains_key(&repo.slug) {
             bail!("{} is configured twice", repo.slug);
@@ -117,14 +118,15 @@ async fn main() -> Result<()> {
     // Use the process-wide crypto provider bundled with rustls (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let repos = open_repos(&args.repos)?;
+    let token = github::gh_token()?;
+    let repos = open_repos(&args.repos, &token)?;
     let db_path = match args.db {
         Some(p) => p,
         None => default_db()?,
     };
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
-    let github = github::GitHub::new(&github::gh_token()?)?;
+    let github = github::GitHub::new(&token)?;
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

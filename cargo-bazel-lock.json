@@ -1,5 +1,5 @@
 {
-  "checksum": "6178ac947b8b9f1ed6f068e8a52a06597b5aacda5429b4db204cae464eb8158e",
+  "checksum": "0aded76c4e8f7ce2669bfb60d964aba655bfa2ef324aaf51c3d5799b3e32019f",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4470,6 +4470,10 @@
             "target": "axum"
           },
           {
+            "id": "base64 0.22.1",
+            "target": "base64"
+          },
+          {
             "id": "chrono 0.4.45",
             "target": "chrono"
           },
@@ -4480,6 +4484,10 @@
           {
             "id": "futures 0.3.34",
             "target": "futures"
+          },
+          {
+            "id": "libc 0.2.189",
+            "target": "libc"
           },
           {
             "id": "reqwest 0.13.5",
@@ -17210,6 +17218,7 @@
     "ammonia 4.2.0",
     "anyhow 1.0.104",
     "axum 0.8.9",
+    "base64 0.22.1",
     "chrono 0.4.45",
     "clap 4.6.7",
     "console_error_panic_hook 0.1.7",
@@ -17217,6 +17226,7 @@
     "gloo-net 0.7.0",
     "js-sys 0.3.98",
     "leptos 0.8.21",
+    "libc 0.2.189",
     "pulldown-cmark 0.13.4",
     "reqwest 0.13.5",
     "rusqlite 0.40.2",

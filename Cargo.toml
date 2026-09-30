@@ -15,6 +15,7 @@ publish = false
 ammonia = "4.2"
 anyhow = "1.0"
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 console_error_panic_hook = "0.1"
@@ -22,6 +23,7 @@ futures = "0.3"
 gloo-net = { version = "0.7", default-features = false, features = ["http", "json", "eventsource"] }
 js-sys = "0.3"
 leptos = { version = "0.8", features = ["csr"] }
+libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"] }
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }

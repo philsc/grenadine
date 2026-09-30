@@ -11,10 +11,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
 grenadine_core = { path = "../core" }
+libc.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

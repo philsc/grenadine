@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use grenadine_core::api::{Blob, ChangeStatus, FileChange};
 use grenadine_core::versions::CommitGraph;
 
@@ -18,14 +19,25 @@ pub const REF_PREFIX: &str = "refs/grenadine/pr";
 /// Blobs larger than this are sent to the page as binary, without contents.
 const MAX_TEXT_BLOB: u64 = 4 << 20;
 
+/// A `git fetch` credential header, redacted in `Debug` output so a
+/// `Repo` can be logged without leaking the token.
+#[derive(Clone)]
+struct AuthHeader(String);
+
+impl std::fmt::Debug for AuthHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthHeader(<redacted>)")
+    }
+}
+
 /// A local clone of a GitHub repository.
 #[derive(Clone, Debug)]
 pub struct Repo {
     pub path: PathBuf,
-    /// The remote that points at the GitHub repository.
-    pub remote: String,
     /// `owner/name` on GitHub.
     pub slug: String,
+    /// The `http.https://github.com/.extraHeader` value sent on fetches.
+    auth: Option<AuthHeader>,
 }
 
 /// Parses `owner/name` out of a GitHub remote URL.
@@ -45,14 +57,15 @@ fn github_slug(url: &str) -> Option<String> {
 }
 
 impl Repo {
-    /// Opens the clone at `path`, whose `remote` must point at github.com.
+    /// Opens the clone at `path`. `remote` must point at github.com; it
+    /// only identifies the repository, fetches go over HTTPS.
     pub fn open(path: &Path, remote: &str) -> Result<Repo> {
         let mut repo = Repo {
             path: path
                 .canonicalize()
                 .with_context(|| format!("no such directory: {}", path.display()))?,
-            remote: remote.to_owned(),
             slug: String::new(),
+            auth: None,
         };
         // Read the configured URL rather than `git remote get-url`, which
         // applies `url.*.insteadOf` rewrites.
@@ -64,14 +77,46 @@ impl Repo {
         Ok(repo)
     }
 
+    /// Authenticates HTTPS fetches to github.com with a GitHub token.
+    pub fn with_token(mut self, token: &str) -> Repo {
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{token}"));
+        self.auth = Some(AuthHeader(format!("Authorization: Basic {basic}")));
+        self
+    }
+
+    /// The HTTPS URL fetches go to, regardless of the remote's own URL.
+    fn fetch_url(&self) -> String {
+        format!("https://github.com/{}.git", self.slug)
+    }
+
     fn command(&self) -> Command {
         let mut c = Command::new("git");
         c.arg("-C").arg(&self.path);
         // Never prompt for credentials; a fetch that needs them should fail.
         c.env("GIT_TERMINAL_PROMPT", "0");
-        // Ctrl-C in a terminal signals the whole foreground process group;
-        // a separate group lets an in-flight sync finish during shutdown.
-        c.process_group(0);
+        if let Some(auth) = &self.auth {
+            // Pass the credential through the environment so the token
+            // never appears in argv, a URL, or a file.
+            c.env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraHeader")
+                .env("GIT_CONFIG_VALUE_0", &auth.0);
+        }
+        // A new session has no controlling terminal, so ssh or askpass
+        // helpers can't open /dev/tty to prompt and stop the process with
+        // SIGTTIN/SIGTTOU. It also keeps git out of the terminal's
+        // foreground process group, so Ctrl-C lets an in-flight sync
+        // finish during shutdown.
+        // SAFETY: setsid is async-signal-safe and the closure touches no
+        // memory outside the call.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         c
     }
 
@@ -108,8 +153,9 @@ impl Repo {
         self.git_ok(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
     }
 
-    /// Fetches commits by SHA from the remote, skipping ones the clone
-    /// already has. Returns the SHAs that could not be fetched.
+    /// Fetches commits by SHA over HTTPS from the GitHub repository,
+    /// skipping ones the clone already has. Returns the SHAs that could
+    /// not be fetched.
     pub fn fetch_commits(&self, shas: &[String]) -> Vec<String> {
         let mut wanted: Vec<&str> = shas
             .iter()
@@ -121,13 +167,14 @@ impl Repo {
         if wanted.is_empty() {
             return Vec::new();
         }
+        let url = self.fetch_url();
         let fetch = |shas: &[&str]| {
             let mut args = vec![
                 "fetch",
                 "--quiet",
                 "--no-tags",
                 "--no-write-fetch-head",
-                &self.remote,
+                &url,
             ];
             args.extend_from_slice(shas);
             self.git(&args)
@@ -149,7 +196,8 @@ impl Repo {
             .collect()
     }
 
-    /// Fetches the tip of a remote branch into `local_ref` and returns it.
+    /// Fetches the tip of a branch over HTTPS from the GitHub repository
+    /// into `local_ref` and returns it.
     pub fn fetch_branch(&self, branch: &str, local_ref: &str) -> Result<String> {
         let refspec = format!("+refs/heads/{branch}:{local_ref}");
         self.git(&[
@@ -157,7 +205,7 @@ impl Repo {
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
-            &self.remote,
+            &self.fetch_url(),
             &refspec,
         ])?;
         Ok(self.git(&["rev-parse", local_ref])?.trim().to_owned())
@@ -393,7 +441,8 @@ pub(crate) mod tests {
     }
 
     /// An "upstream" repository and a clone of it whose remote is renamed to
-    /// look like GitHub, with fetches redirected to the upstream directory.
+    /// look like GitHub, with HTTPS fetches redirected to the upstream
+    /// directory.
     pub(crate) fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let upstream = dir.path().join("upstream");
@@ -424,7 +473,7 @@ pub(crate) mod tests {
             &[
                 "config",
                 &format!("url.{}.insteadOf", upstream.display()),
-                "git@github.com:owner/name.git",
+                "https://github.com/owner/name.git",
             ],
         );
         let clone = Repo::open(&clone, "origin").unwrap();
@@ -443,8 +492,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn debug_does_not_leak_the_token() {
+        let f = fixture();
+        let repo = f.clone.with_token("hunter2");
+        let debug = format!("{repo:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn token_goes_to_git_config_env() {
+        let f = fixture();
+        let repo = f.clone.with_token("secret");
+        let header = repo
+            .git(&["config", "--get", "http.https://github.com/.extraheader"])
+            .unwrap();
+        assert_eq!(
+            header.trim(),
+            "Authorization: Basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0"
+        );
+    }
+
+    #[test]
     fn fetches_unreachable_commits_by_sha() {
         let f = fixture();
+        let clone = f.clone.with_token("secret");
         run(&f.upstream, &["checkout", "-q", "-b", "pr"]);
         let c1 = commit(&f.upstream, "b", "1\n");
         let c2 = commit(&f.upstream, "b", "2\n");
@@ -453,15 +525,13 @@ pub(crate) mod tests {
         let c3 = commit(&f.upstream, "b", "3\n");
 
         let bogus = "1234567890123456789012345678901234567890".to_owned();
-        let failed = f
-            .clone
-            .fetch_commits(&[c2.clone(), c3.clone(), bogus.clone()]);
+        let failed = clone.fetch_commits(&[c2.clone(), c3.clone(), bogus.clone()]);
         assert_eq!(failed, [bogus]);
-        assert!(f.clone.has_commit(&c2));
-        assert!(f.clone.has_commit(&c3));
+        assert!(clone.has_commit(&c2));
+        assert!(clone.has_commit(&c3));
 
-        assert_eq!(f.clone.first_parent_range(&c1, &c3), Some(vec![c3.clone()]));
-        assert_eq!(f.clone.first_parent_range(&c2, &c3), None);
+        assert_eq!(clone.first_parent_range(&c1, &c3), Some(vec![c3.clone()]));
+        assert_eq!(clone.first_parent_range(&c2, &c3), None);
     }
 
     #[test]
