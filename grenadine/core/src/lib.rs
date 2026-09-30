@@ -4,5 +4,6 @@
 
 pub mod api;
 pub mod diff;
+pub mod inline;
 pub mod rebase;
 pub mod versions;

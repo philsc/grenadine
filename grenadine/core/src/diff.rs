@@ -1,6 +1,7 @@
 //! Lays out change blocks as hunks with context, for unified and
 //! side-by-side display.
 
+use crate::inline::Aligned;
 use crate::rebase::Block;
 
 /// One line of a unified diff. Line numbers are 0-based indexes.
@@ -30,8 +31,15 @@ pub struct Hunk {
 }
 
 /// Groups `blocks` into hunks with `context` unchanged lines around each
-/// change. `old_len` and `new_len` are the line counts of the two texts.
-pub fn hunks(blocks: &[Block], old_len: usize, new_len: usize, context: usize) -> Vec<Hunk> {
+/// change. `aligned[k]` is the row alignment of `blocks[k]`, and `old_len`
+/// and `new_len` are the line counts of the two texts.
+pub fn hunks(
+    blocks: &[Block],
+    aligned: &[Vec<Aligned>],
+    old_len: usize,
+    new_len: usize,
+    context: usize,
+) -> Vec<Hunk> {
     let mut out: Vec<Hunk> = Vec::new();
     // The old line just past the last emitted one.
     let mut old_pos = 0usize;
@@ -69,11 +77,10 @@ pub fn hunks(blocks: &[Block], old_len: usize, new_len: usize, context: usize) -
             for new in b.new.clone() {
                 hunk.lines.push(Line::Added { new, block: k });
             }
-            let (ol, nl) = (b.old.len(), b.new.len());
-            for r in 0..ol.max(nl) {
+            for a in &aligned[k] {
                 hunk.rows.push(Row {
-                    old: (r < ol).then(|| b.old.start + r),
-                    new: (r < nl).then(|| b.new.start + r),
+                    old: a.old,
+                    new: a.new,
                     block: Some(k),
                 });
             }
@@ -115,12 +122,17 @@ pub fn skipped_after(hunks: &[Hunk], old_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline::align;
     use crate::rebase::{change_blocks, lines};
+
+    fn alignments(o: &[&str], n: &[&str], blocks: &[Block]) -> Vec<Vec<Aligned>> {
+        blocks.iter().map(|b| align(o, n, b)).collect()
+    }
 
     fn render(old: &str, new: &str, context: usize) -> Vec<String> {
         let (o, n) = (lines(old), lines(new));
         let blocks = change_blocks(&o, &n);
-        hunks(&blocks, o.len(), n.len(), context)
+        hunks(&blocks, &alignments(&o, &n, &blocks), o.len(), n.len(), context)
             .iter()
             .flat_map(|h| {
                 std::iter::once(format!("@@ skip {}", h.skipped_before)).chain(h.lines.iter().map(
@@ -166,7 +178,8 @@ mod tests {
     #[test]
     fn side_by_side_pairs_lines() {
         let (o, n) = (lines("a\nb\nc\n"), lines("a\nx\ny\nc\n"));
-        let h = hunks(&change_blocks(&o, &n), o.len(), n.len(), 0);
+        let blocks = change_blocks(&o, &n);
+        let h = hunks(&blocks, &alignments(&o, &n, &blocks), o.len(), n.len(), 0);
         assert_eq!(
             h[0].rows,
             [
@@ -187,7 +200,8 @@ mod tests {
     #[test]
     fn counts_trailing_lines() {
         let (o, n) = (lines("a\nb\nc\nd\n"), lines("A\nb\nc\nd\n"));
-        let h = hunks(&change_blocks(&o, &n), o.len(), n.len(), 1);
+        let blocks = change_blocks(&o, &n);
+        let h = hunks(&blocks, &alignments(&o, &n, &blocks), o.len(), n.len(), 1);
         assert_eq!(skipped_after(&h, o.len()), 2);
     }
 }

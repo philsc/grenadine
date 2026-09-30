@@ -11,9 +11,11 @@
   --add-bg: #e6ffec;
   --add-ln: #ccffd8;
   --add-fg: #1a7f37;
+  --add-word: #abf2bc;
   --del-bg: #ffebe9;
   --del-ln: #ffd7d5;
   --del-fg: #cf222e;
+  --del-word: rgba(255, 129, 130, 0.4);
   --warn-bg: #fff8c5;
   --warn-border: #d4a72c;
   --error-fg: #cf222e;
@@ -36,9 +38,11 @@
     --add-bg: rgba(46, 160, 67, 0.15);
     --add-ln: rgba(63, 185, 80, 0.3);
     --add-fg: #3fb950;
+    --add-word: rgba(46, 160, 67, 0.4);
     --del-bg: rgba(248, 81, 73, 0.1);
     --del-ln: rgba(248, 81, 73, 0.3);
     --del-fg: #f85149;
+    --del-word: rgba(248, 81, 73, 0.4);
     --warn-bg: rgba(187, 128, 9, 0.15);
     --warn-border: #9e6a03;
     --error-fg: #f85149;
@@ -331,6 +335,9 @@ input[type="text"] {
 .diff tr.del td.ln, .diff td.ln.del { background: var(--del-ln); }
 .diff tr.add td.ln, .diff td.ln.add { background: var(--add-ln); }
 .diff td.blank { background: var(--bg-subtle); }
+
+.diff.inline-changes .word-add { background: var(--add-word); border-radius: 2px; }
+.diff.inline-changes .word-del { background: var(--del-word); border-radius: 2px; }
 
 /* Changes that came from upstream between the two bases. */
 .diff tr.upstream td {

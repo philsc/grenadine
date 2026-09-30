@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, Side};
 use grenadine_core::diff::{self, Hunk, Line};
+use grenadine_core::inline::{self, Aligned};
 use grenadine_core::rebase;
 use leptos::prelude::*;
 
 use crate::api;
-use crate::highlight::highlight_lines;
+use crate::highlight::{highlight_lines, mark};
 use crate::pr::{Anchor, Placed, ThreadView};
 
 const CONTEXT: usize = 3;
@@ -83,6 +84,7 @@ pub fn DiffView(
     upstream: Option<(String, String)>,
     comments: Arc<HashMap<String, Vec<Placed>>>,
     side_by_side: Signal<bool>,
+    inline_changes: Signal<bool>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
     let files = LocalResource::new(move || {
@@ -113,7 +115,7 @@ pub fn DiffView(
                 </ul>
                 {files.iter().map(|f| {
                     let placed = comments.get(f.change.path()).cloned().unwrap_or_default();
-                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side /> }
+                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes /> }
                 }).collect_view()}
             }
             .into_any()
@@ -168,10 +170,30 @@ fn layout(file: &FileData) -> Layout {
         }
         None => vec![false; blocks.len()],
     };
-    let hunks = diff::hunks(&blocks, old_lines.len(), new_lines.len(), CONTEXT);
+    let aligned: Vec<Vec<Aligned>> = blocks
+        .iter()
+        .map(|b| inline::align(&old_lines, &new_lines, b))
+        .collect();
+    let hunks = diff::hunks(&blocks, &aligned, old_lines.len(), new_lines.len(), CONTEXT);
+    let mut old_html = highlight_lines(file.change.old_path.as_deref().unwrap_or_default(), old);
+    let mut new_html = highlight_lines(file.change.path(), new);
+    for rows in &aligned {
+        for r in rows {
+            let (true, Some(o), Some(n)) = (r.paired, r.old, r.new) else {
+                continue;
+            };
+            let (dels, inss) = inline::changed_ranges(old_lines[o], new_lines[n]);
+            if let Some(h) = old_html.get_mut(o) {
+                *h = mark(h, &dels, "word-del");
+            }
+            if let Some(h) = new_html.get_mut(n) {
+                *h = mark(h, &inss, "word-add");
+            }
+        }
+    }
     Layout {
-        old_html: highlight_lines(file.change.old_path.as_deref().unwrap_or_default(), old),
-        new_html: highlight_lines(file.change.path(), new),
+        old_html,
+        new_html,
         skipped_after: diff::skipped_after(&hunks, old_lines.len()),
         hunks,
         upstream,
@@ -219,6 +241,7 @@ fn FileView(
     file: Arc<FileData>,
     comments: Vec<Placed>,
     side_by_side: Signal<bool>,
+    inline_changes: Signal<bool>,
 ) -> impl IntoView {
     let c = &file.change;
     let binary = [&file.old, &file.new]
@@ -259,9 +282,9 @@ fn FileView(
                 l
             });
             if side_by_side.get() {
-                split_view(&l, &comments).into_any()
+                split_view(&l, &comments, inline_changes).into_any()
             } else {
-                unified_view(&l, &comments).into_any()
+                unified_view(&l, &comments, inline_changes).into_any()
             }
         }
     };
@@ -360,7 +383,11 @@ fn html(lines: &[String], n: Option<usize>) -> String {
     n.and_then(|n| lines.get(n)).cloned().unwrap_or_default()
 }
 
-fn unified_view(l: &Layout, comments: &[Placed]) -> impl IntoView + use<> {
+fn unified_view(
+    l: &Layout,
+    comments: &[Placed],
+    inline_changes: Signal<bool>,
+) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
     for h in &l.hunks {
@@ -414,12 +441,16 @@ fn unified_view(l: &Layout, comments: &[Placed]) -> impl IntoView + use<> {
     rows.extend(skip_row(l.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
-        <table class="diff unified"><tbody>{rows}</tbody></table>
+        <table class="diff unified" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>
         {outside}
     }
 }
 
-fn split_view(l: &Layout, comments: &[Placed]) -> impl IntoView + use<> {
+fn split_view(
+    l: &Layout,
+    comments: &[Placed],
+    inline_changes: Signal<bool>,
+) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
     for h in &l.hunks {
@@ -452,7 +483,7 @@ fn split_view(l: &Layout, comments: &[Placed]) -> impl IntoView + use<> {
     rows.extend(skip_row(l.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
-        <table class="diff split"><tbody>{rows}</tbody></table>
+        <table class="diff split" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>
         {outside}
     }
 }

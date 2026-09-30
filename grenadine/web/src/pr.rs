@@ -152,6 +152,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     // `None` until the user picks versions: Base against the latest.
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
+    let inline_changes = RwSignal::new(load_flag("inline-changes", true));
 
     move || {
         match pr.get() {
@@ -161,7 +162,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         Some(Ok(Some(pr))) => {
             let pr = Arc::new(pr);
             prefetch(&pr);
-            view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side /> }.into_any()
+            view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /> }.into_any()
         }
     }
     }
@@ -199,6 +200,7 @@ fn PrBody(
     pr: Arc<PrDetail>,
     chosen: RwSignal<Option<Selection>>,
     side_by_side: RwSignal<bool>,
+    inline_changes: RwSignal<bool>,
 ) -> impl IntoView {
     let latest = pr.versions.len() as u32;
     let selection = {
@@ -267,6 +269,7 @@ fn PrBody(
                     upstream=upstream
                     comments=Arc::new(inline)
                     side_by_side=side_by_side.into()
+                    inline_changes=inline_changes.into()
                 />
             }
             .into_any()
@@ -302,6 +305,18 @@ fn PrBody(
                         }
                     />
                     " Side by side"
+                </label>
+                <label class="toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=move || inline_changes.get()
+                        on:change=move |ev| {
+                            let on = event_target_checked(&ev);
+                            inline_changes.set(on);
+                            save_flag("inline-changes", on);
+                        }
+                    />
+                    " Inline changes"
                 </label>
             </div>
             {diff}
