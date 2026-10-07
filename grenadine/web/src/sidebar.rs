@@ -2,6 +2,7 @@
 //! added, edited, reordered and deleted in place.
 
 use grenadine_core::api::{Inbox, InboxEdit, InboxWithPrs, PrKey};
+use grenadine_core::stack::{Link, group_inbox};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -144,20 +145,36 @@ fn InboxSection(
                 {if prs.is_empty() {
                     view! { <li class="muted none">"No PRs"</li> }.into_any()
                 } else {
-                    prs.into_iter().map(|pr| {
+                    let mut above = None;
+                    group_inbox(&prs).into_iter().map(|row| {
+                        let pr = &prs[row.index];
                         let key = pr.key.clone();
                         let is_selected = {
                             let key = key.clone();
                             move || selected.with(|s| s.as_ref() == Some(&key))
                         };
+                        let link_above = std::mem::replace(&mut above, row.link);
+                        let badge = pr
+                            .stack
+                            .as_ref()
+                            .filter(|s| s.position > 0 && s.length > 1)
+                            .map(|s| view! {
+                                <span class="badge" title="Position in its stack">{format!("{}/{}", s.position, s.length)}</span>
+                            });
                         view! {
-                            <li>
+                            <li
+                                class:stack-above=link_above.is_some()
+                                class:stack-above-gap=link_above == Some(Link::Gap)
+                                class:stack-below=row.link.is_some()
+                                class:stack-below-gap=row.link == Some(Link::Gap)
+                            >
                                 <a
                                     class="pr-item"
                                     class:selected=is_selected
                                     href=hash_for(&key)
                                 >
                                     <span class="pr-title">
+                                        {badge}
                                         {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
                                         {pr.title.clone()}
                                     </span>

@@ -134,6 +134,7 @@ async fn pr(
         state.sync_once(key.clone());
     }
     if let Some(pr) = state.db.pr(&key)? {
+        prefetch_stack(&state, &pr)?;
         return Ok(Json::<PrDetail>(pr).into_response());
     }
     let what = match state.db.pr_sync_error(&key)? {
@@ -141,6 +142,31 @@ async fn pr(
         None => PrMissing::NotSynced,
     };
     Ok(missing(what))
+}
+
+/// Syncs the PR's stack-mates that changed since their last sync, going by
+/// what the stack says about them, so that clicking through the stack is
+/// fast. Stack-mates in an inbox are left to the poller.
+fn prefetch_stack(state: &Arc<State>, pr: &PrDetail) -> ApiResult<()> {
+    let Some(stack) = &pr.stack else {
+        return Ok(());
+    };
+    for mate in stack.prs.iter().filter(|p| p.number != pr.summary.key.number) {
+        let key = PrKey {
+            repo: pr.summary.key.repo.clone(),
+            number: mate.number,
+        };
+        // A sync stores a newer updatedAt than the stack saw, so only an
+        // older one means the mate changed since.
+        let stale = state
+            .db
+            .sync_mark(&key)?
+            .is_none_or(|m| m.updated_at < mate.updated_at);
+        if stale && !state.db.in_any_inbox(&key)? {
+            state.sync_once(key);
+        }
+    }
+    Ok(())
 }
 
 fn is_sha(s: &str) -> bool {
@@ -363,6 +389,7 @@ mod tests {
                 },
                 &[],
                 &[],
+                None,
                 false,
                 None,
             )
@@ -382,6 +409,106 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(state.db.pr_sync_error(&key).unwrap().is_some());
+    }
+
+    /// Opening a PR syncs its stack-mates that no inbox covers; the dead
+    /// test API makes those syncs fail, which leaves an error behind.
+    #[tokio::test]
+    async fn stack_mates_are_prefetched() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+        );
+        let key = |number| PrKey {
+            repo: "owner/name".into(),
+            number,
+        };
+        let mate = |number, parent| grenadine_core::api::StackPr {
+            number,
+            title: "t".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "u".into(),
+            updated_at: "u".into(),
+            head_oid: "h".into(),
+            parent,
+        };
+        let stack = grenadine_core::api::Stack {
+            base_ref: "main".into(),
+            prs: vec![mate(7, Some(6)), mate(6, None), mate(8, Some(7))],
+            more_ancestors: false,
+            more_descendants: false,
+        };
+        state
+            .db
+            .set_inbox_results(
+                1,
+                Ok(&[
+                    crate::github::Hit {
+                        key: key(7),
+                        title: "t".into(),
+                        author: "a".into(),
+                        state: "OPEN".into(),
+                        is_draft: false,
+                        url: "u".into(),
+                        updated_at: "u".into(),
+                        head_oid: "h".into(),
+                    },
+                    crate::github::Hit {
+                        key: key(8),
+                        title: "t".into(),
+                        author: "a".into(),
+                        state: "OPEN".into(),
+                        is_draft: false,
+                        url: "u".into(),
+                        updated_at: "u".into(),
+                        head_oid: "h".into(),
+                    },
+                ]),
+            )
+            .unwrap();
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: key(7),
+                    title: "t".into(),
+                    body: "b".into(),
+                    author: "a".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    created_at: "c".into(),
+                    updated_at: "u".into(),
+                    base_ref: "main".into(),
+                    head_ref: "pr".into(),
+                    head_oid: "h".into(),
+                },
+                &[],
+                &[],
+                Some(&stack),
+                false,
+                None,
+            )
+            .unwrap();
+        let response = pr(AxState(state.clone()), Path(("owner".into(), "name".into(), 7)))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if state.db.pr_sync_error(&key(6)).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(state.db.pr_sync_error(&key(6)).unwrap().is_some());
+        // 8 is in an inbox, so it's the poller's.
+        assert_eq!(state.db.pr_sync_error(&key(8)).unwrap(), None);
     }
 
     /// An inbox PR is the poller's: no on-demand sync starts for it.

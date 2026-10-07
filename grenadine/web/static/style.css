@@ -207,6 +207,21 @@ input[type="text"] {
 .pr-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pr-meta { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Stack-mates in an inbox are joined by a line left of their titles. */
+.pr-list li { position: relative; }
+.pr-list li.stack-above::before,
+.pr-list li.stack-below::after {
+  content: "";
+  position: absolute;
+  left: 26px;
+  border-left: 2px solid var(--border);
+  pointer-events: none;
+}
+.pr-list li.stack-above::before { top: 0; height: 50%; }
+.pr-list li.stack-below::after { top: 50%; bottom: 0; }
+.pr-list li.stack-above-gap::before,
+.pr-list li.stack-below-gap::after { border-left-style: dashed; }
+
 .inbox-form { padding: 8px 16px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .inbox-form label { display: flex; flex-direction: column; gap: 2px; }
 .inbox-form .hint { margin: 0; font-size: 12px; }
@@ -225,6 +240,35 @@ input[type="text"] {
 .state-open { background: #1f883d; }
 .state-merged { background: #8250df; }
 .state-closed { background: #cf222e; }
+
+.stack { margin: 12px 0 0; }
+.stack-row { display: flex; align-items: center; min-height: 26px; }
+.stack-graph { position: relative; flex: none; align-self: stretch; margin-right: 6px; }
+.stack-graph > span { position: absolute; }
+.stack-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane-line, .lane-up, .lane-down { width: 2px; margin-left: -1px; background: var(--border); }
+.lane-line { top: 0; bottom: 0; }
+.lane-up { top: 0; height: 50%; }
+.lane-down { top: 50%; bottom: 0; }
+.lane-join {
+  top: 0;
+  height: 50%;
+  margin-left: -1px;
+  border-right: 2px solid var(--border);
+  border-bottom: 2px solid var(--border);
+  border-bottom-right-radius: 8px;
+  box-sizing: border-box;
+}
+.lane-dot {
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--fg-muted);
+  transform: translate(-50%, -50%);
+}
+.lane-dot.current { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+.lane-dot.base { background: var(--bg); border: 2px solid var(--fg-muted); box-sizing: border-box; }
 
 .banner { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--warn-border); background: var(--warn-bg); }
 .banner.error { border-color: var(--error-fg); background: var(--error-bg); color: var(--fg); }

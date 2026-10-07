@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    Inbox, InboxEdit, PrDetail, PrKey, PrSummary, ReviewComment, Version, VersionKind,
+    Inbox, InboxEdit, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -117,6 +117,10 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
     );
 "#),
     Migration::ResetInboxes,
+    Migration::Sql(r#"
+    -- The PR's stack as JSON, NULL until a sync fetched it.
+    ALTER TABLE prs ADD COLUMN stack TEXT;
+"#),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -353,12 +357,14 @@ impl Db {
                     CASE WHEN i.title = '' THEN COALESCE(p.url, '') ELSE i.url END,
                     (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
                     p.repo IS NOT NULL,
-                    CASE WHEN p.repo IS NULL THEN i.sync_error END
+                    CASE WHEN p.repo IS NULL THEN i.sync_error END,
+                    p.stack
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
         let rows = stmt.query_map([id], |r| {
-            summary_from_row(r, r.get(9)?, r.get(10)?)
+            let stack = parse_stack(r.get(11)?);
+            summary_from_row(r, r.get(9)?, r.get(10)?, stack.as_ref())
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -400,12 +406,14 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Stores the result of a successful sync.
+    /// Stores the result of a successful sync. A `stack` of `None` keeps
+    /// the stored stack.
     pub fn store_sync(
         &self,
         meta: &PrMeta,
         versions: &[Version],
         comments: &[ReviewComment],
+        stack: Option<&Stack>,
         approximate: bool,
         drift: Option<(&str, &str)>,
     ) -> Result<()> {
@@ -414,16 +422,17 @@ impl Db {
         let key = &meta.key;
         let drift_text = drift
             .map(|(old, new)| format!("Versions changed on recomputation: was {old}, now {new}"));
+        let stack_json = stack.map(serde_json::to_string).transpose()?;
         tx.execute(
             "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url, created_at, updated_at,
                               base_ref, head_ref, head_oid, approximate, drift, sync_error,
-                              synced_updated_at, synced_head_oid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?10, ?13)
+                              synced_updated_at, synced_head_oid, stack)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?10, ?13, ?16)
              ON CONFLICT (repo, number) DO UPDATE SET
                 title = ?3, body = ?4, author = ?5, state = ?6, is_draft = ?7, url = ?8, created_at = ?9,
                 updated_at = ?10, base_ref = ?11, head_ref = ?12, head_oid = ?13, approximate = ?14,
                 drift = COALESCE(?15, drift), sync_error = NULL,
-                synced_updated_at = ?10, synced_head_oid = ?13",
+                synced_updated_at = ?10, synced_head_oid = ?13, stack = COALESCE(?16, stack)",
             params![
                 key.repo,
                 key.number,
@@ -440,6 +449,7 @@ impl Db {
                 meta.head_oid,
                 approximate,
                 drift_text,
+                stack_json,
             ],
         )?;
         // The error a not-yet-synced listing carried is now obsolete.
@@ -547,24 +557,27 @@ impl Db {
             conn.query_row(
                 "SELECT p.repo, p.number, p.title, p.author, p.state, p.is_draft, p.updated_at, p.url,
                         (SELECT COUNT(*) FROM versions v WHERE v.repo = p.repo AND v.number = p.number),
-                        p.body, p.base_ref, p.head_ref, p.approximate, p.drift, p.sync_error
+                        p.body, p.base_ref, p.head_ref, p.approximate, p.drift, p.sync_error, p.stack
                  FROM prs p WHERE p.repo = ? AND p.number = ?",
                 params![key.repo, key.number],
                 |r| {
+                    let stack = parse_stack(r.get(15)?);
                     Ok((
-                        summary_from_row(r, true, None)?,
+                        summary_from_row(r, true, None, stack.as_ref())?,
                         r.get::<_, String>(9)?,
                         r.get::<_, String>(10)?,
                         r.get::<_, String>(11)?,
                         r.get::<_, bool>(12)?,
                         r.get::<_, Option<String>>(13)?,
                         r.get::<_, Option<String>>(14)?,
+                        stack,
                     ))
                 },
             )
             .optional()?
         };
-        let Some((summary, body, base_ref, head_ref, approximate, drift, sync_error)) = row else {
+        let Some((summary, body, base_ref, head_ref, approximate, drift, sync_error, stack)) = row
+        else {
             return Ok(None);
         };
         Ok(Some(PrDetail {
@@ -574,6 +587,7 @@ impl Db {
             head_ref,
             versions: self.versions(key)?,
             comments: self.comments(key)?,
+            stack,
             approximate,
             drift,
             sync_error,
@@ -589,15 +603,23 @@ impl Db {
     }
 }
 
+/// A stack that no longer parses is treated like one that was never
+/// fetched; the next sync replaces it.
+fn parse_stack(json: Option<String>) -> Option<Stack> {
+    serde_json::from_str(&json?).ok()
+}
+
 fn summary_from_row(
     r: &rusqlite::Row,
     synced: bool,
     sync_error: Option<String>,
+    stack: Option<&Stack>,
 ) -> rusqlite::Result<PrSummary> {
+    let number = r.get(1)?;
     Ok(PrSummary {
         key: PrKey {
             repo: r.get(0)?,
-            number: r.get(1)?,
+            number,
         },
         title: r.get(2)?,
         author: r.get(3)?,
@@ -608,6 +630,7 @@ fn summary_from_row(
         version_count: r.get(8)?,
         synced,
         sync_error,
+        stack: stack.and_then(|s| s.summary(number)),
     })
 }
 
@@ -728,7 +751,7 @@ mod tests {
             created_at: "c".into(),
             url: "u".into(),
         }];
-        db.store_sync(&meta(&key), &versions, &comments, false, None)
+        db.store_sync(&meta(&key), &versions, &comments, None, false, None)
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert_eq!(pr.versions, versions);
@@ -744,7 +767,7 @@ mod tests {
             })
         );
 
-        db.store_sync(&meta(&key), &versions, &[], false, Some(("a", "b")))
+        db.store_sync(&meta(&key), &versions, &[], None, false, Some(("a", "b")))
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert!(pr.drift.is_some());
@@ -784,7 +807,7 @@ mod tests {
             Some("boom")
         );
 
-        db.store_sync(&meta(&key), &[], &[], false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
         let pr = db.inbox_prs(1).unwrap().remove(0);
         assert!(pr.synced);
         assert_eq!(pr.sync_error, None);
@@ -805,8 +828,47 @@ mod tests {
         db.store_sync_error(&key, "boom 2").unwrap();
         assert_eq!(db.pr_sync_error(&key).unwrap().as_deref(), Some("boom 2"));
 
-        db.store_sync(&meta(&key), &[], &[], false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
         assert_eq!(db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn stack_round_trip() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+            .unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        assert_eq!(db.pr(&key).unwrap().unwrap().stack, None);
+
+        let pr = |number, parent| grenadine_core::api::StackPr {
+            number,
+            title: "t".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "u".into(),
+            updated_at: "u".into(),
+            head_oid: "h".into(),
+            parent,
+        };
+        let stack = Stack {
+            base_ref: "main".into(),
+            prs: vec![pr(7, Some(6)), pr(6, None)],
+            more_ancestors: false,
+            more_descendants: false,
+        };
+        db.store_sync(&meta(&key), &[], &[], Some(&stack), false, None)
+            .unwrap();
+        // A sync that couldn't fetch the stack keeps the stored one.
+        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        let detail = db.pr(&key).unwrap().unwrap();
+        assert_eq!(detail.stack.as_ref(), Some(&stack));
+        let summary = detail.summary.stack.unwrap();
+        assert_eq!((summary.position, summary.length), (2, 2));
+        assert_eq!(db.inbox_prs(1).unwrap()[0].stack.as_ref().map(|s| s.position), Some(2));
     }
 
     #[test]
@@ -846,9 +908,16 @@ mod tests {
             [],
         )
         .unwrap();
-        // Stop before migration 4, which would replace the inboxes and
-        // cascade away the inbox_prs row.
+        // Skip migration 4, which would replace the inboxes and cascade
+        // away the inbox_prs row, but apply the later ones that the
+        // listing's query needs.
         migrate(&mut conn, 3).unwrap();
+        for m in &MIGRATIONS[4..] {
+            let Migration::Sql(sql) = m else {
+                panic!("migrations after 4 are SQL")
+            };
+            conn.execute_batch(sql).unwrap();
+        }
         let db = Db {
             conn: Mutex::new(conn),
         };

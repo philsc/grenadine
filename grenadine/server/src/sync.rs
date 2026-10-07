@@ -10,13 +10,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
-use grenadine_core::api::{PrKey, ServerEvent, SyncPhase, SyncStatus, SyncingPr, Version};
+use grenadine_core::api::{
+    PrKey, ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
+};
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use crate::db::{Db, PrMeta, SyncMark};
 use crate::git::{REF_PREFIX, Repo};
 use crate::github::{self, GitHub, PrData};
+use crate::stack;
 
 /// How many PRs sync at the same time.
 const CONCURRENCY: usize = 4;
@@ -293,6 +296,30 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         );
     }
 
+    let me = StackPr {
+        number: key.number,
+        title: data.title.clone(),
+        state: data.state.clone(),
+        is_draft: data.is_draft,
+        url: data.url.clone(),
+        updated_at: data.updated_at.clone(),
+        head_oid: data.head_oid.clone(),
+        parent: None,
+    };
+    let head_ref = (data.head_repo.as_deref() == Some(key.repo.as_str())).then_some(data.head_ref.as_str());
+    let lookup = |field, refs: Vec<String>| async move {
+        state.github.prs_by_ref(&key.repo, field, &refs).await
+    };
+    // The stack is secondary; failing to fetch it keeps the stored one
+    // rather than failing the whole sync.
+    let stack = match stack::walk(me, &data.base_ref, head_ref, lookup).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("{}#{}: can't fetch the stack: {e:#}", key.repo, key.number);
+            None
+        }
+    };
+
     let meta = PrMeta {
         key: key.clone(),
         title: data.title,
@@ -311,6 +338,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         &meta,
         &versions,
         &comments,
+        stack.as_ref(),
         computed.approximate,
         drifted.then_some((old_text.as_str(), new_text.as_str())),
     )?;

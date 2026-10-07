@@ -6,6 +6,7 @@ mod db;
 mod git;
 mod github;
 mod inboxes;
+mod stack;
 mod sync;
 
 use std::collections::{BTreeMap, BTreeSet};

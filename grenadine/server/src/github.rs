@@ -1,12 +1,12 @@
-//! The GitHub API: searches, PR details, the head branch's activity log and
-//! review comments.
+//! The GitHub API: searches, PR details, PRs by branch, the head branch's
+//! activity log and review comments.
 
 use std::collections::BTreeMap;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
-use grenadine_core::api::{PrKey, ReviewComment, Side};
+use grenadine_core::api::{PrKey, ReviewComment, Side, StackPr};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
@@ -70,6 +70,25 @@ pub struct PrData {
     /// The PR's commits in order, each with the time its first check suite
     /// was created (a stand-in for when it was pushed).
     pub commits: Vec<(String, Option<i64>)>,
+}
+
+/// Which branch of a PR `GitHub::prs_by_ref` matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefField {
+    Head,
+    Base,
+}
+
+/// An open or merged PR that `GitHub::prs_by_ref` found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefPr {
+    /// Its `parent` is always `None`; the stack walk fills it in.
+    pub pr: StackPr,
+    pub base_ref: String,
+    pub head_ref: String,
+    /// The head branch lives in a fork, so no PR can target it.
+    pub cross_repo: bool,
+    pub merged_at: Option<String>,
 }
 
 /// Parses an RFC 3339 timestamp into Unix seconds.
@@ -312,6 +331,83 @@ impl GitHub {
                     .collect())
             })
             .collect())
+    }
+
+    /// The open and merged PRs of `repo` whose head (or base) branch is
+    /// each of `refs`, all in one GraphQL request.
+    pub async fn prs_by_ref(
+        &self,
+        repo: &str,
+        field: RefField,
+        refs: &[String],
+    ) -> Result<Vec<Vec<RefPr>>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| anyhow!("bad repo {repo}"))?;
+        let arg = match field {
+            RefField::Head => "headRefName",
+            RefField::Base => "baseRefName",
+        };
+        let mut gql = String::from("query($owner: String!, $name: String!");
+        for i in 0..refs.len() {
+            gql += &format!(", $r{i}: String!");
+        }
+        gql += ") {\n  repository(owner: $owner, name: $name) {\n";
+        let mut vars = serde_json::Map::new();
+        vars.insert("owner".into(), json!(owner));
+        vars.insert("name".into(), json!(name));
+        for (i, r) in refs.iter().enumerate() {
+            gql += &format!(
+                "    p{i}: pullRequests({arg}: $r{i}, states: [OPEN, MERGED], first: 100) {{
+                       nodes {{ number title state isDraft url updatedAt mergedAt headRefOid
+                                headRefName baseRefName isCrossRepository }}
+                     }}\n"
+            );
+            vars.insert(format!("r{i}"), json!(r));
+        }
+        gql += "  }\n}";
+        let (data, errors) = self.graphql(&gql, Value::Object(vars)).await?;
+        (0..refs.len())
+            .map(|i| {
+                let nodes = data
+                    .pointer(&format!("/repository/p{i}/nodes"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "can't look up PRs by branch in {repo}: {}",
+                            errors
+                                .first()
+                                .and_then(|e| e["message"].as_str())
+                                .unwrap_or("no data")
+                        )
+                    })?;
+                Ok(nodes
+                    .iter()
+                    .filter(|n| n.get("number").is_some())
+                    .map(|n| RefPr {
+                        pr: StackPr {
+                            number: n["number"].as_u64().unwrap_or_default(),
+                            title: str_at(n, "/title").to_owned(),
+                            state: str_at(n, "/state").to_owned(),
+                            is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+                            url: str_at(n, "/url").to_owned(),
+                            updated_at: str_at(n, "/updatedAt").to_owned(),
+                            head_oid: str_at(n, "/headRefOid").to_owned(),
+                            parent: None,
+                        },
+                        base_ref: str_at(n, "/baseRefName").to_owned(),
+                        head_ref: str_at(n, "/headRefName").to_owned(),
+                        cross_repo: n["isCrossRepository"].as_bool().unwrap_or_default(),
+                        merged_at: Some(str_at(n, "/mergedAt"))
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                    })
+                    .collect())
+            })
+            .collect()
     }
 
     pub async fn pr(&self, key: &PrKey) -> Result<PrData> {

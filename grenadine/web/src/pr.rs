@@ -4,13 +4,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grenadine_core::api::{PrDetail, PrKey, ReviewComment, Side, Version, VersionKind};
+use grenadine_core::api::{PrDetail, PrKey, ReviewComment, Side, Stack, Version, VersionKind};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::diffview::DiffView;
 use crate::sidebar::{load_flag, save_flag};
-use crate::{Updates, api, markdown};
+use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.
 #[derive(Clone, Debug, PartialEq)]
@@ -188,9 +188,10 @@ struct PrLinks {
     invert: RwSignal<bool>,
 }
 
-/// Routes clicks on the `data-grenadine` links that markdown rendering
-/// put on PR references. Shift+click — or a plain click when the invert
-/// flag is on — navigates in-app; anything else opens GitHub in a tab.
+/// Routes clicks on the `data-grenadine` links that markdown rendering put
+/// on PR references and that the stack list has. Shift+click — or a plain
+/// click when the invert flag is on — navigates in-app; anything else
+/// opens GitHub in a tab.
 fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
     if ev.button() != 0 || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
         return;
@@ -344,6 +345,9 @@ fn PrBody(
                 {pr.drift.clone().map(|d| view! { <p class="banner warn">{d}</p> })}
                 {pr.sync_error.clone().map(|e| view! { <p class="banner error">{format!("The last sync failed: {e}")}</p> })}
             </header>
+            {pr.stack.clone().filter(|st| st.prs.len() > 1).map(|st| view! {
+                <StackList stack=st repo=s.key.repo.clone() current=s.key.number pr_links=pr_links />
+            })}
             <section class="description markdown" inner_html=body_html
                 on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
             <div class="toolbar">
@@ -387,6 +391,76 @@ fn PrBody(
             </div>
             {diff}
         </article>
+    }
+}
+
+/// The horizontal centre of a lane in the stack graph, in pixels.
+fn lane_x(lane: usize) -> usize {
+    8 + lane * 16
+}
+
+/// The PR's stack, top first, drawn like `git log --graph`.
+#[component]
+fn StackList(stack: Stack, repo: String, current: u64, pr_links: RwSignal<bool>) -> impl IntoView {
+    let rows = stack.graph();
+    let lanes = rows
+        .iter()
+        .flat_map(|r| std::iter::once(r.lane).chain(r.through.iter().copied()).chain(r.joins.iter().copied()))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let width = format!("width: {}px", lane_x(lanes) - 4);
+    let more = |text: &'static str| {
+        let width = width.clone();
+        view! {
+            <div class="stack-row">
+                <span class="stack-graph" style=width></span>
+                <span class="muted">{text}</span>
+            </div>
+        }
+    };
+    let rows = rows.into_iter().map(|row| {
+        let at = |lane: usize| format!("left: {}px", lane_x(lane));
+        let graph = view! {
+            <span class="stack-graph" style=width.clone()>
+                {row.through.iter().map(|&l| view! { <span class="lane-line" style=at(l)></span> }).collect_view()}
+                {row.joins.iter().map(|&l| view! {
+                    <span class="lane-join" style=format!("left: {}px; width: {}px", lane_x(row.lane), lane_x(l) - lane_x(row.lane) + 2)></span>
+                }).collect_view()}
+                {row.up.then(|| view! { <span class="lane-up" style=at(row.lane)></span> })}
+                {row.down.then(|| view! { <span class="lane-down" style=at(row.lane)></span> })}
+                <span class="lane-dot" class:base=row.pr.is_none() class:current=row.pr.is_some_and(|i| stack.prs[i].number == current) style=at(row.lane)></span>
+            </span>
+        };
+        let label = match row.pr {
+            None if stack.more_ancestors => view! { <span class="muted">"… more not shown"</span> }.into_any(),
+            None => view! { <span class="mono muted">{stack.base_ref.clone()}</span> }.into_any(),
+            Some(i) => {
+                let p = &stack.prs[i];
+                let text = format!("#{} {}", p.number, p.title);
+                let hash = hash_for(&PrKey { repo: repo.clone(), number: p.number });
+                let state = p.state.to_lowercase();
+                view! {
+                    {if p.number == current {
+                        view! { <strong>{text}</strong> }.into_any()
+                    } else {
+                        view! { <a href=p.url.clone() target="_blank" data-grenadine=hash>{text}</a> }.into_any()
+                    }}
+                    " "
+                    <span class=format!("state state-{state}")>{state.clone()}</span>
+                    {p.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
+                }
+                .into_any()
+            }
+        };
+        view! { <div class="stack-row">{graph}<span class="stack-label">{label}</span></div> }
+    }).collect_view();
+
+    view! {
+        <section class="stack" on:click=move |ev| markdown_click(ev, pr_links.get_untracked())>
+            {stack.more_descendants.then(|| more("… more not shown"))}
+            {rows}
+        </section>
     }
 }
 

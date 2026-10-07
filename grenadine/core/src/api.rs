@@ -49,6 +49,58 @@ pub struct PrSummary {
     /// Set when the last sync failed before the PR ever synced. After a
     /// successful sync the error lives on `PrDetail` instead.
     pub sync_error: Option<String>,
+    /// Where the PR sits in its stack. `None` when it isn't stacked or
+    /// hasn't synced.
+    pub stack: Option<StackSummary>,
+}
+
+/// One PR of a stack, as GitHub reported it when the stack was fetched.
+/// All PRs of a stack target the same repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPr {
+    pub number: u64,
+    pub title: String,
+    /// OPEN or MERGED.
+    pub state: String,
+    pub is_draft: bool,
+    pub url: String,
+    pub updated_at: String,
+    pub head_oid: String,
+    /// The PR whose head branch this PR targets. `None` for the bottom PR,
+    /// which targets `Stack::base_ref`.
+    pub parent: Option<u64>,
+}
+
+/// A PR's ancestors down to the branch the bottom one targets, the PR
+/// itself, and all of its descendants. Sibling branches of the ancestors
+/// are left out because they don't affect the PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stack {
+    /// The branch the bottom PR targets, e.g. `main`.
+    pub base_ref: String,
+    pub prs: Vec<StackPr>,
+    /// The walk stopped before reaching the bottom of the stack.
+    pub more_ancestors: bool,
+    /// The walk stopped before finding every descendant.
+    pub more_descendants: bool,
+}
+
+/// A PR of a stack and its parent, enough to group and order stack-mates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMember {
+    pub number: u64,
+    pub parent: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackSummary {
+    /// The open PRs from the bottom of the stack up to and including this
+    /// one. 0 when this PR isn't open.
+    pub position: u32,
+    /// The open PRs on the longest path through this PR.
+    pub length: u32,
+    /// Every PR of the stack, this one included.
+    pub members: Vec<StackMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +188,8 @@ pub struct PrDetail {
     pub head_ref: String,
     pub versions: Vec<Version>,
     pub comments: Vec<ReviewComment>,
+    /// `None` until a sync fetched it.
+    pub stack: Option<Stack>,
     /// The push history couldn't be read from GitHub's activity log, so the
     /// versions were reconstructed heuristically.
     pub approximate: bool,
