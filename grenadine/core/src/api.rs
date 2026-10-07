@@ -122,6 +122,17 @@ pub enum VersionKind {
     ForcePush,
 }
 
+/// A GitHub user, or a git author that isn't linked to one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    /// `None` for a git author without a GitHub account.
+    pub login: Option<String>,
+    /// The display name; for a git author without a GitHub account, the
+    /// name from the commit.
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     /// 1-based. Version 0 is the implicit "Base".
@@ -133,6 +144,10 @@ pub struct Version {
     pub kind: VersionKind,
     /// When the push that created this version happened, if known.
     pub pushed_at: Option<String>,
+    /// Who pushed this version, if known.
+    pub pushed_by: Option<Person>,
+    /// `pushed_by` is the commit's author because the pusher is unknown.
+    pub pushed_by_is_guess: bool,
     /// The commit could not be fetched; the version can't be selected.
     pub missing: bool,
 }
@@ -165,6 +180,10 @@ pub struct ReviewComment {
     pub on_file: bool,
     pub created_at: String,
     pub url: String,
+    /// Whether the thread this comment starts is resolved. Only meaningful
+    /// on a thread's root comment.
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 /// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.

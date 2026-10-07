@@ -335,6 +335,12 @@ input[type="text"] {
 .versions tr.missing { opacity: 0.5; }
 .vnum { display: inline-block; min-width: 2ch; text-align: right; font-weight: 600; }
 .vkind, .vtime { margin-left: 8px; font-size: 12px; }
+.pusher { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.pusher.guess { opacity: 0.55; font-style: italic; }
+.avatar { width: 20px; height: 20px; border-radius: 50%; flex: none; }
+.avatar-generic { display: inline-block; background: var(--border); }
+.versions td.threads { text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--fg-muted); }
+.versions td.threads .all-resolved { color: var(--add-fg); }
 
 .comment-panel { margin: 0 0 12px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
 .comment-panel summary { cursor: pointer; }

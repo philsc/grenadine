@@ -1,12 +1,14 @@
 //! The SQLite database: inboxes, the PRs they matched, and each PR's
 //! versions and review comments.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    Inbox, InboxEdit, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
+    Inbox, InboxEdit, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
+    VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -120,6 +122,22 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
     Migration::Sql(r#"
     -- The PR's stack as JSON, NULL until a sync fetched it.
     ALTER TABLE prs ADD COLUMN stack TEXT;
+"#),
+    Migration::Sql(r#"
+    -- pushed_by is the JSON of an api::Person.
+    ALTER TABLE versions ADD COLUMN pushed_by TEXT;
+    ALTER TABLE versions ADD COLUMN pushed_by_is_guess INTEGER NOT NULL DEFAULT 0;
+
+    -- GitHub users' display names and avatars, so that a sync only looks
+    -- up users it hasn't seen recently. name and avatar_url are NULL for
+    -- logins that aren't users, e.g. bots.
+    CREATE TABLE users (
+        login TEXT PRIMARY KEY,
+        name TEXT,
+        avatar_url TEXT,
+        -- Unix seconds.
+        fetched_at INTEGER NOT NULL
+    );
 "#),
 ];
 
@@ -390,8 +408,8 @@ impl Db {
     pub fn versions(&self, key: &PrKey) -> Result<Vec<Version>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT idx, sha, merge_base, kind, pushed_at, missing FROM versions
-             WHERE repo = ? AND number = ? ORDER BY idx",
+            "SELECT idx, sha, merge_base, kind, pushed_at, missing, pushed_by, pushed_by_is_guess
+             FROM versions WHERE repo = ? AND number = ? ORDER BY idx",
         )?;
         let rows = stmt.query_map(params![key.repo, key.number], |r| {
             Ok(Version {
@@ -401,9 +419,73 @@ impl Db {
                 kind: parse_kind(&r.get::<_, String>(3)?),
                 pushed_at: r.get(4)?,
                 missing: r.get(5)?,
+                pushed_by: r
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|j| serde_json::from_str(&j).ok()),
+                pushed_by_is_guess: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The cached users among `logins` that were fetched at or after
+    /// `since` (Unix seconds). A login that isn't a user maps to `None`.
+    pub fn cached_users(
+        &self,
+        logins: &[String],
+        since: i64,
+    ) -> Result<BTreeMap<String, Option<Person>>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name, avatar_url FROM users WHERE login = ? AND fetched_at >= ?",
+        )?;
+        let mut out = BTreeMap::new();
+        for login in logins {
+            let row: Option<(Option<String>, Option<String>)> = stmt
+                .query_row(params![login, since], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((name, avatar_url)) = row {
+                let known = name.is_some() || avatar_url.is_some();
+                out.insert(
+                    login.clone(),
+                    known.then(|| Person {
+                        login: Some(login.clone()),
+                        name,
+                        avatar_url,
+                    }),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Caches the outcome of looking up `logins` at `at` (Unix seconds).
+    /// Logins missing from `found` are cached as not being users.
+    pub fn store_users(
+        &self,
+        logins: &[String],
+        found: &BTreeMap<String, Person>,
+        at: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for login in logins {
+            let p = found.get(login);
+            tx.execute(
+                "INSERT INTO users (login, name, avatar_url, fetched_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT (login) DO UPDATE SET
+                    name = excluded.name, avatar_url = excluded.avatar_url,
+                    fetched_at = excluded.fetched_at",
+                params![
+                    login,
+                    p.and_then(|p| p.name.as_deref()),
+                    p.and_then(|p| p.avatar_url.as_deref()),
+                    at
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Stores the result of a successful sync. A `stack` of `None` keeps
@@ -472,10 +554,23 @@ impl Db {
             params![key.repo, key.number],
         )?;
         for v in versions {
+            let pushed_by = v.pushed_by.as_ref().map(serde_json::to_string).transpose()?;
             tx.execute(
-                "INSERT INTO versions (repo, number, idx, sha, merge_base, kind, pushed_at, missing)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![key.repo, key.number, v.number, v.sha, v.merge_base, kind_str(v.kind), v.pushed_at, v.missing],
+                "INSERT INTO versions (repo, number, idx, sha, merge_base, kind, pushed_at, missing,
+                                       pushed_by, pushed_by_is_guess)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    key.repo,
+                    key.number,
+                    v.number,
+                    v.sha,
+                    v.merge_base,
+                    kind_str(v.kind),
+                    v.pushed_at,
+                    v.missing,
+                    pushed_by,
+                    v.pushed_by_is_guess
+                ],
             )?;
         }
         tx.execute(
@@ -727,14 +822,32 @@ mod tests {
         assert_eq!(prs[0].title, "hit title");
         assert_eq!(prs[0].version_count, 0);
 
-        let versions = vec![Version {
-            number: 1,
-            sha: "h".into(),
-            merge_base: Some("m".into()),
-            kind: VersionKind::Initial,
-            pushed_at: None,
-            missing: false,
-        }];
+        let versions = vec![
+            Version {
+                number: 1,
+                sha: "g".into(),
+                merge_base: Some("m".into()),
+                kind: VersionKind::Initial,
+                pushed_at: None,
+                pushed_by: None,
+                pushed_by_is_guess: false,
+                missing: false,
+            },
+            Version {
+                number: 2,
+                sha: "h".into(),
+                merge_base: Some("m".into()),
+                kind: VersionKind::Push,
+                pushed_at: Some("2026-01-02T00:00:00+00:00".into()),
+                pushed_by: Some(Person {
+                    login: None,
+                    name: Some("Git Author".into()),
+                    avatar_url: None,
+                }),
+                pushed_by_is_guess: true,
+                missing: false,
+            },
+        ];
         let comments = vec![ReviewComment {
             id: 3,
             in_reply_to: None,
@@ -750,13 +863,14 @@ mod tests {
             on_file: false,
             created_at: "c".into(),
             url: "u".into(),
+            resolved: true,
         }];
         db.store_sync(&meta(&key), &versions, &comments, None, false, None)
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert_eq!(pr.versions, versions);
         assert_eq!(pr.comments, comments);
-        assert_eq!(pr.summary.version_count, 1);
+        assert_eq!(pr.summary.version_count, 2);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));
         assert!(db.inbox_prs(1).unwrap()[0].synced);
         assert_eq!(
@@ -927,6 +1041,50 @@ mod tests {
         assert_eq!(pr.title, "old title");
         assert_eq!(pr.author, "au");
         assert!(pr.synced);
+    }
+
+    #[test]
+    fn users_cache() {
+        let db = Db::in_memory();
+        let logins = ["alice".to_owned(), "bot[bot]".to_owned()];
+        assert!(db.cached_users(&logins, 0).unwrap().is_empty());
+
+        let found = BTreeMap::from([(
+            "alice".to_owned(),
+            Person {
+                login: Some("alice".into()),
+                name: Some("Alice A.".into()),
+                avatar_url: Some("https://a".into()),
+            },
+        )]);
+        db.store_users(&logins, &found, 100).unwrap();
+        let cached = db.cached_users(&logins, 100).unwrap();
+        assert_eq!(cached.get("alice"), Some(&found.get("alice").cloned()));
+        // A login that isn't a user is cached as such.
+        assert_eq!(cached.get("bot[bot]"), Some(&None));
+        // Entries fetched before `since` are stale.
+        assert!(db.cached_users(&logins, 101).unwrap().is_empty());
+    }
+
+    #[test]
+    fn comments_stored_before_resolved_existed_load() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO comments (repo, number, id, json) VALUES ('o/n', 7, 1, ?)",
+                [r#"{"id":1,"in_reply_to":null,"author":"a","body":"b","path":"f",
+                     "original_commit":"h","original_line":1,"original_start_line":null,
+                     "line":1,"start_line":null,"side":"Right","on_file":false,
+                     "created_at":"c","url":"u"}"#],
+            )
+            .unwrap();
+        let pr = db.pr(&key).unwrap().unwrap();
+        assert!(!pr.comments[0].resolved);
     }
 
     #[test]

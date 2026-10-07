@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use grenadine_core::api::{
-    PrKey, ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
+    Person, PrKey, ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
 };
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -259,7 +259,11 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         Some(head_repo) => state.github.activity(head_repo, &data.head_ref).await?,
         None => Vec::new(),
     };
-    let comments = state.github.review_comments(key).await?;
+    let mut comments = state.github.review_comments(key).await?;
+    let resolved = state.github.resolved_threads(key).await?;
+    for c in &mut comments {
+        c.resolved = resolved.contains(&c.id);
+    }
 
     let created_at = github::unix(&data.created_at)?;
     let history = History {
@@ -273,7 +277,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
 
     let number = key.number;
     let base_ref = data.base_ref.clone();
-    let (computed, versions) = {
+    let (computed, mut versions) = {
         let _guard = repo.git_lock.lock().await;
         let repo = repo.repo.clone();
         let old = old.clone();
@@ -282,6 +286,11 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         })
         .await??
     };
+    // Who pushed is only shown, so failing to look it up doesn't fail the
+    // sync.
+    if let Err(e) = fill_pushers(state, &key.repo, &mut versions, &old).await {
+        tracing::warn!("{}#{}: can't look up pushers: {e:#}", key.repo, key.number);
+    }
 
     let old_shas: Vec<&str> = old.iter().map(|v| v.sha.as_str()).collect();
     let new_shas: Vec<&str> = versions.iter().map(|v| v.sha.as_str()).collect();
@@ -345,6 +354,87 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
     Ok(())
 }
 
+/// How long a cached user's name and avatar are used before they're
+/// looked up again.
+const USER_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Completes the pushers of `versions`. Pushers from the push history get
+/// their display names from the users cache, which looks up the users it
+/// doesn't have on GitHub. Versions without a known pusher get their
+/// commit's author as a guess. A commit's author never changes, so guesses
+/// carry over from `old` versions with the same SHA.
+async fn fill_pushers(
+    state: &State,
+    repo: &str,
+    versions: &mut [Version],
+    old: &[Version],
+) -> Result<()> {
+    let old_guesses: BTreeMap<&str, &Person> = old
+        .iter()
+        .filter(|v| v.pushed_by_is_guess)
+        .filter_map(|v| Some((v.sha.as_str(), v.pushed_by.as_ref()?)))
+        .collect();
+    for v in versions.iter_mut().filter(|v| v.pushed_by.is_none()) {
+        if let Some(p) = old_guesses.get(v.sha.as_str()) {
+            v.pushed_by = Some((*p).clone());
+            v.pushed_by_is_guess = true;
+        }
+    }
+    let unknown: Vec<String> = versions
+        .iter()
+        .filter(|v| v.pushed_by.is_none())
+        .map(|v| v.sha.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !unknown.is_empty() {
+        let authors = state.github.commit_authors(repo, &unknown).await?;
+        for v in versions.iter_mut().filter(|v| v.pushed_by.is_none()) {
+            if let Some(p) = authors.get(&v.sha) {
+                v.pushed_by = Some(p.clone());
+                v.pushed_by_is_guess = true;
+            }
+        }
+    }
+
+    let logins: Vec<String> = versions
+        .iter()
+        .filter(|v| !v.pushed_by_is_guess)
+        .filter_map(|v| v.pushed_by.as_ref()?.login.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let now = chrono::Utc::now().timestamp();
+    let mut users = state.db.cached_users(&logins, now - USER_TTL_SECS)?;
+    let stale: Vec<String> = logins
+        .iter()
+        .filter(|l| !users.contains_key(*l))
+        .cloned()
+        .collect();
+    if !stale.is_empty() {
+        let found = state.github.users(&stale).await?;
+        state.db.store_users(&stale, &found, now)?;
+        users.extend(stale.into_iter().map(|l| {
+            let p = found.get(&l).cloned();
+            (l, p)
+        }));
+    }
+    for p in versions
+        .iter_mut()
+        .filter(|v| !v.pushed_by_is_guess)
+        .filter_map(|v| v.pushed_by.as_mut())
+    {
+        let Some(Some(user)) = p.login.as_ref().and_then(|l| users.get(l)) else {
+            continue;
+        };
+        p.name = user.name.clone();
+        if p.avatar_url.is_none() {
+            p.avatar_url = user.avatar_url.clone();
+        }
+    }
+    Ok(())
+}
+
 /// Fetches the commits the history mentions, computes the versions and
 /// points the PR's refs at them.
 fn compute_and_store(
@@ -393,6 +483,8 @@ fn compute_and_store(
                 .pushed_at
                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
                 .map(|t| t.to_rfc3339()),
+            pushed_by: v.pushed_by.clone(),
+            pushed_by_is_guess: false,
             missing: v.missing,
         })
         .collect();

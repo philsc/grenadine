@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use grenadine_core::api::{PrDetail, PrKey, ReviewComment, Side, Stack, Version, VersionKind};
+use grenadine_core::api::{
+    Person, PrDetail, PrKey, ReviewComment, Side, Stack, Version, VersionKind,
+};
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -120,6 +122,25 @@ pub fn place(
         }
     }
     (inline, panel)
+}
+
+/// The number of resolved threads and of all threads made on each version,
+/// by version number. Threads made on commits that aren't versions aren't
+/// counted.
+fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u32, (u32, u32)> {
+    let numbers: HashMap<&str, u32> = versions
+        .iter()
+        .map(|v| (v.sha.as_str(), v.number))
+        .collect();
+    let mut counts: HashMap<u32, (u32, u32)> = HashMap::new();
+    for t in threads(comments) {
+        if let Some(&n) = numbers.get(t.root.original_commit.as_str()) {
+            let (resolved, total) = counts.entry(n).or_default();
+            *resolved += u32::from(t.root.resolved);
+            *total += 1;
+        }
+    }
+    counts
 }
 
 fn short(sha: &str) -> &str {
@@ -351,7 +372,7 @@ fn PrBody(
             <section class="description markdown" inner_html=body_html
                 on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
             <div class="toolbar">
-                <VersionPicker versions=pr.versions.clone() chosen=chosen selection=selection />
+                <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
                 <label class="toggle">
                     <input
                         type="checkbox"
@@ -473,13 +494,70 @@ fn kind_label(v: &Version) -> &'static str {
 }
 
 #[component]
+fn Pusher(person: Person, guess: bool) -> impl IntoView {
+    let label = person
+        .name
+        .clone()
+        .or_else(|| person.login.clone())
+        .unwrap_or_default();
+    let title = if guess {
+        format!("{label} authored this commit; who pushed it is unknown")
+    } else {
+        person
+            .login
+            .clone()
+            .filter(|l| Some(l) != person.name.as_ref())
+            .map(|l| format!("{label} ({l})"))
+            .unwrap_or_else(|| label.clone())
+    };
+    view! {
+        <span class="pusher" class:guess=guess title=title>
+            {match person.avatar_url {
+                Some(url) => view! { <img class="avatar" src=url alt="" /> }.into_any(),
+                None => view! { <span class="avatar avatar-generic"></span> }.into_any(),
+            }}
+            <span>{label}</span>
+        </span>
+    }
+}
+
+#[component]
 fn VersionPicker(
     versions: Vec<Version>,
+    comments: Vec<ReviewComment>,
     chosen: RwSignal<Option<Selection>>,
     selection: Memo<Selection>,
 ) -> impl IntoView {
     let latest = versions.len() as u32;
+    let counts = thread_counts(&comments, &versions);
     let versions = Arc::new(versions);
+
+    // Clicks outside the picker and Escape close it.
+    let details = NodeRef::<leptos::html::Details>::new();
+    let close = move || {
+        if let Some(el) = details.get_untracked() {
+            let _ = el.remove_attribute("open");
+        }
+    };
+    let on_click = window_event_listener(leptos::ev::click, move |ev| {
+        let inside = details.get_untracked().is_some_and(|el| {
+            ev.target()
+                .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+                .is_some_and(|t| el.contains(Some(&t)))
+        });
+        if !inside {
+            close();
+        }
+    });
+    let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            close();
+        }
+    });
+    on_cleanup(move || {
+        on_click.remove();
+        on_key.remove();
+    });
     let missing = {
         let versions = versions.clone();
         move |n: u32| n > 0 && versions[n as usize - 1].missing
@@ -519,6 +597,20 @@ fn VersionPicker(
             let v = (n > 0).then(|| versions[n as usize - 1].clone());
             let base_disabled = n == latest || missing(n);
             let head_disabled = n == 0 || missing(n);
+            let pusher = v.as_ref().and_then(|v| {
+                let guess = v.pushed_by_is_guess;
+                v.pushed_by
+                    .clone()
+                    .map(|person| view! { <Pusher person=person guess=guess /> })
+            });
+            let threads = counts.get(&n).map(|&(resolved, total)| {
+                view! {
+                    <span class:all-resolved=resolved == total
+                        title=format!("{resolved} of {total} threads resolved")>
+                        {format!("{resolved}/{total}")}
+                    </span>
+                }
+            });
             view! {
                 <tr class:missing=v.as_ref().is_some_and(|v| v.missing)>
                     <td class="radio">
@@ -544,16 +636,18 @@ fn VersionPicker(
                             }.into_any(),
                         }}
                     </td>
+                    <td class="pushed-by">{pusher}</td>
+                    <td class="threads">{threads}</td>
                 </tr>
             }
         })
         .collect_view();
 
     view! {
-        <details class="picker">
+        <details class="picker" node_ref=details>
             <summary>{label}</summary>
             <table class="versions">
-                <thead><tr><th>"Base"</th><th>"Head"</th><th>"Version"</th></tr></thead>
+                <thead><tr><th>"Base"</th><th>"Head"</th><th>"Version"</th><th>"Pushed by"</th><th>"Threads"</th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
         </details>
@@ -645,6 +739,8 @@ mod tests {
             merge_base: Some("mb".into()),
             kind: VersionKind::Push,
             pushed_at: None,
+            pushed_by: None,
+            pushed_by_is_guess: false,
             missing: false,
         }
     }
@@ -671,6 +767,7 @@ mod tests {
             on_file: false,
             created_at: String::new(),
             url: String::new(),
+            resolved: false,
         }
     }
 
@@ -722,5 +819,30 @@ mod tests {
         let t = threads(&[comment(1, "a", Side::Right, 1, None), reply]);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].replies.len(), 1);
+    }
+
+    #[test]
+    fn thread_counts_per_version() {
+        let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
+        let resolved = |mut c: ReviewComment| {
+            c.resolved = true;
+            c
+        };
+        let mut reply = comment(5, "b", Side::Right, 1, None);
+        reply.in_reply_to = Some(2);
+        let comments = [
+            resolved(comment(1, "a", Side::Right, 1, None)),
+            comment(2, "a", Side::Right, 2, None),
+            resolved(comment(3, "b", Side::Right, 1, None)),
+            // Not a version.
+            comment(4, "x", Side::Right, 1, None),
+            // A reply doesn't count as a thread of its own.
+            reply,
+        ];
+        let counts = thread_counts(&comments, &versions);
+        assert_eq!(
+            counts,
+            HashMap::from([(1, (1, 2)), (2, (1, 1))])
+        );
     }
 }

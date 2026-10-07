@@ -1,12 +1,12 @@
 //! The GitHub API: searches, PR details, PRs by branch, the head branch's
 //! activity log and review comments.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
-use grenadine_core::api::{PrKey, ReviewComment, Side, StackPr};
+use grenadine_core::api::{Person, PrKey, ReviewComment, Side, StackPr};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
@@ -139,6 +139,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             createdAt
             beforeCommit { oid }
             afterCommit { oid }
+            actor { login avatarUrl ... on User { name } }
           }
         }
       }
@@ -149,6 +150,42 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 "#;
+
+const THREADS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+      }
+    }
+  }
+}
+"#;
+
+/// How many users or commits one batched GraphQL lookup asks for.
+const LOOKUP_BATCH: usize = 50;
+
+/// A user from GraphQL: `login`, `avatarUrl` and, for users (not bots),
+/// `name`. `None` for an empty `login`.
+fn person_at(v: &Value) -> Option<Person> {
+    let login = str_at(v, "/login");
+    if login.is_empty() {
+        return None;
+    }
+    let opt = |ptr: &str| Some(str_at(v, ptr)).filter(|s| !s.is_empty()).map(str::to_owned);
+    Some(Person {
+        login: Some(login.to_owned()),
+        name: opt("/name"),
+        avatar_url: opt("/avatarUrl"),
+    })
+}
+
+fn split_repo(repo: &str) -> Result<(&str, &str)> {
+    repo.split_once('/')
+        .ok_or_else(|| anyhow!("bad repo {repo}"))
+}
 
 #[derive(Deserialize)]
 struct RestComment {
@@ -171,6 +208,8 @@ struct RestComment {
 #[derive(Deserialize)]
 struct Login {
     login: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +218,7 @@ struct RestActivity {
     after: String,
     timestamp: String,
     activity_type: String,
+    actor: Option<Login>,
 }
 
 fn str_at<'a>(v: &'a Value, ptr: &str) -> &'a str {
@@ -411,10 +451,7 @@ impl GitHub {
     }
 
     pub async fn pr(&self, key: &PrKey) -> Result<PrData> {
-        let (owner, name) = key
-            .repo
-            .split_once('/')
-            .ok_or_else(|| anyhow!("bad repo {}", key.repo))?;
+        let (owner, name) = split_repo(&key.repo)?;
         let (data, errors) = self
             .graphql(
                 PR_QUERY,
@@ -453,6 +490,7 @@ impl GitHub {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned),
                 after: after.to_owned(),
+                actor: n.get("actor").and_then(person_at),
             });
         }
         let commits = pr
@@ -539,6 +577,11 @@ impl GitHub {
                     },
                     before: a.before,
                     after: a.after,
+                    actor: a.actor.map(|u| Person {
+                        login: Some(u.login),
+                        name: None,
+                        avatar_url: u.avatar_url,
+                    }),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -577,8 +620,139 @@ impl GitHub {
                 on_file: c.subject_type.as_deref() == Some("file"),
                 created_at: c.created_at,
                 url: c.html_url,
+                resolved: false,
             })
             .collect())
+    }
+
+    /// The IDs of the first comments of the PR's resolved review threads.
+    pub async fn resolved_threads(&self, key: &PrKey) -> Result<BTreeSet<u64>> {
+        let (owner, name) = split_repo(&key.repo)?;
+        let mut resolved = BTreeSet::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (data, errors) = self
+                .graphql(
+                    THREADS_QUERY,
+                    json!({ "owner": owner, "name": name, "number": key.number, "after": after }),
+                )
+                .await?;
+            let threads = data
+                .pointer("/repository/pullRequest/reviewThreads")
+                .filter(|v| !v.is_null())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "can't read the review threads of {}#{}: {}",
+                        key.repo,
+                        key.number,
+                        errors
+                            .first()
+                            .and_then(|e| e["message"].as_str())
+                            .unwrap_or("not found")
+                    )
+                })?;
+            resolved.extend(
+                threads["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| t["isResolved"].as_bool() == Some(true))
+                    .filter_map(|t| t.pointer("/comments/nodes/0/databaseId")?.as_u64()),
+            );
+            if threads.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool) != Some(true) {
+                return Ok(resolved);
+            }
+            after = Some(str_at(threads, "/pageInfo/endCursor").to_owned());
+        }
+    }
+
+    /// Looks up users by login. Logins GitHub doesn't know as a user, e.g.
+    /// bots, are missing from the result.
+    pub async fn users(&self, logins: &[String]) -> Result<BTreeMap<String, Person>> {
+        let mut out = BTreeMap::new();
+        for chunk in logins.chunks(LOOKUP_BATCH) {
+            let params = (0..chunk.len())
+                .map(|i| format!("$l{i}: String!"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let fields: String = (0..chunk.len())
+                .map(|i| format!("u{i}: user(login: $l{i}) {{ login name avatarUrl }}\n"))
+                .collect();
+            let vars: serde_json::Map<String, Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (format!("l{i}"), json!(l)))
+                .collect();
+            // A login that isn't a user is an error for its alias only.
+            let (data, _) = self
+                .graphql(&format!("query({params}) {{\n{fields}}}"), Value::Object(vars))
+                .await?;
+            for (i, login) in chunk.iter().enumerate() {
+                if let Some(p) = data.get(format!("u{i}")).and_then(person_at) {
+                    out.insert(login.clone(), p);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The authors of commits by SHA. A commit whose author isn't linked to
+    /// a GitHub user gets the name from the commit and no login. Commits
+    /// GitHub doesn't have are missing from the result.
+    pub async fn commit_authors(
+        &self,
+        repo: &str,
+        shas: &[String],
+    ) -> Result<BTreeMap<String, Person>> {
+        let (owner, name) = split_repo(repo)?;
+        let mut out = BTreeMap::new();
+        for chunk in shas.chunks(LOOKUP_BATCH) {
+            let mut params = vec!["$owner: String!".to_owned(), "$name: String!".to_owned()];
+            params.extend((0..chunk.len()).map(|i| format!("$o{i}: GitObjectID!")));
+            let fields: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "c{i}: object(oid: $o{i}) {{ ... on Commit {{ author {{ name user {{ login name avatarUrl }} }} }} }}\n"
+                    )
+                })
+                .collect();
+            let mut vars = serde_json::Map::new();
+            vars.insert("owner".into(), json!(owner));
+            vars.insert("name".into(), json!(name));
+            for (i, sha) in chunk.iter().enumerate() {
+                vars.insert(format!("o{i}"), json!(sha));
+            }
+            let (data, _) = self
+                .graphql(
+                    &format!(
+                        "query({}) {{\nrepository(owner: $owner, name: $name) {{\n{fields}}}\n}}",
+                        params.join(", ")
+                    ),
+                    Value::Object(vars),
+                )
+                .await?;
+            for (i, sha) in chunk.iter().enumerate() {
+                let Some(author) = data
+                    .pointer(&format!("/repository/c{i}/author"))
+                    .filter(|v| !v.is_null())
+                else {
+                    continue;
+                };
+                let person = author.get("user").and_then(person_at).or_else(|| {
+                    Some(str_at(author, "/name"))
+                        .filter(|s| !s.is_empty())
+                        .map(|n| Person {
+                            login: None,
+                            name: Some(n.to_owned()),
+                            avatar_url: None,
+                        })
+                });
+                if let Some(p) = person {
+                    out.insert(sha.clone(), p);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

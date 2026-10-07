@@ -13,7 +13,7 @@
 //! gone with a deleted fork) the history is reconstructed from the PR's
 //! force-push events, and the result is flagged as approximate.
 
-use crate::api::VersionKind;
+use crate::api::{Person, VersionKind};
 
 /// An entry of GitHub's repository activity log for the PR's head branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +23,8 @@ pub struct Activity {
     pub kind: ActivityKind,
     pub before: String,
     pub after: String,
+    /// Who pushed.
+    pub actor: Option<Person>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub struct ForcePush {
     /// `None` when GitHub no longer has the commit.
     pub before: Option<String>,
     pub after: String,
+    /// Who force-pushed.
+    pub actor: Option<Person>,
 }
 
 /// What is known about a PR's push history.
@@ -79,6 +83,8 @@ pub struct ComputedVersion {
     pub kind: VersionKind,
     /// Unix seconds.
     pub pushed_at: Option<i64>,
+    /// Who pushed, when the push history tells.
+    pub pushed_by: Option<Person>,
     pub missing: bool,
 }
 
@@ -101,11 +107,18 @@ struct Builder<'a, G> {
 }
 
 impl<G: CommitGraph> Builder<'_, G> {
-    fn push_one(&mut self, sha: &str, kind: VersionKind, pushed_at: Option<i64>) {
+    fn push_one(
+        &mut self,
+        sha: &str,
+        kind: VersionKind,
+        pushed_at: Option<i64>,
+        pushed_by: Option<&Person>,
+    ) {
         self.versions.push(ComputedVersion {
             sha: sha.to_owned(),
             kind,
             pushed_at,
+            pushed_by: pushed_by.cloned(),
             missing: !self.graph.has(sha),
         });
     }
@@ -113,17 +126,23 @@ impl<G: CommitGraph> Builder<'_, G> {
     /// Adds one version per commit from `from` (exclusive) to `to`. When the
     /// commits in between can't be listed, `to` alone becomes a version, as
     /// if it had been force-pushed.
-    fn push_range(&mut self, from: &str, to: &str, pushed_at: Option<i64>) {
+    fn push_range(
+        &mut self,
+        from: &str,
+        to: &str,
+        pushed_at: Option<i64>,
+        pushed_by: Option<&Person>,
+    ) {
         if from == to {
             return;
         }
         match self.graph.first_parent_range(from, to) {
             Some(commits) => {
                 for sha in commits {
-                    self.push_one(&sha, VersionKind::Push, pushed_at);
+                    self.push_one(&sha, VersionKind::Push, pushed_at, pushed_by);
                 }
             }
-            None => self.push_one(to, VersionKind::ForcePush, pushed_at),
+            None => self.push_one(to, VersionKind::ForcePush, pushed_at, pushed_by),
         }
     }
 
@@ -155,6 +174,7 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
                 &initial.after,
                 VersionKind::Initial,
                 Some(initial.timestamp),
+                initial.actor.as_ref(),
             );
             for a in history
                 .activities
@@ -168,9 +188,14 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
                 let fast_forward =
                     matches!(a.kind, ActivityKind::Push | ActivityKind::Other) && a.before == cur;
                 if fast_forward {
-                    b.push_range(&cur, &a.after, Some(a.timestamp));
+                    b.push_range(&cur, &a.after, Some(a.timestamp), a.actor.as_ref());
                 } else {
-                    b.push_one(&a.after, VersionKind::ForcePush, Some(a.timestamp));
+                    b.push_one(
+                        &a.after,
+                        VersionKind::ForcePush,
+                        Some(a.timestamp),
+                        a.actor.as_ref(),
+                    );
                 }
             }
             false
@@ -182,16 +207,21 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
                 .and_then(|f| f.before.as_deref())
                 .or(history.initial_guess.as_deref())
                 .unwrap_or(&history.head);
-            b.push_one(initial, VersionKind::Initial, None);
+            b.push_one(initial, VersionKind::Initial, None, None);
             for f in &history.force_pushes {
                 let cur = b.cur().unwrap_or(ZERO_SHA).to_owned();
                 // Regular pushes between the last version and this force
                 // push each add their commits.
                 if let Some(before) = &f.before {
-                    b.push_range(&cur, before, None);
+                    b.push_range(&cur, before, None, None);
                 }
                 if b.cur() != Some(f.after.as_str()) {
-                    b.push_one(&f.after, VersionKind::ForcePush, Some(f.timestamp));
+                    b.push_one(
+                        &f.after,
+                        VersionKind::ForcePush,
+                        Some(f.timestamp),
+                        f.actor.as_ref(),
+                    );
                 }
             }
             true
@@ -200,7 +230,7 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
 
     // Pushes the activity log hasn't caught up with yet.
     let cur = b.cur().unwrap_or(ZERO_SHA).to_owned();
-    b.push_range(&cur, &history.head, None);
+    b.push_range(&cur, &history.head, None, None);
 
     Computed {
         versions: b.versions,
@@ -255,7 +285,35 @@ mod tests {
             kind,
             before: before.to_owned(),
             after: after.to_owned(),
+            actor: None,
         }
+    }
+
+    fn person(login: &str) -> Person {
+        Person {
+            login: Some(login.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn act_by(
+        timestamp: i64,
+        kind: ActivityKind,
+        before: &str,
+        after: &str,
+        login: &str,
+    ) -> Activity {
+        Activity {
+            actor: Some(person(login)),
+            ..act(timestamp, kind, before, after)
+        }
+    }
+
+    fn pushers(c: &Computed) -> Vec<Option<&str>> {
+        c.versions
+            .iter()
+            .map(|v| v.pushed_by.as_ref().and_then(|p| p.login.as_deref()))
+            .collect()
     }
 
     fn shas(c: &Computed) -> Vec<&str> {
@@ -315,11 +373,13 @@ mod tests {
                     timestamp: 120,
                     before: Some("C3".into()),
                     after: "C4".into(),
+                    actor: Some(person("alice")),
                 },
                 ForcePush {
                     timestamp: 140,
                     before: Some("C5".into()),
                     after: "C6".into(),
+                    actor: Some(person("bob")),
                 },
             ],
             initial_guess: Some("C2".into()),
@@ -330,6 +390,56 @@ mod tests {
         // best guess at the initial head, so C3 is folded into version 1.
         assert_eq!(shas(&c), ["C3", "C4", "C5", "C6", "C7", "C8"]);
         assert!(c.approximate);
+        // Only force pushes say who pushed.
+        assert_eq!(
+            pushers(&c),
+            [None, Some("alice"), None, Some("bob"), None, None]
+        );
+    }
+
+    #[test]
+    fn every_commit_of_a_push_has_its_pusher() {
+        let g = example_graph();
+        let history = History {
+            created_at: 100,
+            head: "C8".into(),
+            activities: vec![
+                act_by(90, ActivityKind::BranchCreation, ZERO_SHA, "C2", "alice"),
+                act_by(110, ActivityKind::Push, "C2", "C3", "bob"),
+                act_by(120, ActivityKind::ForcePush, "C3", "C4", "carol"),
+                act_by(130, ActivityKind::Push, "C4", "C5", "alice"),
+                act_by(140, ActivityKind::ForcePush, "C5", "C6", "bob"),
+                act_by(150, ActivityKind::Push, "C6", "C7", "carol"),
+            ],
+            ..Default::default()
+        };
+        let c = compute(&history, &g);
+        assert_eq!(shas(&c), ["C2", "C3", "C4", "C5", "C6", "C7", "C8"]);
+        // C8 isn't in the activity log yet, so its pusher is unknown.
+        assert_eq!(
+            pushers(&c),
+            [
+                Some("alice"),
+                Some("bob"),
+                Some("carol"),
+                Some("alice"),
+                Some("bob"),
+                Some("carol"),
+                None
+            ]
+        );
+
+        let history = History {
+            activities: vec![
+                act_by(90, ActivityKind::BranchCreation, ZERO_SHA, "C6", "alice"),
+                act_by(150, ActivityKind::Push, "C6", "C8", "bob"),
+            ],
+            ..history
+        };
+        assert_eq!(
+            pushers(&compute(&history, &g)),
+            [Some("alice"), Some("bob"), Some("bob")]
+        );
     }
 
     #[test]
