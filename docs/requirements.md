@@ -1,8 +1,16 @@
-# Stacked PRs: requirements
+# grenadine: requirements
+
+These requirements describe how grenadine should behave. Each feature has
+its own section, and each requirement has a stable ID so that tests and
+reviews can refer to it.
+
+- [Stacked PRs](#stacked-prs)
+- [Version picker](#version-picker)
+
+# Stacked PRs
 
 These requirements cover which PRs make up a PR's stack and how grenadine
-shows stacks on the PR page and in the inboxes. Each requirement has a
-stable ID so that tests and reviews can refer to it.
+shows stacks on the PR page and in the inboxes.
 
 ## Terms
 
@@ -176,3 +184,271 @@ when `m` is less than 2.
 **STACK-BADGE-4.** The badge must come from the PR's own stack. Unlike
 grouping (STACK-INBOX-6), it doesn't combine stacks, so it can be stale
 until the PR syncs again.
+
+# Version picker
+
+These requirements cover what a PR's versions are, how the version picker
+shows them, how picking two versions decides the diff, and where review
+comments go for that diff.
+
+## Terms
+
+- **Version**: a commit the PR's head branch pointed at, numbered from 1
+  in push order. VPICK-VER-1 to VPICK-VER-8 define which commits are
+  versions.
+- **Latest version**: the version with the highest number.
+- **Selectable version**: a version whose commit isn't missing
+  (VPICK-VER-8).
+- **Base** and **Head**: the two sides of the diff. Base is the older side,
+  Head the newer one. The picker's columns have these names.
+- **Merge-base**: the merge-base of a version's commit and the tip of the
+  PR's target branch.
+- **Merge-base row**: the picker's row for version 0, labelled "Base". As
+  Base it stands for Head's merge-base, so its commit depends on Head.
+- **Selection**: the pair of Base and Head.
+
+Base and Head refer to the sides of a diff only. The branch the bottom PR
+of a stack targets is the *base branch* (see Stacked PRs).
+
+## Example PR
+
+Most examples below use this PR. It is the one in the tests of
+`core/src/versions.rs`.
+
+1. The author pushes C1 and C2 and opens the PR. *v1 = C2.*
+2. The author pushes C3. *v2 = C3.*
+3. The author rebases onto a newer `main` and force-pushes C4. *v3 = C4.*
+4. The author pushes C5. *v4 = C5.*
+5. The author squashes everything into C6 and force-pushes. *v5 = C6.*
+6. The author pushes C7 and C8 together. *v6 = C7, v7 = C8.*
+
+## Versions
+
+**VPICK-VER-1.** The commit the head branch pointed at when the PR was
+opened must be version 1, however many commits the PR had then.
+*Why:* the commits before opening are the author's drafts. The PR as first
+proposed is what reviewers saw.
+
+**VPICK-VER-2.** Every force push must add one version: its new head.
+
+**VPICK-VER-3.** Every commit that a fast-forward push adds must be its
+own version, following first parents, even when one push adds several
+commits.
+*Example:* step 6 adds v6 and v7.
+*Why:* authors who push fixups one by one, or several at once, still get
+one diff per fixup.
+
+**VPICK-VER-4.** A push that GitHub records as a regular push but that
+doesn't start at the previous version must count as a force push.
+
+**VPICK-VER-5.** Pushes before the PR was opened must not be versions.
+Deleting and restoring the head branch must not add versions by itself.
+
+**VPICK-VER-6.** The push history must come from GitHub's activity log of
+the head branch. Pushes the log doesn't list yet must still become
+versions, one per commit.
+*Why:* the log lags behind the branch by a few minutes.
+
+**VPICK-VER-7.** When the activity log doesn't cover the PR, the versions
+must be reconstructed from the PR's force-push events. Version 1 must be
+the first force push's old head, or else the last commit whose first
+check suite ran before the PR was opened, or else the PR's head. The PR
+page must then show a banner saying that the versions were reconstructed
+and may not match every push.
+*Why:* the log only goes back to around March 2023, and it is gone with a
+deleted fork.
+
+**VPICK-VER-8.** A version whose commit can't be fetched must still be
+listed, marked as missing. When the commits between two versions can't be
+listed, the newer one must become a single version, as if it had been
+force-pushed.
+
+**VPICK-VER-9.** Computing the versions twice from the same history must
+give the same versions. When a sync's versions don't just add to the
+stored ones, the PR page must show a banner saying how they changed, and
+the change must be logged.
+*Why:* version numbers are how people refer to versions. Silently
+renumbering them would make old references wrong.
+
+**VPICK-VER-10.** A commit that has been a version must stay in the local
+clone, even when it is no longer a version.
+*Why:* otherwise git could garbage-collect it.
+
+## Pushers
+
+**VPICK-PUSH-1.** Each version must show who pushed it: the actor of the
+push or force push that created it. Every commit of one push has the same
+pusher.
+
+**VPICK-PUSH-2.** A pusher must show their GitHub avatar and full name,
+or their login when they have no name. The tooltip must show the name and
+the login.
+
+**VPICK-PUSH-3.** When the push history doesn't tell who pushed a
+version, the version must show its commit's author instead. That author
+must be shown dimmed, and the tooltip must say that the author is shown
+because the pusher is unknown. An author without a GitHub account must be
+shown with the name from the commit and a generic avatar.
+*Example:* right after step 6, the activity log doesn't list that push
+yet, so v6 and v7 show the authors of C7 and C8. Once the log lists it,
+they show the pusher. Without the log, only versions created by force
+pushes have a known pusher.
+*Why:* the author usually pushed the commit, but cherry-picks and bots
+break that rule, so the guess must look like one.
+
+**VPICK-PUSH-4.** When neither the pusher nor the author is known, the
+cell must be empty.
+
+**VPICK-PUSH-5.** Names and avatars must be looked up at most once a
+week per user. A commit's author must be looked up at most once per
+commit.
+*Why:* to keep the number of GitHub requests bounded. A commit's author
+never changes.
+
+**VPICK-PUSH-6.** Failing to look up pushers must not fail the PR's sync.
+*Why:* the versions and the diff matter more than who pushed.
+
+## Picker
+
+**VPICK-ROW-1.** The picker must be a drop-down in the toolbar above the
+diff. Closed, it must show the selection as `Base → v4 (1a2b3c4d)`, or
+`v2 (…) → v4 (…)` when Base is a version, with each SHA shortened to 8
+characters. A PR without versions must show "No versions".
+
+**VPICK-ROW-2.** The list must have one row per version and a merge-base
+row. It must start with the latest version and end with the merge-base
+row.
+*Why:* the latest version is the one people pick most, and this matches
+the stack list and `git log`.
+
+**VPICK-ROW-3.** The list must have the columns Base, Head, Version,
+Pushed by and Threads, with these headers.
+
+**VPICK-ROW-4.** The Version cell must show the version's number, its SHA
+shortened to 8 characters with the full SHA as tooltip, how it was created
+("opened", "push" or "force push"), when it was pushed, and "missing" for
+a missing version. A missing version's row must be dimmed.
+
+**VPICK-ROW-5.** The push time must be shown relative to now, e.g. "3
+hours ago", with the exact time in the browser's time zone as tooltip. A
+version whose push time isn't known must show no time.
+*Why:* when reviewing, how recent a push is matters more than its exact
+time, and a time without a time zone is easily misread.
+
+**VPICK-ROW-6.** The Pushed by cell must show the pusher (VPICK-PUSH-1 to
+VPICK-PUSH-4). The merge-base row's cell must be empty.
+
+**VPICK-ROW-7.** The Threads cell must show `resolved/total`, the number
+of resolved review threads and of all review threads whose first comment
+was made on that version's commit. The tooltip must spell the numbers
+out. When every thread is resolved, the count must be shown in the
+"added" color. The cell must be empty for versions without threads and
+for the merge-base row. Threads made on commits that aren't versions must
+not be counted anywhere.
+*Example:* two threads were started on v2 and one of them is resolved.
+v2 shows `1/2`.
+
+**VPICK-ROW-8.** The picker must close when the user clicks anywhere
+outside it or presses Escape. Picking a Base or a Head must leave it open.
+*Why:* choosing a selection often takes two clicks.
+
+## Selection
+
+**VPICK-SEL-1.** Each row must have a Base radio button and a Head radio
+button. Base must be older than Head. The merge-base row can only be Base.
+The latest selectable version can only be Head. Missing versions can't be
+picked.
+
+**VPICK-SEL-2.** Until the user picks something, the selection must be
+the merge-base row as Base and the latest selectable version as Head. It
+must follow new versions as they arrive.
+
+**VPICK-SEL-3.** When the latest version is missing, the PR page must
+show a banner that names the missing versions newer than the default
+Head. When every version is missing, the page must say so instead of
+showing a diff.
+*Why:* the default diff then isn't the latest code, and the reader must
+know.
+
+**VPICK-SEL-4.** Picking a Base at or above Head must move Head to the
+latest selectable version. Picking a Head at or below Base must move Base
+to the merge-base row.
+*Why:* those are the two most common comparisons, "what changed since I
+last looked" and "the whole PR".
+*Example:* the selection is v2 → v4. Picking v5 as Base gives v5 → v7.
+Picking v1 as Head gives Base → v1.
+
+**VPICK-SEL-5.** Once the user has picked something, new versions must
+not change the selection. If a sync makes the selection invalid, e.g.
+because a version became missing, the selection must fall back to the
+default (VPICK-SEL-2).
+*Why:* jumping to a new version in the middle of a review would lose the
+reader's place.
+
+**VPICK-SEL-6.** The selection must reset to the default when the page is
+reloaded or another PR is opened. It is not required to be in the URL or
+to be remembered.
+*Why:* nobody has needed to share or resume a selection yet. This can be
+revisited.
+
+## Diff
+
+**VPICK-DIFF-1.** With the merge-base row as Base, the diff must go from
+Head's merge-base to Head. When Head's merge-base is unknown, the page
+must say so instead of showing a diff.
+
+**VPICK-DIFF-2.** With a version as Base, the diff must go from Base's
+commit to Head's commit.
+
+**VPICK-DIFF-3.** When Base and Head have different merge-bases, files
+that the PR changed in neither version must be hidden. The diff summary
+must say how many were hidden. They can't be shown.
+*Example:* v2 → v4 crosses the rebase of step 3. Upstream changed 40
+files the PR never touched, so the summary says "40 files changed only
+by the rebase are hidden".
+*Why:* those files only differ because of the rebase. To see them,
+compare against the merge-base row.
+
+**VPICK-DIFF-4.** In the same case, a change block that upstream also
+made between the two merge-bases must be marked as brought in by the
+rebase, and the diff summary must explain the mark. A file whose change
+blocks are all marked must say "only rebase changes" in its header.
+Trailing whitespace must not matter when comparing blocks.
+*Why:* this separates the author's changes from upstream's, like Gerrit.
+
+**VPICK-DIFF-5.** A PR without versions must show "This PR has no
+versions yet." instead of a diff.
+
+## Comments
+
+**VPICK-CMT-1.** A review thread must be shown inline at the line it was
+made on when Head is the commit it was made on.
+
+**VPICK-CMT-2.** Otherwise, when Head is the latest version, a thread
+must be shown inline at the line GitHub mapped it to on the PR's head. An
+outdated thread, which GitHub couldn't map, isn't shown inline.
+
+**VPICK-CMT-3.** A thread on the left side of a diff must only be shown
+inline when Base is the merge-base row.
+*Why:* left-side comments were made against the PR's base at the time,
+not against an older version.
+
+**VPICK-CMT-4.** A thread on a whole file must be shown at the top of
+that file when Head is the commit it was made on or the latest version.
+
+**VPICK-CMT-5.** Every other thread must be listed in a collapsed panel
+above the diff, titled "N comment threads on other versions". Each entry
+must show the file and line, and the version it was made on as a button,
+or "on an unknown version" when its commit isn't a version.
+*Example:* with v2 → v4, Head is neither v3 nor the latest version, so a
+thread made on v3 is listed as "on v3".
+
+**VPICK-CMT-6.** The version button must make that version Head. Base
+must stay when it is older than that version and must otherwise become
+the merge-base row.
+
+**VPICK-CMT-7.** A resolved thread must be shown collapsed to one line,
+"Resolved · author: first line of the first comment", inline and in the
+panel. Clicking it must expand it.
+*Why:* the picker counts resolved threads, so the diff must show which
+ones they are, without them taking up space.
