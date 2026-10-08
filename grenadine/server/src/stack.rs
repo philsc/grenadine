@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
+use fancy_regex::Regex;
 use grenadine_core::api::{Stack, StackPr};
 
 use crate::github::{RefField, RefPr};
@@ -12,9 +13,22 @@ use crate::github::{RefField, RefPr};
 pub const MAX_ANCESTORS: usize = 20;
 /// How many PRs on top of the PR the walk collects.
 pub const MAX_DESCENDANTS: usize = 50;
+/// Which branches are trunks unless configured otherwise: everything but
+/// `dev/` branches.
+pub const DEFAULT_TRUNK: &str = "^(?!dev/)";
 
 fn stackable(p: &RefPr) -> bool {
     p.pr.state == "OPEN" || p.pr.state == "MERGED"
+}
+
+/// Whether `branch` is a trunk, i.e. a long-lived branch that PRs merge
+/// into rather than a PR's head. A trunk ends the walk in both directions:
+/// any PR from a trunk into another branch (e.g. syncing a dev branch with
+/// `main`) would otherwise become the parent of every PR into the trunk. A
+/// branch the regex can't decide on, e.g. because it hits the backtrack
+/// limit, counts as a trunk so that the walk stays short.
+fn is_trunk(trunk: &Regex, branch: &str) -> bool {
+    trunk.is_match(branch).unwrap_or(true)
 }
 
 /// The PR that a PR targeting the candidates' head branch sits on. Branch
@@ -34,12 +48,14 @@ fn pick_parent(candidates: Vec<RefPr>, visited: &HashSet<u64>) -> Option<RefPr> 
 
 /// Walks down from `me` to the base branch and up to every PR stacked on
 /// top of it. `head_ref` is `None` when `me`'s head branch lives in a
-/// fork, where no PR can target it. `lookup` returns, for each branch, the
-/// PRs whose head (or base) branch it is.
+/// fork, where no PR can target it. `trunk` matches the branches that end
+/// the walk. `lookup` returns, for each branch, the PRs whose head (or
+/// base) branch it is.
 pub async fn walk<F>(
     me: StackPr,
     base_ref: &str,
     head_ref: Option<&str>,
+    trunk: &Regex,
     lookup: impl Fn(RefField, Vec<String>) -> F,
 ) -> Result<Stack>
 where
@@ -50,7 +66,7 @@ where
     let mut base = base_ref.to_owned();
     let mut more_ancestors = false;
     let mut child = 0;
-    loop {
+    while !is_trunk(trunk, &base) {
         let found = lookup(RefField::Head, vec![base.clone()])
             .await?
             .pop()
@@ -72,6 +88,7 @@ where
     let mut more_descendants = false;
     let mut descendants = 0;
     let mut frontier: Vec<(u64, String)> = head_ref
+        .filter(|h| !is_trunk(trunk, h))
         .map(|h| (prs[0].number, h.to_owned()))
         .into_iter()
         .collect();
@@ -92,7 +109,7 @@ where
                 }
                 descendants += 1;
                 kid.pr.parent = Some(*parent);
-                if !kid.cross_repo {
+                if !kid.cross_repo && !is_trunk(trunk, &kid.head_ref) {
                     next.push((kid.pr.number, kid.head_ref));
                 }
                 prs.push(kid.pr);
@@ -177,8 +194,14 @@ mod tests {
         }
     }
 
+    fn walk_with(fake: &Fake, trunk: &str, number: u64, base: &str, head: Option<&str>) -> Stack {
+        let trunk = Regex::new(trunk).unwrap();
+        futures::executor::block_on(walk(me(number), base, head, &trunk, |f, r| fake.lookup(f, r)))
+            .unwrap()
+    }
+
     fn walk_from(fake: &Fake, number: u64, base: &str, head: Option<&str>) -> Stack {
-        futures::executor::block_on(walk(me(number), base, head, |f, r| fake.lookup(f, r))).unwrap()
+        walk_with(fake, "^main$", number, base, head)
     }
 
     fn parents(s: &Stack) -> Vec<(u64, Option<u64>)> {
@@ -216,11 +239,56 @@ mod tests {
 
     #[test]
     fn fork_heads_are_never_parents() {
-        let mut fork = ref_pr(1, "main", "main");
+        let mut fork = ref_pr(1, "main", "a");
         fork.cross_repo = true;
         let fake = Fake::new(vec![fork]);
-        let s = walk_from(&fake, 2, "main", Some("b"));
+        let s = walk_from(&fake, 2, "a", Some("b"));
         assert_eq!(parents(&s), [(2, None)]);
+        assert_eq!(s.base_ref, "a");
+    }
+
+    #[test]
+    fn prs_from_a_trunk_are_never_parents() {
+        // 1 merged main into a dev branch. 2 targets main and so sits on
+        // nothing.
+        let fake = Fake::new(vec![merged(
+            ref_pr(1, "dev/update_yaml", "main"),
+            "2026-01-01T00:00:00Z",
+        )]);
+        let s = walk_with(&fake, DEFAULT_TRUNK, 2, "main", Some("dev/feature"));
+        assert_eq!(parents(&s), [(2, None)]);
+        assert_eq!(s.base_ref, "main");
+    }
+
+    #[test]
+    fn prs_from_a_trunk_have_no_descendants() {
+        let fake = Fake::new(vec![ref_pr(2, "main", "dev/feature")]);
+        let s = walk_with(&fake, DEFAULT_TRUNK, 1, "dev/update_yaml", Some("main"));
+        assert_eq!(parents(&s), [(1, None)]);
+        assert_eq!(s.base_ref, "dev/update_yaml");
+    }
+
+    #[test]
+    fn descendants_from_a_trunk_are_not_expanded() {
+        // 2 merges main into 1's branch. PRs into main aren't on top of 2.
+        let fake = Fake::new(vec![
+            ref_pr(2, "dev/a", "main"),
+            ref_pr(3, "main", "dev/b"),
+        ]);
+        let s = walk_with(&fake, DEFAULT_TRUNK, 1, "main", Some("dev/a"));
+        assert_eq!(parents(&s), [(1, None), (2, Some(1))]);
+    }
+
+    #[test]
+    fn stacks_of_dev_branches_end_at_the_trunk() {
+        let fake = Fake::new(vec![
+            ref_pr(1, "release/1.0", "dev/a"),
+            ref_pr(2, "dev/a", "dev/b"),
+            ref_pr(3, "dev/b", "dev/c"),
+        ]);
+        let s = walk_with(&fake, DEFAULT_TRUNK, 2, "dev/a", Some("dev/b"));
+        assert_eq!(parents(&s), [(2, Some(1)), (1, None), (3, Some(2))]);
+        assert_eq!(s.base_ref, "release/1.0");
     }
 
     #[test]
@@ -301,7 +369,7 @@ mod tests {
             ref_pr(6, "d", "f"),
         ]);
         walk_from(&fake, 2, "main", Some("b"));
-        // One for the parent, then one per level: [b], [c, d], [e, f].
-        assert_eq!(*fake.calls.borrow(), 4);
+        // None for the trunk, then one per level: [b], [c, d], [e, f].
+        assert_eq!(*fake.calls.borrow(), 3);
     }
 }

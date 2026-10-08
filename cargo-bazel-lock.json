@@ -1,5 +1,5 @@
 {
-  "checksum": "3960fe9384f600fea4394a84f8d5ea51c6fe7d58819d22aa37ec5f13460e94c2",
+  "checksum": "2f79e9679885749e73e3509c6c12ae74be1991ac746f70586b95f9c08ce6eac7",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4516,6 +4516,10 @@
           {
             "id": "clap 4.6.7",
             "target": "clap"
+          },
+          {
+            "id": "fancy-regex 0.16.2",
+            "target": "fancy_regex"
           },
           {
             "id": "futures 0.3.34",
@@ -17370,6 +17374,7 @@
     "clap 4.6.7",
     "console_error_panic_hook 0.1.7",
     "emojis 0.9.0",
+    "fancy-regex 0.16.2",
     "futures 0.3.34",
     "gloo-net 0.7.0",
     "js-sys 0.3.98",

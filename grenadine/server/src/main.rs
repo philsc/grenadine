@@ -49,6 +49,13 @@ struct Args {
     /// Seconds between polls of GitHub.
     #[arg(long, default_value_t = 60)]
     poll_interval: u64,
+
+    /// A regex matching the trunk branches. Stacks end at a trunk: a PR
+    /// into a trunk has no parent PR, and a PR from a trunk has no PRs on
+    /// top of it. The regex isn't anchored implicitly and supports
+    /// lookaround, e.g. `^(?!dev/)` for everything but `dev/` branches.
+    #[arg(long, default_value = stack::DEFAULT_TRUNK, value_parser = fancy_regex::Regex::new)]
+    trunk: fancy_regex::Regex,
 }
 
 fn default_db() -> Result<PathBuf> {
@@ -136,6 +143,7 @@ async fn main() -> Result<()> {
         db,
         github,
         repos,
+        trunk: args.trunk,
         events: broadcast::channel(256).0,
         sync_status: std::sync::Mutex::default(),
         poke: Notify::new(),

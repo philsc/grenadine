@@ -39,6 +39,8 @@ pub struct State {
     /// The configured clones by `owner/name`. Readers clone the `Repo`
     /// without locking; sync serializes its writes through `git_lock`.
     pub repos: BTreeMap<String, Arc<ClonedRepo>>,
+    /// Matches the branches that stacks end at.
+    pub trunk: fancy_regex::Regex,
     pub events: broadcast::Sender<ServerEvent>,
     /// The current poll's progress, shown in the UI's top bar.
     pub sync_status: std::sync::Mutex<SyncStatus>,
@@ -321,7 +323,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
     };
     // The stack is secondary; failing to fetch it keeps the stored one
     // rather than failing the whole sync.
-    let stack = match stack::walk(me, &data.base_ref, head_ref, lookup).await {
+    let stack = match stack::walk(me, &data.base_ref, head_ref, &state.trunk, lookup).await {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!("{}#{}: can't fetch the stack: {e:#}", key.repo, key.number);
@@ -530,6 +532,7 @@ pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
         db: Db::in_memory(),
         github: GitHub::with_api("dummy", "http://127.0.0.1:9").unwrap(),
         repos,
+        trunk: fancy_regex::Regex::new(stack::DEFAULT_TRUNK).unwrap(),
         events: broadcast::channel(1).0,
         sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),
