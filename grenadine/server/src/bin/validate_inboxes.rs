@@ -41,11 +41,17 @@ fn keys(hits: &[Hit]) -> BTreeSet<PrKey> {
 }
 
 fn nondraft(hits: &[Hit]) -> BTreeSet<PrKey> {
-    hits.iter().filter(|h| !h.is_draft).map(|h| h.key.clone()).collect()
+    hits.iter()
+        .filter(|h| !h.is_draft)
+        .map(|h| h.key.clone())
+        .collect()
 }
 
 fn draft(hits: &[Hit]) -> BTreeSet<PrKey> {
-    hits.iter().filter(|h| h.is_draft).map(|h| h.key.clone()).collect()
+    hits.iter()
+        .filter(|h| h.is_draft)
+        .map(|h| h.key.clone())
+        .collect()
 }
 
 fn describe(key: &PrKey, by_key: &BTreeMap<PrKey, Hit>) -> String {
@@ -186,10 +192,7 @@ async fn main() -> Result<ExitCode> {
         if have(labels) {
             return false;
         }
-        let missing: Vec<_> = labels
-            .iter()
-            .filter(|l| !hits.contains_key(**l))
-            .collect();
+        let missing: Vec<_> = labels.iter().filter(|l| !hits.contains_key(**l)).collect();
         println!("SKIP {desc} ({missing:?} unavailable)");
         true
     };
@@ -208,10 +211,7 @@ async fn main() -> Result<ExitCode> {
                 );
             }
         }
-        let union: BTreeSet<PrKey> = mine_members
-            .iter()
-            .flat_map(|l| set(l))
-            .collect();
+        let union: BTreeSet<PrKey> = mine_members.iter().flat_map(|l| set(l)).collect();
         if have(&["MINE"]) {
             report.check_eq(
                 "DR ∪ RET ∪ APP ∪ WR ∪ MRG == MINE",
@@ -226,14 +226,25 @@ async fn main() -> Result<ExitCode> {
         println!("SKIP partition checks (some of {mine_members:?} unavailable)");
     }
 
-    if !skip("RET == authored, reviewed, not queued, not approved", &["RET", "MINE", "MINE_QUEUED", "MINE_APPROVED", "MINE_NONE"]) {
+    if !skip(
+        "RET == authored, reviewed, not queued, not approved",
+        &["RET", "MINE", "MINE_QUEUED", "MINE_APPROVED", "MINE_NONE"],
+    ) {
         let mut want = nondraft(&hits["MINE"]);
         for l in ["MINE_QUEUED", "MINE_APPROVED", "MINE_NONE"] {
             want = &want - &set(l);
         }
-        report.check_eq("RET == (nondraft(MINE) \\ MINE_QUEUED) \\ MINE_APPROVED \\ MINE_NONE", &want, &set("RET"), &by_key);
+        report.check_eq(
+            "RET == (nondraft(MINE) \\ MINE_QUEUED) \\ MINE_APPROVED \\ MINE_NONE",
+            &want,
+            &set("RET"),
+            &by_key,
+        );
     }
-    if !skip("changes-requested PRs are in RET", &["MINE_CR", "MINE_QUEUED", "RET"]) {
+    if !skip(
+        "changes-requested PRs are in RET",
+        &["MINE_CR", "MINE_QUEUED", "RET"],
+    ) {
         let missing = &(&set("MINE_CR") - &set("MINE_QUEUED")) - &set("RET");
         report.check(
             missing.is_empty(),
@@ -241,11 +252,22 @@ async fn main() -> Result<ExitCode> {
             missing.iter().map(|k| describe(k, &by_key)).collect(),
         );
     }
-    if !skip("APP == approved, not queued", &["APP", "MINE_APPROVED", "MINE_QUEUED"]) {
+    if !skip(
+        "APP == approved, not queued",
+        &["APP", "MINE_APPROVED", "MINE_QUEUED"],
+    ) {
         let want = &set("MINE_APPROVED") - &set("MINE_QUEUED");
-        report.check_eq("APP == MINE_APPROVED \\ MINE_QUEUED", &want, &set("APP"), &by_key);
+        report.check_eq(
+            "APP == MINE_APPROVED \\ MINE_QUEUED",
+            &want,
+            &set("APP"),
+            &by_key,
+        );
     }
-    if !skip("WR == unreviewed, not queued", &["WR", "MINE_NONE", "MINE_QUEUED"]) {
+    if !skip(
+        "WR == unreviewed, not queued",
+        &["WR", "MINE_NONE", "MINE_QUEUED"],
+    ) {
         let want = &set("MINE_NONE") - &set("MINE_QUEUED");
         report.check_eq("WR == MINE_NONE \\ MINE_QUEUED", &want, &set("WR"), &by_key);
     }
@@ -258,14 +280,35 @@ async fn main() -> Result<ExitCode> {
         report.check_eq("DR == draft(MINE)", &want, &set("DR"), &by_key);
     }
     if !skip("NR/DNR split USER_REQ by draft", &["NR", "DNR", "USER_REQ"]) {
-        report.check_eq("NR == nondraft(USER_REQ)", &nondraft(&hits["USER_REQ"]), &set("NR"), &by_key);
-        report.check_eq("DNR == draft(USER_REQ)", &draft(&hits["USER_REQ"]), &set("DNR"), &by_key);
+        report.check_eq(
+            "NR == nondraft(USER_REQ)",
+            &nondraft(&hits["USER_REQ"]),
+            &set("NR"),
+            &by_key,
+        );
+        report.check_eq(
+            "DNR == draft(USER_REQ)",
+            &draft(&hits["USER_REQ"]),
+            &set("DNR"),
+            &by_key,
+        );
     }
-    if !skip("NTR == team requests minus user requests", &["NTR", "TEAM_REQ", "USER_REQ"]) {
+    if !skip(
+        "NTR == team requests minus user requests",
+        &["NTR", "TEAM_REQ", "USER_REQ"],
+    ) {
         let want = &nondraft(&hits["TEAM_REQ"]) - &set("USER_REQ");
-        report.check_eq("NTR == nondraft(TEAM_REQ) \\ USER_REQ", &want, &set("NTR"), &by_key);
+        report.check_eq(
+            "NTR == nondraft(TEAM_REQ) \\ USER_REQ",
+            &want,
+            &set("NTR"),
+            &by_key,
+        );
     }
-    if !skip("WA == reviewed, awaiting author", &["WA", "REVIEWED", "USER_REQ", "REVIEWED_QUEUED", "MINE"]) {
+    if !skip(
+        "WA == reviewed, awaiting author",
+        &["WA", "REVIEWED", "USER_REQ", "REVIEWED_QUEUED", "MINE"],
+    ) {
         let mut want = nondraft(&hits["REVIEWED"]);
         for l in ["USER_REQ", "REVIEWED_QUEUED"] {
             want = &want - &set(l);
@@ -294,7 +337,12 @@ async fn main() -> Result<ExitCode> {
                 .filter(|l| **l != "MINE")
                 .flat_map(|l| set(l))
                 .collect();
-            report.check_eq("union of MINE_<repo> == MINE", &union, &set("MINE"), &by_key);
+            report.check_eq(
+                "union of MINE_<repo> == MINE",
+                &union,
+                &set("MINE"),
+                &by_key,
+            );
         }
     } else {
         println!("SKIP union of MINE_<repo> == MINE (needs at least two --repo)");
@@ -316,7 +364,10 @@ async fn main() -> Result<ExitCode> {
                     problems.push(format!("{} is {}", describe(&h.key, &by_key), h.state));
                 }
                 if want_draft.is_some_and(|d| h.is_draft != d) {
-                    problems.push(format!("{} has wrong draft flag", describe(&h.key, &by_key)));
+                    problems.push(format!(
+                        "{} has wrong draft flag",
+                        describe(&h.key, &by_key)
+                    ));
                 }
                 if !repo_set.contains(h.key.repo.as_str()) {
                     problems.push(format!("{} is not in a --repo", describe(&h.key, &by_key)));
@@ -327,7 +378,11 @@ async fn main() -> Result<ExitCode> {
                     problems.push(format!("{} is out of order", describe(&w[1].key, &by_key)));
                 }
             }
-            report.check(problems.is_empty(), &format!("{name} hits are in scope and sorted"), problems);
+            report.check(
+                problems.is_empty(),
+                &format!("{name} hits are in scope and sorted"),
+                problems,
+            );
         }
     }
 

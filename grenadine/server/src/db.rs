@@ -19,7 +19,9 @@ enum Migration {
 }
 
 /// Each entry upgrades the schema by one version.
-const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration::Sql(
+        r#"
     CREATE TABLE inboxes (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -95,8 +97,10 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
         old TEXT NOT NULL,
         new TEXT NOT NULL
     );
-"#),
-    Migration::Sql(r#"
+"#,
+    ),
+    Migration::Sql(
+        r#"
     -- The search's metadata, so a PR shows in its inbox before it has
     -- synced. sync_error holds the error of a PR that has never synced
     -- successfully, because such a PR has no prs row to carry it.
@@ -107,8 +111,10 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
     ALTER TABLE inbox_prs ADD COLUMN url TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
     ALTER TABLE inbox_prs ADD COLUMN sync_error TEXT;
-"#),
-    Migration::Sql(r#"
+"#,
+    ),
+    Migration::Sql(
+        r#"
     -- Sync errors of PRs that have neither a prs row nor an inbox_prs
     -- row, e.g. PRs synced on demand that no inbox covers.
     CREATE TABLE sync_errors (
@@ -117,13 +123,17 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
         error TEXT NOT NULL,
         PRIMARY KEY (repo, number)
     );
-"#),
+"#,
+    ),
     Migration::ResetInboxes,
-    Migration::Sql(r#"
+    Migration::Sql(
+        r#"
     -- The PR's stack as JSON, NULL until a sync fetched it.
     ALTER TABLE prs ADD COLUMN stack TEXT;
-"#),
-    Migration::Sql(r#"
+"#,
+    ),
+    Migration::Sql(
+        r#"
     -- pushed_by is the JSON of an api::Person.
     ALTER TABLE versions ADD COLUMN pushed_by TEXT;
     ALTER TABLE versions ADD COLUMN pushed_by_is_guess INTEGER NOT NULL DEFAULT 0;
@@ -138,7 +148,8 @@ const MIGRATIONS: &[Migration] = &[Migration::Sql(r#"
         -- Unix seconds.
         fetched_at INTEGER NOT NULL
     );
-"#),
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -156,8 +167,7 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::ResetInboxes => {
                 tx.execute("DELETE FROM inboxes", [])?;
-                for (position, (name, filter)) in
-                    crate::inboxes::DEFAULT_INBOXES.iter().enumerate()
+                for (position, (name, filter)) in crate::inboxes::DEFAULT_INBOXES.iter().enumerate()
                 {
                     tx.execute(
                         "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
@@ -336,8 +346,7 @@ impl Db {
                     )?;
                 }
                 // Rows for PRs the search no longer reports go away.
-                let mut sql =
-                    String::from("DELETE FROM inbox_prs WHERE inbox_id = ?");
+                let mut sql = String::from("DELETE FROM inbox_prs WHERE inbox_id = ?");
                 if !hits.is_empty() {
                     sql += " AND (repo, number) NOT IN (VALUES ";
                     sql += &vec!["(?, ?)"; hits.len()].join(",");
@@ -436,9 +445,8 @@ impl Db {
         since: i64,
     ) -> Result<BTreeMap<String, Option<Person>>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT name, avatar_url FROM users WHERE login = ? AND fetched_at >= ?",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT name, avatar_url FROM users WHERE login = ? AND fetched_at >= ?")?;
         let mut out = BTreeMap::new();
         for login in logins {
             let row: Option<(Option<String>, Option<String>)> = stmt
@@ -554,7 +562,11 @@ impl Db {
             params![key.repo, key.number],
         )?;
         for v in versions {
-            let pushed_by = v.pushed_by.as_ref().map(serde_json::to_string).transpose()?;
+            let pushed_by = v
+                .pushed_by
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             tx.execute(
                 "INSERT INTO versions (repo, number, idx, sha, merge_base, kind, pushed_at, missing,
                                        pushed_by, pushed_by_is_guess)
@@ -629,7 +641,9 @@ impl Db {
                      (SELECT error FROM sync_errors WHERE repo = ? AND number = ?),
                      (SELECT sync_error FROM inbox_prs
                       WHERE repo = ? AND number = ? AND sync_error IS NOT NULL LIMIT 1))",
-                params![key.repo, key.number, key.repo, key.number, key.repo, key.number],
+                params![
+                    key.repo, key.number, key.repo, key.number, key.repo, key.number
+                ],
                 |r| r.get(0),
             )
             .map_err(Into::into)
@@ -775,7 +789,10 @@ mod tests {
             .zip(crate::inboxes::DEFAULT_INBOXES.iter())
             .enumerate()
         {
-            assert_eq!((inbox.name.as_str(), inbox.filter.as_str()), (*name, *filter));
+            assert_eq!(
+                (inbox.name.as_str(), inbox.filter.as_str()),
+                (*name, *filter)
+            );
             assert_eq!(inbox.position, position as i64);
         }
     }
@@ -921,7 +938,8 @@ mod tests {
             Some("boom")
         );
 
-        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None)
+            .unwrap();
         let pr = db.inbox_prs(1).unwrap().remove(0);
         assert!(pr.synced);
         assert_eq!(pr.sync_error, None);
@@ -942,7 +960,8 @@ mod tests {
         db.store_sync_error(&key, "boom 2").unwrap();
         assert_eq!(db.pr_sync_error(&key).unwrap().as_deref(), Some("boom 2"));
 
-        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None)
+            .unwrap();
         assert_eq!(db.pr_sync_error(&key).unwrap(), None);
     }
 
@@ -955,7 +974,8 @@ mod tests {
         };
         db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
             .unwrap();
-        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None)
+            .unwrap();
         assert_eq!(db.pr(&key).unwrap().unwrap().stack, None);
 
         let pr = |number, parent| grenadine_core::api::StackPr {
@@ -977,12 +997,19 @@ mod tests {
         db.store_sync(&meta(&key), &[], &[], Some(&stack), false, None)
             .unwrap();
         // A sync that couldn't fetch the stack keeps the stored one.
-        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None)
+            .unwrap();
         let detail = db.pr(&key).unwrap().unwrap();
         assert_eq!(detail.stack.as_ref(), Some(&stack));
         let summary = detail.summary.stack.unwrap();
         assert_eq!((summary.position, summary.length), (2, 2));
-        assert_eq!(db.inbox_prs(1).unwrap()[0].stack.as_ref().map(|s| s.position), Some(2));
+        assert_eq!(
+            db.inbox_prs(1).unwrap()[0]
+                .stack
+                .as_ref()
+                .map(|s| s.position),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1073,14 +1100,17 @@ mod tests {
             repo: "o/n".into(),
             number: 7,
         };
-        db.store_sync(&meta(&key), &[], &[], None, false, None).unwrap();
+        db.store_sync(&meta(&key), &[], &[], None, false, None)
+            .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO comments (repo, number, id, json) VALUES ('o/n', 7, 1, ?)",
-                [r#"{"id":1,"in_reply_to":null,"author":"a","body":"b","path":"f",
+                [
+                    r#"{"id":1,"in_reply_to":null,"author":"a","body":"b","path":"f",
                      "original_commit":"h","original_line":1,"original_start_line":null,
                      "line":1,"start_line":null,"side":"Right","on_file":false,
-                     "created_at":"c","url":"u"}"#],
+                     "created_at":"c","url":"u"}"#,
+                ],
             )
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
@@ -1105,11 +1135,11 @@ mod tests {
         let db = Db::init(conn).unwrap();
         let inboxes = db.inboxes().unwrap();
         assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
-        for (inbox, (name, filter)) in inboxes
-            .iter()
-            .zip(crate::inboxes::DEFAULT_INBOXES.iter())
-        {
-            assert_eq!((inbox.name.as_str(), inbox.filter.as_str()), (*name, *filter));
+        for (inbox, (name, filter)) in inboxes.iter().zip(crate::inboxes::DEFAULT_INBOXES.iter()) {
+            assert_eq!(
+                (inbox.name.as_str(), inbox.filter.as_str()),
+                (*name, *filter)
+            );
         }
         let listed: i64 = db
             .conn()

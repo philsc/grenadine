@@ -265,9 +265,7 @@ mod tests {
         assert!(saw_light && saw_dark);
         assert!(!json_string_selectors.is_empty());
         assert!(
-            json_string_selectors
-                .iter()
-                .all(|s| s.starts_with(LIGHT)),
+            json_string_selectors.iter().all(|s| s.starts_with(LIGHT)),
             "{json_string_selectors:?}"
         );
     }

@@ -22,12 +22,7 @@ fn escape_attr(s: &str) -> String {
 /// written `[text](url)` links only get the attribute for PRs.
 fn grenadine_hash(href: &str, issues: bool) -> Option<String> {
     let mut parts = href.strip_prefix("https://github.com/")?.split('/');
-    let (owner, name, kind, number) = (
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-        parts.next()?,
-    );
+    let (owner, name, kind, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some()
         || (kind != "pull" && !(issues && kind == "issues"))
         || owner.is_empty()
@@ -60,7 +55,11 @@ fn anchor(href: &str, data: Option<&str>, inner: &str) -> Event<'static> {
         .map(|d| format!(" data-grenadine=\"{}\"", escape_attr(d)))
         .unwrap_or_default();
     Event::InlineHtml(
-        format!("<a href=\"{}\" target=\"_blank\"{data}>{inner}</a>", escape_attr(href)).into(),
+        format!(
+            "<a href=\"{}\" target=\"_blank\"{data}>{inner}</a>",
+            escape_attr(href)
+        )
+        .into(),
     )
 }
 
@@ -76,7 +75,10 @@ fn word_boundary(prev: Option<char>) -> bool {
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 39
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && !name.ends_with('-')
         && !name.contains("--")
 }
@@ -174,8 +176,7 @@ fn sha_at(rest: &str, repo: &str) -> Option<(usize, Event<'static>)> {
         return None;
     }
     let sha = &rest[..len];
-    if !sha.bytes().any(|b| b.is_ascii_digit())
-        || !sha.bytes().any(|b| (b'a'..=b'f').contains(&b))
+    if !sha.bytes().any(|b| b.is_ascii_digit()) || !sha.bytes().any(|b| (b'a'..=b'f').contains(&b))
     {
         return None;
     }
@@ -370,8 +371,11 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
                     .map(|h| format!(" data-grenadine=\"{}\"", escape_attr(&h)))
                     .unwrap_or_default();
                 events.push(Event::InlineHtml(
-                    format!("<a href=\"{}\"{title} target=\"_blank\"{data}>", escape_attr(dest_url))
-                        .into(),
+                    format!(
+                        "<a href=\"{}\"{title} target=\"_blank\"{data}>",
+                        escape_attr(dest_url)
+                    )
+                    .into(),
                 ));
             }
             Event::Start(Tag::Image { .. }) => {
@@ -416,9 +420,7 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             {
                 Some(Cow::Borrowed(value))
             }
-            ("a", "data-grenadine") if valid_grenadine_hash(value) => {
-                Some(Cow::Borrowed(value))
-            }
+            ("a", "data-grenadine") if valid_grenadine_hash(value) => Some(Cow::Borrowed(value)),
             ("a", "target") if value == "_blank" => Some(Cow::Borrowed(value)),
             ("span" | "code", "class") | ("a", "data-grenadine" | "target") => None,
             _ => Some(Cow::Borrowed(value)),

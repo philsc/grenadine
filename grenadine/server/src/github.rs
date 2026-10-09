@@ -174,7 +174,11 @@ fn person_at(v: &Value) -> Option<Person> {
     if login.is_empty() {
         return None;
     }
-    let opt = |ptr: &str| Some(str_at(v, ptr)).filter(|s| !s.is_empty()).map(str::to_owned);
+    let opt = |ptr: &str| {
+        Some(str_at(v, ptr))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
     Some(Person {
         login: Some(login.to_owned()),
         name: opt("/name"),
@@ -659,7 +663,11 @@ impl GitHub {
                     .filter(|t| t["isResolved"].as_bool() == Some(true))
                     .filter_map(|t| t.pointer("/comments/nodes/0/databaseId")?.as_u64()),
             );
-            if threads.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool) != Some(true) {
+            if threads
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
                 return Ok(resolved);
             }
             after = Some(str_at(threads, "/pageInfo/endCursor").to_owned());
@@ -685,7 +693,10 @@ impl GitHub {
                 .collect();
             // A login that isn't a user is an error for its alias only.
             let (data, _) = self
-                .graphql(&format!("query({params}) {{\n{fields}}}"), Value::Object(vars))
+                .graphql(
+                    &format!("query({params}) {{\n{fields}}}"),
+                    Value::Object(vars),
+                )
                 .await?;
             for (i, login) in chunk.iter().enumerate() {
                 if let Some(p) = data.get(format!("u{i}")).and_then(person_at) {

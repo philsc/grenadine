@@ -317,7 +317,8 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         head_oid: data.head_oid.clone(),
         parent: None,
     };
-    let head_ref = (data.head_repo.as_deref() == Some(key.repo.as_str())).then_some(data.head_ref.as_str());
+    let head_ref =
+        (data.head_repo.as_deref() == Some(key.repo.as_str())).then_some(data.head_ref.as_str());
     let lookup = |field, refs: Vec<String>| async move {
         state.github.prs_by_ref(&key.repo, field, &refs).await
     };
@@ -585,7 +586,13 @@ mod tests {
         state.status_finished(&a);
         let s = status(&state);
         assert_eq!(s.remaining, 2);
-        assert_eq!(s.in_flight, [SyncingPr { key: b.clone(), title: None }]);
+        assert_eq!(
+            s.in_flight,
+            [SyncingPr {
+                key: b.clone(),
+                title: None
+            }]
+        );
 
         state.status_idle(&Ok(()));
         let s = status(&state);

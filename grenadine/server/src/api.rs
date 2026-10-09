@@ -151,7 +151,11 @@ fn prefetch_stack(state: &Arc<State>, pr: &PrDetail) -> ApiResult<()> {
     let Some(stack) = &pr.stack else {
         return Ok(());
     };
-    for mate in stack.prs.iter().filter(|p| p.number != pr.summary.key.number) {
+    for mate in stack
+        .prs
+        .iter()
+        .filter(|p| p.number != pr.summary.key.number)
+    {
         let key = PrKey {
             repo: pr.summary.key.repo.clone(),
             number: mate.number,
@@ -270,7 +274,9 @@ mod tests {
             git_lock: tokio::sync::Mutex::new(()),
         });
         let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned.clone())].into_iter().collect(),
+            [(fx.clone.slug.clone(), cloned.clone())]
+                .into_iter()
+                .collect(),
         );
 
         let _guard = cloned.git_lock.lock().await;
@@ -322,9 +328,8 @@ mod tests {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
         });
-        let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-        );
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
         let response = pr(
             AxState(state.clone()),
             Path(("owner".into(), "name".into(), 7)),
@@ -363,9 +368,8 @@ mod tests {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
         });
-        let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-        );
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
         let key = PrKey {
             repo: "owner/name".into(),
             number: 7,
@@ -420,9 +424,8 @@ mod tests {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
         });
-        let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-        );
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
         let key = |number| PrKey {
             repo: "owner/name".into(),
             number,
@@ -495,10 +498,13 @@ mod tests {
                 None,
             )
             .unwrap();
-        let response = pr(AxState(state.clone()), Path(("owner".into(), "name".into(), 7)))
-            .await
-            .map_err(|e| e.0)
-            .unwrap();
+        let response = pr(
+            AxState(state.clone()),
+            Path(("owner".into(), "name".into(), 7)),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         for _ in 0..50 {
             if state.db.pr_sync_error(&key(6)).unwrap().is_some() {
@@ -519,25 +525,27 @@ mod tests {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
         });
-        let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-        );
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
         let key = PrKey {
             repo: "owner/name".into(),
             number: 7,
         };
         state
             .db
-            .set_inbox_results(1, Ok(&[crate::github::Hit {
-                key: key.clone(),
-                title: "t".into(),
-                author: "a".into(),
-                state: "OPEN".into(),
-                is_draft: false,
-                url: "u".into(),
-                updated_at: "u".into(),
-                head_oid: "h".into(),
-            }]))
+            .set_inbox_results(
+                1,
+                Ok(&[crate::github::Hit {
+                    key: key.clone(),
+                    title: "t".into(),
+                    author: "a".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    updated_at: "u".into(),
+                    head_oid: "h".into(),
+                }]),
+            )
             .unwrap();
         let response = pr(
             AxState(state.clone()),

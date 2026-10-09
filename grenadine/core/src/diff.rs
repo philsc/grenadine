@@ -132,18 +132,24 @@ mod tests {
     fn render(old: &str, new: &str, context: usize) -> Vec<String> {
         let (o, n) = (lines(old), lines(new));
         let blocks = change_blocks(&o, &n);
-        hunks(&blocks, &alignments(&o, &n, &blocks), o.len(), n.len(), context)
-            .iter()
-            .flat_map(|h| {
-                std::iter::once(format!("@@ skip {}", h.skipped_before)).chain(h.lines.iter().map(
-                    |l| match *l {
-                        Line::Context { old, .. } => format!(" {}", o[old]),
-                        Line::Removed { old, .. } => format!("-{}", o[old]),
-                        Line::Added { new, .. } => format!("+{}", n[new]),
-                    },
-                ))
-            })
-            .collect()
+        hunks(
+            &blocks,
+            &alignments(&o, &n, &blocks),
+            o.len(),
+            n.len(),
+            context,
+        )
+        .iter()
+        .flat_map(|h| {
+            std::iter::once(format!("@@ skip {}", h.skipped_before)).chain(h.lines.iter().map(
+                |l| match *l {
+                    Line::Context { old, .. } => format!(" {}", o[old]),
+                    Line::Removed { old, .. } => format!("-{}", o[old]),
+                    Line::Added { new, .. } => format!("+{}", n[new]),
+                },
+            ))
+        })
+        .collect()
     }
 
     #[test]

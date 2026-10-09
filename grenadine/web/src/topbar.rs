@@ -7,7 +7,10 @@ use std::time::Duration;
 use grenadine_core::api::{SyncPhase, SyncStatus, SyncingPr};
 use leptos::prelude::*;
 
-use crate::{Updates, theme::{self, Theme}};
+use crate::{
+    Updates,
+    theme::{self, Theme},
+};
 
 /// A relative timestamp like "5m ago" for the status line.
 fn ago(now: i64, then: i64) -> String {
@@ -58,8 +61,10 @@ pub fn Topbar(
     let theme = theme::signal();
 
     let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
-    let handle =
-        set_interval_with_handle(move || now.set((js_sys::Date::now() / 1000.0) as i64), Duration::from_secs(30));
+    let handle = set_interval_with_handle(
+        move || now.set((js_sys::Date::now() / 1000.0) as i64),
+        Duration::from_secs(30),
+    );
     on_cleanup(move || {
         if let Ok(h) = handle {
             h.clear();
@@ -145,7 +150,10 @@ mod tests {
         assert_eq!(label(&SyncStatus::default(), 0), "Checking GitHub…");
         assert_eq!(label(&idle(None, None), 0), "Synced");
         assert_eq!(label(&idle(None, Some(40)), 100), "Synced 1m ago");
-        assert_eq!(label(&idle(Some("boom"), Some(100)), 100), "Sync failed just now");
+        assert_eq!(
+            label(&idle(Some("boom"), Some(100)), 100),
+            "Sync failed just now"
+        );
         assert_eq!(label(&idle(Some("boom"), None), 100), "Sync failed");
 
         let mut s = idle(None, None);

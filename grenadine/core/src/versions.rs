@@ -161,14 +161,11 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
 
     // The activity log covers the PR when it shows what the branch pointed
     // at when the PR was opened.
-    let initial_activity = history
-        .activities
-        .iter()
-        .rfind(|a| {
-            a.timestamp <= history.created_at
-                && a.kind != ActivityKind::BranchDeletion
-                && !is_zero(&a.after)
-        });
+    let initial_activity = history.activities.iter().rfind(|a| {
+        a.timestamp <= history.created_at
+            && a.kind != ActivityKind::BranchDeletion
+            && !is_zero(&a.after)
+    });
 
     let approximate = match initial_activity {
         Some(initial) => {

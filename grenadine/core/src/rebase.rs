@@ -92,8 +92,7 @@ pub fn touched_by_pr(
     let mut kept = Vec::new();
     let mut hidden = 0;
     for f in interdiff {
-        if f
-            .old_path
+        if f.old_path
             .iter()
             .chain(&f.new_path)
             .any(|p| touched.contains(p.as_str()))
@@ -203,8 +202,14 @@ mod tests {
             file(Some("old.rs"), Some("shared.rs")),
             file(Some("shared.rs"), Some("new.rs")),
         ];
-        let pr_a = [file(Some("old.rs"), Some("shared.rs")), file(None, Some("new.rs"))];
-        let pr_b = [file(None, Some("old.rs")), file(Some("shared.rs"), Some("new.rs"))];
+        let pr_a = [
+            file(Some("old.rs"), Some("shared.rs")),
+            file(None, Some("new.rs")),
+        ];
+        let pr_b = [
+            file(None, Some("old.rs")),
+            file(Some("shared.rs"), Some("new.rs")),
+        ];
         let (kept, hidden) = touched_by_pr(&interdiff, &pr_a, &pr_b);
         assert_eq!(kept.len(), 2);
         assert_eq!(hidden, 0);

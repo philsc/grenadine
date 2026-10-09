@@ -461,7 +461,11 @@ mod tests {
     fn depth_counts_prs_outside_the_inbox() {
         // D(5) sits above C2(4) even though only C2's parent is listed.
         let s = forked();
-        let prs = [summary(4, Some(&s)), summary(2, Some(&s)), summary(5, Some(&s))];
+        let prs = [
+            summary(4, Some(&s)),
+            summary(2, Some(&s)),
+            summary(5, Some(&s)),
+        ];
         assert_eq!(
             layout(&prs),
             [(5, Some(Link::Gap)), (4, Some(Link::Direct)), (2, None)]

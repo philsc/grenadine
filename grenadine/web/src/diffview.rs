@@ -78,17 +78,17 @@ async fn load(
     Ok((
         files
             .iter()
-        .map(|f| {
-            Arc::new(FileData {
-                change: f.clone(),
-                old: blob(&f.old_blob),
-                new: blob(&f.new_blob),
-                upstream: up_by_path
-                    .get(f.path())
-                    .map(|u| (blob(&u.old_blob), blob(&u.new_blob))),
+            .map(|f| {
+                Arc::new(FileData {
+                    change: f.clone(),
+                    old: blob(&f.old_blob),
+                    new: blob(&f.new_blob),
+                    upstream: up_by_path
+                        .get(f.path())
+                        .map(|u| (blob(&u.old_blob), blob(&u.new_blob))),
+                })
             })
-        })
-        .collect(),
+            .collect(),
         hidden,
     ))
 }
@@ -117,7 +117,8 @@ pub fn DiffView(
                 format!(" {hidden} files changed only by the rebase are hidden.")
             } else {
                 String::new()
-            })}</p> }.into_any()
+            })}</p> }
+            .into_any()
         }
         Some(Ok((files, hidden))) => {
             let comments = comments.clone();

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, PrMissing,
-    SyncStatus,
+    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey,
+    PrMissing, SyncStatus,
 };
 
 pub type Result<T> = std::result::Result<T, String>;

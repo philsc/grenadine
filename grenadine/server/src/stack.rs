@@ -196,8 +196,10 @@ mod tests {
 
     fn walk_with(fake: &Fake, trunk: &str, number: u64, base: &str, head: Option<&str>) -> Stack {
         let trunk = Regex::new(trunk).unwrap();
-        futures::executor::block_on(walk(me(number), base, head, &trunk, |f, r| fake.lookup(f, r)))
-            .unwrap()
+        futures::executor::block_on(walk(me(number), base, head, &trunk, |f, r| {
+            fake.lookup(f, r)
+        }))
+        .unwrap()
     }
 
     fn walk_from(fake: &Fake, number: u64, base: &str, head: Option<&str>) -> Stack {
@@ -224,7 +226,13 @@ mod tests {
         assert_eq!(s.base_ref, "main");
         assert_eq!(
             parents(&s),
-            [(2, Some(1)), (1, None), (3, Some(2)), (4, Some(2)), (5, Some(3))]
+            [
+                (2, Some(1)),
+                (1, None),
+                (3, Some(2)),
+                (4, Some(2)),
+                (5, Some(3))
+            ]
         );
         assert!(!s.more_ancestors && !s.more_descendants);
     }
@@ -271,10 +279,7 @@ mod tests {
     #[test]
     fn descendants_from_a_trunk_are_not_expanded() {
         // 2 merges main into 1's branch. PRs into main aren't on top of 2.
-        let fake = Fake::new(vec![
-            ref_pr(2, "dev/a", "main"),
-            ref_pr(3, "main", "dev/b"),
-        ]);
+        let fake = Fake::new(vec![ref_pr(2, "dev/a", "main"), ref_pr(3, "main", "dev/b")]);
         let s = walk_with(&fake, DEFAULT_TRUNK, 1, "main", Some("dev/a"));
         assert_eq!(parents(&s), [(1, None), (2, Some(1))]);
     }
@@ -348,7 +353,13 @@ mod tests {
     #[test]
     fn long_stacks_are_capped() {
         let n = (MAX_ANCESTORS + MAX_DESCENDANTS + 10) as u64;
-        let branch = |i: u64| if i == 0 { "main".to_owned() } else { format!("b{i}") };
+        let branch = |i: u64| {
+            if i == 0 {
+                "main".to_owned()
+            } else {
+                format!("b{i}")
+            }
+        };
         let fake = Fake::new(
             (1..=n)
                 .map(|i| ref_pr(i, &branch(i - 1), &branch(i)))

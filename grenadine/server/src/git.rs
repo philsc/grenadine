@@ -79,8 +79,8 @@ impl Repo {
 
     /// Authenticates HTTPS fetches to github.com with a GitHub token.
     pub fn with_token(mut self, token: &str) -> Repo {
-        let basic = base64::engine::general_purpose::STANDARD
-            .encode(format!("x-access-token:{token}"));
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         self.auth = Some(AuthHeader(format!("Authorization: Basic {basic}")));
         self
     }
@@ -554,7 +554,9 @@ pub(crate) mod tests {
             .unwrap();
         let refs = f.clone.refs(REF_PREFIX).unwrap();
         assert_eq!(refs.get(&v1_ref), Some(&v1));
-        f.clone.update_refs(&[], std::slice::from_ref(&v1_ref)).unwrap();
+        f.clone
+            .update_refs(&[], std::slice::from_ref(&v1_ref))
+            .unwrap();
         assert!(!f.clone.refs(REF_PREFIX).unwrap().contains_key(&v1_ref));
     }
 

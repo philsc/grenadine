@@ -176,10 +176,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
     let pr_links = RwSignal::new(load_flag("pr-links-in-app", true));
-    let github = format!(
-        "https://github.com/{}/pull/{}",
-        key.repo, key.number
-    );
+    let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
 
     move || {
         match pr.get() {
@@ -426,7 +423,11 @@ fn StackList(stack: Stack, repo: String, current: u64, pr_links: RwSignal<bool>)
     let rows = stack.graph();
     let lanes = rows
         .iter()
-        .flat_map(|r| std::iter::once(r.lane).chain(r.through.iter().copied()).chain(r.joins.iter().copied()))
+        .flat_map(|r| {
+            std::iter::once(r.lane)
+                .chain(r.through.iter().copied())
+                .chain(r.joins.iter().copied())
+        })
         .max()
         .unwrap_or(0)
         + 1;
@@ -840,9 +841,6 @@ mod tests {
             reply,
         ];
         let counts = thread_counts(&comments, &versions);
-        assert_eq!(
-            counts,
-            HashMap::from([(1, (1, 2)), (2, (1, 1))])
-        );
+        assert_eq!(counts, HashMap::from([(1, (1, 2)), (2, (1, 1))]));
     }
 }
