@@ -1,16 +1,18 @@
 //! grenadine: a local web server for reviewing GitHub PRs version by version.
 
+mod agent;
 mod api;
 mod assets;
 mod db;
 mod git;
 mod github;
 mod inboxes;
+mod mcp;
 mod stack;
 mod sync;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +62,15 @@ struct Args {
     /// The GitHub API to talk to; tests point it at a fake.
     #[arg(long, hide = true, default_value = github::API)]
     github_api: String,
+
+    /// The Claude Code executable that agent sessions run.
+    #[arg(long, default_value = "claude")]
+    claude: PathBuf,
+
+    /// Where agent sessions' git worktrees go. Defaults to a `worktrees`
+    /// directory next to the database.
+    #[arg(long)]
+    worktrees: Option<PathBuf>,
 }
 
 fn default_db() -> Result<PathBuf> {
@@ -70,6 +81,16 @@ fn default_db() -> Result<PathBuf> {
         }
     };
     Ok(data.join("grenadine/grenadine.db"))
+}
+
+/// The URL that local processes reach the server at.
+fn local_url(addr: SocketAddr) -> String {
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, addr.port()))
 }
 
 fn open_repos(specs: &[String], token: &str) -> Result<BTreeMap<String, Arc<sync::ClonedRepo>>> {
@@ -140,12 +161,19 @@ async fn main() -> Result<()> {
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
     let github = github::GitHub::new(&token, &args.github_api)?;
+    let addr = SocketAddr::new(args.bind, args.port);
+    let worktrees = match args.worktrees {
+        Some(p) => p,
+        None => db_path.with_file_name("worktrees"),
+    };
+    let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr))?;
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(sync::State {
         db,
         github,
+        agents,
         repos,
         trunk: args.trunk,
         events: broadcast::channel(256).0,
@@ -159,7 +187,6 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.poll_interval.max(1)),
     ));
 
-    let addr = SocketAddr::new(args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("can't listen on {addr}"))?;

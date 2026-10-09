@@ -1,6 +1,8 @@
-//! The grenadine web UI: a landing page with the inboxes of PRs, and a page
-//! for one PR with its version picker and diff.
+//! The grenadine web UI: a landing page with the inboxes of PRs, a page for
+//! one PR with its version picker and diff, and the Claude Code sessions
+//! started from the UI.
 
+mod agents;
 mod api;
 mod diffview;
 mod highlight;
@@ -23,19 +25,43 @@ pub struct Updates {
     pub pr: RwSignal<(Option<PrKey>, u64)>,
     /// The poller's status, shown in the top bar.
     pub sync: RwSignal<SyncStatus>,
+    /// Bumped when an agent session was created, deleted or changed status.
+    pub agents: RwSignal<u64>,
 }
 
-/// Parses `#/owner/name/number`.
-fn key_from_hash(hash: &str) -> Option<PrKey> {
-    let mut parts = hash
-        .trim_start_matches('#')
-        .trim_start_matches('/')
-        .split('/');
-    let (owner, name, number) = (parts.next()?, parts.next()?, parts.next()?);
+/// What the URL's hash shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Route {
+    Inboxes,
+    /// `#/owner/name/number`.
+    Pr(PrKey),
+    /// `#/agents`, or `#/agents/new/owner/name/number` to start a session
+    /// on a PR.
+    Agents(Option<PrKey>),
+    /// `#/agents/<id>`.
+    Agent(String),
+}
+
+fn pr_key(owner: &str, name: &str, number: &str) -> Option<PrKey> {
     Some(PrKey {
         repo: format!("{owner}/{name}"),
         number: number.parse().ok()?,
     })
+}
+
+fn route_from_hash(hash: &str) -> Route {
+    let path = hash.trim_start_matches('#').trim_start_matches('/');
+    let parts: Vec<&str> = path.split('/').collect();
+    let route = match parts[..] {
+        ["agents"] => Some(Route::Agents(None)),
+        ["agents", "new", owner, name, number] => {
+            pr_key(owner, name, number).map(|k| Route::Agents(Some(k)))
+        }
+        ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
+        [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
+        _ => None,
+    };
+    route.unwrap_or(Route::Inboxes)
 }
 
 pub fn hash_for(key: &PrKey) -> String {
@@ -69,6 +95,7 @@ fn listen(updates: Updates) {
             match serde_json::from_str::<ServerEvent>(&data) {
                 Ok(ServerEvent::InboxesChanged) => {
                     updates.inboxes.update(|n| *n += 1);
+                    updates.agents.update(|n| *n += 1);
                     refetch_sync(updates);
                 }
                 Ok(ServerEvent::PrChanged(key)) => updates.pr.update(|(k, n)| {
@@ -76,6 +103,7 @@ fn listen(updates: Updates) {
                     *n += 1;
                 }),
                 Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
+                Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
                 Err(_) => {}
             }
         });
@@ -84,11 +112,19 @@ fn listen(updates: Updates) {
     // After a reconnect (e.g. the server restarted) refetch everything.
     let on_open = Closure::<dyn FnMut()>::new(move || {
         updates.inboxes.update(|n| *n += 1);
+        updates.agents.update(|n| *n += 1);
         refetch_sync(updates);
     });
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     on_open.forget();
     std::mem::forget(source);
+}
+
+fn pr_of(route: &Route) -> Option<PrKey> {
+    match route {
+        Route::Pr(key) => Some(key.clone()),
+        _ => None,
+    }
 }
 
 #[component]
@@ -97,30 +133,38 @@ fn App() -> impl IntoView {
         inboxes: RwSignal::new(0),
         pr: RwSignal::new((None, 0)),
         sync: RwSignal::new(SyncStatus::default()),
+        agents: RwSignal::new(0),
     };
     provide_context(updates);
     listen(updates);
 
-    // The PR in the URL, if any. Without one, the inboxes are shown.
-    let selected = RwSignal::new(key_from_hash(&current_hash()));
+    let route = RwSignal::new(route_from_hash(&current_hash()));
     // The PR shown most recently, highlighted when going back to the inboxes.
-    let last = RwSignal::new(selected.get_untracked());
+    let last = RwSignal::new(route.with_untracked(pr_of));
     let handle = window_event_listener_untyped("hashchange", move |_| {
-        let key = key_from_hash(&current_hash());
-        if key.is_some() {
-            last.set(key.clone());
+        let r = route_from_hash(&current_hash());
+        if let Some(key) = pr_of(&r) {
+            last.set(Some(key));
         }
-        selected.set(key);
+        route.set(r);
     });
     on_cleanup(move || handle.remove());
-    let on_pr = Signal::derive(move || selected.with(Option::is_some));
+    let on_inboxes = Memo::new(move |_| route.with(|r| *r == Route::Inboxes));
+    let selected = Memo::new(move |_| route.with(pr_of));
+    let agents = Memo::new(move |_| {
+        route.with(|r| match r {
+            Route::Agents(_) | Route::Agent(_) => Some(r.clone()),
+            _ => None,
+        })
+    });
 
-    // The inboxes stay mounted while a PR is shown so that going back is
-    // instant. Hiding them loses their scroll position, so remember it.
+    // The inboxes stay mounted while another page is shown so that going
+    // back is instant. Hiding them loses their scroll position, so
+    // remember it.
     let inboxes_ref = NodeRef::<leptos::html::Main>::new();
     let scroll = StoredValue::new(0);
     Effect::new(move |_| {
-        if !on_pr.get()
+        if on_inboxes.get()
             && let Some(main) = inboxes_ref.get_untracked()
         {
             main.set_scroll_top(scroll.get_value());
@@ -129,10 +173,10 @@ fn App() -> impl IntoView {
 
     view! {
         <div class="page">
-            <topbar::Topbar on_pr=on_pr />
+            <topbar::Topbar route=route.into() />
             <main
                 class="main"
-                class:hidden=on_pr
+                class:hidden=move || !on_inboxes.get()
                 node_ref=inboxes_ref
                 on:scroll=move |_| {
                     if let Some(main) = inboxes_ref.get_untracked() {
@@ -144,6 +188,15 @@ fn App() -> impl IntoView {
             </main>
             {move || selected.get().map(|key| view! {
                 <main class="main"><pr::PrView key=key /></main>
+            })}
+            {move || agents.get().map(|r| view! {
+                <main class="main">
+                    {match r {
+                        Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
+                        Route::Agents(pr) => view! { <agents::AgentList pr=pr /> }.into_any(),
+                        _ => ().into_any(),
+                    }}
+                </main>
             })}
         </div>
     }
@@ -161,4 +214,36 @@ pub fn start() {
         }
     }
     leptos::mount::mount_to_body(App);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(repo: &str, number: u64) -> PrKey {
+        PrKey {
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    #[test]
+    fn routes() {
+        assert_eq!(route_from_hash(""), Route::Inboxes);
+        assert_eq!(route_from_hash("#/"), Route::Inboxes);
+        assert_eq!(route_from_hash("#/o/n/7"), Route::Pr(key("o/n", 7)));
+        assert_eq!(route_from_hash("#/o/n/x"), Route::Inboxes);
+        assert_eq!(route_from_hash("#/agents"), Route::Agents(None));
+        assert_eq!(
+            route_from_hash("#/agents/new/o/n/7"),
+            Route::Agents(Some(key("o/n", 7)))
+        );
+        assert_eq!(route_from_hash("#/agents/abc"), Route::Agent("abc".into()));
+        assert_eq!(route_from_hash("#/agents/"), Route::Inboxes);
+        // An owner called "agents" still has PRs.
+        assert_eq!(
+            route_from_hash("#/agents/n/7"),
+            Route::Pr(key("agents/n", 7))
+        );
+    }
 }

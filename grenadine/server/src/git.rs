@@ -211,6 +211,42 @@ impl Repo {
         Ok(self.git(&["rev-parse", local_ref])?.trim().to_owned())
     }
 
+    /// Fetches the tip of the GitHub repository's default branch into
+    /// `local_ref` and returns it.
+    pub fn fetch_default_branch(&self, local_ref: &str) -> Result<String> {
+        let out = self.git(&["ls-remote", "--symref", &self.fetch_url(), "HEAD"])?;
+        let branch = out
+            .lines()
+            .find_map(|l| {
+                let (target, _) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
+                Some(target.to_owned())
+            })
+            .ok_or_else(|| anyhow!("{} has no default branch", self.slug))?;
+        self.fetch_branch(&branch, local_ref)
+    }
+
+    /// Checks out `base` on a new branch in a new worktree at `path`.
+    pub fn worktree_add(&self, path: &Path, branch: &str, base: &str) -> Result<()> {
+        let path = path.to_str().context("the worktree path isn't UTF-8")?;
+        self.git(&["worktree", "add", "--quiet", "-b", branch, path, base])?;
+        Ok(())
+    }
+
+    /// Removes a worktree, changes and all, and deletes its branch. Either
+    /// may be gone already.
+    pub fn worktree_remove(&self, path: &Path, branch: &str) -> Result<()> {
+        let path = path.to_str().context("the worktree path isn't UTF-8")?;
+        if Path::new(path).exists() {
+            self.git(&["worktree", "remove", "--force", "--force", path])?;
+        } else {
+            self.git(&["worktree", "prune"])?;
+        }
+        if self.git_ok(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]) {
+            self.git(&["branch", "-D", branch])?;
+        }
+        Ok(())
+    }
+
     pub fn merge_base(&self, a: &str, b: &str) -> Option<String> {
         self.git(&["merge-base", a, b])
             .ok()
@@ -600,5 +636,26 @@ pub(crate) mod tests {
             Some("hello\n")
         );
         assert_eq!(blobs[files[2].new_blob.as_ref().unwrap()].text, None);
+    }
+
+    #[test]
+    fn worktrees() {
+        let f = fixture();
+        let tip = f.clone.fetch_default_branch("refs/grenadine/agent/trunk").unwrap();
+        assert_eq!(tip, run(&f.upstream, &["rev-parse", "HEAD"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt");
+        f.clone.worktree_add(&path, "grenadine/agent/x", &tip).unwrap();
+        assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "1\n");
+        assert_eq!(run(&path, &["branch", "--show-current"]), "grenadine/agent/x");
+
+        // Uncommitted changes don't stop the removal.
+        std::fs::write(path.join("b"), "2\n").unwrap();
+        f.clone.worktree_remove(&path, "grenadine/agent/x").unwrap();
+        assert!(!path.exists());
+        assert!(!f.clone.git_ok(&["rev-parse", "--verify", "--quiet", "refs/heads/grenadine/agent/x"]));
+        // Removing it again is fine.
+        f.clone.worktree_remove(&path, "grenadine/agent/x").unwrap();
     }
 }

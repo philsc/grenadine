@@ -356,6 +356,7 @@ fn PrBody(
                     <span class=format!("state state-{}", s.state.to_lowercase())>{s.state.to_lowercase()}</span>
                     {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
                     {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
+                    " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
                 </p>
                 {pr.approximate.then(|| view! {
                     <p class="banner warn">"GitHub has no push log for this PR, so its versions were reconstructed from force-push events and may not match every push."</p>

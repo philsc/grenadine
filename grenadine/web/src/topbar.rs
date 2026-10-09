@@ -1,6 +1,6 @@
-//! The top bar: the wordmark on the left, linking back to the inboxes, a theme picker and the poller's
-//! sync status on the right. Hovering the status shows what is syncing or
-//! what went wrong.
+//! The top bar: the wordmark and the Inboxes and Agents tabs on the left, a
+//! theme picker and the poller's sync status on the right. Hovering the
+//! status shows what is syncing or what went wrong.
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use grenadine_core::api::{SyncPhase, SyncStatus, SyncingPr};
 use leptos::prelude::*;
 
 use crate::{
-    Updates,
+    Route, Updates,
     theme::{self, Theme},
 };
 
@@ -54,8 +54,8 @@ fn pr_line(pr: &SyncingPr) -> String {
 
 #[component]
 pub fn Topbar(
-    /// Whether a PR is shown rather than the inboxes.
-    on_pr: Signal<bool>,
+    /// The page shown.
+    route: Signal<Route>,
 ) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let theme = theme::signal();
@@ -75,7 +75,10 @@ pub fn Topbar(
         <header class="topbar">
             <span class="topbar-left">
                 <a class="topbar-brand" href="#/">"grenadine"</a>
-                {move || on_pr.get().then(|| view! { <a class="topbar-back" href="#/">"← Inboxes"</a> })}
+                <nav class="topbar-tabs">
+                    <a href="#/" class:active=move || route.with(|r| matches!(r, Route::Inboxes | Route::Pr(_)))>"Inboxes"</a>
+                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents(_) | Route::Agent(_)))>"Agents"</a>
+                </nav>
             </span>
             <span class="topbar-right">
                 <select

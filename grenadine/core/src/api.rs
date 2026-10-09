@@ -311,4 +311,125 @@ pub enum ServerEvent {
     /// The whole sync status, sent on every change so a missed event
     /// self-heals.
     SyncStatus(SyncStatus),
+    /// An agent session was created, deleted or changed its status.
+    AgentsChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    /// Waiting for a prompt.
+    Idle,
+    /// Claude is working on a prompt.
+    Running,
+    /// Claude is waiting for the user to allow or deny a tool call.
+    AwaitingApproval,
+    /// The user stopped the last turn, or the server restarted during it.
+    Interrupted,
+    /// The last turn ended with an error.
+    Failed,
+}
+
+/// A Claude Code session working in its own git worktree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentSession {
+    /// Also Claude Code's session ID, a UUID.
+    pub id: String,
+    /// `owner/name`.
+    pub repo: String,
+    /// The PR whose head the worktree started from; `None` for trunk.
+    pub pr: Option<u64>,
+    /// The first line of the first prompt.
+    pub title: String,
+    /// The local branch checked out in the worktree.
+    pub branch: String,
+    pub worktree: String,
+    pub base_sha: String,
+    pub status: AgentStatus,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// What all of the session's turns cost, as Claude Code reported it.
+    pub cost_usd: f64,
+}
+
+/// The body of a request that starts an agent session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewAgent {
+    pub repo: String,
+    /// Start from this PR's head rather than from the trunk.
+    pub pr: Option<u64>,
+    pub prompt: String,
+}
+
+/// A follow-up prompt for an agent session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMessage {
+    pub prompt: String,
+}
+
+/// The user's answer to an `ApprovalRequested` event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    /// The tool use's ID.
+    pub id: String,
+    pub allow: bool,
+    /// Told to Claude when the tool call is denied.
+    pub message: Option<String>,
+}
+
+/// Something that happened in an agent session's transcript.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventKind {
+    /// A prompt the user sent.
+    Prompt(String),
+    /// A piece of assistant text while it streams in. Never stored; the
+    /// complete `Text` follows.
+    TextDelta(String),
+    /// A complete block of assistant text, in Markdown.
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        /// The tool's input as JSON.
+        input: String,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
+    /// Claude wants to use a tool and waits for the user's `Approval`.
+    ApprovalRequested {
+        id: String,
+        tool_name: String,
+        /// The tool's input as JSON.
+        input: String,
+    },
+    ApprovalResolved {
+        id: String,
+        allow: bool,
+    },
+    /// A turn ended; `error` is set when it failed.
+    TurnEnded {
+        error: Option<String>,
+        cost_usd: Option<f64>,
+    },
+    /// Grenadine couldn't run Claude Code, or it crashed.
+    Error(String),
+}
+
+impl AgentEventKind {
+    /// Whether the event is only streamed to open pages and never stored.
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, AgentEventKind::TextDelta(_))
+    }
+}
+
+/// Sent over an agent session's event stream.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    /// The event's position in the transcript; `None` for ephemeral events.
+    pub seq: Option<u64>,
+    pub kind: AgentEventKind,
 }

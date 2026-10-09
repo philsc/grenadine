@@ -1,5 +1,5 @@
-//! The SQLite database: inboxes, the PRs they matched, and each PR's
-//! versions and review comments.
+//! The SQLite database: inboxes, the PRs they matched, each PR's versions
+//! and review comments, and the agent sessions with their transcripts.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    Inbox, InboxEdit, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
     VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -147,6 +147,36 @@ const MIGRATIONS: &[Migration] = &[
         avatar_url TEXT,
         -- Unix seconds.
         fetched_at INTEGER NOT NULL
+    );
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- Claude Code sessions started from the UI, each in its own worktree.
+    CREATE TABLE agents (
+        -- Also Claude Code's session ID.
+        id TEXT PRIMARY KEY,
+        repo TEXT NOT NULL,
+        pr_number INTEGER,
+        title TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        worktree TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        status TEXT NOT NULL,
+        -- Whether Claude Code created its session, so that later turns
+        -- resume it.
+        started INTEGER NOT NULL DEFAULT 0,
+        cost_usd REAL NOT NULL DEFAULT 0,
+        -- Unix seconds.
+        created_at INTEGER NOT NULL
+    );
+
+    -- Each session's transcript; event is the JSON of an api::AgentEventKind.
+    CREATE TABLE agent_events (
+        agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        PRIMARY KEY (agent_id, seq)
     );
 "#,
     ),
@@ -710,6 +740,167 @@ impl Db {
         let rows = stmt.query_map(params![key.repo, key.number], |r| r.get::<_, String>(0))?;
         rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect()
     }
+
+    pub fn create_agent(&self, a: &AgentSession) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO agents
+                (id, repo, pr_number, title, branch, worktree, base_sha, status, cost_usd, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                a.id,
+                a.repo,
+                a.pr,
+                a.title,
+                a.branch,
+                a.worktree,
+                a.base_sha,
+                status_str(a.status),
+                a.cost_usd,
+                a.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every agent session, newest first.
+    pub fn agents(&self) -> Result<Vec<AgentSession>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC, id"
+        ))?;
+        let rows = stmt.query_map([], agent_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn agent(&self, id: &str) -> Result<Option<AgentSession>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?"),
+                [id],
+                agent_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn set_agent_status(&self, id: &str, status: AgentStatus) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET status = ? WHERE id = ?",
+            params![status_str(status), id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether Claude Code created the session, so it can be resumed.
+    pub fn agent_started(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .query_row("SELECT started FROM agents WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    pub fn set_agent_started(&self, id: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE agents SET started = 1 WHERE id = ?", [id])?;
+        Ok(())
+    }
+
+    pub fn add_agent_cost(&self, id: &str, cost_usd: f64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET cost_usd = cost_usd + ? WHERE id = ?",
+            params![cost_usd, id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns false when there is no such session.
+    pub fn delete_agent(&self, id: &str) -> Result<bool> {
+        Ok(self.conn().execute("DELETE FROM agents WHERE id = ?", [id])? > 0)
+    }
+
+    /// Marks the sessions that were working when the server stopped as
+    /// interrupted, since their Claude Code processes are gone.
+    pub fn interrupt_agents(&self) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET status = ? WHERE status IN (?, ?)",
+            params![
+                status_str(AgentStatus::Interrupted),
+                status_str(AgentStatus::Running),
+                status_str(AgentStatus::AwaitingApproval)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Appends an event to a session's transcript and returns its `seq`.
+    pub fn append_agent_event(&self, id: &str, kind: &AgentEventKind) -> Result<u64> {
+        let conn = self.conn();
+        let seq: u64 = conn.query_row(
+            "INSERT INTO agent_events (agent_id, seq, event)
+             SELECT ?1, COALESCE(MAX(seq) + 1, 1), ?2 FROM agent_events WHERE agent_id = ?1
+             RETURNING seq",
+            params![id, serde_json::to_string(kind)?],
+            |r| r.get(0),
+        )?;
+        Ok(seq)
+    }
+
+    /// A session's transcript in order.
+    pub fn agent_events(&self, id: &str) -> Result<Vec<AgentEvent>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT seq, event FROM agent_events WHERE agent_id = ? ORDER BY seq")?;
+        let rows = stmt.query_map([id], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (seq, json) = row?;
+            Ok(AgentEvent {
+                seq: Some(seq),
+                kind: serde_json::from_str(&json)?,
+            })
+        })
+        .collect()
+    }
+}
+
+const AGENT_COLUMNS: &str =
+    "id, repo, pr_number, title, branch, worktree, base_sha, status, created_at, cost_usd";
+
+fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
+    Ok(AgentSession {
+        id: r.get(0)?,
+        repo: r.get(1)?,
+        pr: r.get(2)?,
+        title: r.get(3)?,
+        branch: r.get(4)?,
+        worktree: r.get(5)?,
+        base_sha: r.get(6)?,
+        status: parse_status(&r.get::<_, String>(7)?),
+        created_at: r.get(8)?,
+        cost_usd: r.get(9)?,
+    })
+}
+
+fn status_str(s: AgentStatus) -> &'static str {
+    match s {
+        AgentStatus::Idle => "idle",
+        AgentStatus::Running => "running",
+        AgentStatus::AwaitingApproval => "awaiting_approval",
+        AgentStatus::Interrupted => "interrupted",
+        AgentStatus::Failed => "failed",
+    }
+}
+
+fn parse_status(s: &str) -> AgentStatus {
+    match s {
+        "idle" => AgentStatus::Idle,
+        "running" => AgentStatus::Running,
+        "awaiting_approval" => AgentStatus::AwaitingApproval,
+        "interrupted" => AgentStatus::Interrupted,
+        _ => AgentStatus::Failed,
+    }
 }
 
 /// A stack that no longer parses is treated like one that was never
@@ -1146,5 +1337,77 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM inbox_prs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(listed, 0);
+    }
+
+    fn agent(id: &str, status: AgentStatus) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            repo: "o/n".into(),
+            pr: Some(7),
+            title: "t".into(),
+            branch: "b".into(),
+            worktree: "/w".into(),
+            base_sha: "s".into(),
+            status,
+            created_at: 1,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn agents_round_trip() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Running)).unwrap();
+        db.create_agent(&agent("b", AgentStatus::AwaitingApproval))
+            .unwrap();
+        db.create_agent(&agent("c", AgentStatus::Failed)).unwrap();
+        assert_eq!(db.agent("a").unwrap(), Some(agent("a", AgentStatus::Running)));
+        assert_eq!(db.agent("x").unwrap(), None);
+
+        assert!(!db.agent_started("a").unwrap());
+        db.set_agent_started("a").unwrap();
+        assert!(db.agent_started("a").unwrap());
+        db.add_agent_cost("a", 0.25).unwrap();
+        db.add_agent_cost("a", 0.5).unwrap();
+        assert_eq!(db.agent("a").unwrap().unwrap().cost_usd, 0.75);
+
+        db.interrupt_agents().unwrap();
+        let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                AgentStatus::Interrupted,
+                AgentStatus::Interrupted,
+                AgentStatus::Failed
+            ]
+        );
+
+        let text = AgentEventKind::Text("hi".into());
+        assert_eq!(db.append_agent_event("a", &text).unwrap(), 1);
+        assert_eq!(db.append_agent_event("b", &text).unwrap(), 1);
+        assert_eq!(
+            db.append_agent_event("a", &AgentEventKind::Error("e".into()))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.agent_events("a").unwrap(),
+            [
+                AgentEvent {
+                    seq: Some(1),
+                    kind: text.clone()
+                },
+                AgentEvent {
+                    seq: Some(2),
+                    kind: AgentEventKind::Error("e".into())
+                },
+            ]
+        );
+        // Events need their session.
+        assert!(db.append_agent_event("x", &text).is_err());
+
+        assert!(db.delete_agent("a").unwrap());
+        assert!(!db.delete_agent("a").unwrap());
+        assert_eq!(db.agent_events("a").unwrap(), []);
     }
 }

@@ -12,14 +12,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey, PrMissing,
+    AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
+    InboxEdit, InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::assets;
+use crate::agent::{self, Decision};
 use crate::sync::State;
+use crate::{assets, mcp};
 
 type St = AxState<Arc<State>>;
 
@@ -49,6 +51,14 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/blobs", post(blobs))
         .route("/api/sync", get(sync_status))
         .route("/api/events", get(events))
+        .route("/api/repos", get(repos))
+        .route("/api/agents", get(agents).post(create_agent))
+        .route("/api/agents/{id}", get(agent).delete(delete_agent))
+        .route("/api/agents/{id}/messages", post(agent_message))
+        .route("/api/agents/{id}/interrupt", post(interrupt_agent))
+        .route("/api/agents/{id}/approvals", post(approve))
+        .route("/api/agents/{id}/events", get(agent_events))
+        .route("/mcp/{id}/{secret}", post(mcp::handle))
         .fallback(get(assets::serve))
         .with_state(state)
 }
@@ -241,6 +251,123 @@ fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> 
 
 async fn events(AxState(state): St) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     Sse::new(event_stream(&state)).keep_alive(KeepAlive::default())
+}
+
+/// The configured repositories, for the page's repository pickers.
+async fn repos(AxState(state): St) -> Json<Vec<String>> {
+    Json(state.repos.keys().cloned().collect())
+}
+
+async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
+    Ok(Json(state.db.agents()?))
+}
+
+async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResult<Response> {
+    if req.prompt.trim().is_empty() {
+        return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
+    }
+    if !state.repos.contains_key(&req.repo) {
+        return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
+    }
+    Ok(Json(agent::create(&state, req).await?).into_response())
+}
+
+/// The session, if `id` names one.
+fn find_agent(state: &State, id: &str) -> ApiResult<Option<AgentSession>> {
+    if !agent::valid_id(id) {
+        return Ok(None);
+    }
+    Ok(state.db.agent(id)?)
+}
+
+async fn agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    Ok(match find_agent(&state, &id)? {
+        Some(a) => Json(a).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    if find_agent(&state, &id)?.is_none() || !agent::delete(&state, &id).await? {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn agent_message(
+    AxState(state): St,
+    Path(id): Path<String>,
+    Json(msg): Json<AgentMessage>,
+) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    if msg.prompt.trim().is_empty() {
+        return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
+    }
+    agent::send(&state, &id, msg.prompt);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn interrupt_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    agent::interrupt(&state, &id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Answers a permission request; 404 when it isn't waiting anymore.
+async fn approve(
+    AxState(state): St,
+    Path(id): Path<String>,
+    Json(approval): Json<Approval>,
+) -> ApiResult<StatusCode> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    let decision = Decision {
+        allow: approval.allow,
+        message: approval.message,
+    };
+    Ok(if agent::approve(&state, &id, &approval.id, decision)? {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// The session's transcript so far, then its new events as they happen.
+/// The stream ends when the page falls behind; the browser reconnects and
+/// gets the whole transcript again.
+fn agent_event_stream(
+    state: &State,
+    id: &str,
+) -> ApiResult<impl Stream<Item = Result<Event, Infallible>> + use<>> {
+    // Subscribe first so that nothing falls between the stored events and
+    // the live ones; live events that were stored already are skipped.
+    let live = state.agents.subscribe(id);
+    let past = state.db.agent_events(id)?;
+    let last = past.last().and_then(|e| e.seq).unwrap_or(0);
+    let live = BroadcastStream::new(live)
+        .map_while(Result::ok)
+        .filter(move |e: &AgentEvent| e.seq.is_none_or(|s| s > last));
+    let events = tokio_stream::iter(past)
+        .chain(live)
+        .filter_map(|e| Event::default().json_data(e).ok().map(Ok));
+    Ok(futures::StreamExt::take_until(
+        events,
+        state.shutdown.clone().cancelled_owned(),
+    ))
+}
+
+async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Sse::new(agent_event_stream(&state, &id)?)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 #[cfg(test)]

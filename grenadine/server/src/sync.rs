@@ -51,6 +51,8 @@ pub struct State {
     pub on_demand: std::sync::Mutex<BTreeSet<PrKey>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
+    /// The Claude Code sessions started from the UI.
+    pub agents: crate::agent::Agents,
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -528,9 +530,26 @@ pub fn test_state() -> Arc<State> {
 
 #[cfg(test)]
 pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
+    test_state_with_agents(
+        repos,
+        "claude".into(),
+        std::env::temp_dir().join("grenadine-test-worktrees"),
+    )
+}
+
+/// A test state whose agents run `claude` and put worktrees in `worktrees`.
+#[cfg(test)]
+pub fn test_state_with_agents(
+    repos: BTreeMap<String, Arc<ClonedRepo>>,
+    claude: std::path::PathBuf,
+    worktrees: std::path::PathBuf,
+) -> Arc<State> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let db = Db::in_memory();
     Arc::new(State {
-        db: Db::in_memory(),
+        agents: crate::agent::Agents::new(&db, claude, worktrees, "http://127.0.0.1:9".into())
+        .unwrap(),
+        db,
         github: GitHub::new("dummy", "http://127.0.0.1:9").unwrap(),
         repos,
         trunk: fancy_regex::Regex::new(stack::DEFAULT_TRUNK).unwrap(),

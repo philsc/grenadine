@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit, InboxWithPrs, PrDetail, PrKey,
-    PrMissing, SyncStatus,
+    AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
+    InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing, SyncStatus,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -152,4 +152,79 @@ pub async fn load_blobs(repo: &str, ids: impl IntoIterator<Item = String>) -> Re
 /// A blob that `load_blobs` fetched.
 pub fn blob(id: &str) -> Option<Arc<Blob>> {
     BLOBS.with_borrow(|m| m.get(id).cloned())
+}
+
+/// The configured repositories.
+pub async fn repos() -> Result<Vec<String>> {
+    check(Request::get("/api/repos").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn agents() -> Result<Vec<AgentSession>> {
+    check(Request::get("/api/agents").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `None` when there is no such session.
+pub async fn agent(id: &str) -> Result<Option<AgentSession>> {
+    let resp = Request::get(&format!("/api/agents/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    check(Ok(resp))
+        .await?
+        .json()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+pub async fn create_agent(req: &NewAgent) -> Result<AgentSession> {
+    let req = Request::post("/api/agents")
+        .json(req)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn send_agent_message(id: &str, prompt: String) -> Result<()> {
+    let req = Request::post(&format!("/api/agents/{id}/messages"))
+        .json(&AgentMessage { prompt })
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn interrupt_agent(id: &str) -> Result<()> {
+    check(
+        Request::post(&format!("/api/agents/{id}/interrupt"))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn approve(id: &str, approval: &Approval) -> Result<()> {
+    let req = Request::post(&format!("/api/agents/{id}/approvals"))
+        .json(approval)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn delete_agent(id: &str) -> Result<()> {
+    check(Request::delete(&format!("/api/agents/{id}")).send().await)
+        .await
+        .map(|_| ())
 }

@@ -2,7 +2,7 @@
 
 Each test class starts the real server against a fake GitHub (see
 fake_github.py) that it loads with PRs first. A stub `gh` hands the server
-the fake's token.
+the fake's token, and a fake `claude` plays the agent.
 """
 
 import json
@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -24,6 +25,56 @@ from grenadine.testing.fake_github import TOKEN, FakeGitHub
 
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
+
+# Stands in for `claude -p`: it writes a short turn as stream-json and,
+# when the prompt asks it to write, asks grenadine for permission through
+# the MCP tool first, like Claude Code does.
+FAKE_CLAUDE = r'''
+import json
+import sys
+import time
+import urllib.request
+
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
+
+
+def emit(message):
+    message.setdefault("parent_tool_use_id", None)
+    print(json.dumps(message), flush=True)
+
+
+def rpc(method, params, id=1):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).encode(),
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)
+
+
+emit({"type": "system", "subtype": "init", "session_id": "s"})
+for word in ["Working ", "on ", "it"]:
+    emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
+    time.sleep(0.05)
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}]}})
+if "write" in prompt:
+    tool_input = {"file_path": "notes.txt", "content": prompt}
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Write", "input": tool_input}]}})
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    answer = rpc("tools/call", {"name": "approve", "arguments": {"tool_name": "Write", "input": tool_input, "tool_use_id": "toolu_1"}})
+    decision = json.loads(answer["result"]["content"][0]["text"])
+    if decision["behavior"] == "allow":
+        with open("notes.txt", "w") as f:
+            f.write(prompt)
+        result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Wrote notes.txt"}
+    else:
+        result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": decision["message"], "is_error": True}
+    emit({"type": "user", "message": {"content": [result]}})
+emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01})
+'''
 
 
 def free_port() -> int:
@@ -58,6 +109,9 @@ class ServerTestCase(unittest.TestCase):
         gh = bin_dir / "gh"
         gh.write_text(f"#!/bin/sh\necho {TOKEN}\n")
         gh.chmod(0o755)
+        claude = bin_dir / "claude"
+        claude.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}")
+        claude.chmod(0o755)
 
         env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
         clone = tmp / "clone"
@@ -424,6 +478,55 @@ class VersionsTest(ServerTestCase):
                 expect(self.file(path).locator(".status")).to_have_text(status)
         expect(self.file("kinds/modified.txt").locator(".stats")).to_have_text("+1 −1")
         expect(self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")).to_have_text("+0 −0")
+
+
+class AgentTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.commit("Seed", {"README": "hello\n"})
+        repo.push("main")
+
+    def test_agent_session(self) -> None:
+        self.page.goto(self.url)
+        self.page.get_by_role("link", name="Agents").click()
+        self.page.get_by_label("Prompt").fill("please write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note"])
+        expect(transcript.locator(".turn-text strong")).to_have_text("please write a note")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Claude wants to use Write notes.txt")
+        approval.get_by_role("button", name="Allow").click()
+        expect(approval).to_contain_text("Allowed Write")
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        tool = transcript.locator(".tool")
+        tool.locator("summary").click()
+        expect(tool.locator(".tool-result")).to_have_text("Wrote notes.txt")
+
+        # The agent worked in the session's worktree, which starts at main.
+        worktree = Path(self.page.locator(".agent-worktree").inner_text())
+        self.assertEqual((worktree / "notes.txt").read_text(), "please write a note")
+        self.assertEqual((worktree / "README").read_text(), "hello\n")
+
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("thanks")
+        follow_up.press("Control+Enter")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(follow_up).to_have_value("")
+
+        # The transcript is stored, so a reload shows it all again.
+        self.page.reload()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
+        expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
+        expect(self.page.locator(".agent-header")).to_contain_text("idle")
+
+        self.page.get_by_role("link", name="Agents").click()
+        expect(self.page.locator(".agent-item")).to_contain_text(["please write a note"])
+
 
 if __name__ == "__main__":
     unittest.main()
