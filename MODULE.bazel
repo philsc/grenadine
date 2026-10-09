@@ -88,3 +88,28 @@ crate.annotation(
     rustc_env = {"CARGO_MANIFEST_PATH": "wasm_split_helpers/Cargo.toml"},
 )
 use_repo(crate, "crates")
+
+# The browser for the Playwright UI tests. Keep it at the chromium-headless-shell
+# browserVersion in playwright-core's browsers.json for the playwright pinned in
+# requirements.in:
+#   https://unpkg.com/playwright-core@<version>/browsers.json
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "chrome_headless_shell",
+    build_file_content = """
+filegroup(
+    name = "files",
+    srcs = glob(["**"]),
+    visibility = ["//visibility:public"],
+)
+
+exports_files(["chrome-headless-shell"])
+""",
+    sha256 = "a9da028861a0cf789ff25c2fed45f5f1aaf969ed9247835b6a7821a4f7af9d1d",
+    strip_prefix = "chrome-headless-shell-linux64",
+    urls = [
+        "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.12/linux64/chrome-headless-shell-linux64.zip",
+        "https://cdn.playwright.dev/builds/cft/153.0.8010.12/linux64/chrome-headless-shell-linux64.zip",
+    ],
+)

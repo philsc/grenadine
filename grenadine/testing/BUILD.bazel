@@ -1,8 +1,25 @@
-load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 
 # Creates the GitHub repo that grenadine's end-to-end tests run against:
 # bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]
 py_binary(
     name = "create_test_repo",
     srcs = ["create_test_repo.py"],
+)
+
+# Loads the UI in a headless browser against a server with no GitHub access.
+py_test(
+    name = "ui_test",
+    size = "small",
+    srcs = ["ui_test.py"],
+    data = [
+        "//grenadine/server",
+        "@chrome_headless_shell//:chrome-headless-shell",
+        "@chrome_headless_shell//:files",
+    ],
+    env = {
+        "CHROME": "$(rootpath @chrome_headless_shell//:chrome-headless-shell)",
+        "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
+    },
+    deps = ["@grenadine_pypi//playwright"],
 )

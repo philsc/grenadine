@@ -20,6 +20,7 @@ rust_binary(
     crate_name = "grenadine",
     # rules_rust makes these absolute, which include_bytes! needs.
     rustc_env = {k: "$(execpath %s)" % v for k, v in WEB_FILES.items()},
+    visibility = ["//grenadine/testing:__pkg__"],
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],
 )
 

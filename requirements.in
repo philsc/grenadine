@@ -1,1 +1,3 @@
 # Direct Python dependencies. Lock with: bazel run //:requirements
+# When bumping playwright, bump @chrome_headless_shell in MODULE.bazel too.
+playwright==1.63.0

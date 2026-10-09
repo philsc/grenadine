@@ -21,6 +21,7 @@ Use plain `bazel` commands. `.bazelrc` already configures what this repo needs. 
 | Build everything | `bazel build //...`                                      |
 | Run all tests    | `bazel test //...`                                       |
 | Run one test     | `bazel test //grenadine/core:core_test`                  |
+| Run the UI tests | `bazel test //grenadine/testing:ui_test`               |
 | Run the server   | `bazel run //grenadine/server -- --repo=PATH[:REMOTE]`   |
 | Validate default inboxes | `bazel run //grenadine/server:validate_inboxes -- --repo=OWNER/NAME [--repo=...]` |
 | Rebuild the test repo | `bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]` |
