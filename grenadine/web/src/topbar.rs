@@ -1,4 +1,4 @@
-//! The top bar: the wordmark on the left, a theme picker and the poller's
+//! The top bar: the wordmark on the left, linking back to the inboxes, a theme picker and the poller's
 //! sync status on the right. Hovering the status shows what is syncing or
 //! what went wrong.
 
@@ -50,7 +50,10 @@ fn pr_line(pr: &SyncingPr) -> String {
 }
 
 #[component]
-pub fn Topbar() -> impl IntoView {
+pub fn Topbar(
+    /// Whether a PR is shown rather than the inboxes.
+    on_pr: Signal<bool>,
+) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let theme = theme::signal();
 
@@ -65,7 +68,10 @@ pub fn Topbar() -> impl IntoView {
 
     view! {
         <header class="topbar">
-            <span class="topbar-brand">"grenadine"</span>
+            <span class="topbar-left">
+                <a class="topbar-brand" href="#/">"grenadine"</a>
+                {move || on_pr.get().then(|| view! { <a class="topbar-back" href="#/">"← Inboxes"</a> })}
+            </span>
             <span class="topbar-right">
                 <select
                     class="theme-picker"

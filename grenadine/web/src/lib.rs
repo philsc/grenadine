@@ -1,12 +1,12 @@
-//! The grenadine web UI: inboxes of PRs on the left, the selected PR with
-//! its version picker and diff on the right.
+//! The grenadine web UI: a landing page with the inboxes of PRs, and a page
+//! for one PR with its version picker and diff.
 
 mod api;
 mod diffview;
 mod highlight;
+mod inboxes;
 mod markdown;
 mod pr;
-mod sidebar;
 mod theme;
 mod topbar;
 
@@ -101,26 +101,50 @@ fn App() -> impl IntoView {
     provide_context(updates);
     listen(updates);
 
+    // The PR in the URL, if any. Without one, the inboxes are shown.
     let selected = RwSignal::new(key_from_hash(&current_hash()));
+    // The PR shown most recently, highlighted when going back to the inboxes.
+    let last = RwSignal::new(selected.get_untracked());
     let handle = window_event_listener_untyped("hashchange", move |_| {
-        selected.set(key_from_hash(&current_hash()));
+        let key = key_from_hash(&current_hash());
+        if key.is_some() {
+            last.set(key.clone());
+        }
+        selected.set(key);
     });
     on_cleanup(move || handle.remove());
+    let on_pr = Signal::derive(move || selected.with(Option::is_some));
+
+    // The inboxes stay mounted while a PR is shown so that going back is
+    // instant. Hiding them loses their scroll position, so remember it.
+    let inboxes_ref = NodeRef::<leptos::html::Main>::new();
+    let scroll = StoredValue::new(0);
+    Effect::new(move |_| {
+        if !on_pr.get()
+            && let Some(main) = inboxes_ref.get_untracked()
+        {
+            main.set_scroll_top(scroll.get_value());
+        }
+    });
 
     view! {
         <div class="page">
-            <topbar::Topbar />
-            <div class="app">
-                <sidebar::Sidebar selected=selected />
-                <main class="main">
-                    {move || match selected.get() {
-                        Some(key) => view! { <pr::PrView key=key /> }.into_any(),
-                        None => view! {
-                            <div class="empty">"Pick a PR from an inbox on the left."</div>
-                        }.into_any(),
-                    }}
-                </main>
-            </div>
+            <topbar::Topbar on_pr=on_pr />
+            <main
+                class="main"
+                class:hidden=on_pr
+                node_ref=inboxes_ref
+                on:scroll=move |_| {
+                    if let Some(main) = inboxes_ref.get_untracked() {
+                        scroll.set_value(main.scroll_top());
+                    }
+                }
+            >
+                <inboxes::Inboxes last=last />
+            </main>
+            {move || selected.get().map(|key| view! {
+                <main class="main"><pr::PrView key=key /></main>
+            })}
         </div>
     }
 }

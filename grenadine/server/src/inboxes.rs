@@ -1,6 +1,6 @@
 //! The inboxes a new database starts with.
 
-/// `(name, filter)` pairs, in sidebar order.
+/// `(name, filter)` pairs, in display order.
 pub const DEFAULT_INBOXES: &[(&str, &str)] = &[
     (
         "Needs your review",

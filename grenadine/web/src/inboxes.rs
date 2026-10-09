@@ -1,5 +1,5 @@
-//! The list of inboxes, each with the PRs its filter matches. Inboxes can be
-//! added, edited, reordered and deleted in place.
+//! The landing page: the list of inboxes, each with the PRs its filter
+//! matches. Inboxes can be added, edited, reordered and deleted in place.
 
 use grenadine_core::api::{Inbox, InboxEdit, InboxWithPrs, PrKey};
 use grenadine_core::stack::{Link, group_inbox};
@@ -9,7 +9,10 @@ use leptos::task::spawn_local;
 use crate::{Updates, api, hash_for};
 
 #[component]
-pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
+pub fn Inboxes(
+    /// The PR viewed most recently, highlighted in its inbox.
+    last: RwSignal<Option<PrKey>>,
+) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let inboxes = LocalResource::new(move || {
         updates.inboxes.track();
@@ -18,7 +21,7 @@ pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
     let adding = RwSignal::new(false);
 
     view! {
-        <nav class="sidebar">
+        <div class="inboxes">
             {move || match inboxes.get() {
                 None => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),
@@ -29,7 +32,7 @@ pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
                         .map(|(i, inbox)| {
                             let prev = i.checked_sub(1).map(|p| all[p].clone());
                             let next = all.get(i + 1).cloned();
-                            view! { <InboxSection inbox=inbox selected=selected prev=prev next=next /> }
+                            view! { <InboxSection inbox=inbox last=last prev=prev next=next /> }
                         })
                         .collect_view()
                         .into_any()
@@ -48,7 +51,7 @@ pub fn Sidebar(selected: RwSignal<Option<PrKey>>) -> impl IntoView {
                     <button class="add-inbox" on:click=move |_| adding.set(true)>"+ Add inbox"</button>
                 }.into_any()
             }}
-        </nav>
+        </div>
     }
 }
 
@@ -82,7 +85,7 @@ async fn swap(a: Inbox, b: Inbox) -> api::Result<()> {
 #[component]
 fn InboxSection(
     inbox: InboxWithPrs,
-    selected: RwSignal<Option<PrKey>>,
+    last: RwSignal<Option<PrKey>>,
     /// The inboxes above and below, to swap places with.
     prev: Option<Inbox>,
     next: Option<Inbox>,
@@ -151,7 +154,7 @@ fn InboxSection(
                         let key = pr.key.clone();
                         let is_selected = {
                             let key = key.clone();
-                            move || selected.with(|s| s.as_ref() == Some(&key))
+                            move || last.with(|s| s.as_ref() == Some(&key))
                         };
                         let link_above = std::mem::replace(&mut above, row.link);
                         let badge = pr

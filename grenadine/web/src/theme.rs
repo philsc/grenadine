@@ -5,7 +5,7 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 
-use crate::sidebar::storage;
+use crate::inboxes::storage;
 
 const KEY: &str = "theme";
 const DARK_QUERY: &str = "(prefers-color-scheme: dark)";

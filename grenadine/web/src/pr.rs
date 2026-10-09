@@ -11,7 +11,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::diffview::DiffView;
-use crate::sidebar::{load_flag, save_flag};
+use crate::inboxes::{load_flag, save_flag};
 use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.

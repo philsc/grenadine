@@ -111,7 +111,6 @@ input[type="text"] {
 /* Layout */
 
 .page { display: flex; flex-direction: column; height: 100vh; }
-.app { display: flex; flex: 1; min-height: 0; }
 
 /* Top bar */
 
@@ -127,7 +126,9 @@ input[type="text"] {
   font-size: 12px;
   color: var(--fg-muted);
 }
+.topbar-left { display: flex; align-items: center; gap: 12px; }
 .topbar-brand { font-weight: 600; color: var(--fg); }
+.topbar-back { color: var(--fg-muted); }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .theme-picker {
   font: inherit;
@@ -160,24 +161,18 @@ input[type="text"] {
 .sync-popover p { margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .sync-popover .muted { font-size: 11px; margin-bottom: 2px; }
 
-.sidebar {
-  width: 340px;
-  flex: none;
-  overflow-y: auto;
-  border-right: 1px solid var(--border);
-  background: var(--bg-subtle);
-  padding-bottom: 24px;
-}
-
 .main { flex: 1; overflow-y: auto; min-width: 0; }
 
 .empty { padding: 48px; text-align: center; color: var(--fg-muted); }
 
-/* Sidebar */
+/* Inboxes */
 
-.inbox { border-bottom: 1px solid var(--border); }
+.inboxes { max-width: 960px; margin: 0 auto; padding: 16px 24px 48px; }
 
-.inbox-header { display: flex; align-items: center; padding-right: 8px; }
+.inbox { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 16px; overflow: hidden; }
+
+.inbox-header { display: flex; align-items: center; padding-right: 8px; background: var(--bg-subtle); }
+.inbox:has(.pr-list:not(.hidden)) .inbox-header { border-bottom: 1px solid var(--border); }
 .inbox-header:hover .inbox-actions { visibility: visible; }
 .inbox-actions { visibility: hidden; white-space: nowrap; }
 
@@ -227,7 +222,7 @@ input[type="text"] {
 .inbox-form .hint { margin: 0; font-size: 12px; }
 .form-buttons { display: flex; gap: 6px; }
 .form-buttons .danger { margin-left: auto; }
-.add-inbox { margin: 12px 16px; }
+.add-inbox { margin: 0; }
 
 /* PR */
 
@@ -424,9 +419,7 @@ input[type="text"] {
 .outside-comments p { margin: 0 0 4px; }
 
 @media (max-width: 800px) {
-  .app { flex-direction: column; height: auto; }
-  .sidebar { width: auto; border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
-  .main { overflow: visible; }
+  .inboxes { padding: 12px 16px 48px; }
   .pr { padding: 12px 16px 48px; }
   .file-index { columns: 1; }
 }

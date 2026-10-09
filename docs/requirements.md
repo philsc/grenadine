@@ -143,8 +143,9 @@ aren't in this inbox.
 one level above it, so the order is D, C2, B.
 
 **STACK-INBOX-4.** Each pair of neighbors in a group must be joined by a
-vertical line left of the titles. The sidebar doesn't draw lanes.
-*Why:* the sidebar is narrow. The badge tells siblings apart.
+vertical line left of the titles. The inbox list doesn't draw lanes.
+*Why:* lanes would clutter a list of many PRs. The badge tells siblings
+apart.
 
 **STACK-INBOX-5.** The line between two neighbors must be solid when the
 lower one is the upper one's parent, or when both have the same parent.
