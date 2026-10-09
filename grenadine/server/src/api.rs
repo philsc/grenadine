@@ -65,9 +65,9 @@ async fn inboxes(AxState(state): St) -> ApiResult<Json<Vec<InboxWithPrs>>> {
     Ok(Json(out))
 }
 
-fn check_edit(edit: &InboxEdit) -> Result<(), Response> {
+fn check_edit(edit: &InboxEdit) -> Result<(), (StatusCode, &'static str)> {
     if edit.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "the inbox needs a name").into_response());
+        return Err((StatusCode::BAD_REQUEST, "the inbox needs a name"));
     }
     Ok(())
 }
@@ -80,7 +80,7 @@ fn inboxes_changed(state: &State) {
 
 async fn create_inbox(AxState(state): St, Json(edit): Json<InboxEdit>) -> ApiResult<Response> {
     if let Err(r) = check_edit(&edit) {
-        return Ok(r);
+        return Ok(r.into_response());
     }
     let id = state.db.create_inbox(&edit)?;
     inboxes_changed(&state);
@@ -93,7 +93,7 @@ async fn update_inbox(
     Json(edit): Json<InboxEdit>,
 ) -> ApiResult<Response> {
     if let Err(r) = check_edit(&edit) {
-        return Ok(r);
+        return Ok(r.into_response());
     }
     if !state.db.update_inbox(id, &edit)? {
         return Ok(StatusCode::NOT_FOUND.into_response());

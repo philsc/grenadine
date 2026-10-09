@@ -19,13 +19,16 @@ const CONTEXT: usize = 3;
 /// Files with more changed lines than this start collapsed.
 const BIG_FILE: usize = 3000;
 
+/// The old and new blob of one side of a file change.
+type BlobPair = (Option<Arc<Blob>>, Option<Arc<Blob>>);
+
 struct FileData {
     change: FileChange,
     old: Option<Arc<Blob>>,
     new: Option<Arc<Blob>>,
     /// The same file's upstream change between the two bases, when the
     /// diff spans a rebase and upstream touched the file.
-    upstream: Option<(Option<Arc<Blob>>, Option<Arc<Blob>>)>,
+    upstream: Option<BlobPair>,
 }
 
 fn blob(id: &Option<String>) -> Option<Arc<Blob>> {

@@ -164,9 +164,11 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
     let initial_activity = history
         .activities
         .iter()
-        .filter(|a| a.timestamp <= history.created_at && a.kind != ActivityKind::BranchDeletion)
-        .filter(|a| !is_zero(&a.after))
-        .next_back();
+        .rfind(|a| {
+            a.timestamp <= history.created_at
+                && a.kind != ActivityKind::BranchDeletion
+                && !is_zero(&a.after)
+        });
 
     let approximate = match initial_activity {
         Some(initial) => {

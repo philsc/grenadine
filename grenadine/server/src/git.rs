@@ -554,7 +554,7 @@ pub(crate) mod tests {
             .unwrap();
         let refs = f.clone.refs(REF_PREFIX).unwrap();
         assert_eq!(refs.get(&v1_ref), Some(&v1));
-        f.clone.update_refs(&[], &[v1_ref.clone()]).unwrap();
+        f.clone.update_refs(&[], std::slice::from_ref(&v1_ref)).unwrap();
         assert!(!f.clone.refs(REF_PREFIX).unwrap().contains_key(&v1_ref));
     }
 
