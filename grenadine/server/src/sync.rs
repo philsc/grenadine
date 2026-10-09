@@ -531,7 +531,7 @@ pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(State {
         db: Db::in_memory(),
-        github: GitHub::with_api("dummy", "http://127.0.0.1:9").unwrap(),
+        github: GitHub::new("dummy", "http://127.0.0.1:9").unwrap(),
         repos,
         trunk: fancy_regex::Regex::new(stack::DEFAULT_TRUNK).unwrap(),
         events: broadcast::channel(1).0,

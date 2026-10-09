@@ -1,12 +1,13 @@
 """Browser tests for grenadine's web UI.
 
-Each run starts the real server against an empty local clone. The clone's
-remote names a GitHub repository, but the sandbox has no network, so syncing
-fails and the UI shows no PRs. A stub `gh` hands the server a dummy token so
-that it starts at all.
+Each test class starts the real server against a fake GitHub (see
+fake_github.py) that it loads with PRs first. A stub `gh` hands the server
+the fake's token.
 """
 
+import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -16,7 +17,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import expect, sync_playwright
+from playwright.sync_api import Locator, expect, sync_playwright
+
+from grenadine.testing import scenarios
+from grenadine.testing.fake_github import TOKEN, FakeGitHub
 
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
@@ -28,33 +32,51 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-class UiTest(unittest.TestCase):
+def exactly(text: str) -> re.Pattern[str]:
+    return re.compile(f"^{re.escape(text)}$")
+
+
+class ServerTestCase(unittest.TestCase):
+    """Runs the server and a browser for the class's tests."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        """Adds the PRs the tests expect; there are none by default."""
+        gh.repo(scenarios.REPO)
+
     @classmethod
     def setUpClass(cls) -> None:
         tmp = Path(tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR")))
 
+        cls.gh = FakeGitHub(tmp / "github")
+        cls.load(cls.gh)
+        api = cls.gh.start()
+        cls.addClassCleanup(cls.gh.stop)
+
         bin_dir = tmp / "bin"
         bin_dir.mkdir()
         gh = bin_dir / "gh"
-        gh.write_text("#!/bin/sh\necho dummy-token\n")
+        gh.write_text(f"#!/bin/sh\necho {TOKEN}\n")
         gh.chmod(0o755)
 
+        env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
         clone = tmp / "clone"
-        subprocess.run(["git", "init", "--quiet", clone], check=True)
+        subprocess.run(["git", "init", "--quiet", clone], env=env, check=True)
         subprocess.run(
-            ["git", "-C", clone, "remote", "add", "origin", "https://github.com/test/test"],
+            ["git", "-C", clone, "remote", "add", "origin", f"https://github.com/{scenarios.REPO}"],
+            env=env,
             check=True,
         )
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
-        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
         cls.server = subprocess.Popen(
             [
                 os.environ["GRENADINE_SERVER"],
                 f"--repo={clone}",
                 f"--port={port}",
                 f"--db={tmp / 'grenadine.db'}",
+                f"--github-api={api}",
             ],
             env=env,
         )
@@ -86,9 +108,12 @@ class UiTest(unittest.TestCase):
                 time.sleep(0.1)
 
     def setUp(self) -> None:
+        # Each page gets its own context, so local storage starts empty.
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
 
+
+class ChromeTest(ServerTestCase):
     def test_shows_wordmark_top_left(self) -> None:
         self.page.goto(self.url)
         brand = self.page.locator(".topbar-brand")
@@ -132,6 +157,148 @@ class UiTest(unittest.TestCase):
         self.page.reload()
         expect(self.page.get_by_label("Theme")).to_have_value("dark")
         expect(self.page.locator("html")).to_have_attribute("data-theme", "dark")
+
+    def test_inboxes_start_empty(self) -> None:
+        self.page.goto(self.url)
+        inboxes = self.page.locator("section.inbox")
+        expect(inboxes).to_have_count(len(scenarios.default_inboxes()))
+        expect(inboxes.locator(".none")).to_have_count(len(scenarios.default_inboxes()))
+        expect(inboxes.locator(".count")).to_have_text(["0"] * len(scenarios.default_inboxes()))
+
+
+class InboxTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.cases = scenarios.inbox_cases(gh)
+
+    def inbox(self, name: str) -> Locator:
+        return self.page.locator("section.inbox").filter(
+            has=self.page.locator(".inbox-name", has_text=exactly(name)))
+
+    def row(self, title: str) -> Locator:
+        return self.page.locator(".pr-list li").filter(
+            has=self.page.locator(".pr-title", has_text=re.compile(f"{re.escape(title)}$")))
+
+    def expect_titles(self, inbox: Locator, titles: list[str]) -> None:
+        """Checks that `inbox` lists exactly `titles`, in any order, each
+        synced without errors."""
+        expect(inbox.locator(".count")).to_have_text(str(len(titles)))
+        rows = inbox.locator(".pr-list li")
+        expect(rows).to_have_count(len(titles))
+        for title in titles:
+            row = rows.filter(has=self.page.locator(".pr-title", has_text=re.compile(f"{re.escape(title)}$")))
+            expect(row).to_have_count(1)
+            expect(row.locator(".pr-meta")).to_have_text(re.compile(r"· 1 versions$"))
+
+    def test_prs_land_in_their_inboxes(self) -> None:
+        self.page.goto(self.url)
+        for name, _ in scenarios.default_inboxes():
+            with self.subTest(inbox=name):
+                self.expect_titles(self.inbox(name), self.cases.titles_in(name))
+
+    def test_prs_in_no_inbox_are_not_shown(self) -> None:
+        self.page.goto(self.url)
+        # Wait for the first poll.
+        expect(self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")).not_to_have_count(0)
+        for title, inbox in self.cases.expected.items():
+            if inbox is None:
+                expect(self.row(title)).to_have_count(0)
+
+    def test_badges(self) -> None:
+        self.page.goto(self.url)
+        expect(self.inbox(scenarios.DRAFTS).locator(".pr-title .badge")).to_have_text("draft")
+        expect(self.inbox(scenarios.WAITING_FOR_REVIEWERS).locator(".pr-title .badge")).to_have_count(2)
+        expect(self.row(scenarios.STACK_BASE).locator(".badge")).to_have_text("1/2")
+        expect(self.row(scenarios.STACK_TOP).locator(".badge")).to_have_text("2/2")
+        expect(self.row("Wait for reviewers").locator(".badge")).to_have_count(0)
+
+    def test_collapsing_an_inbox_survives_reload(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.inbox(scenarios.APPROVED_INBOX)
+        expect(inbox.locator(".pr-list")).to_be_visible()
+
+        inbox.locator(".inbox-toggle").click()
+        expect(inbox.locator(".pr-list")).to_be_hidden()
+        self.page.reload()
+        expect(inbox.locator(".pr-list")).to_be_hidden()
+        expect(inbox.locator(".count")).to_have_text("1")
+
+        inbox.locator(".inbox-toggle").click()
+        expect(inbox.locator(".pr-list")).to_be_visible()
+
+    def add_inbox(self, name: str, filter: str) -> Locator:
+        self.addCleanup(self.delete_inbox, name)
+        self.page.get_by_role("button", name="+ Add inbox").click()
+        form = self.page.locator("form.inbox-form")
+        form.get_by_label("Name").fill(name)
+        form.get_by_label("GitHub filter").fill(filter)
+        form.get_by_role("button", name="Save").click()
+        return self.inbox(name)
+
+    def delete_inbox(self, name: str) -> None:
+        """Deletes an inbox a test added, so that it doesn't show up in the
+        other tests."""
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            ids = [i["inbox"]["id"] for i in json.load(resp) if i["inbox"]["name"] == name]
+        for id in ids:
+            req = urllib.request.Request(f"{self.url}api/inboxes/{id}", method="DELETE")
+            urllib.request.urlopen(req).close()
+
+    def test_custom_inbox(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.add_inbox("By the other account", "state:open author:other sort:created-asc")
+        others = [
+            title for title, pr in self.cases.prs.items()
+            if pr.author == scenarios.OTHER and pr.state == "OPEN"
+        ]
+        self.expect_titles(inbox, others)
+        # sort:created-asc reaches GitHub and orders the PRs.
+        expect(inbox.locator(".pr-title")).to_have_text(
+            [re.compile(f"{re.escape(t)}$") for t in others])
+
+        empty = self.add_inbox("Nobody's", "author:nobody")
+        expect(empty.locator(".none")).to_have_text("No PRs")
+        expect(empty.locator(".count")).to_have_text("0")
+
+    def test_pr_page(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.goto(self.url)
+        self.row(pr.title).locator("a").click()
+        expect(self.page).to_have_url(re.compile(f"#/{scenarios.REPO}/{pr.number}$"))
+
+        header = self.page.locator(".pr-header")
+        expect(header.locator("h1")).to_have_text(f"{pr.title} #{pr.number}")
+        expect(header.locator(".pr-number")).to_have_attribute("href", pr.url)
+        expect(header.locator(".state")).to_have_text("open")
+        expect(header.locator(".badge")).to_have_count(0)
+
+        description = self.page.locator("section.description")
+        expect(description.locator("h2")).to_have_text("Why")
+        expect(description.locator("li")).to_have_count(2)
+        expect(description.locator("li code")).to_have_text("inline code")
+        expect(description.locator("pre")).to_contain_text("fn main() {}")
+
+    def test_pr_page_of_a_draft(self) -> None:
+        pr = self.cases.prs["Stay a draft"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        header = self.page.locator(".pr-header")
+        expect(header.locator("h1")).to_have_text(f"{pr.title} #{pr.number}")
+        expect(header.locator(".badge")).to_have_text("draft")
+
+    def test_pr_page_shows_the_stack(self) -> None:
+        base = self.cases.prs[scenarios.STACK_BASE]
+        top = self.cases.prs[scenarios.STACK_TOP]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{top.number}")
+
+        rows = self.page.locator("section.stack .stack-label")
+        expect(rows).to_have_text([
+            f"#{top.number} {top.title} open",
+            f"#{base.number} {base.title} open",
+            "main",
+        ])
+        # The PR itself is bold; the others link to GitHub.
+        expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
+        expect(rows.locator("a")).to_have_attribute("href", base.url)
 
 
 if __name__ == "__main__":

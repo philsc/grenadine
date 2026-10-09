@@ -56,6 +56,10 @@ struct Args {
     /// lookaround, e.g. `^(?!dev/)` for everything but `dev/` branches.
     #[arg(long, default_value = stack::DEFAULT_TRUNK, value_parser = fancy_regex::Regex::new)]
     trunk: fancy_regex::Regex,
+
+    /// The GitHub API to talk to; tests point it at a fake.
+    #[arg(long, hide = true, default_value = github::API)]
+    github_api: String,
 }
 
 fn default_db() -> Result<PathBuf> {
@@ -135,7 +139,7 @@ async fn main() -> Result<()> {
     };
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
-    let github = github::GitHub::new(&token)?;
+    let github = github::GitHub::new(&token, &args.github_api)?;
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

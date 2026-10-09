@@ -130,7 +130,7 @@ async fn main() -> Result<ExitCode> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
     let token = github::gh_token()?;
-    let gh = github::GitHub::new(&token)?;
+    let gh = github::GitHub::new(&token, github::API)?;
 
     let mut queries: Vec<(String, String)> = Vec::new();
     for (label, filter) in [

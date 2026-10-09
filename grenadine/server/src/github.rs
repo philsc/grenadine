@@ -12,7 +12,7 @@ use reqwest::header;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-const API: &str = "https://api.github.com";
+pub const API: &str = "https://api.github.com";
 
 /// Reads the token of the `gh` CLI's login.
 pub fn gh_token() -> Result<String> {
@@ -244,18 +244,9 @@ fn next_link(headers: &header::HeaderMap) -> Option<String> {
 }
 
 impl GitHub {
-    pub fn new(token: &str) -> Result<GitHub> {
-        Self::build(token, API)
-    }
-
-    /// A client for a different API base; tests point it at a dead port so
-    /// requests fail fast instead of reaching api.github.com.
-    #[cfg(test)]
-    pub fn with_api(token: &str, api: &str) -> Result<GitHub> {
-        Self::build(token, api)
-    }
-
-    fn build(token: &str, api: &str) -> Result<GitHub> {
+    /// A client for the API at `api`, normally `API`. Tests point it at a
+    /// fake GitHub, or at a dead port so requests fail fast.
+    pub fn new(token: &str, api: &str) -> Result<GitHub> {
         let mut headers = header::HeaderMap::new();
         let mut auth = header::HeaderValue::from_str(&format!("Bearer {token}"))?;
         auth.set_sensitive(true);

@@ -1,4 +1,4 @@
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 # Creates the GitHub repo that grenadine's end-to-end tests run against:
 # bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]
@@ -7,10 +7,33 @@ py_binary(
     srcs = ["create_test_repo.py"],
 )
 
-# Loads the UI in a headless browser against a server with no GitHub access.
+# A fake GitHub API and git host for running the server in tests, and the
+# PRs the tests load it with.
+py_library(
+    name = "fake_github",
+    srcs = [
+        "fake_github.py",
+        "scenarios.py",
+    ],
+    data = [
+        "github_schema.graphql",
+        "//grenadine/server:src/inboxes.rs",
+    ],
+    deps = ["@grenadine_pypi//graphql_core"],
+)
+
+py_test(
+    name = "fake_github_test",
+    size = "small",
+    srcs = ["fake_github_test.py"],
+    deps = [":fake_github"],
+)
+
+# Loads the UI in a headless browser against a server backed by the fake
+# GitHub.
 py_test(
     name = "ui_test",
-    size = "small",
+    size = "medium",
     srcs = ["ui_test.py"],
     data = [
         "//grenadine/server",
@@ -21,5 +44,8 @@ py_test(
         "CHROME": "$(rootpath @chrome_headless_shell//:chrome-headless-shell)",
         "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
     },
-    deps = ["@grenadine_pypi//playwright"],
+    deps = [
+        ":fake_github",
+        "@grenadine_pypi//playwright",
+    ],
 )

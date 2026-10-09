@@ -1,7 +1,11 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
-exports_files(["Cargo.toml"])
+exports_files([
+    "Cargo.toml",
+    # Read by the tests in //grenadine/testing for the default inboxes.
+    "src/inboxes.rs",
+])
 
 WEB_FILES = {
     "GRENADINE_INDEX_HTML": "//grenadine/web:static/index.html",

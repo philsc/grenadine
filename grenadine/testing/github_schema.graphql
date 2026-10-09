@@ -1,0 +1,171 @@
+# The slice of GitHub's GraphQL schema that grenadine's server queries. Field
+# and type names follow https://docs.github.com/en/graphql so that a query that
+# works here works on GitHub. Fields are nullable where GitHub's are not when
+# that keeps one failing alias from nulling out the whole response.
+
+scalar DateTime
+scalar URI
+scalar GitObjectID
+
+type Query {
+  search(type: SearchType!, query: String!, first: Int, after: String): SearchResultItemConnection
+  repository(owner: String!, name: String!): Repository
+  user(login: String!): User
+}
+
+enum SearchType {
+  ISSUE
+  ISSUE_ADVANCED
+  REPOSITORY
+  USER
+}
+
+type SearchResultItemConnection {
+  issueCount: Int!
+  nodes: [SearchResultItem]
+}
+
+union SearchResultItem = Issue | PullRequest
+
+type Issue {
+  number: Int!
+  title: String!
+}
+
+type Repository {
+  nameWithOwner: String!
+  pullRequest(number: Int!): PullRequest
+  pullRequests(
+    headRefName: String
+    baseRefName: String
+    states: [PullRequestState!]
+    first: Int
+    after: String
+  ): PullRequestConnection!
+  object(oid: GitObjectID, expression: String): GitObject
+}
+
+enum PullRequestState {
+  OPEN
+  CLOSED
+  MERGED
+}
+
+type PullRequestConnection {
+  nodes: [PullRequest]
+}
+
+type PullRequest {
+  number: Int!
+  title: String!
+  body: String!
+  url: URI!
+  state: PullRequestState!
+  isDraft: Boolean!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+  mergedAt: DateTime
+  author: Actor
+  repository: Repository!
+  baseRefName: String!
+  headRefName: String!
+  headRefOid: GitObjectID!
+  headRepository: Repository
+  isCrossRepository: Boolean!
+  timelineItems(
+    first: Int
+    after: String
+    itemTypes: [PullRequestTimelineItemsItemType!]
+  ): PullRequestTimelineItemsConnection!
+  commits(first: Int, after: String): PullRequestCommitConnection!
+  reviewThreads(first: Int, after: String): PullRequestReviewThreadConnection!
+}
+
+enum PullRequestTimelineItemsItemType {
+  HEAD_REF_FORCE_PUSHED_EVENT
+  PULL_REQUEST_COMMIT
+}
+
+type PullRequestTimelineItemsConnection {
+  nodes: [PullRequestTimelineItems]
+}
+
+union PullRequestTimelineItems = HeadRefForcePushedEvent | PullRequestCommit
+
+type HeadRefForcePushedEvent {
+  createdAt: DateTime!
+  actor: Actor
+  beforeCommit: Commit
+  afterCommit: Commit
+}
+
+type PullRequestCommitConnection {
+  nodes: [PullRequestCommit]
+}
+
+type PullRequestCommit {
+  commit: Commit!
+}
+
+interface GitObject {
+  oid: GitObjectID!
+}
+
+type Commit implements GitObject {
+  oid: GitObjectID!
+  author: GitActor
+  checkSuites(first: Int, after: String): CheckSuiteConnection
+}
+
+type GitActor {
+  name: String
+  email: String
+  user: User
+}
+
+type CheckSuiteConnection {
+  nodes: [CheckSuite]
+}
+
+type CheckSuite {
+  createdAt: DateTime!
+}
+
+interface Actor {
+  login: String!
+  avatarUrl: URI
+}
+
+type User implements Actor {
+  login: String!
+  avatarUrl: URI
+  name: String
+}
+
+type Bot implements Actor {
+  login: String!
+  avatarUrl: URI
+}
+
+type PullRequestReviewThreadConnection {
+  pageInfo: PageInfo!
+  nodes: [PullRequestReviewThread]
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type PullRequestReviewThread {
+  isResolved: Boolean!
+  comments(first: Int, after: String): PullRequestReviewCommentConnection!
+}
+
+type PullRequestReviewCommentConnection {
+  nodes: [PullRequestReviewComment]
+}
+
+type PullRequestReviewComment {
+  databaseId: Int
+}
