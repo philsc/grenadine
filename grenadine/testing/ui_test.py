@@ -301,5 +301,129 @@ class InboxTest(ServerTestCase):
         expect(rows.locator("a")).to_have_attribute("href", base.url)
 
 
+class VersionsTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.cases = scenarios.versions_cases(gh)
+
+    def open(self, title: str) -> None:
+        pr = self.cases.prs[title]
+        self.shas = self.cases.shas[title]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(f"{pr.title} #{pr.number}")
+
+    def choose(self, base: int, head: int) -> None:
+        """Picks versions to diff; 0 is the base."""
+        picker = self.page.locator("details.picker")
+        picker.locator("summary").click()
+        rows = picker.locator("tbody tr")
+        # Head first: a base at or past the head would move the head.
+        rows.nth(head).locator("input[name=head]").check()
+        rows.nth(base).locator("input[name=base]").check()
+        self.page.keyboard.press("Escape")
+        name = "Base" if base == 0 else f"v{base} ({self.shas[base - 1][:8]})"
+        expect(picker.locator("summary")).to_have_text(f"{name} → v{head} ({self.shas[head - 1][:8]})")
+
+    def file(self, path: str) -> Locator:
+        return self.page.locator("section.file").filter(
+            has=self.page.locator(".file-header .path", has_text=exactly(path)))
+
+    def test_versions_follow_the_pushes(self) -> None:
+        self.open(scenarios.GROW)
+        shas = self.cases.shas[scenarios.GROW]
+        picker = self.page.locator("details.picker")
+        expect(picker.locator("summary")).to_have_text(f"Base → v6 ({shas[-1][:8]})")
+
+        picker.locator("summary").click()
+        rows = picker.locator("tbody tr")
+        expect(rows).to_have_count(len(shas) + 1)
+        expect(rows.locator(".version code")).to_have_text([s[:8] for s in shas])
+        expect(rows.locator(".vkind")).to_have_text(
+            ["opened", "push", "push", "push", "push", "force push"])
+        expect(rows.locator(".pushed-by")).to_have_text([""] + ["Me Myself"] * len(shas))
+        # Base can't be the latest version, and Head can't be the base.
+        expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
+        expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
+
+    def test_diff_against_the_base(self) -> None:
+        self.open(scenarios.GROW)
+        expect(self.page.locator(".diff-summary")).to_have_text("1 files changed")
+        file = self.file(scenarios.STEPS_PY)
+        expect(file.locator(".status")).to_have_text("added")
+        added = scenarios.steps(6, doubled=6).count("\n")
+        expect(file.locator(".stats")).to_have_text(f"+{added} −0")
+
+    def test_diff_between_versions(self) -> None:
+        self.open(scenarios.GROW)
+        self.choose(5, 6)
+        file = self.file(scenarios.STEPS_PY)
+        expect(file.locator(".status")).to_have_text("modified")
+        expect(file.locator(".stats")).to_have_text("+1 −1")
+        expect(file.locator("table.diff.split td.code.del")).to_have_text("    return 6")
+        expect(file.locator("table.diff.split td.code.add")).to_have_text("    return 6 * 2")
+
+        # The unified view shows the same change.
+        self.page.get_by_label("Side by side").uncheck()
+        expect(file.locator("table.diff.unified tr.line.del .code")).to_have_text("    return 6")
+        expect(file.locator("table.diff.unified tr.line.add .code")).to_have_text("    return 6 * 2")
+
+        # Three pushed commits became three versions, so v2 → v5 adds three
+        # steps.
+        self.choose(2, 5)
+        expect(file.locator(".stats")).to_have_text("+12 −0")
+
+    def test_rebase_only_changes_are_hidden(self) -> None:
+        self.open(scenarios.REBASE)
+        self.choose(1, 2)
+        expect(self.page.locator(".diff-summary")).to_contain_text(
+            "1 files changed · 2 files changed only by the rebase are hidden")
+        expect(self.page.locator(".diff-summary .legend")).to_be_visible()
+        expect(self.page.locator(".file-index li")).to_have_text(["rebase/shared.py"])
+
+        # The one file left has only rebase changes, so it starts collapsed.
+        file = self.file("rebase/shared.py")
+        expect(file.locator(".upstream-badge")).to_have_text("only rebase changes")
+        expect(file.locator("table.diff")).to_have_count(0)
+        file.locator(".file-header").click()
+        rows = file.locator("tr.line.upstream")
+        expect(rows).not_to_have_count(0)
+        expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_count(0)
+        expect(rows.locator("td.code.add")).to_contain_text(["changed upstream"])
+
+    def test_rebase_with_an_edit_shows_the_edit(self) -> None:
+        self.open(scenarios.REBASE_AND_EDIT)
+        self.choose(1, 2)
+        expect(self.page.locator(".diff-summary")).to_contain_text(
+            "1 files changed · 2 files changed only by the rebase are hidden")
+        file = self.file("rebase_and_edit/shared.py")
+        expect(file.locator(".upstream-badge")).to_have_count(0)
+        # The PR's own edit is a plain change; the upstream one is marked.
+        expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_text(
+            [scenarios.EDITED_SETTING])
+        expect(file.locator("tr.line.upstream td.code.add")).to_contain_text(["changed upstream"])
+
+    def test_rebased_version_against_the_base(self) -> None:
+        # Against its own merge-base, the rebased version shows only the
+        # PR's changes.
+        self.open(scenarios.REBASE)
+        expect(self.page.locator(".diff-summary")).to_have_text("1 files changed")
+        file = self.file("rebase/shared.py")
+        expect(file.locator(".stats")).to_have_text("+3 −3")
+        expect(file.locator("tr.line.upstream")).to_have_count(0)
+
+    def test_file_kinds(self) -> None:
+        self.open(scenarios.FILE_KINDS)
+        expect(self.page.locator(".diff-summary")).to_have_text("4 files changed")
+        for path, status in [
+            ("kinds/added.txt", "added"),
+            ("kinds/deleted.txt", "deleted"),
+            ("kinds/modified.txt", "modified"),
+            ("kinds/old_name.txt → kinds/new_name.txt", "renamed"),
+        ]:
+            with self.subTest(path=path):
+                expect(self.file(path).locator(".status")).to_have_text(status)
+        expect(self.file("kinds/modified.txt").locator(".stats")).to_have_text("+1 −1")
+        expect(self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")).to_have_text("+0 −0")
+
 if __name__ == "__main__":
     unittest.main()

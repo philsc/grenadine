@@ -187,20 +187,28 @@ class FakeRepo:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content)
             self.git("add", path)
-        when = f"@{self.gh.tick()} +0000"
-        env = {
-            "GIT_AUTHOR_NAME": self.gh.users.get(author, author),
-            "GIT_AUTHOR_EMAIL": f"{author}@users.noreply.github.com",
-            "GIT_AUTHOR_DATE": when,
-            "GIT_COMMITTER_NAME": self.gh.users.get(author, author),
-            "GIT_COMMITTER_EMAIL": f"{author}@users.noreply.github.com",
-            "GIT_COMMITTER_DATE": when,
-        }
         args = ["commit", "--quiet", "--allow-empty", "-m", message]
         if amend:
             args.append("--amend")
-        self.git(*args, env=env)
+        self.git(*args, env=self._identity(author, author=True))
         return self.git("rev-parse", "HEAD").strip()
+
+    def rebase(self, onto: str, *, by: str = VIEWER) -> str:
+        """Rebases the current branch onto `onto`, committed by `by`."""
+        self.git("rebase", "--quiet", onto, env=self._identity(by, author=False))
+        return self.git("rev-parse", "HEAD").strip()
+
+    def _identity(self, login: str, *, author: bool) -> dict[str, str]:
+        """The environment that makes `login` the committer, and the author
+        too if `author`, at the next tick."""
+        when = f"@{self.gh.tick()} +0000"
+        roles = ["COMMITTER", "AUTHOR"] if author else ["COMMITTER"]
+        env = {}
+        for role in roles:
+            env[f"GIT_{role}_NAME"] = self.gh.users.get(login, login)
+            env[f"GIT_{role}_EMAIL"] = f"{login}@users.noreply.github.com"
+            env[f"GIT_{role}_DATE"] = when
+        return env
 
     def push(self, branch: str, *, actor: str = VIEWER) -> str:
         """Pushes the work tree's `branch`, force-pushing if needed, and
