@@ -100,6 +100,39 @@ class UiTest(unittest.TestCase):
         self.assertLess(box["x"], viewport["width"] / 4)
         self.assertLess(box["y"], 100)
 
+    def test_theme_picker_switches_themes(self) -> None:
+        # Auto follows the OS, so pin the OS to light to tell Auto from Dark.
+        self.page.emulate_media(color_scheme="light")
+        self.page.goto(self.url)
+        html = self.page.locator("html")
+        body = self.page.locator("body")
+        picker = self.page.get_by_label("Theme")
+        expect(picker).to_have_value("auto")
+        expect(html).to_have_attribute("data-theme", "light")
+
+        picker.select_option("dark")
+        expect(html).to_have_attribute("data-theme", "dark")
+        expect(body).to_have_css("background-color", "rgb(13, 17, 23)")
+
+        picker.select_option("light")
+        expect(html).to_have_attribute("data-theme", "light")
+        expect(body).to_have_css("background-color", "rgb(255, 255, 255)")
+
+        # Auto tracks the OS's scheme as it changes.
+        picker.select_option("auto")
+        expect(html).to_have_attribute("data-theme", "light")
+        self.page.emulate_media(color_scheme="dark")
+        expect(html).to_have_attribute("data-theme", "dark")
+
+    def test_theme_survives_reload(self) -> None:
+        self.page.emulate_media(color_scheme="light")
+        self.page.goto(self.url)
+        self.page.get_by_label("Theme").select_option("dark")
+
+        self.page.reload()
+        expect(self.page.get_by_label("Theme")).to_have_value("dark")
+        expect(self.page.locator("html")).to_have_attribute("data-theme", "dark")
+
 
 if __name__ == "__main__":
     unittest.main()
