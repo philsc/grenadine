@@ -23,6 +23,7 @@ Use plain `bazel` commands. `.bazelrc` already configures what this repo needs. 
 | Run one test     | `bazel test //grenadine/core:core_test`                  |
 | Run the server   | `bazel run //grenadine/server -- --repo=PATH[:REMOTE]`   |
 | Validate default inboxes | `bazel run //grenadine/server:validate_inboxes -- --repo=OWNER/NAME [--repo=...]` |
+| Rebuild the test repo | `bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]` |
 | Lint             | `bazel build --config=clippy //...`                      |
 | Check formatting | `bazel build --config=rustfmt //...`                     |
 

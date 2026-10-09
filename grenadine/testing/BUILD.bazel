@@ -1,0 +1,8 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+# Creates the GitHub repo that grenadine's end-to-end tests run against:
+# bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]
+py_binary(
+    name = "create_test_repo",
+    srcs = ["create_test_repo.py"],
+)
