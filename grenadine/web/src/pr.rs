@@ -175,7 +175,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
-    let pr_links = RwSignal::new(load_flag("pr-links-in-app", false));
+    let pr_links = RwSignal::new(load_flag("pr-links-in-app", true));
     let github = format!(
         "https://github.com/{}/pull/{}",
         key.repo, key.number
