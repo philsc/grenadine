@@ -164,8 +164,10 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
         }
     });
 
-    let submit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
+    let start = move || {
+        if busy.get_untracked() || prompt.with_untracked(|p| p.trim().is_empty()) {
+            return;
+        }
         let pr = match number.get_untracked().trim() {
             "" => None,
             n => match n.trim_start_matches('#').parse() {
@@ -194,7 +196,10 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
 
     view! {
         <div class="agents">
-            <form class="agent-form" on:submit=submit>
+            <form class="agent-form" on:submit=move |ev| {
+                ev.prevent_default();
+                start();
+            }>
                 <h2>"New session"</h2>
                 <div class="agent-form-row">
                     <label>"Repository"
@@ -221,10 +226,16 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                 <textarea
                     class="agent-prompt"
                     rows="5"
-                    placeholder="What should Claude do?"
+                    placeholder="What should Claude do? (Ctrl+Enter starts)"
                     aria-label="Prompt"
                     prop:value=move || prompt.get()
                     on:input=move |ev| prompt.set(event_target_value(&ev))
+                    on:keydown=move |ev| {
+                        if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
+                            ev.prevent_default();
+                            start();
+                        }
+                    }
                 ></textarea>
                 <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
