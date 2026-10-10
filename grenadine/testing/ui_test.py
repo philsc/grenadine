@@ -90,6 +90,9 @@ def exactly(text: str) -> re.Pattern[str]:
 class ServerTestCase(unittest.TestCase):
     """Runs the server and a browser for the class's tests."""
 
+    # The repositories the server is started with; `load` creates them.
+    REPOS = [scenarios.REPO]
+
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
         """Adds the PRs the tests expect; there are none by default."""
@@ -114,20 +117,23 @@ class ServerTestCase(unittest.TestCase):
         claude.chmod(0o755)
 
         env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
-        clone = tmp / "clone"
-        subprocess.run(["git", "init", "--quiet", clone], env=env, check=True)
-        subprocess.run(
-            ["git", "-C", clone, "remote", "add", "origin", f"https://github.com/{scenarios.REPO}"],
-            env=env,
-            check=True,
-        )
+        repo_flags = []
+        for slug in cls.REPOS:
+            clone = tmp / "clones" / slug
+            subprocess.run(["git", "init", "--quiet", clone], env=env, check=True)
+            subprocess.run(
+                ["git", "-C", clone, "remote", "add", "origin", f"https://github.com/{slug}"],
+                env=env,
+                check=True,
+            )
+            repo_flags.append(f"--repo={clone}")
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
         cls.server = subprocess.Popen(
             [
                 os.environ["GRENADINE_SERVER"],
-                f"--repo={clone}",
+                *repo_flags,
                 f"--port={port}",
                 f"--db={tmp / 'grenadine.db'}",
                 f"--github-api={api}",
@@ -481,15 +487,36 @@ class VersionsTest(ServerTestCase):
 
 
 class AgentTest(ServerTestCase):
+    OTHER_REPO = "test/other"
+    REPOS = [scenarios.REPO, OTHER_REPO]
+
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
-        repo = gh.repo(scenarios.REPO)
-        repo.commit("Seed", {"README": "hello\n"})
-        repo.push("main")
+        for slug in cls.REPOS:
+            repo = gh.repo(slug)
+            repo.commit("Seed", {"README": "hello\n"})
+            repo.push("main")
+
+    def section(self, repo: str) -> Locator:
+        return self.page.locator(".agent-repo").filter(
+            has=self.page.locator(".agent-repo-name span", has_text=exactly(repo)))
+
+    def test_sidebar_has_a_section_per_repo(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.locator(".agent-repo-name span")).to_have_text(
+            sorted([scenarios.REPO, self.OTHER_REPO]))
+
+        # A repository without sessions says so and links to the form.
+        other = self.section(self.OTHER_REPO)
+        expect(other.locator(".agent-none")).to_contain_text("No agents in this repository yet.")
+        other.get_by_role("link", name="Start one").click()
+        expect(self.page).to_have_url(re.compile(f"#/agents/new/{self.OTHER_REPO}$"))
+        expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
 
     def test_agent_session(self) -> None:
         self.page.goto(self.url)
         self.page.get_by_role("link", name="Agents").click()
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
         self.page.get_by_label("Prompt").fill("please write a note")
         self.page.get_by_role("button", name="Start").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
@@ -524,8 +551,14 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
 
+        # The sidebar lists the session under its repository and highlights it.
+        item = self.section(scenarios.REPO).locator(".agent-item")
+        expect(item).to_contain_text(["please write a note"])
+        expect(item).to_have_class(re.compile(r"\bselected\b"))
         self.page.get_by_role("link", name="Agents").click()
-        expect(self.page.locator(".agent-item")).to_contain_text(["please write a note"])
+        expect(item).not_to_have_class(re.compile(r"\bselected\b"))
+        item.click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
 
 
 if __name__ == "__main__":

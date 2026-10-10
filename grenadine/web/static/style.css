@@ -423,8 +423,36 @@ input[type="text"] {
 
 /* Agents */
 
+.agents-page { flex: 1; display: flex; min-height: 0; }
 .agents, .agent { max-width: 960px; margin: 0 auto; padding: 16px 24px 48px; }
 .agents h2 { font-size: 16px; margin: 0 0 8px; }
+
+.agent-sidebar {
+  flex: none;
+  width: 300px;
+  overflow-y: auto;
+  background: var(--bg-subtle);
+  border-right: 1px solid var(--border);
+  padding-bottom: 16px;
+}
+.agent-new { display: block; padding: 8px 16px; color: var(--fg); font-weight: 600; }
+.agent-new:hover { background: var(--bg-hover); text-decoration: none; }
+.agent-new.selected { background: var(--accent-bg); box-shadow: inset 3px 0 var(--accent); }
+.agent-repo { border-top: 1px solid var(--border); }
+.agent-repo-name {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 16px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.agent-repo-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-repo-name a { color: var(--fg-muted); }
+.agent-repo-name a:hover { color: var(--fg); text-decoration: none; }
+.agent-none { margin: 0; padding: 2px 16px 6px; font-size: 13px; }
 
 textarea, select {
   font: inherit;
@@ -451,10 +479,10 @@ textarea { width: 100%; resize: vertical; }
 .agent-form .agent-pr { width: 10em; }
 .agent-form .hint { margin: 0; font-size: 12px; }
 
-.agent-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.agent-list li + li { border-top: 1px solid var(--border); }
-.agent-item { display: block; padding: 6px 16px; color: var(--fg); }
+.agent-list { list-style: none; margin: 0; padding: 0 0 4px; }
+.agent-item { display: block; padding: 4px 16px; color: var(--fg); }
 .agent-item:hover { background: var(--bg-hover); text-decoration: none; }
+.agent-item.selected { background: var(--accent-bg); box-shadow: inset 3px 0 var(--accent); }
 .agent-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-meta { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -518,6 +546,8 @@ textarea { width: 100%; resize: vertical; }
 @media (max-width: 800px) {
   .inboxes { padding: 12px 16px 48px; }
   .agents, .agent { padding: 12px 16px 48px; }
+  .agents-page { flex-direction: column; }
+  .agent-sidebar { width: auto; max-height: 35vh; border-right: none; border-bottom: 1px solid var(--border); }
   .pr { padding: 12px 16px 48px; }
   .file-index { columns: 1; }
 }

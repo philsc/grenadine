@@ -35,9 +35,12 @@ pub enum Route {
     Inboxes,
     /// `#/owner/name/number`.
     Pr(PrKey),
-    /// `#/agents`, or `#/agents/new/owner/name/number` to start a session
-    /// on a PR.
-    Agents(Option<PrKey>),
+    /// `#/agents`, `#/agents/new/owner/name` to start a session in a
+    /// repository, or `#/agents/new/owner/name/number` to start one on a PR.
+    Agents {
+        repo: Option<String>,
+        pr: Option<u64>,
+    },
     /// `#/agents/<id>`.
     Agent(String),
 }
@@ -53,9 +56,21 @@ fn route_from_hash(hash: &str) -> Route {
     let path = hash.trim_start_matches('#').trim_start_matches('/');
     let parts: Vec<&str> = path.split('/').collect();
     let route = match parts[..] {
-        ["agents"] => Some(Route::Agents(None)),
+        ["agents"] => Some(Route::Agents {
+            repo: None,
+            pr: None,
+        }),
+        ["agents", "new", owner, name] if !owner.is_empty() && !name.is_empty() => {
+            Some(Route::Agents {
+                repo: Some(format!("{owner}/{name}")),
+                pr: None,
+            })
+        }
         ["agents", "new", owner, name, number] => {
-            pr_key(owner, name, number).map(|k| Route::Agents(Some(k)))
+            pr_key(owner, name, number).map(|k| Route::Agents {
+                repo: Some(k.repo),
+                pr: Some(k.number),
+            })
         }
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
@@ -153,10 +168,12 @@ fn App() -> impl IntoView {
     let selected = Memo::new(move |_| route.with(pr_of));
     let agents = Memo::new(move |_| {
         route.with(|r| match r {
-            Route::Agents(_) | Route::Agent(_) => Some(r.clone()),
+            Route::Agents { .. } | Route::Agent(_) => Some(r.clone()),
             _ => None,
         })
     });
+    // The sidebar stays mounted while going between the agents' pages.
+    let on_agents = Memo::new(move |_| agents.with(Option::is_some));
 
     // The inboxes stay mounted while another page is shown so that going
     // back is instant. Hiding them loses their scroll position, so
@@ -189,14 +206,21 @@ fn App() -> impl IntoView {
             {move || selected.get().map(|key| view! {
                 <main class="main"><pr::PrView key=key /></main>
             })}
-            {move || agents.get().map(|r| view! {
-                <main class="main">
-                    {match r {
-                        Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
-                        Route::Agents(pr) => view! { <agents::AgentList pr=pr /> }.into_any(),
-                        _ => ().into_any(),
-                    }}
-                </main>
+            {move || on_agents.get().then(|| view! {
+                <div class="agents-page">
+                    <agents::Sidebar route=route.into() />
+                    {move || agents.get().map(|r| view! {
+                        <main class="main">
+                            {match r {
+                                Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
+                                Route::Agents { repo, pr } => {
+                                    view! { <agents::NewSession repo=repo pr=pr /> }.into_any()
+                                }
+                                _ => ().into_any(),
+                            }}
+                        </main>
+                    })}
+                </div>
             })}
         </div>
     }
@@ -233,10 +257,26 @@ mod tests {
         assert_eq!(route_from_hash("#/"), Route::Inboxes);
         assert_eq!(route_from_hash("#/o/n/7"), Route::Pr(key("o/n", 7)));
         assert_eq!(route_from_hash("#/o/n/x"), Route::Inboxes);
-        assert_eq!(route_from_hash("#/agents"), Route::Agents(None));
+        assert_eq!(
+            route_from_hash("#/agents"),
+            Route::Agents {
+                repo: None,
+                pr: None
+            }
+        );
+        assert_eq!(
+            route_from_hash("#/agents/new/o/n"),
+            Route::Agents {
+                repo: Some("o/n".into()),
+                pr: None
+            }
+        );
         assert_eq!(
             route_from_hash("#/agents/new/o/n/7"),
-            Route::Agents(Some(key("o/n", 7)))
+            Route::Agents {
+                repo: Some("o/n".into()),
+                pr: Some(7)
+            }
         );
         assert_eq!(route_from_hash("#/agents/abc"), Route::Agent("abc".into()));
         assert_eq!(route_from_hash("#/agents/"), Route::Inboxes);

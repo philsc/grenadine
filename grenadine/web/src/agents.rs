@@ -1,6 +1,6 @@
-//! Claude Code sessions: the list with a form that starts one, and a
-//! session's page with its live transcript, permission requests and a box
-//! for follow-up prompts.
+//! Claude Code sessions: a sidebar listing them by repository, a form that
+//! starts one, and a session's page with its live transcript, permission
+//! requests and a box for follow-up prompts.
 
 use std::collections::HashMap;
 
@@ -11,7 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::prelude::*;
 
-use crate::{Updates, api, hash_for, markdown};
+use crate::{Route, Updates, api, hash_for, markdown};
 
 fn agent_hash(id: &str) -> String {
     format!("#/agents/{id}")
@@ -50,58 +50,106 @@ fn StatusBadge(status: AgentStatus) -> impl IntoView {
     view! { <span class=status_class(status)>{status_label(status)}</span> }
 }
 
+/// The sessions grouped by repository: every configured repository in
+/// order, even without sessions, then any other repository a session is in.
+fn by_repo(repos: Vec<String>, sessions: Vec<AgentSession>) -> Vec<(String, Vec<AgentSession>)> {
+    let mut groups: Vec<(String, Vec<AgentSession>)> =
+        repos.into_iter().map(|r| (r, Vec::new())).collect();
+    for s in sessions {
+        match groups.iter_mut().find(|(r, _)| *r == s.repo) {
+            Some((_, list)) => list.push(s),
+            None => groups.push((s.repo.clone(), vec![s])),
+        }
+    }
+    groups
+}
+
+/// The sessions down the left of the agents' pages, a section per
+/// repository.
 #[component]
-pub fn AgentList(
-    /// Fills in the form to start a session on this PR.
-    pr: Option<PrKey>,
+pub fn Sidebar(
+    /// The page shown, to highlight its session.
+    route: Signal<Route>,
 ) -> impl IntoView {
     let updates = expect_context::<Updates>();
+    let repos = LocalResource::new(api::repos);
     let sessions = LocalResource::new(move || {
         updates.agents.track();
         api::agents()
     });
 
     view! {
-        <div class="agents">
-            <NewSession pr=pr />
-            <h2>"Sessions"</h2>
-            {move || match sessions.get() {
-                None => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
-                Some(Ok(list)) if list.is_empty() => {
-                    view! { <p class="muted">"No sessions yet."</p> }.into_any()
+        <aside class="agent-sidebar">
+            <a
+                class="agent-new"
+                class:selected=move || route.with(|r| matches!(r, Route::Agents { .. }))
+                href="#/agents"
+            >"+ New session"</a>
+            {move || match (repos.get(), sessions.get()) {
+                (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                    view! { <p class="error pad">{e}</p> }.into_any()
                 }
-                Some(Ok(list)) => view! {
-                    <ul class="agent-list">
-                        {list.into_iter().map(|a| view! {
-                            <li>
-                                <a class="agent-item" href=agent_hash(&a.id)>
-                                    <span class="agent-title">
-                                        <StatusBadge status=a.status />
-                                        {a.title.clone()}
-                                    </span>
-                                    <span class="agent-meta muted">
-                                        {match a.pr {
-                                            Some(n) => format!("{}#{n}", a.repo),
-                                            None => a.repo.clone(),
-                                        }}
-                                        {format!(" · {} · {}", a.branch, cost(a.cost_usd))}
-                                    </span>
-                                </a>
-                            </li>
-                        }).collect_view()}
-                    </ul>
-                }.into_any(),
+                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(repos, sessions)
+                    .into_iter()
+                    .map(|(repo, list)| view! { <RepoSessions repo=repo list=list route=route /> })
+                    .collect_view()
+                    .into_any(),
+                _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
             }}
-        </div>
+        </aside>
     }
 }
 
 #[component]
-fn NewSession(pr: Option<PrKey>) -> impl IntoView {
+fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> impl IntoView {
+    let new = format!("#/agents/new/{repo}");
+    view! {
+        <section class="agent-repo">
+            <h2 class="agent-repo-name">
+                <span>{repo.clone()}</span>
+                <a href=new.clone() title=format!("New session in {repo}")>"+"</a>
+            </h2>
+            {if list.is_empty() {
+                view! {
+                    <p class="agent-none muted">
+                        "No agents in this repository yet. " <a href=new>"Start one"</a>
+                    </p>
+                }.into_any()
+            } else {
+                view! {
+                    <ul class="agent-list">
+                        {list.into_iter().map(|a| {
+                            let id = a.id.clone();
+                            let selected = move || route.with(|r| matches!(r, Route::Agent(s) if *s == id));
+                            let mut meta = vec![a.branch.clone(), cost(a.cost_usd)];
+                            if let Some(n) = a.pr {
+                                meta.insert(0, format!("#{n}"));
+                            }
+                            view! {
+                                <li>
+                                    <a class="agent-item" class:selected=selected href=agent_hash(&a.id)>
+                                        <span class="agent-title">
+                                            <StatusBadge status=a.status />
+                                            {a.title.clone()}
+                                        </span>
+                                        <span class="agent-meta muted">{meta.join(" · ")}</span>
+                                    </a>
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }}
+        </section>
+    }
+}
+
+/// The form that starts a session, filled in with `repo` and `pr` if given.
+#[component]
+pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
     let repos = LocalResource::new(api::repos);
-    let repo = RwSignal::new(pr.as_ref().map(|k| k.repo.clone()).unwrap_or_default());
-    let number = RwSignal::new(pr.map(|k| k.number.to_string()).unwrap_or_default());
+    let repo = RwSignal::new(repo.unwrap_or_default());
+    let number = RwSignal::new(pr.map(|n| n.to_string()).unwrap_or_default());
     let prompt = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -145,50 +193,52 @@ fn NewSession(pr: Option<PrKey>) -> impl IntoView {
     };
 
     view! {
-        <form class="agent-form" on:submit=submit>
-            <h2>"New session"</h2>
-            <div class="agent-form-row">
-                <label>"Repository"
-                    <select
-                        prop:value=move || repo.get()
-                        on:change=move |ev| repo.set(event_target_value(&ev))
+        <div class="agents">
+            <form class="agent-form" on:submit=submit>
+                <h2>"New session"</h2>
+                <div class="agent-form-row">
+                    <label>"Repository"
+                        <select
+                            prop:value=move || repo.get()
+                            on:change=move |ev| repo.set(event_target_value(&ev))
+                        >
+                            {move || repos.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|r| {
+                                let selected = repo.get_untracked() == r;
+                                view! { <option value=r.clone() selected=selected>{r.clone()}</option> }
+                            }).collect_view()}
+                        </select>
+                    </label>
+                    <label>"Start from PR"
+                        <input
+                            type="text"
+                            class="agent-pr"
+                            placeholder="trunk"
+                            prop:value=move || number.get()
+                            on:input=move |ev| number.set(event_target_value(&ev))
+                        />
+                    </label>
+                </div>
+                <textarea
+                    class="agent-prompt"
+                    rows="5"
+                    placeholder="What should Claude do?"
+                    aria-label="Prompt"
+                    prop:value=move || prompt.get()
+                    on:input=move |ev| prompt.set(event_target_value(&ev))
+                ></textarea>
+                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool."</p>
+                {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+                <div class="form-buttons">
+                    <button
+                        type="submit"
+                        class="primary"
+                        disabled=move || busy.get() || prompt.with(|p| p.trim().is_empty())
                     >
-                        {move || repos.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|r| {
-                            let selected = repo.get_untracked() == r;
-                            view! { <option value=r.clone() selected=selected>{r.clone()}</option> }
-                        }).collect_view()}
-                    </select>
-                </label>
-                <label>"Start from PR"
-                    <input
-                        type="text"
-                        class="agent-pr"
-                        placeholder="trunk"
-                        prop:value=move || number.get()
-                        on:input=move |ev| number.set(event_target_value(&ev))
-                    />
-                </label>
-            </div>
-            <textarea
-                class="agent-prompt"
-                rows="5"
-                placeholder="What should Claude do?"
-                aria-label="Prompt"
-                prop:value=move || prompt.get()
-                on:input=move |ev| prompt.set(event_target_value(&ev))
-            ></textarea>
-            <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool."</p>
-            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-            <div class="form-buttons">
-                <button
-                    type="submit"
-                    class="primary"
-                    disabled=move || busy.get() || prompt.with(|p| p.trim().is_empty())
-                >
-                    {move || if busy.get() { "Creating worktree…" } else { "Start" }}
-                </button>
-            </div>
-        </form>
+                        {move || if busy.get() { "Creating worktree…" } else { "Start" }}
+                    </button>
+                </div>
+            </form>
+        </div>
     }
 }
 
@@ -303,7 +353,7 @@ pub fn AgentView(id: String) -> impl IntoView {
                 Load::Loading => view! { <p class="muted">"Loading…"</p> }.into_any(),
                 Load::Failed(e) => view! { <p class="error">{e}</p> }.into_any(),
                 Load::Missing => view! {
-                    <p class="muted">"There is no such session. " <a href="#/agents">"See all sessions"</a></p>
+                    <p class="muted">"There is no such session. " <a href="#/agents">"Start a new one"</a></p>
                 }.into_any(),
                 Load::Ready => {
                     // Ready means a session was loaded, and `current` keeps it.
@@ -628,6 +678,45 @@ mod tests {
         let input = serde_json::json!({"file_path": "/w/a.rs"});
         assert_eq!(tool_summary("Edit", &input), "/w/a.rs");
         assert_eq!(tool_summary("mcp__x__y", &input), "");
+    }
+
+    fn session(id: &str, repo: &str) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            repo: repo.into(),
+            pr: None,
+            title: String::new(),
+            branch: String::new(),
+            worktree: String::new(),
+            base_sha: String::new(),
+            status: AgentStatus::Idle,
+            created_at: 0,
+            cost_usd: 0.0,
+        }
+    }
+
+    #[test]
+    fn groups_sessions_by_repo() {
+        let groups = by_repo(
+            vec!["o/a".into(), "o/b".into()],
+            vec![
+                session("1", "o/b"),
+                session("2", "o/gone"),
+                session("3", "o/b"),
+            ],
+        );
+        let ids: Vec<(&str, Vec<&str>)> = groups
+            .iter()
+            .map(|(r, l)| (r.as_str(), l.iter().map(|s| s.id.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("o/a", vec![]),
+                ("o/b", vec!["1", "3"]),
+                ("o/gone", vec!["2"])
+            ]
+        );
     }
 
     #[test]
