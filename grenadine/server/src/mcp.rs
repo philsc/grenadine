@@ -199,6 +199,7 @@ mod tests {
                 cost_usd: 0.0,
                 context_tokens: None,
                 context_window: None,
+                landed: None,
             })
             .unwrap();
         state

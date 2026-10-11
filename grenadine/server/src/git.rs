@@ -211,18 +211,108 @@ impl Repo {
         Ok(self.git(&["rev-parse", local_ref])?.trim().to_owned())
     }
 
-    /// Fetches the tip of the GitHub repository's default branch into
-    /// `local_ref` and returns it.
-    pub fn fetch_default_branch(&self, local_ref: &str) -> Result<String> {
+    /// The name of the GitHub repository's default branch.
+    pub fn default_branch(&self) -> Result<String> {
         let out = self.git(&["ls-remote", "--symref", &self.fetch_url(), "HEAD"])?;
-        let branch = out
-            .lines()
+        out.lines()
             .find_map(|l| {
                 let (target, _) = l.strip_prefix("ref: refs/heads/")?.split_once('\t')?;
                 Some(target.to_owned())
             })
-            .ok_or_else(|| anyhow!("{} has no default branch", self.slug))?;
-        self.fetch_branch(&branch, local_ref)
+            .ok_or_else(|| anyhow!("{} has no default branch", self.slug))
+    }
+
+    /// Fetches the tip of the GitHub repository's default branch into
+    /// `local_ref` and returns it.
+    pub fn fetch_default_branch(&self, local_ref: &str) -> Result<String> {
+        self.fetch_branch(&self.default_branch()?, local_ref)
+    }
+
+    /// Pushes a local branch over HTTPS to the GitHub repository's branch
+    /// of the same name, replacing what's there.
+    pub fn push_branch(&self, branch: &str) -> Result<()> {
+        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        self.git(&["push", "--quiet", &self.fetch_url(), &refspec])?;
+        Ok(())
+    }
+
+    /// The commit checked out in the clone.
+    pub fn head(&self) -> Result<String> {
+        Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
+    /// Fast-forwards the clone's checkout, a branch or a detached HEAD, to
+    /// `sha`. Fails rather than merging, or overwriting local changes.
+    pub fn merge_ff_only(&self, sha: &str) -> Result<()> {
+        self.git(&["merge", "--quiet", "--ff-only", sha])?;
+        Ok(())
+    }
+
+    pub fn is_ancestor(&self, ancestor: &str, of: &str) -> bool {
+        self.git_ok(&["merge-base", "--is-ancestor", ancestor, of])
+    }
+
+    /// The messages of the commits in `from..to`, oldest first.
+    pub fn messages(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let out = self.git(&[
+            "log",
+            "--reverse",
+            "--format=%B%x00",
+            &format!("{from}..{to}"),
+        ])?;
+        Ok(out
+            .split('\0')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Runs git in the worktree at `path` and returns its stdout.
+    fn git_in(&self, path: &Path, args: &[&str]) -> Result<String> {
+        let path = path.to_str().context("the worktree path isn't UTF-8")?;
+        let mut all = vec!["-C", path];
+        all.extend_from_slice(args);
+        self.git(&all)
+    }
+
+    /// The commit checked out in the worktree at `path`.
+    pub fn worktree_head(&self, path: &Path) -> Result<String> {
+        Ok(self.git_in(path, &["rev-parse", "HEAD"])?.trim().to_owned())
+    }
+
+    /// Why the worktree at `path` isn't ready to land, e.g. the files with
+    /// uncommitted changes; `None` when it is.
+    pub fn worktree_unfinished(&self, path: &Path) -> Result<Option<String>> {
+        let ops = [
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ];
+        for (file, op) in ops {
+            let file = self.git_in(path, &["rev-parse", "--git-path", file])?;
+            if path.join(file.trim()).exists() {
+                return Ok(Some(format!("a {op} is in progress")));
+            }
+        }
+        let status = self.git_in(path, &["status", "--porcelain"])?;
+        Ok((!status.trim().is_empty())
+            .then(|| format!("there are uncommitted changes:\n{}", status.trim_end())))
+    }
+
+    /// Rebases the commits after `upstream` in the worktree at `path` onto
+    /// `onto`. A rebase that stops, e.g. at a conflict, is aborted and
+    /// returns false.
+    pub fn worktree_rebase(&self, path: &Path, onto: &str, upstream: &str) -> Result<bool> {
+        if self
+            .git_in(path, &["rebase", "--quiet", "--onto", onto, upstream])
+            .is_ok()
+        {
+            return Ok(true);
+        }
+        self.git_in(path, &["rebase", "--abort"])?;
+        Ok(false)
     }
 
     /// Checks out `base` on a new branch in a new worktree at `path`.

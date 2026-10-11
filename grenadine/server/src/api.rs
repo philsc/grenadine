@@ -13,7 +13,7 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
-    InboxEdit, InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing,
+    InboxEdit, InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -57,6 +57,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/messages", post(agent_message))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
         .route("/api/agents/{id}/approvals", post(approve))
+        .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/mcp/{id}/{secret}", post(mcp::handle))
         .fallback(get(assets::serve))
@@ -315,6 +316,26 @@ async fn interrupt_agent(AxState(state): St, Path(id): Path<String>) -> ApiResul
     }
     agent::interrupt(&state, &id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lands the session's work; the outcome shows up in its transcript. 409
+/// while the session is busy.
+async fn wrap_up_agent(
+    AxState(state): St,
+    Path(id): Path<String>,
+    Json(req): Json<WrapUp>,
+) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    if !agent::wrap_up(&state, &id, req).await {
+        return Ok((
+            StatusCode::CONFLICT,
+            "the session is busy; wrap up once it's done",
+        )
+            .into_response());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Answers a permission request; 404 when it isn't waiting anymore.

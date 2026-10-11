@@ -6,19 +6,20 @@
 //! tool in `mcp.rs`, which waits for the user's answer from the page.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, NewAgent, PatchHunk, PermissionMode,
-    PrKey, ServerEvent,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Landed, NewAgent, PatchHunk,
+    PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, oneshot};
 
+use crate::git::Repo;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
@@ -30,6 +31,30 @@ const MCP_TOOL_TIMEOUT_MS: &str = "86400000";
 
 /// How much of claude's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
+
+/// What Claude is asked when there's uncommitted work to wrap up.
+const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
+     messages that follow this repository's conventions. Don't change anything else.";
+
+/// A wrap-up in progress.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    target: WrapUpTarget,
+    /// The mode Claude's turns for the wrap-up go with.
+    mode: PermissionMode,
+    /// Claude was already asked to get the worktree ready once.
+    asked: bool,
+}
+
+/// Where a wrap-up stands after a try at landing.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Landed(Landed),
+    /// Claude has to fix the worktree first, as `prompt` tells it.
+    Ask { reason: String, prompt: String },
+    /// The branch is on GitHub; the PR is opened next.
+    Pushed { base: String, messages: Vec<String> },
+}
 
 /// The user's answer to a permission request.
 #[derive(Debug, Default)]
@@ -67,6 +92,8 @@ struct Live {
     interrupted: bool,
     /// Permission requests by tool use ID.
     pending: HashMap<String, oneshot::Sender<Decision>>,
+    /// The wrap-up in progress, if any.
+    wrap_up: Option<Pending>,
 }
 
 impl Live {
@@ -79,6 +106,7 @@ impl Live {
             pid: None,
             interrupted: false,
             pending: HashMap::new(),
+            wrap_up: None,
         }
     }
 }
@@ -277,6 +305,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         cost_usd: 0.0,
         context_tokens: None,
         context_window: None,
+        landed: None,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
@@ -402,8 +431,10 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Runs the queued prompts one turn at a time until the queue is empty.
+/// Runs the queued prompts one turn at a time until the queue is empty,
+/// then goes on with a wrap-up that waited for them.
 async fn run(state: Arc<State>, id: String) {
+    let mut last = AgentStatus::Idle;
     loop {
         let prompt = state.agents.with_live(&id, |l| {
             let prompt = l.queue.pop_front();
@@ -412,6 +443,15 @@ async fn run(state: Arc<State>, id: String) {
             prompt
         });
         let Some((prompt, mode)) = prompt else {
+            if last == AgentStatus::Idle {
+                continue_wrap_up(&state, &id).await;
+            } else if state.agents.with_live(&id, |l| l.wrap_up.take()).is_some() {
+                let _ = emit(
+                    &state,
+                    &id,
+                    AgentEventKind::WrapUpFailed("Claude's turn didn't finish".into()),
+                );
+            }
             return;
         };
         let status = match turn(&state, &id, prompt, mode).await {
@@ -435,7 +475,212 @@ async fn run(state: Arc<State>, id: String) {
         if state.db.agent(&id).ok().flatten().is_some() {
             set_status(&state, &id, status);
         }
+        last = status;
     }
+}
+
+/// Starts landing the session's work. Returns false when the session is
+/// busy with a turn or another wrap-up.
+pub async fn wrap_up(state: &Arc<State>, id: &str, req: WrapUp) -> bool {
+    let start = state.agents.with_live(id, |l| {
+        if l.running || l.wrap_up.is_some() {
+            return false;
+        }
+        l.wrap_up = Some(Pending {
+            target: req.target,
+            mode: req.permission_mode,
+            asked: false,
+        });
+        true
+    });
+    if start {
+        continue_wrap_up(state, id).await;
+    }
+    start
+}
+
+/// Tries to land the work of the session's wrap-up, if one is in
+/// progress. When the worktree isn't ready, Claude is asked to fix it once
+/// and the wrap-up goes on after that turn.
+async fn continue_wrap_up(state: &Arc<State>, id: &str) {
+    let Some(pending) = state.agents.with_live(id, |l| l.wrap_up) else {
+        return;
+    };
+    let outcome = match land(state, id, pending.target).await {
+        Ok(Step::Landed(landed)) => record_landed(state, id, &landed).map(|()| landed),
+        Ok(Step::Ask { prompt, .. }) if !pending.asked => {
+            state.agents.with_live(id, |l| {
+                if let Some(w) = &mut l.wrap_up {
+                    w.asked = true;
+                }
+            });
+            send(state, id, prompt, pending.mode);
+            return;
+        }
+        Ok(Step::Ask { reason, .. }) => Err(anyhow!("{reason}")),
+        Ok(Step::Pushed { .. }) => Err(anyhow!("the PR wasn't opened")),
+        Err(e) => Err(e),
+    };
+    state.agents.with_live(id, |l| l.wrap_up = None);
+    let kind = match outcome {
+        Ok(landed) => AgentEventKind::Landed(landed),
+        Err(e) => {
+            tracing::warn!("agent {id}: wrapping up: {e:#}");
+            AgentEventKind::WrapUpFailed(format!("{e:#}"))
+        }
+    };
+    let _ = emit(state, id, kind);
+}
+
+fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
+    state.db.set_agent_landed(id, landed)?;
+    // Wrapping up again lands only what came after.
+    if let Landed::Checkout { sha } = landed {
+        state.db.set_agent_base(id, sha)?;
+    }
+    state.send(ServerEvent::AgentsChanged);
+    Ok(())
+}
+
+/// One try at landing the session's work on `target`.
+async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step> {
+    let session = state
+        .db
+        .agent(id)?
+        .ok_or_else(|| anyhow!("the session is gone"))?;
+    let cloned = state
+        .repos
+        .get(&session.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?
+        .clone();
+    // A session that started from a PR proposes its work to that PR's
+    // branch.
+    let pr_branch = match (target, session.pr) {
+        (WrapUpTarget::PullRequest, Some(number)) => {
+            let key = PrKey {
+                repo: session.repo.clone(),
+                number,
+            };
+            let pr = state
+                .db
+                .pr(&key)?
+                .ok_or_else(|| anyhow!("{}#{number} isn't synced", session.repo))?;
+            Some(pr.head_ref)
+        }
+        _ => None,
+    };
+    let step = {
+        let _guard = cloned.git_lock.lock().await;
+        let repo = cloned.repo.clone();
+        let session = session.clone();
+        tokio::task::spawn_blocking(move || match target {
+            WrapUpTarget::Checkout => land_on_checkout(&repo, &session),
+            WrapUpTarget::PullRequest => push_branch(&repo, &session, pr_branch),
+        })
+        .await??
+    };
+    let Step::Pushed { base, messages } = step else {
+        return Ok(step);
+    };
+    // The push updated the PR that an earlier wrap-up opened.
+    if let Some(landed @ Landed::PullRequest { .. }) = session.landed {
+        return Ok(Step::Landed(landed));
+    }
+    let (title, body) = pr_text(&session.title, &messages);
+    let (number, url) = state
+        .github
+        .create_pr(&session.repo, &session.branch, &base, &title, &body)
+        .await?;
+    Ok(Step::Landed(Landed::PullRequest { number, url }))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// Rebases the worktree's commits onto the clone's checkout and
+/// fast-forwards the checkout to them.
+fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
+    let worktree = Path::new(&session.worktree);
+    if let Some(reason) = repo.worktree_unfinished(worktree)? {
+        return Ok(Step::Ask {
+            reason,
+            prompt: COMMIT_PROMPT.into(),
+        });
+    }
+    let base = &session.base_sha;
+    // A checkout that moves in the meantime gets a second try.
+    for _ in 0..2 {
+        let head = repo.worktree_head(worktree)?;
+        if head == *base {
+            bail!("there are no commits to land");
+        }
+        let onto = repo.head()?;
+        if !repo.is_ancestor(&onto, &head) {
+            // Only the session's own commits move: those after its base,
+            // or after the checkout's history if it was merged in already.
+            let upstream = match repo.merge_base(&onto, &head) {
+                Some(mb) if repo.is_ancestor(base, &mb) => mb,
+                _ => base.clone(),
+            };
+            if !repo.worktree_rebase(worktree, &onto, &upstream)? {
+                return Ok(Step::Ask {
+                    reason: format!("the commits conflict with the checkout at {}", short(&onto)),
+                    prompt: format!(
+                        "Wrap up: rebase your commits onto {onto} with `git rebase --onto {onto} \
+                         {upstream}`, resolve the conflicts, and check that the result still \
+                         builds and passes the relevant tests. Finish the rebase and leave \
+                         nothing uncommitted."
+                    ),
+                });
+            }
+        }
+        let head = repo.worktree_head(worktree)?;
+        match repo.merge_ff_only(&head) {
+            Ok(()) => return Ok(Step::Landed(Landed::Checkout { sha: head })),
+            Err(_) if repo.head()? != onto => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    bail!("the checkout kept moving")
+}
+
+/// Pushes the session's branch to GitHub. The PR goes into `pr_branch`, or
+/// the default branch.
+fn push_branch(repo: &Repo, session: &AgentSession, pr_branch: Option<String>) -> Result<Step> {
+    let worktree = Path::new(&session.worktree);
+    if let Some(reason) = repo.worktree_unfinished(worktree)? {
+        return Ok(Step::Ask {
+            reason,
+            prompt: COMMIT_PROMPT.into(),
+        });
+    }
+    let head = repo.worktree_head(worktree)?;
+    let messages = repo.messages(&session.base_sha, &head)?;
+    if messages.is_empty() {
+        bail!("there are no commits to push");
+    }
+    repo.push_branch(&session.branch)?;
+    let base = match pr_branch {
+        Some(b) => b,
+        None => repo.default_branch()?,
+    };
+    Ok(Step::Pushed { base, messages })
+}
+
+/// A PR's title and body for commits with `messages`: the commit's own for
+/// one commit, the session's title and the commits' subjects for more.
+fn pr_text(title: &str, messages: &[String]) -> (String, String) {
+    if let [message] = messages {
+        let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
+        return (subject.trim().to_owned(), body.trim().to_owned());
+    }
+    let subjects = messages
+        .iter()
+        .map(|m| format!("- {}", m.lines().next().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (title.to_owned(), subjects)
 }
 
 /// Runs one prompt and returns the status the session ends up in.
@@ -1128,5 +1373,194 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         );
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Interrupted);
+    }
+
+    #[test]
+    fn pr_texts() {
+        assert_eq!(
+            pr_text("t", &["Fix it\n\nBecause.".into()]),
+            ("Fix it".into(), "Because.".into())
+        );
+        assert_eq!(
+            pr_text("t", &["One\n\nx".into(), "Two".into()]),
+            ("t".into(), "- One\n- Two".into())
+        );
+    }
+
+    /// A claude that changes the worktree as its prompts say: `write`
+    /// leaves `file` with `contents` uncommitted, `commit` commits it too,
+    /// and the wrap-up's commit prompt commits everything. It ignores
+    /// other prompts. Prompts are logged to `log`.
+    fn wrap_up_claude(log: &Path) -> String {
+        format!(
+            r#"#!/bin/sh
+prompt=$(cat)
+echo "$prompt" >> {log}
+set -- $prompt
+case "$1" in
+  write) echo "$3" > "$2" ;;
+  commit) echo "$3" > "$2" && git add -A && git commit -qm "Change $2" ;;
+  Wrap) case "$prompt" in "{COMMIT_PROMPT}") git add -A && git commit -qm "Wrapped up" ;; esac ;;
+esac
+echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+"#,
+            log = log.display()
+        )
+    }
+
+    /// A state for wrap-up tests and the clone's directory, which commits
+    /// need an identity in.
+    fn wrap_up_state(fx: &crate::git::tests::Fixture, dir: &Path) -> (Arc<State>, PathBuf) {
+        use crate::git::tests::run;
+        let clone = fx.clone.path.clone();
+        run(&clone, &["config", "user.name", "t"]);
+        run(&clone, &["config", "user.email", "t@example.com"]);
+        let state = state_with_claude(fx, dir, &wrap_up_claude(&dir.join("log")));
+        (state, clone)
+    }
+
+    /// Starts a session with `prompt` and waits for its turn.
+    async fn start(state: &Arc<State>, prompt: &str) -> AgentSession {
+        let session = create(
+            state,
+            NewAgent {
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: prompt.into(),
+                permission_mode: PermissionMode::Auto,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(state, &session.id, 1).await;
+        session
+    }
+
+    /// Wraps up the session and returns how it ended.
+    async fn wrap(state: &Arc<State>, id: &str, target: WrapUpTarget) -> AgentEventKind {
+        let req = WrapUp {
+            target,
+            permission_mode: PermissionMode::Auto,
+        };
+        assert!(wrap_up(state, id, req).await);
+        for _ in 0..100 {
+            let done = state.agents.with_live(id, |l| l.wrap_up.is_none() && !l.running);
+            if done {
+                let events = state.db.agent_events(id).unwrap();
+                return events.into_iter().last().unwrap().kind;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the wrap-up didn't finish");
+    }
+
+    #[tokio::test]
+    async fn wraps_up_into_the_checkout() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+
+        // Claude is asked to commit what it left uncommitted first.
+        let session = start(&state, "write b agent").await;
+        let id = &session.id;
+        let AgentEventKind::Landed(Landed::Checkout { sha }) =
+            wrap(&state, id, WrapUpTarget::Checkout).await
+        else {
+            panic!("{:?}", state.db.agent_events(id));
+        };
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(run(&clone, &["branch", "--show-current"]), "main");
+        assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "agent\n");
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(log.contains(COMMIT_PROMPT), "{log}");
+        let landed = state.db.agent(id).unwrap().unwrap();
+        assert_eq!(landed.landed, Some(Landed::Checkout { sha: sha.clone() }));
+        assert_eq!(landed.base_sha, sha);
+        assert_eq!(landed.status, AgentStatus::Idle);
+
+        // The checkout moves on, detached. Wrapping up again rebases only
+        // the new commit onto it.
+        run(&clone, &["checkout", "-q", "--detach"]);
+        let moved = commit(&clone, "c", "1\n");
+        send(&state, id, "commit b more".into(), PermissionMode::Auto);
+        wait_for_turns(&state, id, 3).await;
+        let AgentEventKind::Landed(Landed::Checkout { sha }) =
+            wrap(&state, id, WrapUpTarget::Checkout).await
+        else {
+            panic!("{:?}", state.db.agent_events(id));
+        };
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(run(&clone, &["branch", "--show-current"]), "");
+        assert_eq!(run(&clone, &["rev-parse", "HEAD^"]), moved);
+        assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "more\n");
+
+        // Nothing new to land.
+        assert_eq!(
+            wrap(&state, id, WrapUpTarget::Checkout).await,
+            AgentEventKind::WrapUpFailed("there are no commits to land".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn asks_once_to_resolve_conflicts() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit a agent").await;
+        let before = commit(&clone, "a", "clone\n");
+
+        // This claude ignores the request to rebase, so the second try
+        // fails the same way.
+        let AgentEventKind::WrapUpFailed(e) = wrap(&state, &session.id, WrapUpTarget::Checkout).await
+        else {
+            panic!("{:?}", state.db.agent_events(&session.id));
+        };
+        assert!(e.contains("conflict"), "{e}");
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert_eq!(log.matches("Wrap up: rebase your commits onto").count(), 1, "{log}");
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), before);
+        let worktree = Path::new(&session.worktree);
+        assert_eq!(fx.clone.worktree_unfinished(worktree).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn keeps_local_changes_in_the_checkout() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        std::fs::write(clone.join("b"), "local\n").unwrap();
+        let before = run(&clone, &["rev-parse", "HEAD"]);
+
+        let event = wrap(&state, &session.id, WrapUpTarget::Checkout).await;
+        assert!(matches!(event, AgentEventKind::WrapUpFailed(_)), "{event:?}");
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "local\n");
+        assert_eq!(state.db.agent(&session.id).unwrap().unwrap().landed, None);
+    }
+
+    #[tokio::test]
+    async fn pushes_the_branch_for_a_pr() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+
+        // The test state's GitHub is unreachable, so only the push works.
+        let event = wrap(&state, &session.id, WrapUpTarget::PullRequest).await;
+        let AgentEventKind::WrapUpFailed(e) = event else {
+            panic!("{event:?}");
+        };
+        assert!(!e.contains("no commits"), "{e}");
+        let worktree = Path::new(&session.worktree);
+        assert_eq!(
+            run(&fx.upstream, &["rev-parse", &format!("refs/heads/{}", session.branch)]),
+            run(worktree, &["rev-parse", "HEAD"])
+        );
     }
 }

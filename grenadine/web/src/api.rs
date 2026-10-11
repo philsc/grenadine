@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
-    InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus,
+    InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -234,4 +234,11 @@ pub async fn delete_agent(id: &str) -> Result<()> {
     check(Request::delete(&format!("/api/agents/{id}")).send().await)
         .await
         .map(|_| ())
+}
+
+pub async fn wrap_up_agent(id: &str, wrap_up: &WrapUp) -> Result<()> {
+    let req = Request::post(&format!("/api/agents/{id}/wrap-up"))
+        .json(wrap_up)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
 }

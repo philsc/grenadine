@@ -355,6 +355,9 @@ pub struct AgentSession {
     pub context_tokens: Option<u64>,
     /// The size of the model's context window, in tokens.
     pub context_window: Option<u64>,
+    /// Where the session's work was last landed by wrapping up.
+    #[serde(default)]
+    pub landed: Option<Landed>,
 }
 
 /// How Claude Code decides about tool uses during a turn; the user picks
@@ -427,6 +430,37 @@ pub struct AgentMessage {
     pub permission_mode: PermissionMode,
 }
 
+/// Where wrapping up a session puts its commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WrapUpTarget {
+    /// On top of whatever the server's clone has checked out, a branch or
+    /// a detached HEAD.
+    #[default]
+    Checkout,
+    /// Pushed to GitHub with a pull request for them.
+    PullRequest,
+}
+
+/// Asks to land an agent session's work. Claude may first get prompts to
+/// commit its changes or to resolve conflicts; those turns go with
+/// `permission_mode`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapUp {
+    pub target: WrapUpTarget,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+}
+
+/// Where a session's work was landed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Landed {
+    /// The clone's checkout was fast-forwarded to `sha`.
+    Checkout { sha: String },
+    PullRequest { number: u64, url: String },
+}
+
 /// The user's answer to an `ApprovalRequested` event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approval {
@@ -494,6 +528,10 @@ pub enum AgentEventKind {
     },
     /// Grenadine couldn't run Claude Code, or it crashed.
     Error(String),
+    /// Wrapping up landed the session's work.
+    Landed(Landed),
+    /// Wrapping up stopped; carries why.
+    WrapUpFailed(String),
 }
 
 /// One hunk of the change a file tool made, as Claude Code reports it.

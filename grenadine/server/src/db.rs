@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
     VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -185,6 +185,13 @@ const MIGRATIONS: &[Migration] = &[
     -- How full the context window is, NULL until Claude Code reports it.
     ALTER TABLE agents ADD COLUMN context_tokens INTEGER;
     ALTER TABLE agents ADD COLUMN context_window INTEGER;
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- Where wrapping up last landed the session's work, the JSON of an
+    -- api::Landed; NULL until then.
+    ALTER TABLE agents ADD COLUMN landed TEXT;
 "#,
     ),
 ];
@@ -842,6 +849,24 @@ impl Db {
         Ok(())
     }
 
+    /// Records where wrapping up landed the session's work.
+    pub fn set_agent_landed(&self, id: &str, landed: &Landed) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET landed = ? WHERE id = ?",
+            params![serde_json::to_string(landed)?, id],
+        )?;
+        Ok(())
+    }
+
+    /// Moves the commit that the session's own work starts after.
+    pub fn set_agent_base(&self, id: &str, base_sha: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET base_sha = ? WHERE id = ?",
+            params![base_sha, id],
+        )?;
+        Ok(())
+    }
+
     /// Returns false when there is no such session.
     pub fn delete_agent(&self, id: &str) -> Result<bool> {
         Ok(self.conn().execute("DELETE FROM agents WHERE id = ?", [id])? > 0)
@@ -892,7 +917,7 @@ impl Db {
 }
 
 const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
-     created_at, cost_usd, context_tokens, context_window";
+     created_at, cost_usd, context_tokens, context_window, landed";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -908,6 +933,9 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         cost_usd: r.get(9)?,
         context_tokens: r.get(10)?,
         context_window: r.get(11)?,
+        landed: r
+            .get::<_, Option<String>>(12)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -1381,6 +1409,7 @@ mod tests {
             cost_usd: 0.0,
             context_tokens: None,
             context_window: None,
+            landed: None,
         }
     }
 
@@ -1404,6 +1433,14 @@ mod tests {
         db.set_agent_usage("a", Some(1_000), None).unwrap();
         let a = db.agent("a").unwrap().unwrap();
         assert_eq!((a.context_tokens, a.context_window), (Some(1_000), Some(200_000)));
+        let landed = Landed::PullRequest {
+            number: 3,
+            url: "https://github.com/o/n/pull/3".into(),
+        };
+        db.set_agent_landed("a", &landed).unwrap();
+        db.set_agent_base("a", "t").unwrap();
+        let a = db.agent("a").unwrap().unwrap();
+        assert_eq!((a.landed, a.base_sha.as_str()), (Some(landed), "t"));
 
         db.interrupt_agents().unwrap();
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();

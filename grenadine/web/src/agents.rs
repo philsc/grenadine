@@ -5,8 +5,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PatchHunk,
-    PermissionMode, PrKey,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, Landed, NewAgent, PatchHunk,
+    PermissionMode, PrKey, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -76,6 +76,27 @@ fn usage_level(percent: f64) -> &'static str {
         "orange"
     } else {
         "red"
+    }
+}
+
+/// Where a session's work went, in a few words.
+fn landed_label(landed: &Landed) -> String {
+    match landed {
+        Landed::Checkout { sha } => format!("merged {}", &sha[..sha.len().min(8)]),
+        Landed::PullRequest { number, .. } => format!("PR #{number}"),
+    }
+}
+
+/// `landed_label`, linking to the PR.
+#[component]
+fn LandedBadge(landed: Landed) -> impl IntoView {
+    let label = landed_label(&landed);
+    match landed {
+        Landed::Checkout { .. } => view! { <span class="agent-landed">{label}</span> }.into_any(),
+        Landed::PullRequest { url, .. } => view! {
+            <a class="agent-landed" href=url target="_blank">{label}</a>
+        }
+        .into_any(),
     }
 }
 
@@ -158,6 +179,9 @@ fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> 
                             let mut meta = vec![a.branch.clone(), cost(a.cost_usd)];
                             if let Some(n) = a.pr {
                                 meta.insert(0, format!("#{n}"));
+                            }
+                            if let Some(landed) = &a.landed {
+                                meta.push(landed_label(landed));
                             }
                             view! {
                                 <li>
@@ -510,7 +534,7 @@ pub fn AgentView(id: String) -> impl IntoView {
                         session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
                     });
                     view! {
-                        <AgentHeader session=session />
+                        <AgentHeader session=session mode=mode />
                         <Transcript session=session events=events streaming=streaming mode=mode />
                         <Composer session=session usage=usage mode=mode />
                     }.into_any()
@@ -521,8 +545,30 @@ pub fn AgentView(id: String) -> impl IntoView {
 }
 
 #[component]
-fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
+fn AgentHeader(session: Signal<AgentSession>, mode: RwSignal<PermissionMode>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
+    let wrapping = RwSignal::new(false);
+    let busy = Signal::derive(move || {
+        wrapping.get()
+            || session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
+    });
+    // Claude may get prompts to commit or to resolve conflicts first;
+    // they go with the mode the composer has picked.
+    let wrap_up = move |target| {
+        let id = session.with_untracked(|s| s.id.clone());
+        let req = WrapUp {
+            target,
+            permission_mode: mode.get_untracked(),
+        };
+        wrapping.set(true);
+        error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::wrap_up_agent(&id, &req).await {
+                error.set(Some(e));
+            }
+            wrapping.set(false);
+        });
+    };
     let delete = move |_| {
         let confirmed = window()
             .confirm_with_message(
@@ -561,7 +607,22 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                         " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
                         " on " <code>{s.branch.clone()}</code>
                         {format!(" · {}", cost(s.cost_usd))}
-                        <button class="link danger" on:click=delete>"Delete"</button>
+                        {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l /> })}
+                        <span class="agent-actions">
+                            <button
+                                class="link"
+                                title="Rebase the session's commits onto the server's checkout and fast-forward it"
+                                disabled=busy
+                                on:click=move |_| wrap_up(WrapUpTarget::Checkout)
+                            >"Merge into checkout"</button>
+                            <button
+                                class="link"
+                                title="Push the session's branch to GitHub and open a pull request"
+                                disabled=busy
+                                on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
+                            >"Open PR"</button>
+                            <button class="link danger" on:click=delete>"Delete"</button>
+                        </span>
                     </p>
                     <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
                 }
@@ -762,6 +823,19 @@ fn Transcript(
                         }.into_any(),
                         AgentEventKind::Error(e) => view! {
                             <pre class="turn-error">{e}</pre>
+                        }.into_any(),
+                        AgentEventKind::Landed(Landed::Checkout { sha }) => view! {
+                            <p class="turn-end wrapped-up">
+                                "Merged into the checkout at " <code>{sha}</code>
+                            </p>
+                        }.into_any(),
+                        AgentEventKind::Landed(Landed::PullRequest { number, url }) => view! {
+                            <p class="turn-end wrapped-up">
+                                "Opened " <a href=url target="_blank">{format!("PR #{number}")}</a>
+                            </p>
+                        }.into_any(),
+                        AgentEventKind::WrapUpFailed(e) => view! {
+                            <pre class="turn-error">{format!("Couldn't wrap up: {e}")}</pre>
                         }.into_any(),
                         AgentEventKind::ToolResult { .. }
                         | AgentEventKind::ApprovalResolved { .. }
@@ -1290,6 +1364,7 @@ mod tests {
             cost_usd: 0.0,
             context_tokens: None,
             context_window: None,
+            landed: None,
         }
     }
 

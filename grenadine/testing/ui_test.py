@@ -32,6 +32,7 @@ STARTUP_TIMEOUT = 30
 # manual allow the write without asking.
 FAKE_CLAUDE = r'''
 import json
+import subprocess
 import sys
 import time
 import urllib.request
@@ -83,6 +84,10 @@ for word in ["Working ", "on ", "it"]:
     time.sleep(0.05)
 usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 40000, "output_tokens": 500}
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
+# Grenadine asks it to commit before landing its work.
+if prompt.startswith("Wrap up: commit"):
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "Write notes"], check=True)
 if "write" in prompt:
     tool_input = {"file_path": "notes.txt", "content": prompt}
     tool_use = use("Write", tool_input)
@@ -167,8 +172,10 @@ class ServerTestCase(unittest.TestCase):
 
         env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
         repo_flags = []
+        cls.clones = {}
         for slug in cls.REPOS:
             clone = tmp / "clones" / slug
+            cls.clones[slug] = clone
             subprocess.run(["git", "init", "--quiet", clone], env=env, check=True)
             subprocess.run(
                 ["git", "-C", clone, "remote", "add", "origin", f"https://github.com/{slug}"],
@@ -648,6 +655,53 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_wrap_up(self) -> None:
+        # The server's clone has main checked out, which the work lands on.
+        clone = self.clones[self.OTHER_REPO]
+        env = self.gh.git_env()
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", clone, *args], env=env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        git("fetch", "--quiet", "origin", "main")
+        git("checkout", "--quiet", "-B", "main", "FETCH_HEAD")
+
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The note isn't committed, so Claude is asked to commit it first.
+        header = self.page.locator(".agent-header")
+        header.get_by_role("button", name="Merge into checkout").click()
+        expect(transcript.locator(".turn-prompt").nth(1)).to_contain_text("Wrap up: commit")
+        expect(transcript.locator(".wrapped-up")).to_contain_text("Merged into the checkout at")
+        sha = git("rev-parse", "HEAD")
+        expect(transcript.locator(".wrapped-up code")).to_have_text(sha)
+        expect(header).to_contain_text(f"merged {sha[:8]}")
+        self.assertEqual(git("branch", "--show-current"), "main")
+        self.assertEqual((clone / "notes.txt").read_text(), "write a note")
+        self.assertEqual(git("log", "-1", "--format=%s"), "Write notes")
+
+        # Then it proposes more work in a PR.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("write more")
+        follow_up.press("Control+Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+        header.get_by_role("button", name="Open PR").click()
+        opened = transcript.locator(".wrapped-up").nth(1)
+        expect(opened).to_contain_text(re.compile(r"Opened PR #\d+"))
+        pr = next(pr for pr in self.gh.repo(self.OTHER_REPO).prs.values() if pr.title == "Write notes")
+        expect(opened.get_by_role("link")).to_have_attribute("href", pr.url)
+        expect(header.get_by_role("link", name=f"PR #{pr.number}")).to_be_visible()
+        self.assertEqual(pr.base, "main")
+        self.assertTrue(pr.head.startswith("grenadine/agent/"))
+        # The checkout stays where the first wrap-up left it.
+        self.assertEqual(git("rev-parse", "HEAD"), sha)
 
     def test_plan_mode(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

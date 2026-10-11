@@ -528,6 +528,37 @@ impl GitHub {
         })
     }
 
+    /// Opens a pull request from `head` into `base`, both branches of
+    /// `repo`. Returns its number and URL.
+    pub async fn create_pr(
+        &self,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(u64, String)> {
+        let resp = self
+            .http
+            .post(format!("{}/repos/{repo}/pulls", self.api))
+            .json(&json!({ "head": head, "base": base, "title": title, "body": body }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            let reason = v["errors"][0]["message"]
+                .as_str()
+                .or(v["message"].as_str())
+                .unwrap_or("no reason given");
+            bail!("GitHub didn't open the PR ({status}): {reason}");
+        }
+        let number = v["number"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("GitHub's response has no PR number"))?;
+        Ok((number, str_at(&v, "/html_url").to_owned()))
+    }
+
     /// GETs every page of a REST list.
     async fn get_all<T: serde::de::DeserializeOwned>(&self, url: String) -> Result<Vec<T>> {
         let mut out = Vec::new();

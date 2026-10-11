@@ -182,6 +182,26 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(comment["body"], "Nit")
         self.assertEqual(comment["original_commit_id"], pr.head_oid)
 
+        def post(path: str, body: object) -> object:
+            req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
+                "Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req) as resp:
+                return json.load(resp)
+
+        # A PR from a branch that was pushed straight to the bare repo, the
+        # way the server's wrap-up pushes.
+        new = {"head": "agent", "base": "main", "title": "Agent work", "body": "Did it"}
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            post("/repos/test/test/pulls", new)
+        self.assertEqual(e.exception.code, 422)
+        self.repo.checkout("agent", "main")
+        sha = self.repo.commit("Agent work", {"agent.txt": "1\n"})
+        self.repo.git("push", "--quiet", "origin", "agent:refs/heads/agent")
+        created = post("/repos/test/test/pulls", new)
+        opened = self.repo.prs[created["number"]]
+        self.assertEqual((opened.title, opened.base, opened.head_oid), ("Agent work", "main", sha))
+        self.assertEqual(created["html_url"], opened.url)
+
     def test_github_urls_resolve_to_the_bare_repo(self) -> None:
         clone = self.gh.root / "clone"
         env = self.gh.git_env()

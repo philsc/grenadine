@@ -376,7 +376,26 @@ class FakeGitHub:
             return self._activity(m[1], query)
         if method == "GET" and (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)/comments", path)):
             return self._review_comments(m[1], int(m[2]))
+        if method == "POST" and (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls", path)):
+            return self._create_pr(m[1], json.loads(body))
         return 404, {"message": "Not Found"}
+
+    def _create_pr(self, slug: str, req: dict[str, Any]) -> tuple[int, Any]:
+        repo = self.repos.get(slug)
+        if repo is None:
+            return 404, {"message": "Not Found"}
+        head = req["head"]
+        try:
+            after = self.git("-C", str(repo.bare), "rev-parse", "--verify", f"refs/heads/{head}").strip()
+        except subprocess.CalledProcessError:
+            return 422, {"message": "Validation Failed", "errors": [{"message": f"No commits on {head}"}]}
+        # The branch was pushed straight to the bare repo; log it like a push.
+        before = repo.tip(head) or ZERO_SHA
+        if after != before:
+            repo.pushes.setdefault(head, []).append(
+                Push(before=before, after=after, at=self.tick(), actor=VIEWER, force=False))
+        pr = repo.open_pr(req["title"], head=head, base=req["base"], body=req.get("body", ""))
+        return 201, {"number": pr.number, "html_url": pr.url}
 
     def _activity(self, slug: str, query: dict[str, list[str]]) -> tuple[int, Any]:
         repo = self.repos.get(slug)
