@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, NewAgent, PermissionMode, PrKey,
-    ServerEvent,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, NewAgent, PatchHunk, PermissionMode,
+    PrKey, ServerEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -621,6 +621,27 @@ fn result_text(content: &Value) -> String {
     }
 }
 
+/// The hunks of a file tool's `structuredPatch`, or none when the result
+/// has no patch.
+fn patch(result: &Value) -> Vec<PatchHunk> {
+    result["structuredPatch"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| {
+            Some(PatchHunk {
+                old_start: h["oldStart"].as_u64()? as usize,
+                new_start: h["newStart"].as_u64()? as usize,
+                lines: h["lines"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|l| Some(l.as_str()?.to_owned()))
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
 /// The context window of a model by its name, until a turn's result tells.
 fn guess_window(model: &str) -> u64 {
     if model.ends_with("[1m]") {
@@ -695,6 +716,9 @@ fn parse_line(line: &str) -> Parsed {
                 id: b["tool_use_id"].as_str().unwrap_or_default().to_owned(),
                 content: result_text(&b["content"]),
                 is_error: b["is_error"].as_bool().unwrap_or(false),
+                // A message carries one tool result, and its patch is
+                // beside it.
+                patch: patch(&v["tool_use_result"]),
             })
             .collect(),
         Some("result") => {
@@ -825,6 +849,7 @@ mod tests {
                 id: "toolu_1".into(),
                 content: "No shell for you".into(),
                 is_error: true,
+                patch: vec![],
             }]
         );
         assert_eq!(
@@ -835,6 +860,22 @@ mod tests {
                 id: "toolu_2".into(),
                 content: "a\n[image]".into(),
                 is_error: false,
+                patch: vec![],
+            }]
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_3","type":"tool_result","content":"Updated"}]},"parent_tool_use_id":null,"tool_use_result":{"filePath":"/w/a.rs","structuredPatch":[{"oldStart":4,"oldLines":2,"newStart":4,"newLines":2,"lines":[" a","-b","+c"]}]}}"#
+            ),
+            [AgentEventKind::ToolResult {
+                id: "toolu_3".into(),
+                content: "Updated".into(),
+                is_error: false,
+                patch: vec![PatchHunk {
+                    old_start: 4,
+                    new_start: 4,
+                    lines: vec![" a".into(), "-b".into(), "+c".into()],
+                }],
             }]
         );
         assert_eq!(

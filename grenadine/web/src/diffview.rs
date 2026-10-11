@@ -1,17 +1,19 @@
 //! The diff between two commits, computed in the browser from blobs the
-//! server sends.
+//! server sends, and the diff of an agent's file edit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, Side};
 use grenadine_core::diff::{self, Hunk, Line};
+use grenadine_core::edit::Fragment;
 use grenadine_core::inline::{self, Aligned};
 use grenadine_core::rebase;
 use leptos::prelude::*;
 
 use crate::api;
 use crate::highlight::{highlight_lines, mark};
+use crate::inboxes::load_flag;
 use crate::pr::{Anchor, Placed, ThreadView};
 
 const CONTEXT: usize = 3;
@@ -169,6 +171,10 @@ struct Layout {
     skipped_after: usize,
     /// Per change block: whether upstream made the same change.
     upstream: Vec<bool>,
+    /// The file lines that the first old and new line are, when the texts
+    /// are only part of the file.
+    old_start: usize,
+    new_start: usize,
 }
 
 fn text(b: &Option<Arc<Blob>>) -> Option<&str> {
@@ -176,23 +182,38 @@ fn text(b: &Option<Arc<Blob>>) -> Option<&str> {
 }
 
 fn layout(file: &FileData) -> Layout {
-    let (old, new) = (
+    let upstream = file
+        .upstream
+        .as_ref()
+        .map(|(a, b)| (text(a).unwrap_or_default(), text(b).unwrap_or_default()));
+    layout_texts(
+        file.change.old_path.as_deref().unwrap_or_default(),
+        file.change.path(),
         text(&file.old).unwrap_or_default(),
         text(&file.new).unwrap_or_default(),
-    );
+        upstream,
+    )
+}
+
+/// Lays out the diff from `old` to `new`, which are named by their paths
+/// for highlighting. `upstream` is the same file's upstream change.
+fn layout_texts(
+    old_path: &str,
+    new_path: &str,
+    old: &str,
+    new: &str,
+    upstream: Option<(&str, &str)>,
+) -> Layout {
     let (old_lines, new_lines) = (rebase::lines(old), rebase::lines(new));
     let blocks = rebase::change_blocks(&old_lines, &new_lines);
-    let upstream = match &file.upstream {
-        Some((a, b)) => {
-            let (ua, ub) = (text(a).unwrap_or_default(), text(b).unwrap_or_default());
-            rebase::from_upstream(
-                &old_lines,
-                &new_lines,
-                &blocks,
-                &rebase::lines(ua),
-                &rebase::lines(ub),
-            )
-        }
+    let upstream = match upstream {
+        Some((ua, ub)) => rebase::from_upstream(
+            &old_lines,
+            &new_lines,
+            &blocks,
+            &rebase::lines(ua),
+            &rebase::lines(ub),
+        ),
         None => vec![false; blocks.len()],
     };
     let aligned: Vec<Vec<Aligned>> = blocks
@@ -200,8 +221,8 @@ fn layout(file: &FileData) -> Layout {
         .map(|b| inline::align(&old_lines, &new_lines, b))
         .collect();
     let hunks = diff::hunks(&blocks, &aligned, old_lines.len(), new_lines.len(), CONTEXT);
-    let mut old_html = highlight_lines(file.change.old_path.as_deref().unwrap_or_default(), old);
-    let mut new_html = highlight_lines(file.change.path(), new);
+    let mut old_html = highlight_lines(old_path, old);
+    let mut new_html = highlight_lines(new_path, new);
     for rows in &aligned {
         for r in rows {
             let (true, Some(o), Some(n)) = (r.paired, r.old, r.new) else {
@@ -222,6 +243,8 @@ fn layout(file: &FileData) -> Layout {
         skipped_after: diff::skipped_after(&hunks, old_lines.len()),
         hunks,
         upstream,
+        old_start: 0,
+        new_start: 0,
     }
 }
 
@@ -327,6 +350,25 @@ fn FileView(
             })}
             {body}
         </section>
+    }
+}
+
+/// The change an agent's file tool made to `path`, laid out like a PR's
+/// unified diff.
+#[component]
+pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
+    let inline_changes = Signal::stored(load_flag("inline-changes", true));
+    view! {
+        <div class="edit-diff">
+            {fragments.iter().map(|f| {
+                let l = Layout {
+                    old_start: f.old_start,
+                    new_start: f.new_start,
+                    ..layout_texts(&path, &path, &f.old, &f.new, None)
+                };
+                unified_view(&l, &[], inline_changes)
+            }).collect_view()}
+        </div>
     }
 }
 
@@ -450,8 +492,8 @@ fn unified_view(
             rows.push(
                 view! {
                     <tr class=format!("line {kind}") class:upstream=upstream>
-                        <td class="ln">{num(old)}</td>
-                        <td class="ln">{num(new)}</td>
+                        <td class="ln">{num(old.map(|o| o + l.old_start))}</td>
+                        <td class="ln">{num(new.map(|n| n + l.new_start))}</td>
                         <td class="marker">{marker}</td>
                         <td class="code" inner_html=code></td>
                     </tr>

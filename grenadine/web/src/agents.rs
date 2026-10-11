@@ -5,14 +5,16 @@
 use std::collections::{BTreeMap, HashMap};
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PermissionMode,
-    PrKey,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PatchHunk,
+    PermissionMode, PrKey,
 };
+use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
+use crate::diffview::EditDiff;
 use crate::inboxes::storage;
 use crate::{Route, Updates, api, hash_for, markdown};
 
@@ -417,6 +419,32 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// The file a file tool changes and the pieces of it that change, or `None`
+/// for other tools. The `patch` from the tool's result places the pieces in
+/// the file; without it, they are numbered from the first line.
+fn edit_fragments(
+    name: &str,
+    input: &serde_json::Value,
+    patch: &[PatchHunk],
+) -> Option<(String, Vec<Fragment>)> {
+    let text = |v: &serde_json::Value, field: &str| v[field].as_str().unwrap_or_default().to_owned();
+    let fragments = match name {
+        "Edit" | "MultiEdit" | "Write" if !patch.is_empty() => edit::from_patch(patch),
+        "Edit" => vec![edit::from_strings(
+            &text(input, "old_string"),
+            &text(input, "new_string"),
+        )],
+        "MultiEdit" => input["edits"]
+            .as_array()?
+            .iter()
+            .map(|e| edit::from_strings(&text(e, "old_string"), &text(e, "new_string")))
+            .collect(),
+        "Write" => vec![edit::from_strings("", &text(input, "content"))],
+        _ => return None,
+    };
+    Some((input["file_path"].as_str()?.to_owned(), fragments))
+}
+
 fn pretty(json: &str) -> String {
     serde_json::from_str::<serde_json::Value>(json)
         .and_then(|v| serde_json::to_string_pretty(&v))
@@ -561,7 +589,8 @@ fn Transcript(
                         id,
                         content,
                         is_error,
-                    } => Some((id.clone(), (content.clone(), *is_error))),
+                        patch,
+                    } => Some((id.clone(), (content.clone(), *is_error, patch.clone()))),
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>()
@@ -645,9 +674,20 @@ fn Transcript(
                             <div class="turn-text markdown" inner_html=markdown::to_html(&t, &repo)></div>
                         }.into_any(),
                         AgentEventKind::ToolUse { id: tool, name, input } => {
-                            let value = serde_json::from_str(&input).unwrap_or_default();
+                            let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
                             let summary = tool_summary(&name, &value);
                             let result = Signal::derive(move || results.with(|r| r.get(&tool).cloned()));
+                            let is_edit = edit_fragments(&name, &value, &[]).is_some();
+                            let body = {
+                                let name = name.clone();
+                                move || {
+                                    let patch = result.with(|r| r.as_ref().map(|(_, _, p)| p.clone()));
+                                    match edit_fragments(&name, &value, &patch.unwrap_or_default()) {
+                                        Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
+                                        None => view! { <pre class="tool-input">{pretty(&input)}</pre> }.into_any(),
+                                    }
+                                }
+                            };
                             view! {
                                 <details class="tool">
                                     <summary>
@@ -655,14 +695,17 @@ fn Transcript(
                                         " " <code>{summary}</code>
                                         {move || match result.get() {
                                             None => view! { <span class="muted">" …"</span> }.into_any(),
-                                            Some((_, true)) => view! { <span class="error">" failed"</span> }.into_any(),
+                                            Some((_, true, _)) => view! { <span class="error">" failed"</span> }.into_any(),
                                             Some(_) => ().into_any(),
                                         }}
                                     </summary>
-                                    <pre class="tool-input">{pretty(&input)}</pre>
-                                    {move || result.get().map(|(content, is_error)| view! {
-                                        <pre class="tool-result" class:error=is_error>{content}</pre>
-                                    })}
+                                    {body}
+                                    // A successful edit's result only repeats the diff.
+                                    {move || result.get()
+                                        .filter(|(_, is_error, _)| *is_error || !is_edit)
+                                        .map(|(content, is_error, _)| view! {
+                                            <pre class="tool-result" class:error=is_error>{content}</pre>
+                                        })}
                                 </details>
                             }.into_any()
                         }
@@ -697,6 +740,7 @@ fn Transcript(
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input } => {
                             let value = serde_json::from_str(&input).unwrap_or_default();
                             let summary = tool_summary(&tool_name, &value);
+                            let diff = edit_fragments(&tool_name, &value, &[]);
                             view! {
                                 <ApprovalCard
                                     agent=id
@@ -704,6 +748,7 @@ fn Transcript(
                                     tool_name=tool_name
                                     summary=summary
                                     input=pretty(&input)
+                                    diff=diff
                                     resolved=resolved
                                     waiting=waiting
                                 />
@@ -1007,6 +1052,8 @@ fn ApprovalCard(
     tool_name: String,
     summary: String,
     input: String,
+    /// What a file tool would change, shown instead of `input`.
+    diff: Option<(String, Vec<Fragment>)>,
     resolved: Memo<HashMap<String, bool>>,
     /// Whether Claude Code is running and so may wait for an answer;
     /// requests from before a restart stay unanswered.
@@ -1043,7 +1090,10 @@ fn ApprovalCard(
             {move || (state.get().is_none() && waiting.get()).then(|| {
                 let (allow, deny) = (answer.clone(), deny.clone());
                 view! {
-                    <pre class="tool-input">{input.clone()}</pre>
+                    {match diff.clone() {
+                        Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
+                        None => view! { <pre class="tool-input">{input.clone()}</pre> }.into_any(),
+                    }}
                     <div class="form-buttons">
                         <button class="primary" disabled=move || busy.get() on:click=move |_| allow(true)>"Allow"</button>
                         <button disabled=move || busy.get() on:click=move |_| deny(false)>"Deny"</button>
@@ -1162,6 +1212,42 @@ fn ContextMeter(usage: Signal<(Option<u64>, Option<u64>)>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_fragments_by_tool() {
+        let path = || "/w/a.rs".to_owned();
+        let input = serde_json::json!({"file_path": "/w/a.rs", "old_string": "a", "new_string": "b"});
+        assert_eq!(
+            edit_fragments("Edit", &input, &[]),
+            Some((path(), vec![edit::from_strings("a", "b")]))
+        );
+        let input = serde_json::json!({"file_path": "/w/a.rs", "edits": [
+            {"old_string": "a", "new_string": "b"},
+            {"old_string": "c", "new_string": "d"},
+        ]});
+        assert_eq!(
+            edit_fragments("MultiEdit", &input, &[]),
+            Some((
+                path(),
+                vec![edit::from_strings("a", "b"), edit::from_strings("c", "d")]
+            ))
+        );
+        let input = serde_json::json!({"file_path": "/w/a.rs", "content": "x\n"});
+        assert_eq!(
+            edit_fragments("Write", &input, &[]),
+            Some((path(), vec![edit::from_strings("", "x\n")]))
+        );
+        let patch = [PatchHunk {
+            old_start: 7,
+            new_start: 7,
+            lines: vec!["-a".into(), "+b".into()],
+        }];
+        assert_eq!(
+            edit_fragments("Edit", &input, &patch),
+            Some((path(), edit::from_patch(&patch)))
+        );
+        assert_eq!(edit_fragments("Read", &input, &patch), None);
+    }
 
     #[test]
     fn tool_summaries() {

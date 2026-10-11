@@ -70,8 +70,11 @@ def approve(name, tool_input, tool_use):
     return json.loads(answer["result"]["content"][0]["text"])
 
 
-def result(tool_use, content, is_error=False):
-    emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use, "content": content, "is_error": is_error}]}})
+def result(tool_use, content, is_error=False, patch=None):
+    line = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use, "content": content, "is_error": is_error}]}}
+    if patch:
+        line["tool_use_result"] = {"structuredPatch": patch}
+    emit(line)
 
 
 emit({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-test"})
@@ -89,7 +92,9 @@ if "write" in prompt:
     if decision["behavior"] == "allow":
         with open("notes.txt", "w") as f:
             f.write(prompt)
-        result(tool_use, "Wrote notes.txt")
+        # Claude Code reports where in the file the change went.
+        patch = [{"oldStart": 1, "oldLines": 0, "newStart": 1, "newLines": 1, "lines": ["+" + prompt]}]
+        result(tool_use, "Wrote notes.txt", patch=patch)
     else:
         result(tool_use, decision["message"], is_error=True)
 # In plan mode, it asks which file to write, then has its plan approved,
@@ -574,6 +579,7 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-text strong")).to_have_text("please write a note")
         approval = transcript.locator(".approval")
         expect(approval).to_contain_text("Claude wants to use Write notes.txt")
+        expect(approval.locator(".edit-diff tr.add .code")).to_have_text("please write a note")
         approval.get_by_role("button", name="Allow").click()
         expect(approval).to_contain_text("Allowed Write")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
@@ -591,7 +597,11 @@ class AgentTest(ServerTestCase):
         self.assertLess(send["x"] + send["width"], box["x"])
         tool = transcript.locator(".tool")
         tool.locator("summary").click()
-        expect(tool.locator(".tool-result")).to_have_text("Wrote notes.txt")
+        # The write shows as a diff, without the result that only repeats it.
+        added = tool.locator(".edit-diff tr.add")
+        expect(added.locator(".ln")).to_have_text(["", "1"])
+        expect(added.locator(".code")).to_have_text("please write a note")
+        expect(tool.locator(".tool-result")).to_have_count(0)
 
         # The agent worked in the session's worktree, which starts at main.
         worktree = Path(self.page.locator(".agent-worktree").inner_text())

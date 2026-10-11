@@ -535,11 +535,13 @@ textarea { width: 100%; resize: vertical; }
   overflow-y: auto;
 }
 .tool-result.error { color: var(--error-fg); }
+.edit-diff { border-top: 1px solid var(--border); max-height: 400px; overflow-y: auto; }
+.edit-diff .diff + .diff { border-top: 1px dashed var(--border); }
 
 .approval { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
 .approval p { margin: 0; }
 .approval.pending { border-color: var(--warn-border); background: var(--warn-bg); }
-.approval .tool-input { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; }
+.approval .tool-input, .approval .edit-diff { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; }
 .approval .plan-text { margin: 6px 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
 .approval .plan-feedback { width: 100%; box-sizing: border-box; font: inherit; }
 .approval .question { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px 8px; display: flex; flex-direction: column; gap: 4px; }

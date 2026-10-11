@@ -466,6 +466,9 @@ pub enum AgentEventKind {
         id: String,
         content: String,
         is_error: bool,
+        /// The change a file tool made, when Claude Code reports one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        patch: Vec<PatchHunk>,
     },
     /// Claude wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
@@ -491,6 +494,17 @@ pub enum AgentEventKind {
     },
     /// Grenadine couldn't run Claude Code, or it crashed.
     Error(String),
+}
+
+/// One hunk of the change a file tool made, as Claude Code reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchHunk {
+    /// The 1-based line the hunk starts on in the old file.
+    pub old_start: usize,
+    /// The 1-based line the hunk starts on in the new file.
+    pub new_start: usize,
+    /// The hunk's lines, each prefixed with ' ', '-' or '+'.
+    pub lines: Vec<String>,
 }
 
 impl AgentEventKind {
