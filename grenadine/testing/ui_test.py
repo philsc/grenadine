@@ -58,6 +58,22 @@ def rpc(method, params, id=1):
         return json.load(response)
 
 
+def use(name, tool_input):
+    tool_use = "toolu_" + uuid.uuid4().hex
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_use, "name": name, "input": tool_input}]}})
+    return tool_use
+
+
+def approve(name, tool_input, tool_use):
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    answer = rpc("tools/call", {"name": "approve", "arguments": {"tool_name": name, "input": tool_input, "tool_use_id": tool_use}})
+    return json.loads(answer["result"]["content"][0]["text"])
+
+
+def result(tool_use, content, is_error=False):
+    emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use, "content": content, "is_error": is_error}]}})
+
+
 emit({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-test"})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
@@ -65,21 +81,42 @@ for word in ["Working ", "on ", "it"]:
 usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 40000, "output_tokens": 500}
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
 if "write" in prompt:
-    tool_use = "toolu_" + uuid.uuid4().hex
     tool_input = {"file_path": "notes.txt", "content": prompt}
-    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_use, "name": "Write", "input": tool_input}]}})
+    tool_use = use("Write", tool_input)
     decision = {"behavior": "allow"}
     if mode == "manual":
-        rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
-        answer = rpc("tools/call", {"name": "approve", "arguments": {"tool_name": "Write", "input": tool_input, "tool_use_id": tool_use}})
-        decision = json.loads(answer["result"]["content"][0]["text"])
+        decision = approve("Write", tool_input, tool_use)
     if decision["behavior"] == "allow":
         with open("notes.txt", "w") as f:
             f.write(prompt)
-        result = {"type": "tool_result", "tool_use_id": tool_use, "content": "Wrote notes.txt"}
+        result(tool_use, "Wrote notes.txt")
     else:
-        result = {"type": "tool_result", "tool_use_id": tool_use, "content": decision["message"], "is_error": True}
-    emit({"type": "user", "message": {"content": [result]}})
+        result(tool_use, decision["message"], is_error=True)
+# In plan mode, it asks which file to write, then has its plan approved,
+# revising it with the feedback until it is. The file gets the mode the
+# approval switches to.
+if mode == "plan":
+    question = "Which file?"
+    tool_input = {"questions": [{
+        "question": question,
+        "header": "File",
+        "options": [{"label": "notes.txt", "description": "The usual"}, {"label": "todo.txt", "description": ""}],
+        "multiSelect": False,
+    }]}
+    tool_use = use("AskUserQuestion", tool_input)
+    name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
+    result(tool_use, f'"{question}"="{name}"')
+    plan = f"# Plan\n\nWrite **{name}**."
+    while True:
+        tool_use = use("ExitPlanMode", {"plan": plan})
+        decision = approve("ExitPlanMode", {"plan": plan}, tool_use)
+        if decision["behavior"] == "allow":
+            break
+        result(tool_use, decision["message"], is_error=True)
+        plan += f"\n\nAlso: {decision['message']}"
+    result(tool_use, "User has approved your plan.")
+    with open(name, "w") as f:
+        f.write(decision["updatedPermissions"][0]["mode"])
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
 '''
 
@@ -601,6 +638,44 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_plan_mode(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Plan first")
+        self.page.get_by_label("Prompt").fill("make a plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+
+        # Claude asks a question first; it takes an answer to every question.
+        question = transcript.locator(".approval.questions")
+        expect(question).to_contain_text("Claude asks")
+        expect(question.locator("legend")).to_have_text("File Which file?")
+        answer = question.get_by_role("button", name="Answer")
+        expect(answer).to_be_disabled()
+        question.get_by_label("todo.txt").check()
+        answer.click()
+        expect(question).to_contain_text("Answered")
+
+        # A plan sent back comes again with the feedback in it.
+        plans = transcript.locator(".approval.plan")
+        expect(plans.locator(".plan-text strong")).to_have_text("todo.txt")
+        plans.get_by_label("Feedback").fill("Add a title")
+        plans.get_by_role("button", name="Keep planning").click()
+        expect(plans).to_have_count(2)
+        expect(plans.first).to_contain_text("Plan sent back")
+        revised = plans.nth(1)
+        expect(revised.locator(".plan-text")).to_contain_text("Also: Add a title")
+
+        # Approving it switches the turn and the follow-ups to the mode picked.
+        after = revised.get_by_label("After the plan")
+        expect(after).to_have_value("acceptEdits")
+        after.select_option(label="Auto")
+        revised.get_by_role("button", name="Approve plan").click()
+        expect(revised).to_contain_text("Plan approved")
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        worktree = Path(self.page.locator(".agent-worktree").inner_text())
+        self.assertEqual((worktree / "todo.txt").read_text(), "auto")
+        expect(self.page.get_by_label("Permissions")).to_have_value("auto")
 
 
 if __name__ == "__main__":

@@ -329,6 +329,8 @@ async fn approve(
     let decision = Decision {
         allow: approval.allow,
         message: approval.message,
+        mode: approval.mode,
+        answers: approval.answers,
     };
     Ok(if agent::approve(&state, &id, &approval.id, decision)? {
         StatusCode::NO_CONTENT

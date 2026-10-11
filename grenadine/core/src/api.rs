@@ -370,13 +370,17 @@ pub enum PermissionMode {
     AcceptEdits,
     /// A classifier allows routine tool uses and asks for risky ones.
     Auto,
+    /// Research without changing anything, then ask the user to approve a
+    /// plan; the turn goes on in the mode picked with the approval.
+    Plan,
 }
 
 impl PermissionMode {
-    pub const ALL: [PermissionMode; 3] = [
+    pub const ALL: [PermissionMode; 4] = [
         PermissionMode::Manual,
         PermissionMode::AcceptEdits,
         PermissionMode::Auto,
+        PermissionMode::Plan,
     ];
 
     /// The value of Claude Code's `--permission-mode`.
@@ -385,6 +389,7 @@ impl PermissionMode {
             PermissionMode::Manual => "manual",
             PermissionMode::AcceptEdits => "acceptEdits",
             PermissionMode::Auto => "auto",
+            PermissionMode::Plan => "plan",
         }
     }
 
@@ -398,6 +403,7 @@ impl PermissionMode {
             PermissionMode::Manual => "Ask for everything",
             PermissionMode::AcceptEdits => "Accept edits",
             PermissionMode::Auto => "Auto",
+            PermissionMode::Plan => "Plan first",
         }
     }
 }
@@ -429,6 +435,14 @@ pub struct Approval {
     pub allow: bool,
     /// Told to Claude when the tool call is denied.
     pub message: Option<String>,
+    /// For `ExitPlanMode`: the mode the turn goes on in once the plan is
+    /// approved.
+    #[serde(default)]
+    pub mode: Option<PermissionMode>,
+    /// For `AskUserQuestion`: the answer to each question, keyed by the
+    /// question's text.
+    #[serde(default)]
+    pub answers: Option<BTreeMap<String, String>>,
 }
 
 /// Something that happened in an agent session's transcript.

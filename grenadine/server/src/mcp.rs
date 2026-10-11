@@ -1,14 +1,18 @@
 //! A minimal MCP server (JSON-RPC over streamable HTTP, JSON responses
 //! only) with one tool, `approve`, that Claude Code calls through
 //! `--permission-prompt-tool` before it uses a tool. The call waits until
-//! the user allows or denies the tool use on the page.
+//! the user allows or denies the tool use on the page. The user's answers
+//! to `AskUserQuestion` and the mode an approved plan goes on in come back
+//! with the approval.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use grenadine_core::api::PermissionMode;
 use serde_json::{Value, json};
 
 use crate::agent::{self, Decision};
@@ -35,6 +39,29 @@ fn reply(id: &Value, result: Value) -> Response {
 fn error(id: &Value, code: i64, message: &str) -> Response {
     Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
         .into_response()
+}
+
+/// The tool's answer when the user allows a tool use. `AskUserQuestion`
+/// takes the user's answers as part of its input, and `setMode` switches
+/// the turn out of plan mode when `ExitPlanMode` is allowed.
+fn allowed(
+    input: &Value,
+    mode: Option<PermissionMode>,
+    answers: Option<BTreeMap<String, String>>,
+) -> Value {
+    let mut input = input.clone();
+    if let (Some(answers), Some(fields)) = (answers, input.as_object_mut()) {
+        fields.insert("answers".into(), json!(answers));
+    }
+    let mut answer = json!({"behavior": "allow", "updatedInput": input});
+    if let Some(mode) = mode {
+        answer["updatedPermissions"] = json!([{
+            "type": "setMode",
+            "mode": mode.as_str(),
+            "destination": "session",
+        }]);
+    }
+    answer
 }
 
 pub async fn handle(
@@ -108,12 +135,16 @@ pub async fn handle(
                 }
             };
             let answer = match decision {
-                Some(Decision { allow: true, .. }) => {
-                    json!({"behavior": "allow", "updatedInput": args["input"]})
-                }
+                Some(Decision {
+                    allow: true,
+                    mode,
+                    answers,
+                    ..
+                }) => allowed(&args["input"], mode, answers),
                 Some(Decision {
                     allow: false,
                     message,
+                    ..
                 }) => json!({
                     "behavior": "deny",
                     "message": message.unwrap_or_else(|| "The user denied this tool use.".into()),
@@ -249,7 +280,7 @@ mod tests {
         }
         let decision = Decision {
             allow,
-            message: None,
+            ..Decision::default()
         };
         assert!(agent::approve(state, ID, tool_use, decision).unwrap());
         let (_, body) = task.await.unwrap();
@@ -274,7 +305,7 @@ mod tests {
         // Answered requests are gone.
         let decision = Decision {
             allow: true,
-            message: None,
+            ..Decision::default()
         };
         assert!(!agent::approve(&state, ID, "toolu_2", decision).unwrap());
 
@@ -307,6 +338,34 @@ mod tests {
                     allow: false
                 },
             ]
+        );
+    }
+
+    /// The answers Claude Code 2.1 takes, as tried with a real `claude -p`.
+    #[test]
+    fn allowed_answers() {
+        let plan = json!({"plan": "# Plan", "planFilePath": "/p.md"});
+        assert_eq!(
+            allowed(&plan, Some(PermissionMode::AcceptEdits), None),
+            json!({
+                "behavior": "allow",
+                "updatedInput": plan,
+                "updatedPermissions": [
+                    {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+                ],
+            })
+        );
+        let questions = json!({"questions": [{"question": "Tea?", "options": []}]});
+        let answers = BTreeMap::from([("Tea?".to_owned(), "Yes".to_owned())]);
+        assert_eq!(
+            allowed(&questions, None, Some(answers)),
+            json!({
+                "behavior": "allow",
+                "updatedInput": {
+                    "questions": [{"question": "Tea?", "options": []}],
+                    "answers": {"Tea?": "Yes"},
+                },
+            })
         );
     }
 }

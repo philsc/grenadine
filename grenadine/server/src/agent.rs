@@ -5,7 +5,7 @@
 //! the tool uses that the mode doesn't decide on its own through the MCP
 //! tool in `mcp.rs`, which waits for the user's answer from the page.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,10 +32,14 @@ const MCP_TOOL_TIMEOUT_MS: &str = "86400000";
 const STDERR_TAIL: usize = 4096;
 
 /// The user's answer to a permission request.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Decision {
     pub allow: bool,
     pub message: Option<String>,
+    /// The mode an approved plan goes on in.
+    pub mode: Option<PermissionMode>,
+    /// The answers to `AskUserQuestion`, by question.
+    pub answers: Option<BTreeMap<String, String>>,
 }
 
 pub struct Agents {
@@ -305,6 +309,7 @@ pub fn interrupt(state: &State, id: &str) {
         let _ = tx.send(Decision {
             allow: false,
             message: Some("The user interrupted the turn.".into()),
+            ..Decision::default()
         });
         let _ = emit(
             state,

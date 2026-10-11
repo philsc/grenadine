@@ -2,7 +2,7 @@
 //! starts one, and a session's page with its live transcript, permission
 //! requests and a box for follow-up prompts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PermissionMode,
@@ -10,6 +10,7 @@ use grenadine_core::api::{
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use crate::inboxes::storage;
@@ -195,12 +196,23 @@ fn mode_signal() -> RwSignal<PermissionMode> {
     mode
 }
 
+/// The modes the turn can go on in once a plan is approved.
+const AFTER_PLAN: [PermissionMode; 3] = [
+    PermissionMode::Manual,
+    PermissionMode::AcceptEdits,
+    PermissionMode::Auto,
+];
+
 #[component]
-fn ModeSelect(mode: RwSignal<PermissionMode>) -> impl IntoView {
+fn ModeSelect(
+    mode: RwSignal<PermissionMode>,
+    #[prop(default = &PermissionMode::ALL)] modes: &'static [PermissionMode],
+    #[prop(default = "Permissions")] label: &'static str,
+) -> impl IntoView {
     view! {
         <select
             class="agent-mode"
-            aria-label="Permissions"
+            aria-label=label
             title="What Claude may do without asking here"
             prop:value=move || mode.get().as_str()
             on:change=move |ev| {
@@ -209,7 +221,7 @@ fn ModeSelect(mode: RwSignal<PermissionMode>) -> impl IntoView {
                 }
             }
         >
-            {PermissionMode::ALL.into_iter().map(|m| view! {
+            {modes.iter().map(|&m| view! {
                 <option value=m.as_str() selected=move || mode.get() == m>{m.label()}</option>
             }).collect_view()}
         </select>
@@ -312,7 +324,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                         }
                     }
                 ></textarea>
-                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Every prompt can pick different permissions."</p>
+                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -389,6 +401,13 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         "WebFetch" => "url",
         "WebSearch" => "query",
         "Task" | "Agent" => "description",
+        "ExitPlanMode" => "plan",
+        "AskUserQuestion" => {
+            return input["questions"][0]["question"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+        }
         _ => "",
     };
     match input.get(field).and_then(|v| v.as_str()) {
@@ -442,6 +461,8 @@ pub fn AgentView(id: String) -> impl IntoView {
     let streaming = RwSignal::new(String::new());
     let live_usage = RwSignal::new((None, None));
     follow(&id, events, streaming, live_usage);
+    // Approving a plan also picks the mode the follow-ups go with.
+    let mode = mode_signal();
 
     view! {
         <div class="agent">
@@ -461,8 +482,8 @@ pub fn AgentView(id: String) -> impl IntoView {
                     });
                     view! {
                         <AgentHeader session=session />
-                        <Transcript session=session events=events streaming=streaming />
-                        <Composer session=session usage=usage />
+                        <Transcript session=session events=events streaming=streaming mode=mode />
+                        <Composer session=session usage=usage mode=mode />
                     }.into_any()
                 }
             }}
@@ -526,6 +547,7 @@ fn Transcript(
     session: Signal<AgentSession>,
     events: RwSignal<Vec<AgentEvent>>,
     streaming: RwSignal<String>,
+    mode: RwSignal<PermissionMode>,
 ) -> impl IntoView {
     // Tool results and approval answers are shown with the event they
     // belong to.
@@ -643,6 +665,34 @@ fn Transcript(
                                 </details>
                             }.into_any()
                         }
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "ExitPlanMode" => {
+                            let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                            let plan = value["plan"].as_str().unwrap_or_default();
+                            view! {
+                                <PlanCard
+                                    agent=id
+                                    tool=tool
+                                    plan=markdown::to_html(plan, &repo)
+                                    resolved=resolved
+                                    waiting=waiting
+                                    mode=mode
+                                />
+                            }.into_any()
+                        }
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "AskUserQuestion" => {
+                            let questions = serde_json::from_str::<Questions>(&input)
+                                .map(|q| q.questions)
+                                .unwrap_or_default();
+                            view! {
+                                <QuestionCard
+                                    agent=id
+                                    tool=tool
+                                    questions=questions
+                                    resolved=resolved
+                                    waiting=waiting
+                                />
+                            }.into_any()
+                        }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input } => {
                             let value = serde_json::from_str(&input).unwrap_or_default();
                             let summary = tool_summary(&tool_name, &value);
@@ -683,6 +733,272 @@ fn Transcript(
     }
 }
 
+/// Sends the user's answer to a permission request.
+fn send_approval(
+    agent: String,
+    approval: Approval,
+    busy: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+) {
+    busy.set(true);
+    error.set(None);
+    spawn_local(async move {
+        if let Err(e) = api::approve(&agent, &approval).await {
+            error.set(Some(e));
+        }
+        busy.set(false);
+    });
+}
+
+/// `ExitPlanMode`: Claude's plan, to approve or to send back with
+/// feedback.
+#[component]
+fn PlanCard(
+    agent: String,
+    tool: String,
+    /// The plan as HTML.
+    plan: String,
+    resolved: Memo<HashMap<String, bool>>,
+    waiting: Signal<bool>,
+    /// The composer's mode, which moves on from planning with an approval.
+    mode: RwSignal<PermissionMode>,
+) -> impl IntoView {
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let feedback = RwSignal::new(String::new());
+    let then = RwSignal::new(PermissionMode::AcceptEdits);
+    let answer = {
+        let tool = tool.clone();
+        move |allow: bool| {
+            let message = Some(feedback.get_untracked())
+                .filter(|f| !f.trim().is_empty())
+                .unwrap_or_else(|| "The user wants you to keep planning.".into());
+            let approval = Approval {
+                id: tool.clone(),
+                allow,
+                message: (!allow).then_some(message),
+                mode: allow.then(|| then.get_untracked()),
+                answers: None,
+            };
+            if allow && mode.get_untracked() == PermissionMode::Plan {
+                mode.set(then.get_untracked());
+            }
+            send_approval(agent.clone(), approval, busy, error);
+        }
+    };
+    let keep = answer.clone();
+    let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
+    let pending = move || state.get().is_none() && waiting.get();
+    view! {
+        <div class="approval plan" class:pending=pending>
+            <p>
+                {move || match state.get() {
+                    Some(true) => "Plan approved",
+                    Some(false) => "Plan sent back",
+                    None if waiting.get() => "Claude's plan is waiting for your approval",
+                    None => "Unanswered plan",
+                }}
+            </p>
+            <div class="plan-text markdown" inner_html=plan></div>
+            {move || pending().then(|| {
+                let (approve, keep) = (answer.clone(), keep.clone());
+                view! {
+                    <textarea
+                        class="plan-feedback"
+                        rows="2"
+                        aria-label="Feedback"
+                        placeholder="What should change? Claude gets this when it keeps planning."
+                        prop:value=move || feedback.get()
+                        on:input=move |ev| feedback.set(event_target_value(&ev))
+                    ></textarea>
+                    <div class="form-buttons">
+                        <label>"Then " <ModeSelect mode=then modes=&AFTER_PLAN label="After the plan" /></label>
+                        <button class="primary" disabled=move || busy.get() on:click=move |_| approve(true)>"Approve plan"</button>
+                        <button disabled=move || busy.get() on:click=move |_| keep(false)>"Keep planning"</button>
+                    </div>
+                }
+            })}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+}
+
+/// `AskUserQuestion`'s input.
+#[derive(Deserialize)]
+struct Questions {
+    questions: Vec<Question>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Question {
+    question: String,
+    /// A short label for the question.
+    #[serde(default)]
+    header: String,
+    #[serde(default)]
+    options: Vec<QuestionOption>,
+    #[serde(default, rename = "multiSelect")]
+    multi_select: bool,
+}
+
+#[derive(Clone, Deserialize)]
+struct QuestionOption {
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// The answer to a question the way Claude Code puts it together: the
+/// picked options in their order, then whatever the user wrote.
+fn answer_text(q: &Question, picked: &[String], other: &str) -> String {
+    q.options
+        .iter()
+        .map(|o| o.label.as_str())
+        .filter(|l| picked.iter().any(|p| p == l))
+        .chain(Some(other.trim()).filter(|o| !o.is_empty()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `AskUserQuestion`: Claude's questions with their options and room for
+/// another answer.
+#[component]
+fn QuestionCard(
+    agent: String,
+    tool: String,
+    questions: Vec<Question>,
+    resolved: Memo<HashMap<String, bool>>,
+    waiting: Signal<bool>,
+) -> impl IntoView {
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    // The options picked and the text written for each question.
+    let picks: Vec<(RwSignal<Vec<String>>, RwSignal<String>)> = questions
+        .iter()
+        .map(|_| (RwSignal::new(Vec::new()), RwSignal::new(String::new())))
+        .collect();
+    let questions = StoredValue::new(questions);
+    let picks = StoredValue::new(picks);
+    let answers = move || {
+        questions.with_value(|qs| {
+            picks.with_value(|ps| {
+                qs.iter()
+                    .zip(ps)
+                    .map(|(q, (picked, other))| {
+                        let answer = picked.with(|p| other.with(|o| answer_text(q, p, o)));
+                        (q.question.clone(), answer)
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+        })
+    };
+    let complete = move || answers().values().all(|a| !a.is_empty());
+    let answer = {
+        let tool = tool.clone();
+        move |allow: bool| {
+            let approval = Approval {
+                id: tool.clone(),
+                allow,
+                message: (!allow).then(|| "The user didn't answer.".into()),
+                mode: None,
+                answers: allow.then(answers),
+            };
+            send_approval(agent.clone(), approval, busy, error);
+        }
+    };
+    let skip = answer.clone();
+    let name = StoredValue::new(tool.clone());
+    let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
+    let pending = move || state.get().is_none() && waiting.get();
+    view! {
+        <div class="approval questions" class:pending=pending>
+            <p>
+                {move || match state.get() {
+                    Some(true) => "Answered",
+                    Some(false) => "Not answered",
+                    None if waiting.get() => "Claude asks",
+                    None => "Unanswered",
+                }}
+            </p>
+            {move || if pending() {
+                let (answer, skip) = (answer.clone(), skip.clone());
+                let fields = questions.get_value().into_iter().zip(picks.get_value()).enumerate().map(|(i, (q, (picked, other)))| {
+                    let group = format!("{}-{i}", name.get_value());
+                    let multi = q.multi_select;
+                    let options = q.options.into_iter().map(|o| {
+                        let label = StoredValue::new(o.label.clone());
+                        let checked = move || picked.with(|p| label.with_value(|l| p.contains(l)));
+                        let toggle = move |_| {
+                            let label = label.get_value();
+                            if multi {
+                                picked.update(|p| match p.iter().position(|l| *l == label) {
+                                    Some(i) => {
+                                        p.remove(i);
+                                    }
+                                    None => p.push(label),
+                                });
+                            } else {
+                                picked.set(vec![label]);
+                                other.set(String::new());
+                            }
+                        };
+                        view! {
+                            <label class="question-option">
+                                <input
+                                    type=if multi { "checkbox" } else { "radio" }
+                                    name=group.clone()
+                                    prop:checked=checked
+                                    on:change=toggle
+                                />
+                                " " <span>{o.label}</span>
+                                {(!o.description.is_empty()).then(|| view! {
+                                    <span class="muted">{format!(" – {}", o.description)}</span>
+                                })}
+                            </label>
+                        }
+                    }).collect_view();
+                    view! {
+                        <fieldset class="question">
+                            <legend>
+                                {(!q.header.is_empty()).then(|| view! { <span class="tool-name">{q.header}</span> " " })}
+                                {q.question}
+                            </legend>
+                            {options}
+                            <input
+                                type="text"
+                                class="question-other"
+                                placeholder="Something else…"
+                                aria-label="Something else"
+                                prop:value=move || other.get()
+                                on:input=move |ev| {
+                                    let text = event_target_value(&ev);
+                                    // A single answer is either an option or the text.
+                                    if !multi && !text.trim().is_empty() {
+                                        picked.set(Vec::new());
+                                    }
+                                    other.set(text);
+                                }
+                            />
+                        </fieldset>
+                    }
+                }).collect_view();
+                view! {
+                    {fields}
+                    <div class="form-buttons">
+                        <button class="primary" disabled=move || busy.get() || !complete() on:click=move |_| answer(true)>"Answer"</button>
+                        <button disabled=move || busy.get() on:click=move |_| skip(false)>"Skip"</button>
+                    </div>
+                }.into_any()
+            } else {
+                questions.with_value(|qs| qs.iter().map(|q| view! {
+                    <p class="muted">{q.question.clone()}</p>
+                }).collect_view()).into_any()
+            }}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+}
+
 #[component]
 fn ApprovalCard(
     agent: String,
@@ -704,15 +1020,10 @@ fn ApprovalCard(
                 id: tool.clone(),
                 allow,
                 message: None,
+                mode: None,
+                answers: None,
             };
-            let agent = agent.clone();
-            busy.set(true);
-            spawn_local(async move {
-                if let Err(e) = api::approve(&agent, &approval).await {
-                    error.set(Some(e));
-                }
-                busy.set(false);
-            });
+            send_approval(agent.clone(), approval, busy, error);
         }
     };
     let deny = answer.clone();
@@ -747,9 +1058,9 @@ fn ApprovalCard(
 fn Composer(
     session: Signal<AgentSession>,
     usage: Signal<(Option<u64>, Option<u64>)>,
+    mode: RwSignal<PermissionMode>,
 ) -> impl IntoView {
     let prompt = RwSignal::new(String::new());
-    let mode = mode_signal();
     let error = RwSignal::new(None::<String>);
     let working = move || {
         session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
@@ -858,6 +1169,24 @@ mod tests {
         let input = serde_json::json!({"file_path": "/w/a.rs"});
         assert_eq!(tool_summary("Edit", &input), "/w/a.rs");
         assert_eq!(tool_summary("mcp__x__y", &input), "");
+        let input = serde_json::json!({"plan": "# Plan\n\nSteps"});
+        assert_eq!(tool_summary("ExitPlanMode", &input), "# Plan");
+        let input = serde_json::json!({"questions": [{"question": "Tea?"}]});
+        assert_eq!(tool_summary("AskUserQuestion", &input), "Tea?");
+    }
+
+    #[test]
+    fn answers() {
+        let q: Question = serde_json::from_value(serde_json::json!({
+            "question": "Drinks?",
+            "options": [{"label": "Tea"}, {"label": "Coffee"}],
+            "multiSelect": true,
+        }))
+        .unwrap();
+        let picked = ["Coffee".to_owned(), "Tea".to_owned()];
+        assert_eq!(answer_text(&q, &picked, ""), "Tea, Coffee");
+        assert_eq!(answer_text(&q, &picked[..1], " Water "), "Coffee, Water");
+        assert_eq!(answer_text(&q, &[], "  "), "");
     }
 
     fn session(id: &str, repo: &str) -> AgentSession {

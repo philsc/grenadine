@@ -540,6 +540,11 @@ textarea { width: 100%; resize: vertical; }
 .approval p { margin: 0; }
 .approval.pending { border-color: var(--warn-border); background: var(--warn-bg); }
 .approval .tool-input { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; }
+.approval .plan-text { margin: 6px 0; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+.approval .plan-feedback { width: 100%; box-sizing: border-box; font: inherit; }
+.approval .question { margin: 6px 0; border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px 8px; display: flex; flex-direction: column; gap: 4px; }
+.approval .question legend { padding: 0 4px; font-weight: 600; }
+.approval .question-other { font: inherit; }
 
 .composer { position: sticky; bottom: 0; background: var(--bg); padding: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
 .composer .form-buttons { align-items: center; }
