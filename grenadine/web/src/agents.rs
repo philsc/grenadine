@@ -178,15 +178,15 @@ fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> 
 
 const MODE_KEY: &str = "grenadine.agent-permission-mode";
 
-/// The permission mode the next prompt goes with: the last one picked,
-/// Auto at first.
-fn mode_signal() -> RwSignal<PermissionMode> {
-    let mode = RwSignal::new(
+/// The permission mode the next prompt goes with: `initial` if given,
+/// otherwise the last one picked, Auto at first.
+fn mode_signal(initial: Option<PermissionMode>) -> RwSignal<PermissionMode> {
+    let mode = RwSignal::new(initial.unwrap_or_else(|| {
         storage()
             .and_then(|s| s.get_item(MODE_KEY).ok().flatten())
             .and_then(|v| PermissionMode::parse(&v))
-            .unwrap_or(PermissionMode::Auto),
-    );
+            .unwrap_or(PermissionMode::Auto)
+    }));
     Effect::new(move |_| {
         let mode = mode.get();
         if let Some(s) = storage() {
@@ -235,7 +235,8 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
     let repo = RwSignal::new(repo.unwrap_or_default());
     let number = RwSignal::new(pr.map(|n| n.to_string()).unwrap_or_default());
     let prompt = RwSignal::new(String::new());
-    let mode = mode_signal();
+    // New sessions start out planning, whatever was picked last.
+    let mode = mode_signal(Some(PermissionMode::Plan));
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
@@ -462,7 +463,7 @@ pub fn AgentView(id: String) -> impl IntoView {
     let live_usage = RwSignal::new((None, None));
     follow(&id, events, streaming, live_usage);
     // Approving a plan also picks the mode the follow-ups go with.
-    let mode = mode_signal();
+    let mode = mode_signal(None);
 
     view! {
         <div class="agent">
@@ -766,7 +767,7 @@ fn PlanCard(
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
-    let then = RwSignal::new(PermissionMode::AcceptEdits);
+    let then = RwSignal::new(PermissionMode::Auto);
     let answer = {
         let tool = tool.clone();
         move |allow: bool| {

@@ -561,9 +561,9 @@ class AgentTest(ServerTestCase):
         self.page.goto(self.url)
         self.page.get_by_role("link", name="Agents").click()
         self.page.get_by_label("Repository").select_option(scenarios.REPO)
-        # Prompts go in Auto mode until another one is picked.
+        # New sessions start out planning unless another mode is picked.
         permissions = self.page.get_by_label("Permissions")
-        expect(permissions).to_have_value("auto")
+        expect(permissions).to_have_value("plan")
         permissions.select_option(label="Ask for everything")
         self.page.get_by_label("Prompt").fill("please write a note")
         self.page.get_by_role("button", name="Start").click()
@@ -641,7 +641,7 @@ class AgentTest(ServerTestCase):
 
     def test_plan_mode(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
-        self.page.get_by_label("Permissions").select_option(label="Plan first")
+        expect(self.page.get_by_label("Permissions")).to_have_value("plan")
         self.page.get_by_label("Prompt").fill("make a plan")
         self.page.get_by_role("button", name="Start").click()
         transcript = self.page.locator(".transcript")
@@ -668,14 +668,14 @@ class AgentTest(ServerTestCase):
 
         # Approving it switches the turn and the follow-ups to the mode picked.
         after = revised.get_by_label("After the plan")
-        expect(after).to_have_value("acceptEdits")
-        after.select_option(label="Auto")
+        expect(after).to_have_value("auto")
+        after.select_option(label="Accept edits")
         revised.get_by_role("button", name="Approve plan").click()
         expect(revised).to_contain_text("Plan approved")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
-        self.assertEqual((worktree / "todo.txt").read_text(), "auto")
-        expect(self.page.get_by_label("Permissions")).to_have_value("auto")
+        self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
+        expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
 
 
 if __name__ == "__main__":
