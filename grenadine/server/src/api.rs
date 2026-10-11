@@ -305,7 +305,7 @@ async fn agent_message(
     if msg.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
-    agent::send(&state, &id, msg.prompt);
+    agent::send(&state, &id, msg.prompt, msg.permission_mode);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

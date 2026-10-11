@@ -352,6 +352,51 @@ pub struct AgentSession {
     pub cost_usd: f64,
 }
 
+/// How Claude Code decides about tool uses during a turn; the user picks
+/// it with every prompt. Whatever the mode doesn't decide on its own is
+/// asked on the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    /// Ask before every tool use.
+    #[default]
+    Manual,
+    /// Allow file edits, ask for the rest.
+    AcceptEdits,
+    /// A classifier allows routine tool uses and asks for risky ones.
+    Auto,
+}
+
+impl PermissionMode {
+    pub const ALL: [PermissionMode; 3] = [
+        PermissionMode::Manual,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Auto,
+    ];
+
+    /// The value of Claude Code's `--permission-mode`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "manual",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Auto => "auto",
+        }
+    }
+
+    /// The mode `as_str` returns, if any.
+    pub fn parse(s: &str) -> Option<PermissionMode> {
+        PermissionMode::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PermissionMode::Manual => "Ask for everything",
+            PermissionMode::AcceptEdits => "Accept edits",
+            PermissionMode::Auto => "Auto",
+        }
+    }
+}
+
 /// The body of a request that starts an agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgent {
@@ -359,12 +404,16 @@ pub struct NewAgent {
     /// Start from this PR's head rather than from the trunk.
     pub pr: Option<u64>,
     pub prompt: String,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
 }
 
 /// A follow-up prompt for an agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessage {
     pub prompt: String,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
 }
 
 /// The user's answer to an `ApprovalRequested` event.

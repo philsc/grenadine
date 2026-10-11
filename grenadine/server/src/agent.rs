@@ -1,7 +1,8 @@
 //! Claude Code sessions driven from the UI. Each session works in its own
 //! git worktree; every prompt runs one `claude -p` process that resumes
 //! the session, and its stream-json output becomes the session's
-//! transcript. Claude asks for permission to use tools through the MCP
+//! transcript. Each prompt comes with a permission mode; Claude asks about
+//! the tool uses that the mode doesn't decide on its own through the MCP
 //! tool in `mcp.rs`, which waits for the user's answer from the page.
 
 use std::collections::{HashMap, VecDeque};
@@ -11,7 +12,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, NewAgent, PrKey, ServerEvent,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, NewAgent, PermissionMode, PrKey,
+    ServerEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -52,7 +54,7 @@ struct Live {
     events: broadcast::Sender<AgentEvent>,
     /// Authenticates the session's MCP endpoint.
     secret: String,
-    queue: VecDeque<String>,
+    queue: VecDeque<(String, PermissionMode)>,
     /// Whether a task is running the queued prompts.
     running: bool,
     /// The current claude process.
@@ -261,14 +263,14 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
-    send(state, &id, req.prompt);
+    send(state, &id, req.prompt, req.permission_mode);
     Ok(session)
 }
 
 /// Queues a prompt; it runs once the turns before it are done.
-pub fn send(state: &Arc<State>, id: &str, prompt: String) {
+pub fn send(state: &Arc<State>, id: &str, prompt: String, mode: PermissionMode) {
     let start = state.agents.with_live(id, |l| {
-        l.queue.push_back(prompt);
+        l.queue.push_back((prompt, mode));
         !std::mem::replace(&mut l.running, true)
     });
     if start {
@@ -391,10 +393,10 @@ async fn run(state: Arc<State>, id: String) {
             l.interrupted = false;
             prompt
         });
-        let Some(prompt) = prompt else {
+        let Some((prompt, mode)) = prompt else {
             return;
         };
-        let status = match turn(&state, &id, prompt).await {
+        let status = match turn(&state, &id, prompt, mode).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!("agent {id}: {e:#}");
@@ -419,7 +421,12 @@ async fn run(state: Arc<State>, id: String) {
 }
 
 /// Runs one prompt and returns the status the session ends up in.
-async fn turn(state: &Arc<State>, id: &str, prompt: String) -> Result<AgentStatus> {
+async fn turn(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    mode: PermissionMode,
+) -> Result<AgentStatus> {
     let session = state
         .db
         .agent(id)?
@@ -447,6 +454,8 @@ async fn turn(state: &Arc<State>, id: &str, prompt: String) -> Result<AgentStatu
         "stream-json",
         "--verbose",
         "--include-partial-messages",
+        "--permission-mode",
+        mode.as_str(),
         "--permission-prompt-tool",
         "mcp__grenadine__approve",
     ])
@@ -658,6 +667,19 @@ mod tests {
         assert!(!valid_id("../../etc"));
     }
 
+    /// The page sends permission modes as JSON; Claude Code gets them as
+    /// arguments. Both use its names.
+    #[test]
+    fn permission_modes() {
+        for mode in PermissionMode::ALL {
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+            assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
+        }
+        let msg: grenadine_core::api::AgentMessage =
+            serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();
+        assert_eq!(msg.permission_mode, PermissionMode::Manual);
+    }
+
     #[test]
     fn titles() {
         assert_eq!(title("\n  Fix the bug  \nin detail"), "Fix the bug");
@@ -834,6 +856,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "-first".into(),
+                permission_mode: PermissionMode::Auto,
             },
         )
         .await
@@ -845,7 +868,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         );
         let mut events = state.agents.subscribe(&session.id);
         wait_for_turns(&state, &session.id, 1).await;
-        send(&state, &session.id, "second".into());
+        send(&state, &session.id, "second".into(), PermissionMode::Manual);
         let transcript = wait_for_turns(&state, &session.id, 2).await;
 
         let turn = |prompt: &str| {
@@ -870,8 +893,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2, "{log}");
         assert!(lines[0].starts_with(&format!("-p --session-id {id} ")), "{log}");
+        assert!(lines[0].contains(" --permission-mode auto "), "{log}");
         assert!(lines[0].ends_with(" | -first | 1"), "{log}");
         assert!(lines[1].starts_with(&format!("-p --resume {id} ")), "{log}");
+        assert!(lines[1].contains(" --permission-mode manual "), "{log}");
         assert!(lines[1].contains("--permission-prompt-tool mcp__grenadine__approve"));
         assert!(lines[1].ends_with(" | second | 1"), "{log}");
 
@@ -904,6 +929,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
+                permission_mode: PermissionMode::default(),
             },
         )
         .await
@@ -935,11 +961,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
+                permission_mode: PermissionMode::default(),
             },
         )
         .await
         .unwrap();
-        send(&state, &session.id, "queued".into());
+        send(&state, &session.id, "queued".into(), PermissionMode::default());
         for _ in 0..100 {
             if state.agents.with_live(&session.id, |l| l.pid.is_some()) {
                 break;

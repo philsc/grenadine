@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
-    InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing, SyncStatus,
+    InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -199,9 +199,16 @@ pub async fn create_agent(req: &NewAgent) -> Result<AgentSession> {
         .map_err(|e| e.to_string())
 }
 
-pub async fn send_agent_message(id: &str, prompt: String) -> Result<()> {
+pub async fn send_agent_message(
+    id: &str,
+    prompt: String,
+    permission_mode: PermissionMode,
+) -> Result<()> {
     let req = Request::post(&format!("/api/agents/{id}/messages"))
-        .json(&AgentMessage { prompt })
+        .json(&AgentMessage {
+            prompt,
+            permission_mode,
+        })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
 }

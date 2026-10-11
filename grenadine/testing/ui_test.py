@@ -28,16 +28,19 @@ STARTUP_TIMEOUT = 30
 
 # Stands in for `claude -p`: it writes a short turn as stream-json and,
 # when the prompt asks it to write, asks grenadine for permission through
-# the MCP tool first, like Claude Code does.
+# the MCP tool first, like Claude Code does. Permission modes other than
+# manual allow the write without asking.
 FAKE_CLAUDE = r'''
 import json
 import sys
 import time
 import urllib.request
+import uuid
 
 args = sys.argv[1:]
 prompt = sys.stdin.read()
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
+mode = args[args.index("--permission-mode") + 1]
 
 
 def emit(message):
@@ -61,17 +64,20 @@ for word in ["Working ", "on ", "it"]:
     time.sleep(0.05)
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}]}})
 if "write" in prompt:
+    tool_use = "toolu_" + uuid.uuid4().hex
     tool_input = {"file_path": "notes.txt", "content": prompt}
-    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Write", "input": tool_input}]}})
-    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
-    answer = rpc("tools/call", {"name": "approve", "arguments": {"tool_name": "Write", "input": tool_input, "tool_use_id": "toolu_1"}})
-    decision = json.loads(answer["result"]["content"][0]["text"])
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_use, "name": "Write", "input": tool_input}]}})
+    decision = {"behavior": "allow"}
+    if mode == "manual":
+        rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+        answer = rpc("tools/call", {"name": "approve", "arguments": {"tool_name": "Write", "input": tool_input, "tool_use_id": tool_use}})
+        decision = json.loads(answer["result"]["content"][0]["text"])
     if decision["behavior"] == "allow":
         with open("notes.txt", "w") as f:
             f.write(prompt)
-        result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Wrote notes.txt"}
+        result = {"type": "tool_result", "tool_use_id": tool_use, "content": "Wrote notes.txt"}
     else:
-        result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": decision["message"], "is_error": True}
+        result = {"type": "tool_result", "tool_use_id": tool_use, "content": decision["message"], "is_error": True}
     emit({"type": "user", "message": {"content": [result]}})
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01})
 '''
@@ -517,6 +523,10 @@ class AgentTest(ServerTestCase):
         self.page.goto(self.url)
         self.page.get_by_role("link", name="Agents").click()
         self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        # Prompts go in Auto mode until another one is picked.
+        permissions = self.page.get_by_label("Permissions")
+        expect(permissions).to_have_value("auto")
+        permissions.select_option(label="Ask for everything")
         self.page.get_by_label("Prompt").fill("please write a note")
         self.page.get_by_role("button", name="Start").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
@@ -545,9 +555,20 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(follow_up).to_have_value("")
 
+        # The composer starts with the permissions picked last. In Auto
+        # mode, the write goes ahead without asking.
+        expect(permissions).to_have_value("manual")
+        permissions.select_option(label="Auto")
+        follow_up.fill("write more")
+        follow_up.press("Control+Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+        expect(transcript.locator(".approval")).to_have_count(1)
+        self.assertEqual((worktree / "notes.txt").read_text(), "write more")
+
         # The transcript is stored, so a reload shows it all again.
         self.page.reload()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
+        expect(permissions).to_have_value("auto")
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
 
@@ -558,7 +579,7 @@ class AgentTest(ServerTestCase):
         self.page.get_by_role("link", name="Agents").click()
         expect(item).not_to_have_class(re.compile(r"\bselected\b"))
         item.click()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
 
 
 if __name__ == "__main__":

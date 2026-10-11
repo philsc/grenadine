@@ -5,12 +5,14 @@
 use std::collections::HashMap;
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PrKey,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, NewAgent, PermissionMode,
+    PrKey,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::prelude::*;
 
+use crate::inboxes::storage;
 use crate::{Route, Updates, api, hash_for, markdown};
 
 fn agent_hash(id: &str) -> String {
@@ -144,6 +146,47 @@ fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> 
     }
 }
 
+const MODE_KEY: &str = "grenadine.agent-permission-mode";
+
+/// The permission mode the next prompt goes with: the last one picked,
+/// Auto at first.
+fn mode_signal() -> RwSignal<PermissionMode> {
+    let mode = RwSignal::new(
+        storage()
+            .and_then(|s| s.get_item(MODE_KEY).ok().flatten())
+            .and_then(|v| PermissionMode::parse(&v))
+            .unwrap_or(PermissionMode::Auto),
+    );
+    Effect::new(move |_| {
+        let mode = mode.get();
+        if let Some(s) = storage() {
+            let _ = s.set_item(MODE_KEY, mode.as_str());
+        }
+    });
+    mode
+}
+
+#[component]
+fn ModeSelect(mode: RwSignal<PermissionMode>) -> impl IntoView {
+    view! {
+        <select
+            class="agent-mode"
+            aria-label="Permissions"
+            title="What Claude may do without asking here"
+            prop:value=move || mode.get().as_str()
+            on:change=move |ev| {
+                if let Some(m) = PermissionMode::parse(&event_target_value(&ev)) {
+                    mode.set(m);
+                }
+            }
+        >
+            {PermissionMode::ALL.into_iter().map(|m| view! {
+                <option value=m.as_str() selected=move || mode.get() == m>{m.label()}</option>
+            }).collect_view()}
+        </select>
+    }
+}
+
 /// The form that starts a session, filled in with `repo` and `pr` if given.
 #[component]
 pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
@@ -151,6 +194,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
     let repo = RwSignal::new(repo.unwrap_or_default());
     let number = RwSignal::new(pr.map(|n| n.to_string()).unwrap_or_default());
     let prompt = RwSignal::new(String::new());
+    let mode = mode_signal();
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
@@ -182,6 +226,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
             repo: repo.get_untracked(),
             pr,
             prompt: prompt.get_untracked(),
+            permission_mode: mode.get_untracked(),
         };
         busy.set(true);
         error.set(None);
@@ -222,6 +267,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                             on:input=move |ev| number.set(event_target_value(&ev))
                         />
                     </label>
+                    <label>"Permissions" <ModeSelect mode=mode /></label>
                 </div>
                 <textarea
                     class="agent-prompt"
@@ -237,7 +283,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                         }
                     }
                 ></textarea>
-                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool."</p>
+                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Every prompt can pick different permissions."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -625,6 +671,7 @@ fn ApprovalCard(
 #[component]
 fn Composer(session: Signal<AgentSession>) -> impl IntoView {
     let prompt = RwSignal::new(String::new());
+    let mode = mode_signal();
     let error = RwSignal::new(None::<String>);
     let working = move || {
         session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
@@ -636,8 +683,9 @@ fn Composer(session: Signal<AgentSession>) -> impl IntoView {
         if text.trim().is_empty() {
             return;
         }
+        let mode = mode.get_untracked();
         spawn_local(async move {
-            match api::send_agent_message(&id.get_value(), text).await {
+            match api::send_agent_message(&id.get_value(), text, mode).await {
                 Ok(()) => prompt.set(String::new()),
                 Err(e) => error.set(Some(e)),
             }
@@ -671,6 +719,7 @@ fn Composer(session: Signal<AgentSession>) -> impl IntoView {
             ></textarea>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
+                <ModeSelect mode=mode />
                 <button type="submit" class="primary" disabled=move || prompt.with(|p| p.trim().is_empty())>"Send"</button>
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
             </div>
