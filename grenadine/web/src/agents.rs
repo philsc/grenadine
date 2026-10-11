@@ -561,19 +561,49 @@ fn Transcript(
     });
     let (repo, id) = session.with_untracked(|s| (s.repo.clone(), s.id.clone()));
 
-    // Keeps the newest output in view unless the user scrolled up.
+    // Keeps the newest output in view, starting with the bottom of the
+    // transcript, until the user scrolls up. Scrolling back down follows
+    // it again. Whether to follow is decided by where the user scrolled
+    // rather than by how far the bottom is, since replaying a long
+    // transcript adds a lot of it at once.
     let end = NodeRef::<leptos::html::Div>::new();
+    let follow = StoredValue::new(true);
+    let on_scroll = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        let Some(main) = e
+            .current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let below = main.scroll_height() - main.scroll_top() - main.client_height();
+        follow.set_value(below < 40);
+    });
+    let on_scroll = StoredValue::new_local(on_scroll);
+    let main = StoredValue::new_local(None::<web_sys::Element>);
     Effect::new(move |_| {
         events.track();
         streaming.track();
         let Some(end) = end.get() else { return };
-        let Some(main) = end.closest(".main").ok().flatten() else {
+        let Some(el) = end.closest(".main").ok().flatten() else {
             return;
         };
-        let below = main.scroll_height() - main.scroll_top() - main.client_height();
-        if below < 400 {
-            main.set_scroll_top(main.scroll_height());
+        if main.with_value(Option::is_none) {
+            on_scroll.with_value(|f| {
+                let _ = el.add_event_listener_with_callback("scroll", f.as_ref().unchecked_ref());
+            });
+            main.set_value(Some(el.clone()));
         }
+        if follow.get_value() {
+            el.set_scroll_top(el.scroll_height());
+        }
+    });
+    on_cleanup(move || {
+        let Some(Some(m)) = main.try_get_value() else {
+            return;
+        };
+        on_scroll.try_with_value(|f| {
+            let _ = m.remove_event_listener_with_callback("scroll", f.as_ref().unchecked_ref());
+        });
     });
 
     view! {

@@ -595,6 +595,13 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
 
+        # Opening a session that doesn't fit shows the end of its transcript.
+        self.page.set_viewport_size({"width": 1000, "height": 300})
+        self.page.get_by_role("link", name="Agents").click()
+        item.click()
+        expect(transcript.locator(".turn-end").last).to_be_in_viewport()
+        expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
 
 if __name__ == "__main__":
     unittest.main()
