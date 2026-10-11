@@ -180,6 +180,13 @@ const MIGRATIONS: &[Migration] = &[
     );
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- How full the context window is, NULL until Claude Code reports it.
+    ALTER TABLE agents ADD COLUMN context_tokens INTEGER;
+    ALTER TABLE agents ADD COLUMN context_window INTEGER;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -744,8 +751,9 @@ impl Db {
     pub fn create_agent(&self, a: &AgentSession) -> Result<()> {
         self.conn().execute(
             "INSERT INTO agents
-                (id, repo, pr_number, title, branch, worktree, base_sha, status, cost_usd, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, repo, pr_number, title, branch, worktree, base_sha, status, cost_usd,
+                 context_tokens, context_window, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.repo,
@@ -756,6 +764,8 @@ impl Db {
                 a.base_sha,
                 status_str(a.status),
                 a.cost_usd,
+                a.context_tokens,
+                a.context_window,
                 a.created_at
             ],
         )?;
@@ -816,6 +826,22 @@ impl Db {
         Ok(())
     }
 
+    /// Records how full the context window is; `None` leaves a value
+    /// unchanged.
+    pub fn set_agent_usage(
+        &self,
+        id: &str,
+        tokens: Option<u64>,
+        window: Option<u64>,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET context_tokens = COALESCE(?, context_tokens),
+                context_window = COALESCE(?, context_window) WHERE id = ?",
+            params![tokens, window, id],
+        )?;
+        Ok(())
+    }
+
     /// Returns false when there is no such session.
     pub fn delete_agent(&self, id: &str) -> Result<bool> {
         Ok(self.conn().execute("DELETE FROM agents WHERE id = ?", [id])? > 0)
@@ -865,8 +891,8 @@ impl Db {
     }
 }
 
-const AGENT_COLUMNS: &str =
-    "id, repo, pr_number, title, branch, worktree, base_sha, status, created_at, cost_usd";
+const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
+     created_at, cost_usd, context_tokens, context_window";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -880,6 +906,8 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         status: parse_status(&r.get::<_, String>(7)?),
         created_at: r.get(8)?,
         cost_usd: r.get(9)?,
+        context_tokens: r.get(10)?,
+        context_window: r.get(11)?,
     })
 }
 
@@ -1351,6 +1379,8 @@ mod tests {
             status,
             created_at: 1,
             cost_usd: 0.0,
+            context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -1370,6 +1400,10 @@ mod tests {
         db.add_agent_cost("a", 0.25).unwrap();
         db.add_agent_cost("a", 0.5).unwrap();
         assert_eq!(db.agent("a").unwrap().unwrap().cost_usd, 0.75);
+        db.set_agent_usage("a", None, Some(200_000)).unwrap();
+        db.set_agent_usage("a", Some(1_000), None).unwrap();
+        let a = db.agent("a").unwrap().unwrap();
+        assert_eq!((a.context_tokens, a.context_window), (Some(1_000), Some(200_000)));
 
         db.interrupt_agents().unwrap();
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();

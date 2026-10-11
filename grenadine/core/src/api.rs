@@ -350,6 +350,11 @@ pub struct AgentSession {
     pub created_at: i64,
     /// What all of the session's turns cost, as Claude Code reported it.
     pub cost_usd: f64,
+    /// How many tokens the context holds after the latest assistant
+    /// message; `None` until Claude Code reports it.
+    pub context_tokens: Option<u64>,
+    /// The size of the model's context window, in tokens.
+    pub context_window: Option<u64>,
 }
 
 /// How Claude Code decides about tool uses during a turn; the user picks
@@ -464,6 +469,12 @@ pub enum AgentEventKind {
         error: Option<String>,
         cost_usd: Option<f64>,
     },
+    /// How full the context window is. Never stored; the session keeps
+    /// the latest values. `None` leaves a value unchanged.
+    Usage {
+        tokens: Option<u64>,
+        window: Option<u64>,
+    },
     /// Grenadine couldn't run Claude Code, or it crashed.
     Error(String),
 }
@@ -471,7 +482,10 @@ pub enum AgentEventKind {
 impl AgentEventKind {
     /// Whether the event is only streamed to open pages and never stored.
     pub fn is_ephemeral(&self) -> bool {
-        matches!(self, AgentEventKind::TextDelta(_))
+        matches!(
+            self,
+            AgentEventKind::TextDelta(_) | AgentEventKind::Usage { .. }
+        )
     }
 }
 

@@ -166,6 +166,8 @@ mod tests {
                 status: AgentStatus::Running,
                 created_at: 0,
                 cost_usd: 0.0,
+                context_tokens: None,
+                context_window: None,
             })
             .unwrap();
         state

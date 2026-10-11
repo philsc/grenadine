@@ -190,6 +190,17 @@ pub fn emit(state: &State, id: &str, kind: AgentEventKind) -> Result<()> {
     Ok(())
 }
 
+/// Stores how full the context window is and sends it to open pages.
+fn record_usage(
+    state: &State,
+    id: &str,
+    tokens: Option<u64>,
+    window: Option<u64>,
+) -> Result<()> {
+    state.db.set_agent_usage(id, tokens, window)?;
+    emit(state, id, AgentEventKind::Usage { tokens, window })
+}
+
 pub fn set_status(state: &State, id: &str, status: AgentStatus) {
     if let Err(e) = state.db.set_agent_status(id, status) {
         tracing::warn!("agent {id}: {e:#}");
@@ -260,6 +271,8 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         status: AgentStatus::Idle,
         created_at: now(),
         cost_usd: 0.0,
+        context_tokens: None,
+        context_window: None,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
@@ -525,9 +538,19 @@ async fn turn(
         };
         let Some(line) = line else { break };
         match parse_line(&line) {
-            Parsed::Started => state.db.set_agent_started(id)?,
+            Parsed::Started { window } => {
+                state.db.set_agent_started(id)?;
+                // A resumed session keeps the window its result reported.
+                if state.db.agent(id)?.is_some_and(|s| s.context_window.is_none()) {
+                    record_usage(state, id, None, Some(window))?;
+                }
+            }
             Parsed::Events(events) => {
                 for kind in events {
+                    if let AgentEventKind::Usage { tokens, window } = kind {
+                        record_usage(state, id, tokens, window)?;
+                        continue;
+                    }
                     if let AgentEventKind::TurnEnded { error, cost_usd } = &kind {
                         if let Some(cost) = cost_usd {
                             state.db.add_agent_cost(id, *cost)?;
@@ -569,8 +592,9 @@ async fn turn(
 /// What one line of `--output-format stream-json` means for the transcript.
 #[derive(Debug, PartialEq)]
 enum Parsed {
-    /// Claude Code created (or resumed) its session.
-    Started,
+    /// Claude Code created (or resumed) its session; `window` is the
+    /// context window that its model likely has.
+    Started { window: u64 },
     Events(Vec<AgentEventKind>),
 }
 
@@ -592,6 +616,29 @@ fn result_text(content: &Value) -> String {
     }
 }
 
+/// The context window of a model by its name, until a turn's result tells.
+fn guess_window(model: &str) -> u64 {
+    if model.ends_with("[1m]") {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+/// How many tokens the context holds after an assistant message.
+fn context_tokens(usage: &Value) -> Option<u64> {
+    if !usage.is_object() {
+        return None;
+    }
+    let fields = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ];
+    Some(fields.iter().filter_map(|f| usage[f].as_u64()).sum())
+}
+
 /// Picks the parts of a stream-json line that the transcript shows. Lines
 /// of subagents (with a `parent_tool_use_id`) and unknown lines are
 /// skipped, so a newer Claude Code degrades to showing less.
@@ -604,7 +651,11 @@ fn parse_line(line: &str) -> Parsed {
     }
     let blocks = || v["message"]["content"].as_array().into_iter().flatten();
     let events = match v["type"].as_str() {
-        Some("system") if v["subtype"] == "init" => return Parsed::Started,
+        Some("system") if v["subtype"] == "init" => {
+            return Parsed::Started {
+                window: guess_window(v["model"].as_str().unwrap_or_default()),
+            };
+        }
         Some("stream_event") => {
             let delta = &v["event"]["delta"];
             match (v["event"]["type"].as_str(), delta["type"].as_str()) {
@@ -626,6 +677,12 @@ fn parse_line(line: &str) -> Parsed {
                 }),
                 _ => None,
             })
+            .chain(
+                context_tokens(&v["message"]["usage"]).map(|tokens| AgentEventKind::Usage {
+                    tokens: Some(tokens),
+                    window: None,
+                }),
+            )
             .collect(),
         Some("user") => blocks()
             .filter(|b| b["type"] == "tool_result")
@@ -644,10 +701,25 @@ fn parse_line(line: &str) -> Parsed {
                     .unwrap_or("error")
                     .to_owned()
             });
-            vec![AgentEventKind::TurnEnded {
-                error,
-                cost_usd: v["total_cost_usd"].as_f64(),
-            }]
+            // The main model has the largest window; subagents' may be
+            // smaller.
+            let window = v["modelUsage"]
+                .as_object()
+                .into_iter()
+                .flat_map(|m| m.values())
+                .filter_map(|m| m["contextWindow"].as_u64())
+                .max();
+            let usage = window.map(|w| AgentEventKind::Usage {
+                tokens: None,
+                window: Some(w),
+            });
+            usage
+                .into_iter()
+                .chain([AgentEventKind::TurnEnded {
+                    error,
+                    cost_usd: v["total_cost_usd"].as_f64(),
+                }])
+                .collect()
         }
         _ => Vec::new(),
     };
@@ -690,7 +762,7 @@ mod tests {
     fn events(line: &str) -> Vec<AgentEventKind> {
         match parse_line(line) {
             Parsed::Events(e) => e,
-            Parsed::Started => panic!("{line} started a session"),
+            Parsed::Started { .. } => panic!("{line} started a session"),
         }
     }
 
@@ -698,8 +770,14 @@ mod tests {
     #[test]
     fn parses_stream_json() {
         assert_eq!(
-            parse_line(r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[]}"#),
-            Parsed::Started
+            parse_line(
+                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
+            ),
+            Parsed::Started { window: 200_000 }
+        );
+        assert_eq!(
+            parse_line(r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#),
+            Parsed::Started { window: 1_000_000 }
         );
         assert_eq!(
             events(r#"{"type":"system","subtype":"hook_started","session_id":"s"}"#),
@@ -719,7 +797,7 @@ mod tests {
         );
         assert_eq!(
             events(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"},{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/w/b.txt","content":"hello\n"},"caller":{"type":"direct"}}]},"parent_tool_use_id":null,"session_id":"s"}"#
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"},{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/w/b.txt","content":"hello\n"},"caller":{"type":"direct"}}],"usage":{"input_tokens":3,"cache_creation_input_tokens":1000,"cache_read_input_tokens":40000,"output_tokens":500,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"s"}"#
             ),
             [
                 AgentEventKind::Text("Hello".into()),
@@ -727,6 +805,10 @@ mod tests {
                     id: "toolu_1".into(),
                     name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                },
+                AgentEventKind::Usage {
+                    tokens: Some(41_503),
+                    window: None,
                 },
             ]
         );
@@ -764,12 +846,18 @@ mod tests {
         );
         assert_eq!(
             events(
-                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.5}"#
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.5,"modelUsage":{"claude-haiku-4-5":{"contextWindow":200000},"claude-opus-4-6":{"inputTokens":3,"contextWindow":1000000}}}"#
             ),
-            [AgentEventKind::TurnEnded {
-                error: None,
-                cost_usd: Some(0.5)
-            }]
+            [
+                AgentEventKind::Usage {
+                    tokens: None,
+                    window: Some(1_000_000),
+                },
+                AgentEventKind::TurnEnded {
+                    error: None,
+                    cost_usd: Some(0.5)
+                },
+            ]
         );
         assert_eq!(
             events(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
@@ -841,9 +929,9 @@ mod tests {
             r#"#!/bin/sh
 prompt=$(cat)
 echo "$* | $prompt | $(cat a)" >> {log}
-echo '{{"type":"system","subtype":"init","session_id":"s"}}'
+echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
 echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"Hi"}}}},"parent_tool_use_id":null}}'
-echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Hi there"}}]}},"parent_tool_use_id":null}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Hi there"}}],"usage":{{"input_tokens":10,"output_tokens":5}}}},"parent_tool_use_id":null}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there","total_cost_usd":0.25}}'
 "#,
             log = log.display()
@@ -885,6 +973,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
         assert_eq!(session.cost_usd, 0.5);
+        assert_eq!(session.context_tokens, Some(15));
+        assert_eq!(session.context_window, Some(200_000));
 
         // The first turn creates the session, the second resumes it, both
         // in the worktree.
@@ -908,6 +998,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(live.contains(&AgentEvent {
             seq: None,
             kind: AgentEventKind::TextDelta("Hi".into())
+        }));
+        assert!(live.contains(&AgentEvent {
+            seq: None,
+            kind: AgentEventKind::Usage {
+                tokens: Some(15),
+                window: None
+            }
         }));
         // At least the second turn's, which started after subscribing.
         assert!(live.iter().filter(|e| e.seq.is_some()).count() >= 3);

@@ -58,11 +58,12 @@ def rpc(method, params, id=1):
         return json.load(response)
 
 
-emit({"type": "system", "subtype": "init", "session_id": "s"})
+emit({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-test"})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
     time.sleep(0.05)
-emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}]}})
+usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 40000, "output_tokens": 500}
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
 if "write" in prompt:
     tool_use = "toolu_" + uuid.uuid4().hex
     tool_input = {"file_path": "notes.txt", "content": prompt}
@@ -79,7 +80,7 @@ if "write" in prompt:
     else:
         result = {"type": "tool_result", "tool_use_id": tool_use, "content": decision["message"], "is_error": True}
     emit({"type": "user", "message": {"content": [result]}})
-emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01})
+emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
 '''
 
 
@@ -539,6 +540,18 @@ class AgentTest(ServerTestCase):
         approval.get_by_role("button", name="Allow").click()
         expect(approval).to_contain_text("Allowed Write")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+
+        # The context meter sits at the right of the composer's buttons,
+        # with Send on the left.
+        meter = self.page.get_by_role("meter", name="Context")
+        expect(meter.locator(".context-text")).to_have_text("41.5k / 200k")
+        expect(meter.locator(".context-fill")).to_have_class(re.compile(r"\bgreen\b"))
+        buttons = self.page.locator(".composer .form-buttons").bounding_box()
+        send = self.page.get_by_role("button", name="Send").bounding_box()
+        box = meter.bounding_box()
+        assert buttons and send and box
+        self.assertAlmostEqual(box["x"] + box["width"], buttons["x"] + buttons["width"], delta=1)
+        self.assertLess(send["x"] + send["width"], box["x"])
         tool = transcript.locator(".tool")
         tool.locator("summary").click()
         expect(tool.locator(".tool-result")).to_have_text("Wrote notes.txt")
@@ -571,6 +584,7 @@ class AgentTest(ServerTestCase):
         expect(permissions).to_have_value("auto")
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
+        expect(self.page.get_by_role("meter", name="Context")).to_contain_text("41.5k / 200k")
 
         # The sidebar lists the session under its repository and highlights it.
         item = self.section(scenarios.REPO).locator(".agent-item")

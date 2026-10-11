@@ -47,6 +47,35 @@ fn cost(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// A token count in a few characters, e.g. `950`, `41.5k` or `1M`.
+fn format_tokens(n: u64) -> String {
+    let short = |v: f64| {
+        let s = format!("{v:.1}");
+        s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+    };
+    let k = n as f64 / 1_000.0;
+    if n < 1_000 {
+        n.to_string()
+    } else if k < 999.95 {
+        format!("{}k", short(k))
+    } else {
+        format!("{}M", short(k / 1_000.0))
+    }
+}
+
+/// The colour of the context meter at `percent` full.
+fn usage_level(percent: f64) -> &'static str {
+    if percent < 25.0 {
+        "green"
+    } else if percent < 50.0 {
+        "yellow"
+    } else if percent <= 75.0 {
+        "orange"
+    } else {
+        "red"
+    }
+}
+
 #[component]
 fn StatusBadge(status: AgentStatus) -> impl IntoView {
     view! { <span class=status_class(status)>{status_label(status)}</span> }
@@ -301,8 +330,14 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
 
 /// Follows a session's event stream while the page is open. Events arrive
 /// in `seq` order; a reconnect replays the transcript, which is skipped up
-/// to the last event seen.
-fn follow(id: &str, events: RwSignal<Vec<AgentEvent>>, streaming: RwSignal<String>) {
+/// to the last event seen. `usage` gets the context window's tokens and
+/// size as Claude Code reports them.
+fn follow(
+    id: &str,
+    events: RwSignal<Vec<AgentEvent>>,
+    streaming: RwSignal<String>,
+    usage: RwSignal<(Option<u64>, Option<u64>)>,
+) {
     let Ok(source) = web_sys::EventSource::new(&format!("/api/agents/{id}/events")) else {
         return;
     };
@@ -316,11 +351,14 @@ fn follow(id: &str, events: RwSignal<Vec<AgentEvent>>, streaming: RwSignal<Strin
                 return;
             };
             match event.seq {
-                None => {
-                    if let AgentEventKind::TextDelta(t) = &event.kind {
-                        streaming.update(|s| s.push_str(t));
-                    }
-                }
+                None => match event.kind {
+                    AgentEventKind::TextDelta(t) => streaming.update(|s| s.push_str(&t)),
+                    AgentEventKind::Usage { tokens, window } => usage.update(|(t, w)| {
+                        *t = tokens.or(*t);
+                        *w = window.or(*w);
+                    }),
+                    _ => {}
+                },
                 Some(seq) => {
                     let last = events.with_untracked(|e| e.last().and_then(|e| e.seq));
                     if last.is_some_and(|l| seq <= l) {
@@ -402,7 +440,8 @@ pub fn AgentView(id: String) -> impl IntoView {
     });
     let events = RwSignal::new(Vec::<AgentEvent>::new());
     let streaming = RwSignal::new(String::new());
-    follow(&id, events, streaming);
+    let live_usage = RwSignal::new((None, None));
+    follow(&id, events, streaming, live_usage);
 
     view! {
         <div class="agent">
@@ -415,10 +454,15 @@ pub fn AgentView(id: String) -> impl IntoView {
                 Load::Ready => {
                     // Ready means a session was loaded, and `current` keeps it.
                     let session = Signal::derive(move || current.get().expect("a loaded session"));
+                    // The stream's values are newer than the loaded session's.
+                    let usage = Signal::derive(move || {
+                        let (tokens, window) = live_usage.get();
+                        session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
+                    });
                     view! {
                         <AgentHeader session=session />
                         <Transcript session=session events=events streaming=streaming />
-                        <Composer session=session />
+                        <Composer session=session usage=usage />
                     }.into_any()
                 }
             }}
@@ -595,7 +639,8 @@ fn Transcript(
                         }.into_any(),
                         AgentEventKind::ToolResult { .. }
                         | AgentEventKind::ApprovalResolved { .. }
-                        | AgentEventKind::TextDelta(_) => ().into_any(),
+                        | AgentEventKind::TextDelta(_)
+                        | AgentEventKind::Usage { .. } => ().into_any(),
                     }
                 }
             />
@@ -669,7 +714,10 @@ fn ApprovalCard(
 }
 
 #[component]
-fn Composer(session: Signal<AgentSession>) -> impl IntoView {
+fn Composer(
+    session: Signal<AgentSession>,
+    usage: Signal<(Option<u64>, Option<u64>)>,
+) -> impl IntoView {
     let prompt = RwSignal::new(String::new());
     let mode = mode_signal();
     let error = RwSignal::new(None::<String>);
@@ -722,8 +770,50 @@ fn Composer(session: Signal<AgentSession>) -> impl IntoView {
                 <ModeSelect mode=mode />
                 <button type="submit" class="primary" disabled=move || prompt.with(|p| p.trim().is_empty())>"Send"</button>
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
+                <ContextMeter usage=usage />
             </div>
         </form>
+    }
+}
+
+/// How full the context window is, at the right of the composer's buttons.
+#[component]
+fn ContextMeter(usage: Signal<(Option<u64>, Option<u64>)>) -> impl IntoView {
+    move || {
+        let (Some(tokens), window) = usage.get() else {
+            return ().into_any();
+        };
+        let Some(window) = window.filter(|w| *w > 0) else {
+            return view! {
+                <div class="context-usage" title="Tokens in the context window">
+                    <span class="context-text">{format_tokens(tokens)}</span>
+                </div>
+            }
+            .into_any();
+        };
+        let percent = tokens as f64 * 100.0 / window as f64;
+        view! {
+            <div
+                class="context-usage"
+                role="meter"
+                aria-label="Context"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow=format!("{percent:.0}")
+                title=format!("{percent:.0}% of the context window")
+            >
+                <span class="context-bar">
+                    <span
+                        class=format!("context-fill {}", usage_level(percent))
+                        style=format!("width: {:.1}%", percent.min(100.0))
+                    ></span>
+                </span>
+                <span class="context-text">
+                    {format!("{} / {}", format_tokens(tokens), format_tokens(window))}
+                </span>
+            </div>
+        }
+        .into_any()
     }
 }
 
@@ -752,6 +842,8 @@ mod tests {
             status: AgentStatus::Idle,
             created_at: 0,
             cost_usd: 0.0,
+            context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -777,6 +869,28 @@ mod tests {
                 ("o/gone", vec!["2"])
             ]
         );
+    }
+
+    #[test]
+    fn formats_tokens() {
+        assert_eq!(format_tokens(950), "950");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(41_503), "41.5k");
+        assert_eq!(format_tokens(200_000), "200k");
+        assert_eq!(format_tokens(999_990), "1M");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_260_000), "1.3M");
+    }
+
+    #[test]
+    fn usage_levels() {
+        assert_eq!(usage_level(0.0), "green");
+        assert_eq!(usage_level(24.9), "green");
+        assert_eq!(usage_level(25.0), "yellow");
+        assert_eq!(usage_level(50.0), "orange");
+        assert_eq!(usage_level(75.0), "orange");
+        assert_eq!(usage_level(75.1), "red");
+        assert_eq!(usage_level(120.0), "red");
     }
 
     #[test]
