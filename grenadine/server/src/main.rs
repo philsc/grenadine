@@ -166,7 +166,11 @@ async fn main() -> Result<()> {
         Some(p) => p,
         None => db_path.with_file_name("worktrees"),
     };
-    let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr))?;
+    let slices = agent::systemd_available();
+    if !slices {
+        tracing::warn!("no systemd user manager: deleting a session only stops the processes still in its worktree");
+    }
+    let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr), slices)?;
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

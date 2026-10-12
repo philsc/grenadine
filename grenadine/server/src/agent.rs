@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
@@ -38,6 +39,10 @@ const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
 /// How much of claude's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
+
+/// How long a deleted session's processes get to exit before they're
+/// killed.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What Claude is asked when there's uncommitted work to wrap up.
 const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
@@ -88,6 +93,9 @@ pub struct Agents {
     worktrees: PathBuf,
     /// Where Claude Code reaches this server, e.g. `http://127.0.0.1:8765`.
     base_url: String,
+    /// Whether each session's processes go into their own systemd user
+    /// slice.
+    slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// The models Claude Code offers, once it has listed them.
     models: OnceCell<Vec<AgentModelInfo>>,
@@ -189,14 +197,87 @@ fn interrupt_pid(pid: u32) {
     }
 }
 
+/// Whether processes can be put into systemd user slices.
+pub fn systemd_available() -> bool {
+    std::process::Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The systemd user slice the session's processes run in. A cgroup holds on
+/// to daemons that leave claude's process group, like Bazel's server, so
+/// stopping the slice stops them too. Dashes nest slices, so the ID loses
+/// them; every session's slice is then inside `grenadine-agent.slice`.
+fn slice(id: &str) -> String {
+    format!("grenadine-agent-{}.slice", id.replace('-', ""))
+}
+
+/// A process's state and controlling terminal, from `/proc/<pid>/stat`.
+fn proc_stat(pid: u32) -> Option<(char, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name before them can contain anything, even `)`.
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // ppid, pgrp, session, then tty_nr.
+    let tty = fields.nth(3)?.parse().ok()?;
+    Some((state, tty))
+}
+
+fn alive(pid: u32) -> bool {
+    proc_stat(pid).is_some_and(|(state, _)| !matches!(state, 'Z' | 'X'))
+}
+
+/// Stops the processes working in `dir` that have no terminal, first
+/// asking, then killing the ones that don't exit in time. A person's shell
+/// there has a terminal and keeps going.
+fn stop_processes_in(dir: &Path) {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut pids: Vec<u32> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|&pid| {
+            pid != me
+                && proc_stat(pid).is_some_and(|(_, tty)| tty == 0)
+                && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(&dir))
+        })
+        .collect();
+    let signal = |pids: &[u32], signal| {
+        for &pid in pids {
+            // SAFETY: kill has no memory-safety preconditions.
+            unsafe {
+                libc::kill(pid as libc::pid_t, signal);
+            }
+        }
+    };
+    signal(&pids, libc::SIGTERM);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        pids.retain(|&pid| alive(pid));
+        if pids.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    signal(&pids, libc::SIGKILL);
+}
+
 impl Agents {
     /// Marks the sessions that were running when the server last stopped as
-    /// interrupted.
+    /// interrupted. With `slices`, each session's processes go into their
+    /// own systemd user slice.
     pub fn new(
         db: &crate::db::Db,
         claude: PathBuf,
         worktrees: PathBuf,
         base_url: String,
+        slices: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
         Ok(Agents {
@@ -205,6 +286,7 @@ impl Agents {
             // resolve differently there.
             worktrees: std::path::absolute(&worktrees)?,
             base_url,
+            slices,
             live: std::sync::Mutex::default(),
             models: OnceCell::new(),
         })
@@ -518,6 +600,20 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         return Ok(false);
     };
     interrupt(state, id);
+    // Whatever claude started can outlive it, e.g. Bazel's server, which
+    // would hold on to its memory for hours.
+    if state.agents.slices {
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["--user", "stop", "--quiet"])
+            .arg(slice(id))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let worktree = PathBuf::from(&session.worktree);
+    tokio::task::spawn_blocking(move || stop_processes_in(&worktree)).await?;
     if let Some(cloned) = state.repos.get(&session.repo).cloned() {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
@@ -807,7 +903,17 @@ async fn turn(
             }
         }
     });
-    let mut cmd = tokio::process::Command::new(&state.agents.claude);
+    // `systemd-run --scope` execs claude, so the PID stays claude's.
+    let mut cmd = if state.agents.slices {
+        let mut cmd = tokio::process::Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--collect"])
+            .arg(format!("--slice={}", slice(id)))
+            .arg("--")
+            .arg(&state.agents.claude);
+        cmd
+    } else {
+        tokio::process::Command::new(&state.agents.claude)
+    };
     cmd.arg("-p");
     if state.db.agent_started(id)? {
         cmd.args(["--resume", id]);
@@ -1499,6 +1605,47 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(!std::path::Path::new(&session.worktree).exists());
         assert_eq!(state.db.agent(id).unwrap(), None);
         assert!(!delete(&state, id).await.unwrap());
+    }
+
+    /// Deleting a session stops what claude left running in the worktree,
+    /// even outside its process group, the way Bazel's server is.
+    #[tokio::test]
+    async fn delete_stops_leftover_processes() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            r#"#!/bin/sh
+cat > /dev/null
+setsid sleep 1000 < /dev/null > /dev/null 2>&1 &
+echo $! > {pid}
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+"#,
+            pid = pid_file.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let session = create(
+            &state,
+            NewAgent {
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "build".into(),
+                permission_mode: PermissionMode::Auto,
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(alive(pid));
+
+        assert!(delete(&state, &session.id).await.unwrap());
+        assert!(!alive(pid));
     }
 
     #[tokio::test]

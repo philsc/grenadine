@@ -547,7 +547,7 @@ pub fn test_state_with_agents(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let db = Db::in_memory();
     Arc::new(State {
-        agents: crate::agent::Agents::new(&db, claude, worktrees, "http://127.0.0.1:9".into())
+        agents: crate::agent::Agents::new(&db, claude, worktrees, "http://127.0.0.1:9".into(), false)
             .unwrap(),
         db,
         github: GitHub::new("dummy", "http://127.0.0.1:9").unwrap(),
