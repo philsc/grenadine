@@ -170,6 +170,11 @@ async fn main() -> Result<()> {
     if !slices {
         tracing::warn!("no systemd user manager: deleting a session only stops the processes still in its worktree");
     }
+    // A thread rather than spawn_blocking, which shutting down would wait for.
+    std::thread::spawn({
+        let worktrees = worktrees.clone();
+        move || agent::remove_orphaned_output_bases(&worktrees)
+    });
     let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr), slices)?;
 
     let mut signals = Signals::new()?;

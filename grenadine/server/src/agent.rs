@@ -6,6 +6,7 @@
 //! tool in `mcp.rs`, which waits for the user's answer from the page.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -233,19 +234,31 @@ fn alive(pid: u32) -> bool {
 
 /// Stops the processes working in `dir` that have no terminal, first
 /// asking, then killing the ones that don't exit in time. A person's shell
-/// there has a terminal and keeps going.
-fn stop_processes_in(dir: &Path) {
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+/// there has a terminal and keeps going. `dir` has its symlinks resolved,
+/// like the working directories. Returns the output bases of the Bazel
+/// servers among them.
+fn stop_processes_in(dir: &Path) -> Vec<PathBuf> {
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
+        return Vec::new();
     };
     let mut pids: Vec<u32> = entries
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
         .filter(|&pid| {
             pid != me
                 && proc_stat(pid).is_some_and(|(_, tty)| tty == 0)
-                && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(&dir))
+                && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+        })
+        .collect();
+    let output_bases = pids
+        .iter()
+        .filter_map(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .flat_map(|cmdline| {
+            cmdline
+                .split(|&b| b == 0)
+                .filter_map(|arg| arg.strip_prefix(b"--output_base="))
+                .map(|base| PathBuf::from(std::ffi::OsStr::from_bytes(base)))
+                .collect::<Vec<_>>()
         })
         .collect();
     let signal = |pids: &[u32], signal| {
@@ -266,6 +279,94 @@ fn stop_processes_in(dir: &Path) {
         std::thread::sleep(Duration::from_millis(50));
     }
     signal(&pids, libc::SIGKILL);
+    output_bases
+}
+
+/// Where Bazel puts output bases unless told otherwise.
+fn bazel_output_user_roots() -> Vec<PathBuf> {
+    let Ok(user) = std::env::var("USER") else {
+        return Vec::new();
+    };
+    let caches = [
+        std::env::var_os("XDG_CACHE_HOME")
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")),
+    ];
+    let mut roots: Vec<_> = caches
+        .into_iter()
+        .flatten()
+        .map(|c| c.join("bazel").join(format!("_bazel_{user}")))
+        .collect();
+    roots.dedup();
+    roots
+}
+
+/// The output bases in `roots` whose workspace `belongs`. Bazel names the
+/// workspace in each one's `DO_NOT_BUILD_HERE`.
+fn output_bases(roots: &[PathBuf], belongs: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
+        .filter_map(|e| {
+            let base = e.ok()?.path();
+            let workspace = std::fs::read_to_string(base.join("DO_NOT_BUILD_HERE")).ok()?;
+            belongs(Path::new(workspace.trim_end())).then_some(base)
+        })
+        .collect();
+    bases.sort();
+    bases.dedup();
+    bases
+}
+
+/// Removes `dir` even though Bazel made parts of it read-only.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn make_writable(dir: &Path) {
+        // Symlinks aren't followed, so nothing outside `dir` changes.
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            make_writable(&e.path());
+        }
+    }
+    if std::fs::remove_dir_all(dir).is_ok() {
+        return Ok(());
+    }
+    make_writable(dir);
+    std::fs::remove_dir_all(dir)
+}
+
+fn remove_output_bases(bases: Vec<PathBuf>) {
+    for base in bases {
+        match remove_tree(&base) {
+            Ok(()) => tracing::info!("removed Bazel output base {}", base.display()),
+            Err(e) => tracing::warn!("can't remove Bazel output base {}: {e}", base.display()),
+        }
+    }
+}
+
+/// Removes the Bazel output bases of worktrees in `worktrees` that are
+/// gone, e.g. those of sessions deleted before their output bases were.
+pub fn remove_orphaned_output_bases(worktrees: &Path) {
+    let Ok(worktrees) = worktrees
+        .canonicalize()
+        .or_else(|_| std::path::absolute(worktrees))
+    else {
+        return;
+    };
+    remove_output_bases(output_bases(&bazel_output_user_roots(), |workspace| {
+        workspace.starts_with(&worktrees) && !workspace.exists()
+    }));
 }
 
 impl Agents {
@@ -613,7 +714,11 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             .await;
     }
     let worktree = PathBuf::from(&session.worktree);
-    tokio::task::spawn_blocking(move || stop_processes_in(&worktree)).await?;
+    let worktree = worktree.canonicalize().unwrap_or(worktree);
+    let stopped = {
+        let worktree = worktree.clone();
+        tokio::task::spawn_blocking(move || stop_processes_in(&worktree)).await?
+    };
     if let Some(cloned) = state.repos.get(&session.repo).cloned() {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
@@ -621,6 +726,18 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         tokio::task::spawn_blocking(move || repo.worktree_remove(&worktree, &session.branch))
             .await??;
     }
+    // Bazel keeps each workspace's build in an output base outside the
+    // worktree, and workspaces can be anywhere in it. The stopped servers
+    // name their output bases, which matters when they aren't in the
+    // default place. Removing several GB takes a while, so it goes on in
+    // a thread, which unlike spawn_blocking doesn't hold up shutting down.
+    let mut roots = bazel_output_user_roots();
+    roots.extend(stopped.iter().filter_map(|b| b.parent().map(Path::to_owned)));
+    std::thread::spawn(move || {
+        remove_output_bases(output_bases(&roots, |workspace| {
+            workspace.starts_with(&worktree)
+        }))
+    });
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
     state.send(ServerEvent::AgentsChanged);
@@ -1646,6 +1763,45 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
         assert!(delete(&state, &session.id).await.unwrap());
         assert!(!alive(pid));
+    }
+
+    /// A worktree's output bases are those of the workspaces in it, even
+    /// nested ones, and come off despite their read-only parts.
+    #[test]
+    fn removes_a_worktrees_output_bases() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("_bazel_user");
+        let worktree = dir.path().join("worktrees/abc");
+        let base = |name: &str, workspace: &Path| {
+            let base = root.join(name);
+            std::fs::create_dir_all(base.join("execroot/_main")).unwrap();
+            std::fs::write(
+                base.join("DO_NOT_BUILD_HERE"),
+                workspace.as_os_str().as_bytes(),
+            )
+            .unwrap();
+            base
+        };
+        let nested = base("1", &worktree.join("sub/ws"));
+        let at_root = base("2", &worktree);
+        let sibling = base("3", &dir.path().join("worktrees/abc-2"));
+        let other = base("4", Path::new("/elsewhere"));
+        std::fs::create_dir_all(root.join("install")).unwrap();
+        let read_only = nested.join("execroot/_main/external");
+        std::fs::create_dir(&read_only).unwrap();
+        std::fs::write(read_only.join("file"), "x").unwrap();
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let bases = output_bases(&[root.clone(), dir.path().join("missing")], |w| {
+            w.starts_with(&worktree)
+        });
+        assert_eq!(bases, [nested.clone(), at_root.clone()]);
+        remove_output_bases(bases);
+        assert!(!nested.exists());
+        assert!(!at_root.exists());
+        assert!(sibling.exists());
+        assert!(other.exists());
     }
 
     #[tokio::test]
