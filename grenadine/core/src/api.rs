@@ -457,8 +457,13 @@ pub struct WrapUp {
 #[serde(rename_all = "snake_case")]
 pub enum Landed {
     /// The clone's checkout was fast-forwarded to `sha`.
-    Checkout { sha: String },
-    PullRequest { number: u64, url: String },
+    Checkout {
+        sha: String,
+    },
+    PullRequest {
+        number: u64,
+        url: String,
+    },
 }
 
 /// The user's answer to an `ApprovalRequested` event.

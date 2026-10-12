@@ -451,7 +451,8 @@ fn edit_fragments(
     input: &serde_json::Value,
     patch: &[PatchHunk],
 ) -> Option<(String, Vec<Fragment>)> {
-    let text = |v: &serde_json::Value, field: &str| v[field].as_str().unwrap_or_default().to_owned();
+    let text =
+        |v: &serde_json::Value, field: &str| v[field].as_str().unwrap_or_default().to_owned();
     let fragments = match name {
         "Edit" | "MultiEdit" | "Write" if !patch.is_empty() => edit::from_patch(patch),
         "Edit" => vec![edit::from_strings(
@@ -550,7 +551,12 @@ fn AgentHeader(session: Signal<AgentSession>, mode: RwSignal<PermissionMode>) ->
     let wrapping = RwSignal::new(false);
     let busy = Signal::derive(move || {
         wrapping.get()
-            || session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
+            || session.with(|s| {
+                matches!(
+                    s.status,
+                    AgentStatus::Running | AgentStatus::AwaitingApproval
+                )
+            })
     });
     // Claude may get prompts to commit or to resolve conflicts first;
     // they go with the mode the composer has picked.
@@ -670,7 +676,12 @@ fn Transcript(
     });
     // The page may hear of a request before it refetches the status.
     let waiting = Signal::derive(move || {
-        session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
+        session.with(|s| {
+            matches!(
+                s.status,
+                AgentStatus::Running | AgentStatus::AwaitingApproval
+            )
+        })
     });
     let (repo, id) = session.with_untracked(|s| (s.repo.clone(), s.id.clone()));
 
@@ -1188,7 +1199,12 @@ fn Composer(
     let prompt = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let working = move || {
-        session.with(|s| matches!(s.status, AgentStatus::Running | AgentStatus::AwaitingApproval))
+        session.with(|s| {
+            matches!(
+                s.status,
+                AgentStatus::Running | AgentStatus::AwaitingApproval
+            )
+        })
     };
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
 
@@ -1290,7 +1306,8 @@ mod tests {
     #[test]
     fn edit_fragments_by_tool() {
         let path = || "/w/a.rs".to_owned();
-        let input = serde_json::json!({"file_path": "/w/a.rs", "old_string": "a", "new_string": "b"});
+        let input =
+            serde_json::json!({"file_path": "/w/a.rs", "old_string": "a", "new_string": "b"});
         assert_eq!(
             edit_fragments("Edit", &input, &[]),
             Some((path(), vec![edit::from_strings("a", "b")]))

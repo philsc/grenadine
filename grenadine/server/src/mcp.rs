@@ -111,29 +111,24 @@ pub async fn handle(
                 Some(t) => t.to_owned(),
                 None => format!("request-{rpc_id}"),
             };
-            let decision = match agent::request_approval(
-                &state,
-                &id,
-                &tool_use,
-                tool_name,
-                &args["input"],
-            ) {
-                Ok(rx) => {
-                    let _guard = PendingGuard {
-                        state: &state,
-                        id: &id,
-                        tool_use: &tool_use,
-                    };
-                    tokio::select! {
-                        d = rx => d.ok(),
-                        _ = state.shutdown.cancelled() => None,
+            let decision =
+                match agent::request_approval(&state, &id, &tool_use, tool_name, &args["input"]) {
+                    Ok(rx) => {
+                        let _guard = PendingGuard {
+                            state: &state,
+                            id: &id,
+                            tool_use: &tool_use,
+                        };
+                        tokio::select! {
+                            d = rx => d.ok(),
+                            _ = state.shutdown.cancelled() => None,
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("agent {id}: {e:#}");
-                    None
-                }
-            };
+                    Err(e) => {
+                        tracing::warn!("agent {id}: {e:#}");
+                        None
+                    }
+                };
             let answer = match decision {
                 Some(Decision {
                     allow: true,
@@ -299,10 +294,7 @@ mod tests {
             state.db.agent(ID).unwrap().unwrap().status,
             AgentStatus::Running
         );
-        assert_eq!(
-            ask(&state, "toolu_2", false).await["behavior"],
-            "deny"
-        );
+        assert_eq!(ask(&state, "toolu_2", false).await["behavior"], "deny");
         // Answered requests are gone.
         let decision = Decision {
             allow: true,

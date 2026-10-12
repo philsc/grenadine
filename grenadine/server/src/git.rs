@@ -331,7 +331,12 @@ impl Repo {
         } else {
             self.git(&["worktree", "prune"])?;
         }
-        if self.git_ok(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]) {
+        if self.git_ok(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]) {
             self.git(&["branch", "-D", branch])?;
         }
         Ok(())
@@ -731,20 +736,33 @@ pub(crate) mod tests {
     #[test]
     fn worktrees() {
         let f = fixture();
-        let tip = f.clone.fetch_default_branch("refs/grenadine/agent/trunk").unwrap();
+        let tip = f
+            .clone
+            .fetch_default_branch("refs/grenadine/agent/trunk")
+            .unwrap();
         assert_eq!(tip, run(&f.upstream, &["rev-parse", "HEAD"]));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wt");
-        f.clone.worktree_add(&path, "grenadine/agent/x", &tip).unwrap();
+        f.clone
+            .worktree_add(&path, "grenadine/agent/x", &tip)
+            .unwrap();
         assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "1\n");
-        assert_eq!(run(&path, &["branch", "--show-current"]), "grenadine/agent/x");
+        assert_eq!(
+            run(&path, &["branch", "--show-current"]),
+            "grenadine/agent/x"
+        );
 
         // Uncommitted changes don't stop the removal.
         std::fs::write(path.join("b"), "2\n").unwrap();
         f.clone.worktree_remove(&path, "grenadine/agent/x").unwrap();
         assert!(!path.exists());
-        assert!(!f.clone.git_ok(&["rev-parse", "--verify", "--quiet", "refs/heads/grenadine/agent/x"]));
+        assert!(!f.clone.git_ok(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/grenadine/agent/x"
+        ]));
         // Removing it again is fine.
         f.clone.worktree_remove(&path, "grenadine/agent/x").unwrap();
     }

@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version,
-    VersionKind,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Landed, Person,
+    PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -869,7 +869,10 @@ impl Db {
 
     /// Returns false when there is no such session.
     pub fn delete_agent(&self, id: &str) -> Result<bool> {
-        Ok(self.conn().execute("DELETE FROM agents WHERE id = ?", [id])? > 0)
+        Ok(self
+            .conn()
+            .execute("DELETE FROM agents WHERE id = ?", [id])?
+            > 0)
     }
 
     /// Marks the sessions that were working when the server stopped as
@@ -1420,7 +1423,10 @@ mod tests {
         db.create_agent(&agent("b", AgentStatus::AwaitingApproval))
             .unwrap();
         db.create_agent(&agent("c", AgentStatus::Failed)).unwrap();
-        assert_eq!(db.agent("a").unwrap(), Some(agent("a", AgentStatus::Running)));
+        assert_eq!(
+            db.agent("a").unwrap(),
+            Some(agent("a", AgentStatus::Running))
+        );
         assert_eq!(db.agent("x").unwrap(), None);
 
         assert!(!db.agent_started("a").unwrap());
@@ -1432,7 +1438,10 @@ mod tests {
         db.set_agent_usage("a", None, Some(200_000)).unwrap();
         db.set_agent_usage("a", Some(1_000), None).unwrap();
         let a = db.agent("a").unwrap().unwrap();
-        assert_eq!((a.context_tokens, a.context_window), (Some(1_000), Some(200_000)));
+        assert_eq!(
+            (a.context_tokens, a.context_window),
+            (Some(1_000), Some(200_000))
+        );
         let landed = Landed::PullRequest {
             number: 3,
             url: "https://github.com/o/n/pull/3".into(),

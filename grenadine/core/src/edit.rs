@@ -101,7 +101,11 @@ mod tests {
     #[test]
     fn skips_missing_newline_markers() {
         assert_eq!(
-            from_patch(&[hunk(3, 3, &["-a", "\\ No newline at end of file", "+b", ""])]),
+            from_patch(&[hunk(
+                3,
+                3,
+                &["-a", "\\ No newline at end of file", "+b", ""]
+            )]),
             [Fragment {
                 old_start: 2,
                 new_start: 2,

@@ -51,9 +51,15 @@ struct Pending {
 enum Step {
     Landed(Landed),
     /// Claude has to fix the worktree first, as `prompt` tells it.
-    Ask { reason: String, prompt: String },
+    Ask {
+        reason: String,
+        prompt: String,
+    },
     /// The branch is on GitHub; the PR is opened next.
-    Pushed { base: String, messages: Vec<String> },
+    Pushed {
+        base: String,
+        messages: Vec<String>,
+    },
 }
 
 /// The user's answer to a permission request.
@@ -223,12 +229,7 @@ pub fn emit(state: &State, id: &str, kind: AgentEventKind) -> Result<()> {
 }
 
 /// Stores how full the context window is and sends it to open pages.
-fn record_usage(
-    state: &State,
-    id: &str,
-    tokens: Option<u64>,
-    window: Option<u64>,
-) -> Result<()> {
+fn record_usage(state: &State, id: &str, tokens: Option<u64>, window: Option<u64>) -> Result<()> {
     state.db.set_agent_usage(id, tokens, window)?;
     emit(state, id, AgentEventKind::Usage { tokens, window })
 }
@@ -420,10 +421,8 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
         let worktree = PathBuf::from(&session.worktree);
-        tokio::task::spawn_blocking(move || {
-            repo.worktree_remove(&worktree, &session.branch)
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || repo.worktree_remove(&worktree, &session.branch))
+            .await??;
     }
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
@@ -791,7 +790,11 @@ async fn turn(
             Parsed::Started { window } => {
                 state.db.set_agent_started(id)?;
                 // A resumed session keeps the window its result reported.
-                if state.db.agent(id)?.is_some_and(|s| s.context_window.is_none()) {
+                if state
+                    .db
+                    .agent(id)?
+                    .is_some_and(|s| s.context_window.is_none())
+                {
                     record_usage(state, id, None, Some(window))?;
                 }
             }
@@ -844,7 +847,9 @@ async fn turn(
 enum Parsed {
     /// Claude Code created (or resumed) its session; `window` is the
     /// context window that its model likely has.
-    Started { window: u64 },
+    Started {
+        window: u64,
+    },
     Events(Vec<AgentEventKind>),
 }
 
@@ -1050,7 +1055,9 @@ mod tests {
             Parsed::Started { window: 200_000 }
         );
         assert_eq!(
-            parse_line(r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#),
+            parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
+            ),
             Parsed::Started { window: 1_000_000 }
         );
         assert_eq!(
@@ -1273,7 +1280,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         let log = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2, "{log}");
-        assert!(lines[0].starts_with(&format!("-p --session-id {id} ")), "{log}");
+        assert!(
+            lines[0].starts_with(&format!("-p --session-id {id} ")),
+            "{log}"
+        );
         assert!(lines[0].contains(" --permission-mode auto "), "{log}");
         assert!(lines[0].ends_with(" | -first | 1"), "{log}");
         assert!(lines[1].starts_with(&format!("-p --resume {id} ")), "{log}");
@@ -1354,7 +1364,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         )
         .await
         .unwrap();
-        send(&state, &session.id, "queued".into(), PermissionMode::default());
+        send(
+            &state,
+            &session.id,
+            "queued".into(),
+            PermissionMode::default(),
+        );
         for _ in 0..100 {
             if state.agents.with_live(&session.id, |l| l.pid.is_some()) {
                 break;
@@ -1445,7 +1460,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         assert!(wrap_up(state, id, req).await);
         for _ in 0..100 {
-            let done = state.agents.with_live(id, |l| l.wrap_up.is_none() && !l.running);
+            let done = state
+                .agents
+                .with_live(id, |l| l.wrap_up.is_none() && !l.running);
             if done {
                 let events = state.db.agent_events(id).unwrap();
                 return events.into_iter().last().unwrap().kind;
@@ -1514,13 +1531,18 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
         // This claude ignores the request to rebase, so the second try
         // fails the same way.
-        let AgentEventKind::WrapUpFailed(e) = wrap(&state, &session.id, WrapUpTarget::Checkout).await
+        let AgentEventKind::WrapUpFailed(e) =
+            wrap(&state, &session.id, WrapUpTarget::Checkout).await
         else {
             panic!("{:?}", state.db.agent_events(&session.id));
         };
         assert!(e.contains("conflict"), "{e}");
         let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
-        assert_eq!(log.matches("Wrap up: rebase your commits onto").count(), 1, "{log}");
+        assert_eq!(
+            log.matches("Wrap up: rebase your commits onto").count(),
+            1,
+            "{log}"
+        );
         assert_eq!(run(&clone, &["rev-parse", "HEAD"]), before);
         let worktree = Path::new(&session.worktree);
         assert_eq!(fx.clone.worktree_unfinished(worktree).unwrap(), None);
@@ -1537,7 +1559,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let before = run(&clone, &["rev-parse", "HEAD"]);
 
         let event = wrap(&state, &session.id, WrapUpTarget::Checkout).await;
-        assert!(matches!(event, AgentEventKind::WrapUpFailed(_)), "{event:?}");
+        assert!(
+            matches!(event, AgentEventKind::WrapUpFailed(_)),
+            "{event:?}"
+        );
         assert_eq!(run(&clone, &["rev-parse", "HEAD"]), before);
         assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "local\n");
         assert_eq!(state.db.agent(&session.id).unwrap().unwrap().landed, None);
@@ -1559,7 +1584,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(!e.contains("no commits"), "{e}");
         let worktree = Path::new(&session.worktree);
         assert_eq!(
-            run(&fx.upstream, &["rev-parse", &format!("refs/heads/{}", session.branch)]),
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{}", session.branch)]
+            ),
             run(worktree, &["rev-parse", "HEAD"])
         );
     }
