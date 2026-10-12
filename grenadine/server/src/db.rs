@@ -194,6 +194,12 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agents ADD COLUMN landed TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The model Claude Code runs the session with, NULL until it starts.
+    ALTER TABLE agents ADD COLUMN model TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -759,8 +765,8 @@ impl Db {
         self.conn().execute(
             "INSERT INTO agents
                 (id, repo, pr_number, title, branch, worktree, base_sha, status, cost_usd,
-                 context_tokens, context_window, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 context_tokens, context_window, model, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.repo,
@@ -773,6 +779,7 @@ impl Db {
                 a.cost_usd,
                 a.context_tokens,
                 a.context_window,
+                a.model,
                 a.created_at
             ],
         )?;
@@ -849,6 +856,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_agent_model(&self, id: &str, model: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE agents SET model = ? WHERE id = ?", params![model, id])?;
+        Ok(())
+    }
+
     /// Records where wrapping up landed the session's work.
     pub fn set_agent_landed(&self, id: &str, landed: &Landed) -> Result<()> {
         self.conn().execute(
@@ -920,7 +933,7 @@ impl Db {
 }
 
 const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
-     created_at, cost_usd, context_tokens, context_window, landed";
+     created_at, cost_usd, context_tokens, context_window, landed, model";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -939,6 +952,7 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         landed: r
             .get::<_, Option<String>>(12)?
             .and_then(|j| serde_json::from_str(&j).ok()),
+        model: r.get(13)?,
     })
 }
 
@@ -1412,6 +1426,7 @@ mod tests {
             cost_usd: 0.0,
             context_tokens: None,
             context_window: None,
+            model: None,
             landed: None,
         }
     }
@@ -1441,6 +1456,11 @@ mod tests {
         assert_eq!(
             (a.context_tokens, a.context_window),
             (Some(1_000), Some(200_000))
+        );
+        db.set_agent_model("a", "claude-opus-4-6").unwrap();
+        assert_eq!(
+            db.agent("a").unwrap().unwrap().model.as_deref(),
+            Some("claude-opus-4-6")
         );
         let landed = Landed::PullRequest {
             number: 3,

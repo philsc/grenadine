@@ -551,7 +551,9 @@ textarea { width: 100%; resize: vertical; }
 
 .composer { position: sticky; bottom: 0; background: var(--bg); padding: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
 .composer .form-buttons { align-items: center; }
-.context-usage { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+.composer-status { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.agent-model { font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+.context-usage { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
 .context-bar { width: 80px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .context-fill { display: block; height: 100%; border-radius: 3px; }
 .context-fill.green { background: #2da44e; }

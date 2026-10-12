@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
+    AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
     InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus, WrapUp,
 };
 
@@ -163,6 +163,15 @@ pub async fn repos() -> Result<Vec<String>> {
         .map_err(|e| e.to_string())
 }
 
+/// The models Claude Code offers; empty when it can't list them.
+pub async fn agent_models() -> Result<Vec<AgentModelInfo>> {
+    check(Request::get("/api/agents/models").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub async fn agents() -> Result<Vec<AgentSession>> {
     check(Request::get("/api/agents").send().await)
         .await?
@@ -203,11 +212,13 @@ pub async fn send_agent_message(
     id: &str,
     prompt: String,
     permission_mode: PermissionMode,
+    model: Option<String>,
 ) -> Result<()> {
     let req = Request::post(&format!("/api/agents/{id}/messages"))
         .json(&AgentMessage {
             prompt,
             permission_mode,
+            model,
         })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())

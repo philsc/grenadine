@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Landed, NewAgent, PatchHunk,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, NewAgent, PatchHunk,
     PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{OnceCell, broadcast, oneshot};
 
 use crate::git::Repo;
 use crate::sync::State;
@@ -37,11 +37,12 @@ const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptiv
      messages that follow this repository's conventions. Don't change anything else.";
 
 /// A wrap-up in progress.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     target: WrapUpTarget,
-    /// The mode Claude's turns for the wrap-up go with.
+    /// The mode and model Claude's turns for the wrap-up go with.
     mode: PermissionMode,
+    model: Option<String>,
     /// Claude was already asked to get the worktree ready once.
     asked: bool,
 }
@@ -81,6 +82,8 @@ pub struct Agents {
     /// Where Claude Code reaches this server, e.g. `http://127.0.0.1:8765`.
     base_url: String,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// The models Claude Code offers, once it has listed them.
+    models: OnceCell<Vec<AgentModelInfo>>,
 }
 
 /// What only exists while the server runs: the event channel open pages
@@ -89,7 +92,8 @@ struct Live {
     events: broadcast::Sender<AgentEvent>,
     /// Authenticates the session's MCP endpoint.
     secret: String,
-    queue: VecDeque<(String, PermissionMode)>,
+    /// Prompts with their mode and model.
+    queue: VecDeque<(String, PermissionMode, Option<String>)>,
     /// Whether a task is running the queued prompts.
     running: bool,
     /// The current claude process.
@@ -195,6 +199,7 @@ impl Agents {
             worktrees: std::path::absolute(&worktrees)?,
             base_url,
             live: std::sync::Mutex::default(),
+            models: OnceCell::new(),
         })
     }
 
@@ -212,6 +217,87 @@ impl Agents {
     pub fn subscribe(&self, id: &str) -> broadcast::Receiver<AgentEvent> {
         self.with_live(id, |l| l.events.subscribe())
     }
+
+    /// The models Claude Code offers, listed once and kept; none while it
+    /// can't list them.
+    pub async fn models(&self) -> Vec<AgentModelInfo> {
+        match self.models.get_or_try_init(|| list_models(&self.claude)).await {
+            Ok(models) => models.clone(),
+            Err(e) => {
+                tracing::warn!("listing Claude Code's models: {e:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether prompts may ask for `model`: Claude Code's default, or one
+    /// it lists.
+    pub async fn offers(&self, model: Option<&str>) -> bool {
+        match model {
+            None => true,
+            Some(m) => self.models().await.iter().any(|i| i.value == m),
+        }
+    }
+}
+
+/// The `initialize` control request the Agent SDK starts with. Claude Code
+/// answers it without calling a model.
+const INITIALIZE: &str =
+    r#"{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}"#;
+
+/// Asks Claude Code for its models the way the Agent SDK does.
+async fn list_models(claude: &Path) -> Result<Vec<AgentModelInfo>> {
+    let mut child = tokio::process::Command::new(claude)
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("running {}", claude.display()))?;
+    // Stdin stays open until the answer is in, so claude waits for more.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(format!("{INITIALIZE}\n").as_bytes()).await?;
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let read = async {
+        while let Some(line) = lines.next_line().await? {
+            if let Some(models) = parse_models(&line) {
+                return Ok(models);
+            }
+        }
+        bail!("claude exited without listing its models")
+    };
+    let models = tokio::time::timeout(std::time::Duration::from_secs(30), read)
+        .await
+        .context("claude didn't list its models in time")?;
+    drop(stdin);
+    let _ = child.kill().await;
+    models
+}
+
+/// The models in the answer to `INITIALIZE`, if `line` is that answer.
+/// Entries that don't parse are skipped.
+fn parse_models(line: &str) -> Option<Vec<AgentModelInfo>> {
+    let v = serde_json::from_str::<Value>(line).ok()?;
+    let response = &v["response"];
+    if v["type"] != "control_response" || response["request_id"] != "models" {
+        return None;
+    }
+    Some(
+        response["response"]["models"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| serde_json::from_value(m.clone()).ok())
+            .collect(),
+    )
 }
 
 /// Stores an event (unless it's ephemeral) and sends it to open pages. The
@@ -306,18 +392,26 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         cost_usd: 0.0,
         context_tokens: None,
         context_window: None,
+        model: None,
         landed: None,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
-    send(state, &id, req.prompt, req.permission_mode);
+    send(state, &id, req.prompt, req.permission_mode, req.model);
     Ok(session)
 }
 
-/// Queues a prompt; it runs once the turns before it are done.
-pub fn send(state: &Arc<State>, id: &str, prompt: String, mode: PermissionMode) {
+/// Queues a prompt; it runs once the turns before it are done, with
+/// `model` or else Claude Code's default.
+pub fn send(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    mode: PermissionMode,
+    model: Option<String>,
+) {
     let start = state.agents.with_live(id, |l| {
-        l.queue.push_back((prompt, mode));
+        l.queue.push_back((prompt, mode, model));
         !std::mem::replace(&mut l.running, true)
     });
     if start {
@@ -441,7 +535,7 @@ async fn run(state: Arc<State>, id: String) {
             l.interrupted = false;
             prompt
         });
-        let Some((prompt, mode)) = prompt else {
+        let Some((prompt, mode, model)) = prompt else {
             if last == AgentStatus::Idle {
                 continue_wrap_up(&state, &id).await;
             } else if state.agents.with_live(&id, |l| l.wrap_up.take()).is_some() {
@@ -453,7 +547,7 @@ async fn run(state: Arc<State>, id: String) {
             }
             return;
         };
-        let status = match turn(&state, &id, prompt, mode).await {
+        let status = match turn(&state, &id, prompt, mode, model).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!("agent {id}: {e:#}");
@@ -488,6 +582,7 @@ pub async fn wrap_up(state: &Arc<State>, id: &str, req: WrapUp) -> bool {
         l.wrap_up = Some(Pending {
             target: req.target,
             mode: req.permission_mode,
+            model: req.model,
             asked: false,
         });
         true
@@ -502,7 +597,7 @@ pub async fn wrap_up(state: &Arc<State>, id: &str, req: WrapUp) -> bool {
 /// progress. When the worktree isn't ready, Claude is asked to fix it once
 /// and the wrap-up goes on after that turn.
 async fn continue_wrap_up(state: &Arc<State>, id: &str) {
-    let Some(pending) = state.agents.with_live(id, |l| l.wrap_up) else {
+    let Some(pending) = state.agents.with_live(id, |l| l.wrap_up.clone()) else {
         return;
     };
     let outcome = match land(state, id, pending.target).await {
@@ -513,7 +608,7 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
                     w.asked = true;
                 }
             });
-            send(state, id, prompt, pending.mode);
+            send(state, id, prompt, pending.mode, pending.model);
             return;
         }
         Ok(Step::Ask { reason, .. }) => Err(anyhow!("{reason}")),
@@ -688,6 +783,7 @@ async fn turn(
     id: &str,
     prompt: String,
     mode: PermissionMode,
+    model: Option<String>,
 ) -> Result<AgentStatus> {
     let session = state
         .db
@@ -729,6 +825,9 @@ async fn turn(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
+    if let Some(model) = model.filter(|m| m != "default") {
+        cmd.arg("--model").arg(model);
+    }
     // Keep claude out of the terminal's process group, like git in
     // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
     // SAFETY: setsid is async-signal-safe and the closure touches no
@@ -787,15 +886,17 @@ async fn turn(
         };
         let Some(line) = line else { break };
         match parse_line(&line) {
-            Parsed::Started { window } => {
+            Parsed::Started { window, model } => {
                 state.db.set_agent_started(id)?;
-                // A resumed session keeps the window its result reported.
-                if state
-                    .db
-                    .agent(id)?
-                    .is_some_and(|s| s.context_window.is_none())
-                {
+                // A resumed session keeps the window its result reported,
+                // unless it switched models.
+                let before = state.db.agent(id)?;
+                if before.is_some_and(|s| s.context_window.is_none() || s.model != model) {
                     record_usage(state, id, None, Some(window))?;
+                }
+                if let Some(model) = model {
+                    state.db.set_agent_model(id, &model)?;
+                    emit(state, id, AgentEventKind::Model(model))?;
                 }
             }
             Parsed::Events(events) => {
@@ -845,10 +946,11 @@ async fn turn(
 /// What one line of `--output-format stream-json` means for the transcript.
 #[derive(Debug, PartialEq)]
 enum Parsed {
-    /// Claude Code created (or resumed) its session; `window` is the
-    /// context window that its model likely has.
+    /// Claude Code created (or resumed) its session with `model`; `window`
+    /// is the context window that the model likely has.
     Started {
         window: u64,
+        model: Option<String>,
     },
     Events(Vec<AgentEventKind>),
 }
@@ -928,8 +1030,10 @@ fn parse_line(line: &str) -> Parsed {
     let blocks = || v["message"]["content"].as_array().into_iter().flatten();
     let events = match v["type"].as_str() {
         Some("system") if v["subtype"] == "init" => {
+            let model = v["model"].as_str().unwrap_or_default();
             return Parsed::Started {
-                window: guess_window(v["model"].as_str().unwrap_or_default()),
+                window: guess_window(model),
+                model: (!model.is_empty()).then(|| model.to_owned()),
             };
         }
         Some("stream_event") => {
@@ -1052,13 +1156,19 @@ mod tests {
             parse_line(
                 r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
             ),
-            Parsed::Started { window: 200_000 }
+            Parsed::Started {
+                window: 200_000,
+                model: Some("claude-opus-4-6".into())
+            }
         );
         assert_eq!(
             parse_line(
                 r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
             ),
-            Parsed::Started { window: 1_000_000 }
+            Parsed::Started {
+                window: 1_000_000,
+                model: Some("claude-opus-4-6[1m]".into())
+            }
         );
         assert_eq!(
             events(r#"{"type":"system","subtype":"hook_started","session_id":"s"}"#),
@@ -1218,6 +1328,65 @@ mod tests {
         panic!("the session didn't finish {turns} turns");
     }
 
+    /// Claude Code lists its models in its answer to `initialize`, as
+    /// 2.1 writes it, shortened.
+    #[tokio::test]
+    async fn lists_models() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let script = format!(
+            r#"#!/bin/sh
+read -r request
+echo "$* | $request" >> {log}
+echo '{{"type":"system","subtype":"hook_started"}}'
+echo '{{"type":"control_response","response":{{"subtype":"success","request_id":"models","response":{{"commands":[],"models":[{{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)","description":"Opus 5.5"}},{{"value":"sonnet","displayName":"Sonnet 5.5","description":"Efficient","supportsEffort":true}},{{"displayName":"no value"}}]}}}}}}'
+"#,
+            log = log.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let models = state.agents.models().await;
+        assert_eq!(
+            models,
+            [
+                AgentModelInfo {
+                    value: "default".into(),
+                    display_name: "Default (recommended)".into(),
+                    description: "Opus 5.5".into(),
+                },
+                AgentModelInfo {
+                    value: "sonnet".into(),
+                    display_name: "Sonnet 5.5".into(),
+                    description: "Efficient".into(),
+                },
+            ]
+        );
+        assert!(state.agents.offers(None).await);
+        assert!(state.agents.offers(Some("sonnet")).await);
+        assert!(!state.agents.offers(Some("--help")).await);
+
+        // Claude Code is asked once, without a prompt or a session to keep.
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log,
+            format!(
+                "-p --input-format stream-json --output-format stream-json --verbose \
+                 --no-session-persistence | {INITIALIZE}\n"
+            )
+        );
+    }
+
+    /// Without a list, prompts can only go with Claude Code's default.
+    #[tokio::test]
+    async fn offers_only_the_default_without_models() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
+        assert_eq!(state.agents.models().await, []);
+        assert!(state.agents.offers(None).await);
+        assert!(!state.agents.offers(Some("sonnet")).await);
+    }
+
     #[tokio::test]
     async fn runs_turns_in_a_worktree_and_resumes() {
         let fx = crate::git::tests::fixture();
@@ -1243,6 +1412,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 pr: None,
                 prompt: "-first".into(),
                 permission_mode: PermissionMode::Auto,
+                model: Some("sonnet".into()),
             },
         )
         .await
@@ -1254,7 +1424,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         );
         let mut events = state.agents.subscribe(&session.id);
         wait_for_turns(&state, &session.id, 1).await;
-        send(&state, &session.id, "second".into(), PermissionMode::Manual);
+        send(&state, &session.id, "second".into(), PermissionMode::Manual, None);
         let transcript = wait_for_turns(&state, &session.id, 2).await;
 
         let turn = |prompt: &str| {
@@ -1273,6 +1443,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert_eq!(session.cost_usd, 0.5);
         assert_eq!(session.context_tokens, Some(15));
         assert_eq!(session.context_window, Some(200_000));
+        assert_eq!(session.model.as_deref(), Some("claude-test"));
 
         // The first turn creates the session, the second resumes it, both
         // in the worktree.
@@ -1285,9 +1456,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             "{log}"
         );
         assert!(lines[0].contains(" --permission-mode auto "), "{log}");
+        assert!(lines[0].contains(" --model sonnet "), "{log}");
         assert!(lines[0].ends_with(" | -first | 1"), "{log}");
         assert!(lines[1].starts_with(&format!("-p --resume {id} ")), "{log}");
         assert!(lines[1].contains(" --permission-mode manual "), "{log}");
+        assert!(!lines[1].contains("--model"), "{log}");
         assert!(lines[1].contains("--permission-prompt-tool mcp__grenadine__approve"));
         assert!(lines[1].ends_with(" | second | 1"), "{log}");
 
@@ -1306,6 +1479,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 tokens: Some(15),
                 window: None
             }
+        }));
+        assert!(live.contains(&AgentEvent {
+            seq: None,
+            kind: AgentEventKind::Model("claude-test".into())
         }));
         // At least the second turn's, which started after subscribing.
         assert!(live.iter().filter(|e| e.seq.is_some()).count() >= 3);
@@ -1328,6 +1505,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 pr: None,
                 prompt: "go".into(),
                 permission_mode: PermissionMode::default(),
+                model: None,
             },
         )
         .await
@@ -1360,6 +1538,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 pr: None,
                 prompt: "go".into(),
                 permission_mode: PermissionMode::default(),
+                model: None,
             },
         )
         .await
@@ -1369,6 +1548,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             &session.id,
             "queued".into(),
             PermissionMode::default(),
+            None,
         );
         for _ in 0..100 {
             if state.agents.with_live(&session.id, |l| l.pid.is_some()) {
@@ -1444,6 +1624,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 pr: None,
                 prompt: prompt.into(),
                 permission_mode: PermissionMode::Auto,
+                model: None,
             },
         )
         .await
@@ -1457,6 +1638,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let req = WrapUp {
             target,
             permission_mode: PermissionMode::Auto,
+            model: None,
         };
         assert!(wrap_up(state, id, req).await);
         for _ in 0..100 {
@@ -1501,7 +1683,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         // the new commit onto it.
         run(&clone, &["checkout", "-q", "--detach"]);
         let moved = commit(&clone, "c", "1\n");
-        send(&state, id, "commit b more".into(), PermissionMode::Auto);
+        send(&state, id, "commit b more".into(), PermissionMode::Auto, None);
         wait_for_turns(&state, id, 3).await;
         let AgentEventKind::Landed(Landed::Checkout { sha }) =
             wrap(&state, id, WrapUpTarget::Checkout).await

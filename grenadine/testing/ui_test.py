@@ -29,7 +29,8 @@ STARTUP_TIMEOUT = 30
 # Stands in for `claude -p`: it writes a short turn as stream-json and,
 # when the prompt asks it to write, asks grenadine for permission through
 # the MCP tool first, like Claude Code does. Permission modes other than
-# manual allow the write without asking.
+# manual allow the write without asking. It runs the model `--model` names, and
+# lists its models when asked like the Agent SDK does.
 FAKE_CLAUDE = r'''
 import json
 import subprocess
@@ -39,9 +40,20 @@ import urllib.request
 import uuid
 
 args = sys.argv[1:]
+if "--input-format" in args:
+    request = json.loads(sys.stdin.readline())
+    models = [
+        {"value": "default", "displayName": "Default (recommended)", "description": "claude-test"},
+        {"value": "sonnet", "displayName": "Sonnet", "description": "Efficient"},
+        {"value": "haiku", "displayName": "Haiku", "description": "Fast"},
+    ]
+    response = {"subtype": "success", "request_id": request["request_id"], "response": {"models": models}}
+    print(json.dumps({"type": "control_response", "response": response}), flush=True)
+    sys.exit()
 prompt = sys.stdin.read()
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
 mode = args[args.index("--permission-mode") + 1]
+model = args[args.index("--model") + 1] if "--model" in args else "claude-test"
 
 
 def emit(message):
@@ -78,7 +90,7 @@ def result(tool_use, content, is_error=False, patch=None):
     emit(line)
 
 
-emit({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-test"})
+emit({"type": "system", "subtype": "init", "session_id": "s", "model": model})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
     time.sleep(0.05)
@@ -577,6 +589,10 @@ class AgentTest(ServerTestCase):
         permissions = self.page.get_by_label("Permissions")
         expect(permissions).to_have_value("plan")
         permissions.select_option(label="Ask for everything")
+        # The models are the ones Claude Code lists; its default comes first.
+        model = self.page.get_by_label("Model")
+        expect(model).to_have_value("default")
+        expect(model.locator("option")).to_have_text(["Default (recommended)", "Sonnet", "Haiku"])
         self.page.get_by_label("Prompt").fill("please write a note")
         self.page.get_by_role("button", name="Start").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
@@ -592,7 +608,7 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
 
         # The context meter sits at the right of the composer's buttons,
-        # with Send on the left.
+        # after the model, with Send on the left.
         meter = self.page.get_by_role("meter", name="Context")
         expect(meter.locator(".context-text")).to_have_text("41.5k / 200k")
         expect(meter.locator(".context-fill")).to_have_class(re.compile(r"\bgreen\b"))
@@ -601,7 +617,12 @@ class AgentTest(ServerTestCase):
         box = meter.bounding_box()
         assert buttons and send and box
         self.assertAlmostEqual(box["x"] + box["width"], buttons["x"] + buttons["width"], delta=1)
-        self.assertLess(send["x"] + send["width"], box["x"])
+        active = self.page.locator(".composer .agent-model")
+        expect(active).to_have_text("claude-test")
+        active_box = active.bounding_box()
+        assert active_box
+        self.assertLess(send["x"] + send["width"], active_box["x"])
+        self.assertLess(active_box["x"] + active_box["width"], box["x"])
         tool = transcript.locator(".tool")
         tool.locator("summary").click()
         # The write shows as a diff, without the result that only repeats it.
@@ -616,11 +637,14 @@ class AgentTest(ServerTestCase):
         self.assertEqual((worktree / "README").read_text(), "hello\n")
 
         follow_up = self.page.get_by_label("Follow-up")
+        # A follow-up can switch models, which the composer then shows.
+        model.select_option(label="Sonnet")
         follow_up.fill("thanks")
         follow_up.press("Control+Enter")
         expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(follow_up).to_have_value("")
+        expect(active).to_have_text("sonnet")
 
         # The composer starts with the permissions picked last. In Auto
         # mode, the write goes ahead without asking.
@@ -636,9 +660,11 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
         expect(permissions).to_have_value("auto")
+        expect(model).to_have_value("sonnet")
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
         expect(self.page.get_by_role("meter", name="Context")).to_contain_text("41.5k / 200k")
+        expect(active).to_have_text("sonnet")
 
         # The sidebar lists the session under its repository and highlights it.
         item = self.section(scenarios.REPO).locator(".agent-item")
@@ -646,6 +672,8 @@ class AgentTest(ServerTestCase):
         expect(item).to_have_class(re.compile(r"\bselected\b"))
         self.page.get_by_role("link", name="Agents").click()
         expect(item).not_to_have_class(re.compile(r"\bselected\b"))
+        # New sessions start with the model picked last.
+        expect(model).to_have_value("sonnet")
         item.click()
         expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
 

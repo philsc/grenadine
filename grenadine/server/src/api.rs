@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
+    AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
     InboxEdit, InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing, WrapUp,
 };
 use serde::Deserialize;
@@ -53,6 +53,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/events", get(events))
         .route("/api/repos", get(repos))
         .route("/api/agents", get(agents).post(create_agent))
+        .route("/api/agents/models", get(agent_models))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route("/api/agents/{id}/messages", post(agent_message))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
@@ -263,9 +264,19 @@ async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
     Ok(Json(state.db.agents()?))
 }
 
+/// The models prompts may ask for, as Claude Code lists them.
+async fn agent_models(AxState(state): St) -> Json<Vec<AgentModelInfo>> {
+    Json(state.agents.models().await)
+}
+
+const UNKNOWN_MODEL: &str = "Claude Code doesn't offer that model";
+
 async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResult<Response> {
     if req.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
+    }
+    if !state.agents.offers(req.model.as_deref()).await {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
     if !state.repos.contains_key(&req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
@@ -306,7 +317,10 @@ async fn agent_message(
     if msg.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
-    agent::send(&state, &id, msg.prompt, msg.permission_mode);
+    if !state.agents.offers(msg.model.as_deref()).await {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    }
+    agent::send(&state, &id, msg.prompt, msg.permission_mode, msg.model);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -327,6 +341,9 @@ async fn wrap_up_agent(
 ) -> ApiResult<Response> {
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    if !state.agents.offers(req.model.as_deref()).await {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
     if !agent::wrap_up(&state, &id, req).await {
         return Ok((

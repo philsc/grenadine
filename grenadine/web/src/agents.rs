@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Approval, Landed, NewAgent, PatchHunk,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, Landed, NewAgent, PatchHunk,
     PermissionMode, PrKey, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
@@ -254,6 +254,78 @@ fn ModeSelect(
     }
 }
 
+const MODEL_KEY: &str = "grenadine.agent-model";
+
+/// What the model picker shows for Claude Code's configured default.
+const DEFAULT_MODEL: &str = "default";
+
+/// The model the next prompt goes with, an `AgentModelInfo::value`: the
+/// last one picked, Claude Code's default at first.
+fn model_signal() -> RwSignal<String> {
+    let model = RwSignal::new(
+        storage()
+            .and_then(|s| s.get_item(MODEL_KEY).ok().flatten())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+    );
+    Effect::new(move |_| {
+        if let Some(s) = storage() {
+            let _ = s.set_item(MODEL_KEY, &model.get());
+        }
+    });
+    model
+}
+
+/// The model a request asks for; `None` leaves it to Claude Code.
+fn model_arg(model: RwSignal<String>) -> Option<String> {
+    Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL)
+}
+
+/// Picks one of the models Claude Code offers. Until they're listed, or
+/// when they can't be, only its default is offered.
+#[component]
+fn ModelSelect(model: RwSignal<String>) -> impl IntoView {
+    let listed = LocalResource::new(api::agent_models);
+    let models = Memo::new(move |_| {
+        let mut models = listed.get().and_then(Result::ok).unwrap_or_default();
+        if !models.iter().any(|m| m.value == DEFAULT_MODEL) {
+            models.insert(
+                0,
+                AgentModelInfo {
+                    value: DEFAULT_MODEL.into(),
+                    display_name: "Default".into(),
+                    description: "Claude Code's configured default".into(),
+                },
+            );
+        }
+        models
+    });
+    // A pick that's no longer offered goes back to the default.
+    Effect::new(move |_| {
+        if listed.get().is_some()
+            && !models.with(|ms| model.with_untracked(|m| ms.iter().any(|i| &i.value == m)))
+        {
+            model.set(DEFAULT_MODEL.into());
+        }
+    });
+    view! {
+        <select
+            class="agent-model-select"
+            aria-label="Model"
+            title="The model Claude runs with"
+            prop:value=move || model.get()
+            on:change=move |ev| model.set(event_target_value(&ev))
+        >
+            {move || models.get().into_iter().map(|m| {
+                let value = m.value.clone();
+                let selected = move || model.with(|v| *v == value);
+                view! {
+                    <option value=m.value title=m.description selected=selected>{m.display_name}</option>
+                }
+            }).collect_view()}
+        </select>
+    }
+}
+
 /// The form that starts a session, filled in with `repo` and `pr` if given.
 #[component]
 pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
@@ -263,6 +335,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
     let prompt = RwSignal::new(String::new());
     // New sessions start out planning, whatever was picked last.
     let mode = mode_signal(Some(PermissionMode::Plan));
+    let model = model_signal();
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
@@ -295,6 +368,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
             pr,
             prompt: prompt.get_untracked(),
             permission_mode: mode.get_untracked(),
+            model: model_arg(model),
         };
         busy.set(true);
         error.set(None);
@@ -336,6 +410,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                         />
                     </label>
                     <label>"Permissions" <ModeSelect mode=mode /></label>
+                    <label>"Model" <ModelSelect model=model /></label>
                 </div>
                 <textarea
                     class="agent-prompt"
@@ -351,7 +426,7 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                         }
                     }
                 ></textarea>
-                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions."</p>
+                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions and a different model."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -370,12 +445,13 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
 /// Follows a session's event stream while the page is open. Events arrive
 /// in `seq` order; a reconnect replays the transcript, which is skipped up
 /// to the last event seen. `usage` gets the context window's tokens and
-/// size as Claude Code reports them.
+/// size as Claude Code reports them, and `model` the model it runs.
 fn follow(
     id: &str,
     events: RwSignal<Vec<AgentEvent>>,
     streaming: RwSignal<String>,
     usage: RwSignal<(Option<u64>, Option<u64>)>,
+    model: RwSignal<Option<String>>,
 ) {
     let Ok(source) = web_sys::EventSource::new(&format!("/api/agents/{id}/events")) else {
         return;
@@ -396,6 +472,7 @@ fn follow(
                         *t = tokens.or(*t);
                         *w = window.or(*w);
                     }),
+                    AgentEventKind::Model(m) => model.set(Some(m)),
                     _ => {}
                 },
                 Some(seq) => {
@@ -514,9 +591,11 @@ pub fn AgentView(id: String) -> impl IntoView {
     let events = RwSignal::new(Vec::<AgentEvent>::new());
     let streaming = RwSignal::new(String::new());
     let live_usage = RwSignal::new((None, None));
-    follow(&id, events, streaming, live_usage);
+    let live_model = RwSignal::new(None);
+    follow(&id, events, streaming, live_usage, live_model);
     // Approving a plan also picks the mode the follow-ups go with.
     let mode = mode_signal(None);
+    let model = model_signal();
 
     view! {
         <div class="agent">
@@ -534,10 +613,13 @@ pub fn AgentView(id: String) -> impl IntoView {
                         let (tokens, window) = live_usage.get();
                         session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
                     });
+                    let active_model = Signal::derive(move || {
+                        live_model.get().or_else(|| session.with(|s| s.model.clone()))
+                    });
                     view! {
-                        <AgentHeader session=session mode=mode />
+                        <AgentHeader session=session mode=mode model=model />
                         <Transcript session=session events=events streaming=streaming mode=mode />
-                        <Composer session=session usage=usage mode=mode />
+                        <Composer session=session usage=usage active_model=active_model mode=mode model=model />
                     }.into_any()
                 }
             }}
@@ -546,7 +628,11 @@ pub fn AgentView(id: String) -> impl IntoView {
 }
 
 #[component]
-fn AgentHeader(session: Signal<AgentSession>, mode: RwSignal<PermissionMode>) -> impl IntoView {
+fn AgentHeader(
+    session: Signal<AgentSession>,
+    mode: RwSignal<PermissionMode>,
+    model: RwSignal<String>,
+) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let wrapping = RwSignal::new(false);
     let busy = Signal::derive(move || {
@@ -559,12 +645,13 @@ fn AgentHeader(session: Signal<AgentSession>, mode: RwSignal<PermissionMode>) ->
             })
     });
     // Claude may get prompts to commit or to resolve conflicts first;
-    // they go with the mode the composer has picked.
+    // they go with the mode and model the composer has picked.
     let wrap_up = move |target| {
         let id = session.with_untracked(|s| s.id.clone());
         let req = WrapUp {
             target,
             permission_mode: mode.get_untracked(),
+            model: model_arg(model),
         };
         wrapping.set(true);
         error.set(None);
@@ -851,7 +938,8 @@ fn Transcript(
                         AgentEventKind::ToolResult { .. }
                         | AgentEventKind::ApprovalResolved { .. }
                         | AgentEventKind::TextDelta(_)
-                        | AgentEventKind::Usage { .. } => ().into_any(),
+                        | AgentEventKind::Usage { .. }
+                        | AgentEventKind::Model(_) => ().into_any(),
                     }
                 }
             />
@@ -1194,7 +1282,9 @@ fn ApprovalCard(
 fn Composer(
     session: Signal<AgentSession>,
     usage: Signal<(Option<u64>, Option<u64>)>,
+    active_model: Signal<Option<String>>,
     mode: RwSignal<PermissionMode>,
+    model: RwSignal<String>,
 ) -> impl IntoView {
     let prompt = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
@@ -1214,8 +1304,9 @@ fn Composer(
             return;
         }
         let mode = mode.get_untracked();
+        let model = model_arg(model);
         spawn_local(async move {
-            match api::send_agent_message(&id.get_value(), text, mode).await {
+            match api::send_agent_message(&id.get_value(), text, mode, model).await {
                 Ok(()) => prompt.set(String::new()),
                 Err(e) => error.set(Some(e)),
             }
@@ -1250,15 +1341,20 @@ fn Composer(
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode />
+                <ModelSelect model=model />
                 <button type="submit" class="primary" disabled=move || prompt.with(|p| p.trim().is_empty())>"Send"</button>
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
-                <ContextMeter usage=usage />
+                <div class="composer-status">
+                    {move || active_model.get().map(|m| view! { <span class="agent-model" title="Model">{m}</span> })}
+                    <ContextMeter usage=usage />
+                </div>
             </div>
         </form>
     }
 }
 
-/// How full the context window is, at the right of the composer's buttons.
+/// How full the context window is, at the right of the composer's buttons
+/// after the model.
 #[component]
 fn ContextMeter(usage: Signal<(Option<u64>, Option<u64>)>) -> impl IntoView {
     move || {
@@ -1381,6 +1477,7 @@ mod tests {
             cost_usd: 0.0,
             context_tokens: None,
             context_window: None,
+            model: None,
             landed: None,
         }
     }

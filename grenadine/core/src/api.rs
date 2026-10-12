@@ -355,6 +355,10 @@ pub struct AgentSession {
     pub context_tokens: Option<u64>,
     /// The size of the model's context window, in tokens.
     pub context_window: Option<u64>,
+    /// The model Claude Code runs the session with, as its init line names
+    /// it; `None` until it starts.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Where the session's work was last landed by wrapping up.
     #[serde(default)]
     pub landed: Option<Landed>,
@@ -411,6 +415,18 @@ impl PermissionMode {
     }
 }
 
+/// A model Claude Code offers, as it lists them to the Agent SDK.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelInfo {
+    /// What `--model` takes, e.g. `sonnet` or `claude-opus-4-8`;
+    /// `default` is Claude Code's configured default.
+    pub value: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 /// The body of a request that starts an agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgent {
@@ -420,6 +436,9 @@ pub struct NewAgent {
     pub prompt: String,
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A follow-up prompt for an agent session.
@@ -428,6 +447,9 @@ pub struct AgentMessage {
     pub prompt: String,
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Where wrapping up a session puts its commits.
@@ -444,12 +466,14 @@ pub enum WrapUpTarget {
 
 /// Asks to land an agent session's work. Claude may first get prompts to
 /// commit its changes or to resolve conflicts; those turns go with
-/// `permission_mode`.
+/// `permission_mode` and `model`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapUp {
     pub target: WrapUpTarget,
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Where a session's work was landed.
@@ -531,6 +555,9 @@ pub enum AgentEventKind {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// The model Claude Code runs the session with. Never stored; the
+    /// session keeps the latest.
+    Model(String),
     /// Grenadine couldn't run Claude Code, or it crashed.
     Error(String),
     /// Wrapping up landed the session's work.
@@ -555,7 +582,7 @@ impl AgentEventKind {
     pub fn is_ephemeral(&self) -> bool {
         matches!(
             self,
-            AgentEventKind::TextDelta(_) | AgentEventKind::Usage { .. }
+            AgentEventKind::TextDelta(_) | AgentEventKind::Usage { .. } | AgentEventKind::Model(_)
         )
     }
 }
