@@ -26,8 +26,15 @@ use crate::sync::State;
 const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
-/// permission tool waits for a person, so make it a day.
-const MCP_TOOL_TIMEOUT_MS: &str = "86400000";
+/// permission tool waits for a person, so make it the most Claude Code
+/// allows (about 24 days). 0 doesn't mean "never" here; it becomes 1s.
+const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
+
+/// How long Claude Code lets an MCP tool call go without a response or
+/// progress before it gives up, in milliseconds. It's 5 minutes for HTTP
+/// servers by default, which would cut off a person who's away from the
+/// page. 0 turns the check off.
+const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
 /// How much of claude's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
@@ -821,6 +828,7 @@ async fn turn(
     .arg(mcp.to_string())
     .current_dir(&session.worktree)
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
+    .env("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", MCP_TOOL_IDLE_TIMEOUT_MS)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
