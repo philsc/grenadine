@@ -559,6 +559,12 @@ fn ModelSelect(model: RwSignal<String>) -> impl IntoView {
     }
 }
 
+/// Whether a key in a prompt sends it: Enter does, Shift+Enter adds a line,
+/// and Enter that picks an input method's candidate does neither.
+fn submits(ev: &web_sys::KeyboardEvent) -> bool {
+    ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing()
+}
+
 /// The form that starts a session, filled in with `repo` and `pr` if given.
 #[component]
 pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
@@ -648,12 +654,12 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
                 <textarea
                     class="agent-prompt"
                     rows="5"
-                    placeholder="What should Claude do? (Ctrl+Enter starts)"
+                    placeholder="What should Claude do? (Enter starts, Shift+Enter for a new line)"
                     aria-label="Prompt"
                     prop:value=move || prompt.get()
                     on:input=move |ev| prompt.set(event_target_value(&ev))
                     on:keydown=move |ev| {
-                        if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
+                        if submits(&ev) {
                             ev.prevent_default();
                             start();
                         }
@@ -1659,7 +1665,7 @@ fn Composer(
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:keydown=move |ev| {
-                    if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() {
+                    if submits(&ev) {
                         ev.prevent_default();
                         send();
                     }

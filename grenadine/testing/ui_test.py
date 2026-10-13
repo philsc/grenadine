@@ -751,8 +751,10 @@ class AgentTest(ServerTestCase):
 
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
-        self.page.get_by_label("Prompt").fill("write a note")
-        self.page.get_by_role("button", name="Start").click()
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("write a note")
+        # Enter starts the session.
+        prompt.press("Enter")
         transcript = self.page.locator(".transcript")
         expect(transcript.locator(".turn-end")).to_have_count(1)
 
