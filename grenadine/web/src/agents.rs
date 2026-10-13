@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, Landed, NewAgent, PatchHunk,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, CleanupState,
+    Landed, NewAgent, NewCleanupSession, PatchHunk,
     PermissionMode, PrKey, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
@@ -151,7 +152,238 @@ pub fn Sidebar(
                     .into_any(),
                 _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
             }}
+            <CleanupSection route=route />
         </aside>
+    }
+}
+
+/// The cleanup items and the running scans, refetched when they change.
+fn cleanup_resource() -> LocalResource<api::Result<CleanupState>> {
+    let updates = expect_context::<Updates>();
+    LocalResource::new(move || {
+        updates.cleanup.track();
+        api::cleanup()
+    })
+}
+
+/// "1 session", "2 items", ….
+fn count(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The sidebar's last section, always there: what deleted sessions left
+/// behind, linking to the page that lists it.
+#[component]
+fn CleanupSection(route: Signal<Route>) -> impl IntoView {
+    let cleanup = cleanup_resource();
+    let summary = move || match cleanup.get() {
+        Some(Ok(c)) => {
+            let title = match c.items.len() {
+                0 => "Nothing to clean up".to_owned(),
+                n => format!("{} to clean up", count(n, "item")),
+            };
+            let meta = match c.scanning.len() {
+                0 => "Left behind by deleted sessions".to_owned(),
+                n => format!("Scanning {}…", count(n, "deleted session")),
+            };
+            (title, meta)
+        }
+        Some(Err(e)) => ("Cleanup".to_owned(), e),
+        None => ("Cleanup".to_owned(), "Loading…".to_owned()),
+    };
+    view! {
+        <section class="agent-repo agent-cleanup">
+            <h2 class="agent-repo-name">"Cleanup"</h2>
+            <ul class="agent-list">
+                <li>
+                    <a
+                        class="agent-item"
+                        class:selected=move || route.with(|r| *r == Route::Cleanup)
+                        href="#/agents/cleanup"
+                    >
+                        <span class="agent-title">{move || summary().0}</span>
+                        <span class="agent-meta muted">{move || summary().1}</span>
+                    </a>
+                </li>
+            </ul>
+        </section>
+    }
+}
+
+/// A day, as the browser writes dates.
+fn date(unix_seconds: i64) -> String {
+    js_sys::Date::new(&JsValue::from_f64(unix_seconds as f64 * 1000.0))
+        .to_locale_date_string("default", &JsValue::UNDEFINED)
+        .into()
+}
+
+/// What deleted sessions left behind. Items can be deleted one by one, or
+/// picked and handed off to a new session that plans how to clean them up.
+#[component]
+pub fn CleanupView() -> impl IntoView {
+    let cleanup = cleanup_resource();
+    let repos = LocalResource::new(api::repos);
+    let picked = RwSignal::new(Vec::<i64>::new());
+    let repo = RwSignal::new(String::new());
+    // Until a repository is picked, it follows the first picked item's.
+    let repo_picked = RwSignal::new(false);
+    let model = model_signal();
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+
+    let items = move || match cleanup.get() {
+        Some(Ok(c)) => c.items,
+        _ => Vec::new(),
+    };
+    // Items that are gone can't stay picked.
+    Effect::new(move |_| {
+        if let Some(Ok(c)) = cleanup.get() {
+            picked.update(|p| p.retain(|id| c.items.iter().any(|i| i.id == *id)));
+        }
+    });
+    Effect::new(move |_| {
+        if repo_picked.get() {
+            return;
+        }
+        let first_picked = picked.with(|p| p.first().copied()).and_then(|id| {
+            cleanup.with(|c| match c {
+                Some(Ok(c)) => c.items.iter().find(|i| i.id == id).map(|i| i.repo.clone()),
+                _ => None,
+            })
+        });
+        let configured = repos.with(|r| match r {
+            Some(Ok(list)) => list.clone(),
+            _ => Vec::new(),
+        });
+        let next = first_picked
+            .filter(|r| configured.contains(r))
+            .or_else(|| configured.first().cloned());
+        if let Some(next) = next {
+            repo.set(next);
+        }
+    });
+
+    let delete = move |id: i64| {
+        error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::delete_cleanup_item(id).await {
+                error.set(Some(e));
+            }
+        });
+    };
+    let hand_off = move |_| {
+        let ids = picked.get_untracked();
+        if busy.get_untracked() || ids.is_empty() {
+            return;
+        }
+        let req = NewCleanupSession {
+            ids,
+            repo: repo.get_untracked(),
+            model: model_arg(model),
+        };
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::create_cleanup_session(&req).await {
+                Ok(session) => go(&agent_hash(&session.id)),
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <div class="agents cleanup">
+            <h2>"Cleanup"</h2>
+            <p class="hint muted">"When a session is deleted, Claude Haiku reads its transcript for what it left behind outside its worktree, like containers, files elsewhere or pushed branches. Deleting an item here only forgets it. To get rid of what items describe, pick them and start a session that plans how to clean them up."</p>
+            {move || cleanup.get().map(|c| match c {
+                Err(e) => view! { <p class="error">{e}</p> }.into_any(),
+                Ok(c) => view! {
+                    {c.scanning.into_iter().map(|title| view! {
+                        <p class="cleanup-scanning muted">{format!("Scanning \u{201c}{title}\u{201d}…")}</p>
+                    }).collect_view()}
+                    {c.items.is_empty().then(|| view! { <p class="muted">"Nothing to clean up."</p> })}
+                }.into_any(),
+            })}
+            <ul class="cleanup-items">
+                <For each=items key=|i| (i.id, i.handed_off_to.clone()) let:item>
+                    {
+                        let id = item.id;
+                        let checked = move || picked.with(|p| p.contains(&id));
+                        let toggle = move |ev| {
+                            let on = event_target_checked(&ev);
+                            picked.update(|p| {
+                                p.retain(|i| *i != id);
+                                if on {
+                                    p.push(id);
+                                }
+                            });
+                        };
+                        let meta = format!(
+                            "From \u{201c}{}\u{201d} in {} · {}",
+                            item.session_title,
+                            item.repo,
+                            date(item.created_at)
+                        );
+                        view! {
+                            <li class="cleanup-item">
+                                <div class="cleanup-head">
+                                    <label class="cleanup-pick">
+                                        <input type="checkbox" prop:checked=checked on:change=toggle />
+                                        <span class="cleanup-title">{item.title.clone()}</span>
+                                    </label>
+                                    <button
+                                        class="link danger"
+                                        title="Forget this item; what it describes stays"
+                                        on:click=move |_| delete(id)
+                                    >"Delete"</button>
+                                </div>
+                                <p class="cleanup-meta muted">
+                                    {meta}
+                                    {item.handed_off_to.clone().map(|s| view! {
+                                        " · " <a href=agent_hash(&s)>"handed off"</a>
+                                    })}
+                                </p>
+                                <div
+                                    class="cleanup-detail markdown"
+                                    inner_html=markdown::to_html(&item.detail, &item.repo)
+                                ></div>
+                            </li>
+                        }
+                    }
+                </For>
+            </ul>
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <div class="cleanup-hand-off">
+                <label>"Repository"
+                    <select
+                        prop:value=move || repo.get()
+                        on:change=move |ev| {
+                            repo_picked.set(true);
+                            repo.set(event_target_value(&ev));
+                        }
+                    >
+                        {move || repos.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|r| {
+                            let value = r.clone();
+                            let selected = move || repo.with(|v| *v == value);
+                            view! { <option value=r.clone() selected=selected>{r.clone()}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+                <label>"Model" <ModelSelect model=model /></label>
+                <button
+                    class="primary"
+                    disabled=move || busy.get() || picked.with(Vec::is_empty)
+                    on:click=hand_off
+                >
+                    {move || match (busy.get(), picked.with(Vec::len)) {
+                        (true, _) => "Creating worktree…".to_owned(),
+                        (false, 0) => "Pick items to clean up".to_owned(),
+                        (false, n) => format!("Clean up {} in a new session", count(n, "item")),
+                    }}
+                </button>
+            </div>
+        </div>
     }
 }
 

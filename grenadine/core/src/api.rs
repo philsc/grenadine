@@ -313,6 +313,48 @@ pub enum ServerEvent {
     SyncStatus(SyncStatus),
     /// An agent session was created, deleted or changed its status.
     AgentsChanged,
+    /// A cleanup item was found, deleted or handed off, or a scan started
+    /// or ended.
+    CleanupChanged,
+}
+
+/// Something a deleted agent session left behind outside its worktree,
+/// as a scan of its transcript found it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupItem {
+    pub id: i64,
+    /// The session's `owner/name`.
+    pub repo: String,
+    pub session_id: String,
+    pub session_title: String,
+    /// One line, e.g. "Docker container grenadine-e2e".
+    pub title: String,
+    /// Markdown: what was created, where, and how to remove it.
+    pub detail: String,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// The agent session the item was handed off to for cleaning up.
+    pub handed_off_to: Option<String>,
+}
+
+/// The cleanup items and the scans still looking for more.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupState {
+    pub items: Vec<CleanupItem>,
+    /// The titles of the deleted sessions whose scans are running.
+    pub scanning: Vec<String>,
+}
+
+/// The body of a request that hands cleanup items off to a new agent
+/// session, which starts in plan mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewCleanupSession {
+    pub ids: Vec<i64>,
+    /// The repo the session's worktree is in.
+    pub repo: String,
+    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

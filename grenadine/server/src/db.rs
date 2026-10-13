@@ -7,7 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, Inbox, InboxEdit, Landed, Person,
+    AgentEvent, AgentEventKind, AgentSession, AgentStatus, CleanupItem, Inbox, InboxEdit, Landed,
+    Person,
     PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -198,6 +199,25 @@ const MIGRATIONS: &[Migration] = &[
         r#"
     -- The model Claude Code runs the session with, NULL until it starts.
     ALTER TABLE agents ADD COLUMN model TEXT;
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- What deleted agent sessions left behind, as scans of their
+    -- transcripts found it. The sessions are gone, so their details are
+    -- copied rather than referenced.
+    CREATE TABLE cleanup_items (
+        id INTEGER PRIMARY KEY,
+        repo TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        session_title TEXT NOT NULL,
+        title TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        -- Unix seconds.
+        created_at INTEGER NOT NULL,
+        -- The agent session the item was handed off to, if any.
+        handed_off_to TEXT
+    );
 "#,
     ),
 ];
@@ -930,6 +950,69 @@ impl Db {
         })
         .collect()
     }
+
+    /// The cleanup items, newest first.
+    pub fn cleanup_items(&self) -> Result<Vec<CleanupItem>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo, session_id, session_title, title, detail, created_at, handed_off_to
+             FROM cleanup_items ORDER BY created_at DESC, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CleanupItem {
+                id: r.get(0)?,
+                repo: r.get(1)?,
+                session_id: r.get(2)?,
+                session_title: r.get(3)?,
+                title: r.get(4)?,
+                detail: r.get(5)?,
+                created_at: r.get(6)?,
+                handed_off_to: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records what `session` left behind, as `(title, detail)` pairs.
+    pub fn add_cleanup_items(
+        &self,
+        session: &AgentSession,
+        found: &[(String, String)],
+        created_at: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for (title, detail) in found {
+            tx.execute(
+                "INSERT INTO cleanup_items (repo, session_id, session_title, title, detail, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![session.repo, session.id, session.title, title, detail, created_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns false when there is no such item.
+    pub fn delete_cleanup_item(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM cleanup_items WHERE id = ?", [id])?
+            > 0)
+    }
+
+    pub fn set_cleanup_handed_off(&self, ids: &[i64], session_id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE cleanup_items SET handed_off_to = ? WHERE id = ?",
+                params![session_id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
@@ -1509,5 +1592,49 @@ mod tests {
         assert!(db.delete_agent("a").unwrap());
         assert!(!db.delete_agent("a").unwrap());
         assert_eq!(db.agent_events("a").unwrap(), []);
+    }
+
+    #[test]
+    fn cleanup_items_round_trip() {
+        let db = Db::in_memory();
+        let session = agent("a", AgentStatus::Idle);
+        db.add_cleanup_items(&session, &[("old".into(), "d1".into())], 1)
+            .unwrap();
+        db.add_cleanup_items(
+            &session,
+            &[("new".into(), "d2".into()), ("newer".into(), "d3".into())],
+            2,
+        )
+        .unwrap();
+        let items = db.cleanup_items().unwrap();
+        let titles: Vec<_> = items.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["new", "newer", "old"]);
+        assert_eq!(
+            items[2],
+            CleanupItem {
+                id: items[2].id,
+                repo: "o/n".into(),
+                session_id: "a".into(),
+                session_title: "t".into(),
+                title: "old".into(),
+                detail: "d1".into(),
+                created_at: 1,
+                handed_off_to: None,
+            }
+        );
+
+        db.set_cleanup_handed_off(&[items[0].id, items[2].id], "s")
+            .unwrap();
+        let handed: Vec<_> = db
+            .cleanup_items()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.handed_off_to)
+            .collect();
+        assert_eq!(handed, [Some("s".into()), None, Some("s".into())]);
+
+        assert!(db.delete_cleanup_item(items[1].id).unwrap());
+        assert!(!db.delete_cleanup_item(items[1].id).unwrap());
+        assert_eq!(db.cleanup_items().unwrap().len(), 2);
     }
 }

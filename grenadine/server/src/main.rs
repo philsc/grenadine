@@ -3,6 +3,7 @@
 mod agent;
 mod api;
 mod assets;
+mod cleanup;
 mod db;
 mod git;
 mod github;
@@ -175,7 +176,7 @@ async fn main() -> Result<()> {
         let worktrees = worktrees.clone();
         move || agent::remove_orphaned_output_bases(&worktrees)
     });
-    let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr), slices)?;
+    let agents = agent::Agents::new(&db, args.claude, worktrees, local_url(addr), slices, true)?;
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

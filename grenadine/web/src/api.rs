@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes, InboxEdit,
+    AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, InboxEdit, NewCleanupSession,
     InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus, WrapUp,
 };
 
@@ -245,6 +246,32 @@ pub async fn delete_agent(id: &str) -> Result<()> {
     check(Request::delete(&format!("/api/agents/{id}")).send().await)
         .await
         .map(|_| ())
+}
+
+pub async fn cleanup() -> Result<CleanupState> {
+    check(Request::get("/api/cleanup").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn delete_cleanup_item(id: i64) -> Result<()> {
+    check(Request::delete(&format!("/api/cleanup/{id}")).send().await)
+        .await
+        .map(|_| ())
+}
+
+/// Hands cleanup items off to a new agent session, in plan mode.
+pub async fn create_cleanup_session(req: &NewCleanupSession) -> Result<AgentSession> {
+    let req = Request::post("/api/cleanup/sessions")
+        .json(req)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub async fn wrap_up_agent(id: &str, wrap_up: &WrapUp) -> Result<()> {

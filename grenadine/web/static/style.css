@@ -486,6 +486,19 @@ textarea { width: 100%; resize: vertical; }
 .agent-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-meta { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Cleanup */
+
+.cleanup .hint { font-size: 13px; }
+.cleanup-scanning { margin: 4px 0; font-size: 13px; }
+.cleanup-items { list-style: none; margin: 0 0 16px; padding: 0; }
+.cleanup-item { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; }
+.cleanup-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cleanup-pick { display: flex; align-items: baseline; gap: 8px; font-weight: 600; cursor: pointer; }
+.cleanup-meta { margin: 2px 0 0 24px; font-size: 12px; }
+.cleanup-detail { margin-left: 24px; font-size: 13px; }
+.cleanup-hand-off { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+.cleanup-hand-off label { display: flex; flex-direction: column; gap: 2px; }
+
 .agent-status {
   display: inline-block;
   font-size: 11px;

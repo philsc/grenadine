@@ -13,7 +13,8 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
-    InboxEdit, InboxWithPrs, NewAgent, PrDetail, PrKey, PrMissing, WrapUp,
+    CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail, PrKey, PrMissing,
+    ServerEvent, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -21,7 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{self, Decision};
 use crate::sync::State;
-use crate::{assets, mcp};
+use crate::{assets, cleanup, mcp};
 
 type St = AxState<Arc<State>>;
 
@@ -60,6 +61,9 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/approvals", post(approve))
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
+        .route("/api/cleanup", get(cleanup))
+        .route("/api/cleanup/sessions", post(create_cleanup_session))
+        .route("/api/cleanup/{id}", axum::routing::delete(delete_cleanup_item))
         .route("/mcp/{id}/{secret}", post(mcp::handle))
         .fallback(get(assets::serve))
         .with_state(state)
@@ -288,6 +292,36 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
     }
     Ok(Json(agent::create(&state, req).await?).into_response())
+}
+
+async fn cleanup(AxState(state): St) -> ApiResult<Json<CleanupState>> {
+    Ok(Json(cleanup::cleanup_state(&state)?))
+}
+
+async fn delete_cleanup_item(AxState(state): St, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+    if !state.db.delete_cleanup_item(id)? {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    state.send(ServerEvent::CleanupChanged);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Hands cleanup items off to a new agent session, which starts in plan
+/// mode.
+async fn create_cleanup_session(
+    AxState(state): St,
+    Json(req): Json<NewCleanupSession>,
+) -> ApiResult<Response> {
+    if !state.agents.offers(req.model.as_deref()).await {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    }
+    if !state.repos.contains_key(&req.repo) {
+        return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
+    }
+    Ok(match cleanup::hand_off(&state, req).await? {
+        Some(session) => Json(session).into_response(),
+        None => (StatusCode::BAD_REQUEST, "no such cleanup items").into_response(),
+    })
 }
 
 /// The session, if `id` names one.

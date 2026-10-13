@@ -29,8 +29,9 @@ STARTUP_TIMEOUT = 30
 # Stands in for `claude -p`: it writes a short turn as stream-json and,
 # when the prompt asks it to write, asks grenadine for permission through
 # the MCP tool first, like Claude Code does. Permission modes other than
-# manual allow the write without asking. It runs the model `--model` names, and
-# lists its models when asked like the Agent SDK does.
+# manual allow the write without asking. It runs the model `--model` names,
+# lists its models when asked like the Agent SDK does, and answers the scans
+# of deleted sessions with a container they left behind.
 FAKE_CLAUDE = r'''
 import json
 import subprocess
@@ -49,6 +50,11 @@ if "--input-format" in args:
     ]
     response = {"subtype": "success", "request_id": request["request_id"], "response": {"models": models}}
     print(json.dumps({"type": "control_response", "response": response}), flush=True)
+    sys.exit()
+if "--json-schema" in args:
+    sys.stdin.read()
+    item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
+    print(json.dumps({"type": "result", "is_error": False, "structured_output": {"items": [item]}}), flush=True)
     sys.exit()
 prompt = sys.stdin.read()
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
@@ -768,6 +774,59 @@ class AgentTest(ServerTestCase):
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
         expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
+
+
+class CleanupTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.commit("Seed", {"README": "hello\n"})
+        repo.push("main")
+
+    def test_deleted_sessions_leave_cleanup_items(self) -> None:
+        # The section is there before anything is left behind.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        section = self.page.locator(".agent-cleanup .agent-item")
+        expect(section).to_contain_text("Nothing to clean up")
+
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("run the e2e tests")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.locator(".agent-header").get_by_role("button", name="Delete").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents$"))
+
+        # Scanning the deleted session finds what it left behind.
+        expect(section).to_contain_text("1 item to clean up")
+        section.click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/cleanup$"))
+        expect(section).to_have_class(re.compile(r"\bselected\b"))
+        item = self.page.locator(".cleanup-item")
+        expect(item.locator(".cleanup-title")).to_have_text(["Container e2e"])
+        expect(item.locator(".cleanup-meta")).to_contain_text(f"From “run the e2e tests” in {scenarios.REPO}")
+        expect(item.locator(".cleanup-detail code")).to_have_text("docker rm -f e2e")
+
+        # Picked items go to a new session that plans how to clean them up.
+        hand_off = self.page.get_by_role("button", name="Pick items to clean up")
+        expect(hand_off).to_be_disabled()
+        self.page.get_by_label("Container e2e").check()
+        self.page.get_by_role("button", name="Clean up 1 item in a new session").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        prompt = self.page.locator(".transcript .turn-prompt")
+        expect(prompt).to_contain_text("Clean up what deleted agent sessions left behind")
+        expect(prompt).to_contain_text("Container e2e")
+        expect(self.page.get_by_label("Permissions")).to_have_value("plan")
+        session = self.page.url
+
+        # The item stays, linking to that session, until it's deleted.
+        section.click()
+        handed_off = item.get_by_role("link", name="handed off")
+        expect(handed_off).to_have_attribute("href", "#" + session.split("#", 1)[1])
+        item.get_by_role("button", name="Delete").click()
+        expect(item).to_have_count(0)
+        expect(self.page.locator(".cleanup")).to_contain_text("Nothing to clean up.")
+        expect(section).to_contain_text("Nothing to clean up")
 
 
 if __name__ == "__main__":

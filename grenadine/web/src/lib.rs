@@ -28,6 +28,8 @@ pub struct Updates {
     pub sync: RwSignal<SyncStatus>,
     /// Bumped when an agent session was created, deleted or changed status.
     pub agents: RwSignal<u64>,
+    /// Bumped when the cleanup items or the scans for them changed.
+    pub cleanup: RwSignal<u64>,
 }
 
 /// What the URL's hash shows.
@@ -44,6 +46,8 @@ pub enum Route {
     },
     /// `#/agents/<id>`.
     Agent(String),
+    /// `#/agents/cleanup`: what deleted sessions left behind.
+    Cleanup,
 }
 
 fn pr_key(owner: &str, name: &str, number: &str) -> Option<PrKey> {
@@ -73,6 +77,7 @@ fn route_from_hash(hash: &str) -> Route {
                 pr: Some(k.number),
             })
         }
+        ["agents", "cleanup"] => Some(Route::Cleanup),
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
         _ => None,
@@ -112,6 +117,7 @@ fn listen(updates: Updates) {
         }),
         Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
         Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
+        Ok(ServerEvent::CleanupChanged) => updates.cleanup.update(|n| *n += 1),
         Err(_) => {}
     };
     // After a reconnect (e.g. the server restarted or the machine slept)
@@ -119,6 +125,7 @@ fn listen(updates: Updates) {
     let on_open = move || {
         updates.inboxes.update(|n| *n += 1);
         updates.agents.update(|n| *n += 1);
+        updates.cleanup.update(|n| *n += 1);
         refetch_sync(updates);
     };
     events::subscribe("/api/events".into(), on_message, on_open);
@@ -138,6 +145,7 @@ fn App() -> impl IntoView {
         pr: RwSignal::new((None, 0)),
         sync: RwSignal::new(SyncStatus::default()),
         agents: RwSignal::new(0),
+        cleanup: RwSignal::new(0),
     };
     provide_context(updates);
     listen(updates);
@@ -157,7 +165,7 @@ fn App() -> impl IntoView {
     let selected = Memo::new(move |_| route.with(pr_of));
     let agents = Memo::new(move |_| {
         route.with(|r| match r {
-            Route::Agents { .. } | Route::Agent(_) => Some(r.clone()),
+            Route::Agents { .. } | Route::Agent(_) | Route::Cleanup => Some(r.clone()),
             _ => None,
         })
     });
@@ -205,6 +213,7 @@ fn App() -> impl IntoView {
                                 Route::Agents { repo, pr } => {
                                     view! { <agents::NewSession repo=repo pr=pr /> }.into_any()
                                 }
+                                Route::Cleanup => view! { <agents::CleanupView /> }.into_any(),
                                 _ => ().into_any(),
                             }}
                         </main>
@@ -268,6 +277,7 @@ mod tests {
             }
         );
         assert_eq!(route_from_hash("#/agents/abc"), Route::Agent("abc".into()));
+        assert_eq!(route_from_hash("#/agents/cleanup"), Route::Cleanup);
         assert_eq!(route_from_hash("#/agents/"), Route::Inboxes);
         // An owner called "agents" still has PRs.
         assert_eq!(

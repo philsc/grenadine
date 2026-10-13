@@ -100,6 +100,8 @@ pub struct Agents {
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// The models Claude Code offers, once it has listed them.
     models: OnceCell<Vec<AgentModelInfo>>,
+    /// The scans of deleted sessions for what they left behind.
+    pub scans: crate::cleanup::Scans,
 }
 
 /// What only exists while the server runs: the event channel open pages
@@ -184,7 +186,7 @@ fn title(prompt: &str) -> String {
     }
 }
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -372,13 +374,15 @@ pub fn remove_orphaned_output_bases(worktrees: &Path) {
 impl Agents {
     /// Marks the sessions that were running when the server last stopped as
     /// interrupted. With `slices`, each session's processes go into their
-    /// own systemd user slice.
+    /// own systemd user slice. With `scans`, deleting a session scans its
+    /// transcript for what it left behind.
     pub fn new(
         db: &crate::db::Db,
         claude: PathBuf,
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
+        scans: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
         Ok(Agents {
@@ -390,7 +394,13 @@ impl Agents {
             slices,
             live: std::sync::Mutex::default(),
             models: OnceCell::new(),
+            scans: crate::cleanup::Scans::new(scans),
         })
+    }
+
+    /// The `claude` executable.
+    pub fn claude(&self) -> &Path {
+        &self.claude
     }
 
     /// Runs `f` on the session's live state, creating it if needed.
@@ -700,6 +710,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     let Some(session) = state.db.agent(id)? else {
         return Ok(false);
     };
+    // The transcript goes with the session; the scan reads it after.
+    let events = state.db.agent_events(id)?;
+    let scanned = session.clone();
     interrupt(state, id);
     // Whatever claude started can outlive it, e.g. Bazel's server, which
     // would hold on to its memory for hours.
@@ -741,6 +754,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
     state.send(ServerEvent::AgentsChanged);
+    crate::cleanup::scan(state, scanned, events);
     Ok(true)
 }
 
@@ -1722,6 +1736,155 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(!std::path::Path::new(&session.worktree).exists());
         assert_eq!(state.db.agent(id).unwrap(), None);
         assert!(!delete(&state, id).await.unwrap());
+    }
+
+    /// A session whose fake claude starts a container, and answers scans
+    /// with `scan` after logging their arguments and input to `dir`.
+    async fn scanned_session(dir: &Path, scan: &str) -> (crate::git::tests::Fixture, Arc<State>, AgentSession) {
+        let fx = crate::git::tests::fixture();
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in
+*" --json-schema "*)
+  echo "$*" > {dir}/scan_args
+  cat > {dir}/scan_input
+  {scan}
+  ;;
+*)
+  echo "$*" >> {dir}/turn_args
+  cat > /dev/null
+  echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"docker run -d --name e2e pg"}}}}]}},"parent_tool_use_id":null}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+  ;;
+esac
+"#,
+            dir = dir.display()
+        );
+        let state = state_with_claude(&fx, dir, &script);
+        state
+            .agents
+            .scans
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = create(
+            &state,
+            NewAgent {
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "Run the e2e tests".into(),
+                permission_mode: PermissionMode::Auto,
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        (fx, state, session)
+    }
+
+    /// Waits for the scans to end and returns the cleanup items.
+    async fn wait_for_scans(state: &State) -> Vec<grenadine_core::api::CleanupItem> {
+        for _ in 0..200 {
+            let c = crate::cleanup::cleanup_state(state).unwrap();
+            if c.scanning.is_empty() {
+                return c.items;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the scan didn't end");
+    }
+
+    /// Deleting a session has Haiku scan its transcript in the background
+    /// for what it left behind, and the items can be handed off to a new
+    /// session that plans how to clean them up.
+    #[tokio::test]
+    async fn delete_scans_for_leftovers_and_hands_them_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_fx, state, session) = scanned_session(
+            dir.path(),
+            r#"sleep 1
+  echo '{"type":"result","is_error":false,"structured_output":{"items":[{"title":"Container e2e","detail":"`docker rm -f e2e`"}]}}'"#,
+        )
+        .await;
+
+        assert!(delete(&state, &session.id).await.unwrap());
+        // The delete doesn't wait for the scan.
+        let c = crate::cleanup::cleanup_state(&state).unwrap();
+        assert_eq!(c.scanning, ["Run the e2e tests"]);
+        assert_eq!(c.items, []);
+
+        let items = wait_for_scans(&state).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Container e2e");
+        assert_eq!(items[0].detail, "`docker rm -f e2e`");
+        assert_eq!(items[0].session_id, session.id);
+        assert_eq!(items[0].session_title, "Run the e2e tests");
+        assert_eq!(items[0].handed_off_to, None);
+        let args = std::fs::read_to_string(dir.path().join("scan_args")).unwrap();
+        assert!(args.starts_with("-p --model haiku "), "{args}");
+        assert!(args.contains(" --permission-mode dontAsk "), "{args}");
+        assert!(args.contains(" --allowedTools Read Glob Grep "), "{args}");
+        let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
+        assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
+
+        let cleaner = crate::cleanup::hand_off(
+            &state,
+            grenadine_core::api::NewCleanupSession {
+                ids: vec![items[0].id],
+                repo: "owner/name".into(),
+                model: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cleaner.title,
+            "Clean up what deleted agent sessions left behind"
+        );
+        wait_for_turns(&state, &cleaner.id, 1).await;
+        let turns = std::fs::read_to_string(dir.path().join("turn_args")).unwrap();
+        let last = turns.lines().last().unwrap();
+        assert!(last.contains(&format!("--session-id {}", cleaner.id)), "{last}");
+        assert!(last.contains(" --permission-mode plan "), "{last}");
+        let prompt = state.db.agent_events(&cleaner.id).unwrap();
+        let AgentEventKind::Prompt(prompt) = &prompt[0].kind else {
+            panic!("{prompt:?}");
+        };
+        assert!(prompt.contains("## Container e2e\n"), "{prompt}");
+        assert!(prompt.contains("`docker rm -f e2e`"), "{prompt}");
+        let items = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(items[0].handed_off_to.as_deref(), Some(cleaner.id.as_str()));
+
+        // Items that are gone can't be handed off.
+        assert!(state.db.delete_cleanup_item(items[0].id).unwrap());
+        let none = crate::cleanup::hand_off(
+            &state,
+            grenadine_core::api::NewCleanupSession {
+                ids: vec![items[0].id],
+                repo: "owner/name".into(),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(none, None);
+    }
+
+    /// A scan that fails leaves an item saying so.
+    #[tokio::test]
+    async fn a_failed_scan_leaves_an_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_fx, state, session) =
+            scanned_session(dir.path(), "echo 'out of credit' >&2; exit 1").await;
+        assert!(delete(&state, &session.id).await.unwrap());
+        let items = wait_for_scans(&state).await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].title,
+            "Couldn't scan \u{201c}Run the e2e tests\u{201d}"
+        );
+        assert!(items[0].detail.contains("out of credit"), "{}", items[0].detail);
     }
 
     /// Deleting a session stops what claude left running in the worktree,
