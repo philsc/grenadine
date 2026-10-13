@@ -206,17 +206,14 @@ fn App() -> impl IntoView {
             {move || on_agents.get().then(|| view! {
                 <div class="agents-page">
                     <agents::Sidebar route=route.into() />
-                    {move || agents.get().map(|r| view! {
-                        <main class="main">
-                            {match r {
-                                Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
-                                Route::Agents { repo, pr } => {
-                                    view! { <agents::NewSession repo=repo pr=pr /> }.into_any()
-                                }
-                                Route::Cleanup => view! { <agents::CleanupView /> }.into_any(),
-                                _ => ().into_any(),
-                            }}
-                        </main>
+                    {move || agents.get().map(|r| match r {
+                        // It has its own main, next to the worktree's changes.
+                        Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
+                        Route::Agents { repo, pr } => view! {
+                            <main class="main"><agents::NewSession repo=repo pr=pr /></main>
+                        }.into_any(),
+                        Route::Cleanup => view! { <main class="main"><agents::CleanupView /></main> }.into_any(),
+                        _ => ().into_any(),
                     })}
                 </div>
             })}

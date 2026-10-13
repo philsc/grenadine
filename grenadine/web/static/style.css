@@ -575,6 +575,24 @@ textarea { width: 100%; resize: vertical; }
 .context-fill.red { background: #cf222e; }
 .agent-actions { display: flex; justify-content: flex-end; gap: 12px; font-size: 13px; padding: 4px 0 8px; }
 
+/* The worktree's changes only get room the transcript can spare; the
+   width is CHANGES_PANE_QUERY in agents.rs. */
+.changes-pane { display: none; }
+@media (min-width: 1500px) {
+  /* The transcript keeps its full width (that of .agent) when it
+     can, and the pane gets the rest. */
+  .agents-page > .main { flex: 0 1 960px; min-width: 720px; }
+  .changes-pane {
+    display: block;
+    flex: 1 1 480px;
+    min-width: 480px;
+    overflow-y: auto;
+    border-left: 1px solid var(--border);
+    padding: 12px 16px 48px;
+  }
+  .changes-pane h2 { font-size: 16px; margin: 4px 0 8px; }
+}
+
 @media (max-width: 800px) {
   .inboxes { padding: 12px 16px 48px; }
   .agents, .agent { padding: 12px 16px 48px; }

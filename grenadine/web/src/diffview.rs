@@ -1,10 +1,11 @@
 //! The diff between two commits, computed in the browser from blobs the
-//! server sends, and the diff of an agent's file edit.
+//! server sends, and the diffs of an agent's file edits and worktree.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
-use grenadine_core::api::{Blob, ChangeStatus, FileChange, Side};
+use grenadine_core::api::{Blob, ChangeStatus, FileChange, Side, WorktreeFile};
 use grenadine_core::diff::{self, Hunk, Line};
 use grenadine_core::edit::Fragment;
 use grenadine_core::inline::{self, Aligned};
@@ -350,6 +351,33 @@ fn FileView(
             })}
             {body}
         </section>
+    }
+}
+
+/// The unstaged changes in an agent's worktree, laid out like a PR's
+/// unified diff. A file keeps its view, and whether it is collapsed, until
+/// its contents change.
+#[component]
+pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>) -> impl IntoView {
+    let inline_changes = Signal::stored(load_flag("inline-changes", true));
+    let side_by_side = Signal::stored(false);
+    let key = |f: &WorktreeFile| {
+        let mut h = DefaultHasher::new();
+        f.hash(&mut h);
+        h.finish()
+    };
+    view! {
+        <For each=move || files.get() key=key let:f>
+            {
+                let file = Arc::new(FileData {
+                    change: f.change,
+                    old: f.old.map(Arc::new),
+                    new: f.new.map(Arc::new),
+                    upstream: None,
+                });
+                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes /> }
+            }
+        </For>
     }
 }
 

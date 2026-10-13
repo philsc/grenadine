@@ -695,6 +695,48 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
 
+    def test_unstaged_changes_pane(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The note the agent wrote isn't tracked yet, so it shows as added.
+        pane = self.page.locator(".changes-pane")
+        files = pane.locator("section.file")
+        expect(files.locator(".path")).to_have_text(["notes.txt"])
+        expect(files.locator(".status")).to_have_text(["added"])
+        expect(pane.locator("table.diff.unified tr.add .code")).to_have_text(["write a note"])
+
+        # Edits made since show up with the agent's next events.
+        worktree = Path(self.page.locator(".agent-worktree").inner_text())
+        (worktree / "README").write_text("hello\nworld\n")
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("write more")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
+        expect(files.locator(".status")).to_have_text(["modified", "added"])
+        expect(files.first.locator("tr.add .code")).to_have_text(["world"])
+        expect(files.nth(1).locator("tr.add .code")).to_have_text(["write more"])
+
+        # The transcript keeps most of the width.
+        main = self.page.locator(".agents-page > .main").bounding_box()
+        side = pane.bounding_box()
+        assert main and side
+        self.assertGreaterEqual(main["width"], 720)
+        self.assertGreaterEqual(main["width"], side["width"])
+
+        # Without room for both, only the transcript stays.
+        self.page.set_viewport_size({"width": 1200, "height": 900})
+        expect(pane).to_have_count(0)
+        expect(transcript).to_be_visible()
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
+
     def test_wrap_up(self) -> None:
         # The server's clone has main checked out, which the work lands on.
         clone = self.clones[self.OTHER_REPO]

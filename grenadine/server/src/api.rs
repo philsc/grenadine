@@ -14,7 +14,7 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
     CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail, PrKey, PrMissing,
-    ServerEvent, WrapUp,
+    ServerEvent, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -61,6 +61,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/approvals", post(approve))
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
+        .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/cleanup", get(cleanup))
         .route("/api/cleanup/sessions", post(create_cleanup_session))
         .route("/api/cleanup/{id}", axum::routing::delete(delete_cleanup_item))
@@ -339,6 +340,20 @@ async fn agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
     })
 }
 
+/// The unstaged changes in the session's worktree; none once the worktree
+/// is gone.
+async fn agent_changes(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let worktree = std::path::PathBuf::from(&session.worktree);
+    let Some(repo) = state.repo(&session.repo).filter(|_| worktree.is_dir()) else {
+        return Ok(Json(WorktreeChanges::default()).into_response());
+    };
+    let files = tokio::task::spawn_blocking(move || repo.worktree_changes(&worktree)).await??;
+    Ok(Json(WorktreeChanges { files }).into_response())
+}
+
 async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if find_agent(&state, &id)?.is_none() || !agent::delete(&state, &id).await? {
         return Ok(StatusCode::NOT_FOUND);
@@ -503,6 +518,56 @@ mod tests {
         .map_err(|e| e.0)
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_changes_come_from_the_worktree() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt");
+        fx.clone.worktree_add(&worktree, "x", "HEAD").unwrap();
+        std::fs::write(worktree.join("a"), "2\n").unwrap();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+        );
+        let id = "00000000-0000-0000-0000-000000000000";
+        state
+            .db
+            .create_agent(&AgentSession {
+                id: id.into(),
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                title: "t".into(),
+                branch: "x".into(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                base_sha: "s".into(),
+                status: grenadine_core::api::AgentStatus::Idle,
+                created_at: 0,
+                cost_usd: 0.0,
+                context_tokens: None,
+                context_window: None,
+                model: None,
+                landed: None,
+            })
+            .unwrap();
+        let get = |id: &str| agent_changes(AxState(state.clone()), Path(id.to_owned()));
+
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let changes: WorktreeChanges = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].change.path(), "a");
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        assert_eq!(body(response).await, r#"{"files":[]}"#);
+
+        let response = get("00000000-0000-0000-0000-000000000001").await.map_err(|e| e.0).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn body(response: Response) -> String {

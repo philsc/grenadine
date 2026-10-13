@@ -219,7 +219,7 @@ pub struct PrDetail {
     pub sync_error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChangeStatus {
     Added,
     Deleted,
@@ -230,7 +230,7 @@ pub enum ChangeStatus {
 }
 
 /// One file that differs between two trees.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileChange {
     pub status: ChangeStatus,
     pub old_path: Option<String>,
@@ -254,13 +254,31 @@ pub struct Changes {
     pub files: Vec<FileChange>,
 }
 
+/// A file whose working copy in an agent's worktree differs from the
+/// index, or that git doesn't track yet.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorktreeFile {
+    /// The blob ids are left out; the contents come along instead.
+    pub change: FileChange,
+    /// The index's version; `None` for untracked files.
+    pub old: Option<Blob>,
+    /// The working copy; `None` for deleted files.
+    pub new: Option<Blob>,
+}
+
+/// The changes `git add` would stage in an agent's worktree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeChanges {
+    pub files: Vec<WorktreeFile>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobsRequest {
     pub repo: String,
     pub ids: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Blob {
     /// `None` for binary content.
     pub text: Option<String>,

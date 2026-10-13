@@ -3,11 +3,12 @@
 //! requests and a box for follow-up prompts.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, CleanupState,
     Landed, NewAgent, NewCleanupSession, PatchHunk,
-    PermissionMode, PrKey, WrapUp, WrapUpTarget,
+    PermissionMode, PrKey, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -15,7 +16,7 @@ use leptos::task::spawn_local;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-use crate::diffview::EditDiff;
+use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::inboxes::storage;
 use crate::{Route, Updates, api, hash_for, markdown};
 
@@ -819,35 +820,129 @@ pub fn AgentView(id: String) -> impl IntoView {
     let model = model_signal();
 
     view! {
-        <div class="agent">
-            {move || match load.get() {
-                Load::Loading => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                Load::Failed(e) => view! { <p class="error">{e}</p> }.into_any(),
-                Load::Missing => view! {
-                    <p class="muted">"There is no such session. " <a href="#/agents">"Start a new one"</a></p>
-                }.into_any(),
-                Load::Ready => {
-                    // Ready means a session was loaded, and `current` keeps it.
-                    let session = Signal::derive(move || current.get().expect("a loaded session"));
-                    // The stream's values are newer than the loaded session's.
-                    let usage = Signal::derive(move || {
-                        let (tokens, window) = live_usage.get();
-                        session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
-                    });
-                    let active_model = Signal::derive(move || {
-                        live_model.get().or_else(|| session.with(|s| s.model.clone()))
-                    });
-                    view! {
-                        <AgentHeader session=session />
-                        <Transcript session=session events=events streaming=streaming mode=mode />
-                        <div class="agent-footer">
-                            <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                            <AgentActions session=session mode=mode model=model />
-                        </div>
-                    }.into_any()
-                }
-            }}
-        </div>
+        <main class="main">
+            <div class="agent">
+                {move || match load.get() {
+                    Load::Loading => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                    Load::Failed(e) => view! { <p class="error">{e}</p> }.into_any(),
+                    Load::Missing => view! {
+                        <p class="muted">"There is no such session. " <a href="#/agents">"Start a new one"</a></p>
+                    }.into_any(),
+                    Load::Ready => {
+                        // Ready means a session was loaded, and `current` keeps it.
+                        let session = Signal::derive(move || current.get().expect("a loaded session"));
+                        // The stream's values are newer than the loaded session's.
+                        let usage = Signal::derive(move || {
+                            let (tokens, window) = live_usage.get();
+                            session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
+                        });
+                        let active_model = Signal::derive(move || {
+                            live_model.get().or_else(|| session.with(|s| s.model.clone()))
+                        });
+                        view! {
+                            <AgentHeader session=session />
+                            <Transcript session=session events=events streaming=streaming mode=mode />
+                            <div class="agent-footer">
+                                <Composer session=session usage=usage active_model=active_model mode=mode model=model />
+                                <AgentActions session=session mode=mode model=model />
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </div>
+        </main>
+        {move || (load.get() == Load::Ready).then(|| view! { <ChangesPane id=id.clone() events=events /> })}
+    }
+}
+
+/// The window width from which the worktree's changes fit next to the
+/// transcript; `.changes-pane` in style.css uses the same.
+const CHANGES_PANE_QUERY: &str = "(min-width: 1500px)";
+
+/// How often at most the pane refetches while events stream in.
+const CHANGES_THROTTLE: Duration = Duration::from_millis(500);
+
+fn wide_enough() -> bool {
+    window()
+        .match_media(CHANGES_PANE_QUERY)
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.matches())
+}
+
+/// The unstaged changes in the session's worktree, next to the transcript
+/// when the window has room for them. They are refetched as the session's
+/// events come in, since those are when the agent changes files.
+#[component]
+fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
+    let updates = expect_context::<Updates>();
+    let wide = RwSignal::new(wide_enough());
+    let on_resize = window_event_listener_untyped("resize", move |_| {
+        let w = wide_enough();
+        if wide.get_untracked() != w {
+            wide.set(w);
+        }
+    });
+    on_cleanup(move || on_resize.remove());
+
+    let tick = RwSignal::new(0u32);
+    let pending = StoredValue::new(false);
+    Effect::new(move |_| {
+        events.track();
+        updates.agents.track();
+        if !pending.get_value() {
+            pending.set_value(true);
+            set_timeout(
+                move || {
+                    pending.try_set_value(false);
+                    tick.try_update(|t| *t += 1);
+                },
+                CHANGES_THROTTLE,
+            );
+        }
+    });
+    let changes = LocalResource::new(move || {
+        tick.track();
+        let (id, wide) = (id.clone(), wide.get());
+        async move {
+            match wide {
+                true => api::agent_changes(&id).await.map(|c| Some(c.files)),
+                false => Ok(None),
+            }
+        }
+    });
+    // Keeps the last changes while refetching so that the files don't
+    // flicker.
+    let loaded = Memo::new(move |prev: Option<&Option<Result<Vec<WorktreeFile>, String>>>| {
+        match changes.get() {
+            Some(Ok(None)) => None,
+            Some(r) => Some(r.map(Option::unwrap_or_default)),
+            None => prev.cloned().flatten(),
+        }
+    });
+    let files = Signal::derive(move || {
+        loaded.with(|l| l.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default())
+    });
+
+    move || {
+        wide.get().then(|| {
+            view! {
+                <aside class="changes-pane">
+                    <h2>"Unstaged changes"</h2>
+                    {move || match loaded.get() {
+                        None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                        Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                        Some(Ok(f)) if f.is_empty() => {
+                            view! { <p class="muted">"No unstaged changes."</p> }.into_any()
+                        }
+                        Some(Ok(f)) => view! {
+                            <p class="muted">{format!("{} files changed", f.len())}</p>
+                        }.into_any(),
+                    }}
+                    <WorktreeDiff files=files />
+                </aside>
+            }
+        })
     }
 }
 

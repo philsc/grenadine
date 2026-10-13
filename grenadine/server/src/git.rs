@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
-use grenadine_core::api::{Blob, ChangeStatus, FileChange};
+use grenadine_core::api::{Blob, ChangeStatus, FileChange, WorktreeFile};
 use grenadine_core::versions::CommitGraph;
 
 /// Refs that grenadine writes into the clone live under this prefix.
@@ -301,6 +301,62 @@ impl Repo {
             .then(|| format!("there are uncommitted changes:\n{}", status.trim_end())))
     }
 
+    /// The unstaged changes in the worktree at `path`: the files whose
+    /// working copy differs from the index, and the untracked files that
+    /// aren't ignored, as additions. Symlinks and submodules are left out.
+    pub fn worktree_changes(&self, path: &Path) -> Result<Vec<WorktreeFile>> {
+        // Without optional locks, git doesn't take the index's lock to
+        // refresh it, which could make the agent's own git commands fail.
+        let diff = self.git_in(path, &["--no-optional-locks", "diff", "--raw", "-z"])?;
+        let mut changes = parse_raw_diff(&diff)?;
+        let untracked = self.git_in(
+            path,
+            &[
+                "--no-optional-locks",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        changes.extend(untracked.split('\0').filter(|p| !p.is_empty()).map(|p| {
+            FileChange {
+                status: ChangeStatus::Added,
+                old_path: None,
+                new_path: Some(p.to_owned()),
+                old_blob: None,
+                new_blob: None,
+            }
+        }));
+        let ids: Vec<String> = changes.iter().filter_map(|c| c.old_blob.clone()).collect();
+        let mut olds = self.blobs(&ids)?;
+        let mut files = Vec::new();
+        for mut change in changes {
+            let new = match &change.new_path {
+                Some(p) => {
+                    let p = path.join(p);
+                    match std::fs::symlink_metadata(&p) {
+                        // Symlinks, and submodules' directories.
+                        Ok(m) if !m.is_file() => continue,
+                        Ok(_) => Some(to_blob(std::fs::read(&p)?)),
+                        // Deleted since git looked.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                None => None,
+            };
+            let old = change.old_blob.take().and_then(|id| olds.remove(&id));
+            // The index may only have stale timestamps for the file.
+            if old == new {
+                continue;
+            }
+            change.new_blob = None;
+            files.push(WorktreeFile { change, old, new });
+        }
+        Ok(files)
+    }
+
     /// Rebases the commits after `upstream` in the worktree at `path` onto
     /// `onto`. A rebase that stops, e.g. at a conflict, is aborted and
     /// returns false.
@@ -435,12 +491,7 @@ impl Repo {
             if kind != "blob" {
                 continue;
             }
-            let text = if size <= MAX_TEXT_BLOB && !data.contains(&0) {
-                String::from_utf8(data).ok()
-            } else {
-                None
-            };
-            blobs.insert(id.clone(), Blob { text, size });
+            blobs.insert(id.clone(), to_blob(data));
         }
         writer.join().unwrap()?;
         child.wait()?;
@@ -470,6 +521,18 @@ impl CommitGraph for Repo {
 }
 
 const NULL_OID: &str = "0000000000000000000000000000000000000000";
+
+/// A file's contents as the page gets them: without the text when it is
+/// binary or too big.
+fn to_blob(data: Vec<u8>) -> Blob {
+    let size = data.len() as u64;
+    let text = if size <= MAX_TEXT_BLOB && !data.contains(&0) {
+        String::from_utf8(data).ok()
+    } else {
+        None
+    };
+    Blob { text, size }
+}
 
 fn parse_raw_diff(out: &str) -> Result<Vec<FileChange>> {
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
@@ -765,5 +828,63 @@ pub(crate) mod tests {
         ]));
         // Removing it again is fine.
         f.clone.worktree_remove(&path, "grenadine/agent/x").unwrap();
+    }
+
+    #[test]
+    fn worktree_changes() {
+        let f = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt");
+        f.clone.worktree_add(&path, "x", "HEAD").unwrap();
+        commit(&path, "b", "b\n");
+        commit(&path, "c", "c\n");
+        commit(&path, "d", "d\n");
+        assert!(f.clone.worktree_changes(&path).unwrap().is_empty());
+
+        std::fs::write(path.join("a"), "1\n2\n").unwrap();
+        std::fs::remove_file(path.join("b")).unwrap();
+        // Staged changes aren't shown, only what changed since.
+        std::fs::write(path.join("c"), "c\nstaged\n").unwrap();
+        run(&path, &["add", "c"]);
+        std::fs::write(path.join("c"), "c\nstaged\nunstaged\n").unwrap();
+        std::fs::write(path.join("d"), "d\n").unwrap();
+        run(&path, &["add", "d"]);
+        std::fs::write(path.join("new"), "new\n").unwrap();
+        std::fs::write(path.join("bin"), b"\0\x01").unwrap();
+        std::fs::write(path.join(".gitignore"), "ignored\n").unwrap();
+        std::fs::write(path.join("ignored"), "x\n").unwrap();
+        std::os::unix::fs::symlink("a", path.join("link")).unwrap();
+
+        let files = f.clone.worktree_changes(&path).unwrap();
+        let text = |b: &Option<Blob>| b.as_ref().map(|b| b.text.clone());
+        let summary: Vec<_> = files
+            .iter()
+            .map(|w| {
+                (
+                    w.change.status,
+                    w.change.path().to_owned(),
+                    text(&w.old),
+                    text(&w.new),
+                )
+            })
+            .collect();
+        let s = |t: &str| Some(Some(t.to_owned()));
+        assert_eq!(
+            summary,
+            [
+                (ChangeStatus::Modified, "a".to_owned(), s("1\n"), s("1\n2\n")),
+                (ChangeStatus::Deleted, "b".to_owned(), s("b\n"), None),
+                (
+                    ChangeStatus::Modified,
+                    "c".to_owned(),
+                    s("c\nstaged\n"),
+                    s("c\nstaged\nunstaged\n")
+                ),
+                (ChangeStatus::Added, ".gitignore".to_owned(), None, s("ignored\n")),
+                (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
+                (ChangeStatus::Added, "new".to_owned(), None, s("new\n")),
+            ]
+        );
+        assert!(files.iter().all(|w| w.change.old_blob.is_none() && w.change.new_blob.is_none()));
     }
 }
