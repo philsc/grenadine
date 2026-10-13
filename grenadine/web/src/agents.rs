@@ -453,47 +453,36 @@ fn follow(
     usage: RwSignal<(Option<u64>, Option<u64>)>,
     model: RwSignal<Option<String>>,
 ) {
-    let Ok(source) = web_sys::EventSource::new(&format!("/api/agents/{id}/events")) else {
-        return;
-    };
-    let on_message =
-        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
-            let Some(event) = e
-                .data()
-                .as_string()
-                .and_then(|d| serde_json::from_str::<AgentEvent>(&d).ok())
-            else {
-                return;
-            };
-            match event.seq {
-                None => match event.kind {
-                    AgentEventKind::TextDelta(t) => streaming.update(|s| s.push_str(&t)),
-                    AgentEventKind::Usage { tokens, window } => usage.update(|(t, w)| {
-                        *t = tokens.or(*t);
-                        *w = window.or(*w);
-                    }),
-                    AgentEventKind::Model(m) => model.set(Some(m)),
-                    _ => {}
-                },
-                Some(seq) => {
-                    let last = events.with_untracked(|e| e.last().and_then(|e| e.seq));
-                    if last.is_some_and(|l| seq <= l) {
-                        return;
-                    }
-                    // The streamed text is complete once anything else
-                    // comes along.
-                    streaming.set(String::new());
-                    events.update(|e| e.push(event));
+    let on_message = move |data: String| {
+        let Ok(event) = serde_json::from_str::<AgentEvent>(&data) else {
+            return;
+        };
+        match event.seq {
+            None => match event.kind {
+                AgentEventKind::TextDelta(t) => streaming.update(|s| s.push_str(&t)),
+                AgentEventKind::Usage { tokens, window } => usage.update(|(t, w)| {
+                    *t = tokens.or(*t);
+                    *w = window.or(*w);
+                }),
+                AgentEventKind::Model(m) => model.set(Some(m)),
+                _ => {}
+            },
+            Some(seq) => {
+                let last = events.with_untracked(|e| e.last().and_then(|e| e.seq));
+                if last.is_some_and(|l| seq <= l) {
+                    return;
                 }
+                // The streamed text is complete once anything else
+                // comes along.
+                streaming.set(String::new());
+                events.update(|e| e.push(event));
             }
-        });
-    source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let source = StoredValue::new_local(source);
-    // The handler lives as long as the view.
-    StoredValue::new_local(on_message);
-    on_cleanup(move || {
-        source.try_with_value(|s| s.close());
-    });
+        }
+    };
+    // Text streamed on a connection that died is incomplete; the replay
+    // brings the finished message.
+    let on_open = move || streaming.set(String::new());
+    crate::events::subscribe(format!("/api/agents/{id}/events"), on_message, on_open);
 }
 
 /// A one-line summary of a tool call's input, e.g. the command or the path.

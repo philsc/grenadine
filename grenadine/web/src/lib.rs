@@ -5,6 +5,7 @@
 mod agents;
 mod api;
 mod diffview;
+mod events;
 mod highlight;
 mod inboxes;
 mod markdown;
@@ -99,40 +100,28 @@ fn refetch_sync(updates: Updates) {
 
 /// Subscribes to the server's events for the life of the page.
 fn listen(updates: Updates) {
-    let Ok(source) = web_sys::EventSource::new("/api/events") else {
-        return;
+    let on_message = move |data: String| match serde_json::from_str::<ServerEvent>(&data) {
+        Ok(ServerEvent::InboxesChanged) => {
+            updates.inboxes.update(|n| *n += 1);
+            updates.agents.update(|n| *n += 1);
+            refetch_sync(updates);
+        }
+        Ok(ServerEvent::PrChanged(key)) => updates.pr.update(|(k, n)| {
+            *k = Some(key);
+            *n += 1;
+        }),
+        Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
+        Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
+        Err(_) => {}
     };
-    let on_message =
-        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
-            let Some(data) = e.data().as_string() else {
-                return;
-            };
-            match serde_json::from_str::<ServerEvent>(&data) {
-                Ok(ServerEvent::InboxesChanged) => {
-                    updates.inboxes.update(|n| *n += 1);
-                    updates.agents.update(|n| *n += 1);
-                    refetch_sync(updates);
-                }
-                Ok(ServerEvent::PrChanged(key)) => updates.pr.update(|(k, n)| {
-                    *k = Some(key);
-                    *n += 1;
-                }),
-                Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
-                Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
-                Err(_) => {}
-            }
-        });
-    source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    on_message.forget();
-    // After a reconnect (e.g. the server restarted) refetch everything.
-    let on_open = Closure::<dyn FnMut()>::new(move || {
+    // After a reconnect (e.g. the server restarted or the machine slept)
+    // refetch everything.
+    let on_open = move || {
         updates.inboxes.update(|n| *n += 1);
         updates.agents.update(|n| *n += 1);
         refetch_sync(updates);
-    });
-    source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    on_open.forget();
-    std::mem::forget(source);
+    };
+    events::subscribe("/api/events".into(), on_message, on_open);
 }
 
 fn pr_of(route: &Route) -> Option<PrKey> {

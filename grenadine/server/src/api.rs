@@ -237,6 +237,12 @@ async fn sync_status(AxState(state): St) -> Json<grenadine_core::api::SyncStatus
     Json(state.sync_status.lock().unwrap().clone())
 }
 
+/// Keep-alives as a named "ping" event rather than a comment, so that the
+/// page sees them and can tell a quiet stream from a dead connection.
+fn keep_alive() -> KeepAlive {
+    KeepAlive::new().event(Event::default().event("ping"))
+}
+
 /// The SSE stream of server events; it ends on shutdown so that open
 /// connections don't block the server's graceful shutdown.
 fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
@@ -252,7 +258,7 @@ fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> 
 }
 
 async fn events(AxState(state): St) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(event_stream(&state)).keep_alive(KeepAlive::default())
+    Sse::new(event_stream(&state)).keep_alive(keep_alive())
 }
 
 /// The configured repositories, for the page's repository pickers.
@@ -406,7 +412,7 @@ async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<R
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
     Ok(Sse::new(agent_event_stream(&state, &id)?)
-        .keep_alive(KeepAlive::default())
+        .keep_alive(keep_alive())
         .into_response())
 }
 
