@@ -8,7 +8,7 @@ Never invoke these tools directly, even if they are installed on the host:
 
 - `cargo`, in any form (`build`, `test`, `run`, `check`, `clippy`, `fmt`, ...)
 - `rustc`, `rustup`, `rustfmt`, `clippy-driver`, `wasm-bindgen`
-- `python`, `python3`, `pip`, `uv`
+- `pip`, `uv`
 
 The `Cargo.toml` files exist only so that crate_universe and rust-analyzer see the same dependencies as Bazel. They are not a second build system.
 
