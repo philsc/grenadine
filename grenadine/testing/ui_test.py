@@ -716,7 +716,8 @@ class AgentTest(ServerTestCase):
 
         # The note isn't committed, so Claude is asked to commit it first.
         header = self.page.locator(".agent-header")
-        header.get_by_role("button", name="Merge into checkout").click()
+        actions = self.page.locator(".agent-actions")
+        actions.get_by_role("button", name="Merge into checkout").click()
         expect(transcript.locator(".turn-prompt").nth(1)).to_contain_text("Wrap up: commit")
         expect(transcript.locator(".wrapped-up")).to_contain_text("Merged into the checkout at")
         sha = git("rev-parse", "HEAD")
@@ -731,7 +732,7 @@ class AgentTest(ServerTestCase):
         follow_up.fill("write more")
         follow_up.press("Enter")
         expect(transcript.locator(".turn-end")).to_have_count(3)
-        header.get_by_role("button", name="Open PR").click()
+        actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up").nth(1)
         expect(opened).to_contain_text(re.compile(r"Opened PR #\d+"))
         pr = next(pr for pr in self.gh.repo(self.OTHER_REPO).prs.values() if pr.title == "Write notes")
@@ -799,7 +800,7 @@ class CleanupTest(ServerTestCase):
         self.page.get_by_role("button", name="Start").click()
         expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
         self.page.once("dialog", lambda dialog: dialog.accept())
-        self.page.locator(".agent-header").get_by_role("button", name="Delete").click()
+        self.page.locator(".agent-actions").get_by_role("button", name="Delete").click()
         expect(self.page).to_have_url(re.compile(r"#/agents$"))
 
         # Scanning the deleted session finds what it left behind.

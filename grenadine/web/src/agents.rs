@@ -838,9 +838,12 @@ pub fn AgentView(id: String) -> impl IntoView {
                         live_model.get().or_else(|| session.with(|s| s.model.clone()))
                     });
                     view! {
-                        <AgentHeader session=session mode=mode model=model />
+                        <AgentHeader session=session />
                         <Transcript session=session events=events streaming=streaming mode=mode />
-                        <Composer session=session usage=usage active_model=active_model mode=mode model=model />
+                        <div class="agent-footer">
+                            <Composer session=session usage=usage active_model=active_model mode=mode model=model />
+                            <AgentActions session=session mode=mode model=model />
+                        </div>
                     }.into_any()
                 }
             }}
@@ -849,7 +852,41 @@ pub fn AgentView(id: String) -> impl IntoView {
 }
 
 #[component]
-fn AgentHeader(
+fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
+    view! {
+        <header class="agent-header">
+            {move || {
+                let s = session.get();
+                let from = match s.pr {
+                    Some(n) => {
+                        let key = PrKey {
+                            repo: s.repo.clone(),
+                            number: n,
+                        };
+                        view! { <a href=hash_for(&key)>{format!("{}#{n}", s.repo)}</a> }.into_any()
+                    }
+                    None => view! { <span>{format!("{} trunk", s.repo)}</span> }.into_any(),
+                };
+                view! {
+                    <h1>{s.title.clone()}</h1>
+                    <p class="muted">
+                        <StatusBadge status=s.status />
+                        " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
+                        " on " <code>{s.branch.clone()}</code>
+                        {format!(" · {}", cost(s.cost_usd))}
+                        {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l /> })}
+                    </p>
+                    <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
+                }
+            }}
+        </header>
+    }
+}
+
+/// The session's wrap-up and delete buttons, under the composer so they stay
+/// in reach however long the transcript gets.
+#[component]
+fn AgentActions(
     session: Signal<AgentSession>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
@@ -901,48 +938,22 @@ fn AgentHeader(
         });
     };
     view! {
-        <header class="agent-header">
-            {move || {
-                let s = session.get();
-                let from = match s.pr {
-                    Some(n) => {
-                        let key = PrKey {
-                            repo: s.repo.clone(),
-                            number: n,
-                        };
-                        view! { <a href=hash_for(&key)>{format!("{}#{n}", s.repo)}</a> }.into_any()
-                    }
-                    None => view! { <span>{format!("{} trunk", s.repo)}</span> }.into_any(),
-                };
-                view! {
-                    <h1>{s.title.clone()}</h1>
-                    <p class="muted">
-                        <StatusBadge status=s.status />
-                        " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
-                        " on " <code>{s.branch.clone()}</code>
-                        {format!(" · {}", cost(s.cost_usd))}
-                        {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l /> })}
-                        <span class="agent-actions">
-                            <button
-                                class="link"
-                                title="Rebase the session's commits onto the server's checkout and fast-forward it"
-                                disabled=busy
-                                on:click=move |_| wrap_up(WrapUpTarget::Checkout)
-                            >"Merge into checkout"</button>
-                            <button
-                                class="link"
-                                title="Push the session's branch to GitHub and open a pull request"
-                                disabled=busy
-                                on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
-                            >"Open PR"</button>
-                            <button class="link danger" on:click=delete>"Delete"</button>
-                        </span>
-                    </p>
-                    <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
-                }
-            }}
-            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-        </header>
+        {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        <div class="agent-actions">
+            <button
+                class="link"
+                title="Rebase the session's commits onto the server's checkout and fast-forward it"
+                disabled=busy
+                on:click=move |_| wrap_up(WrapUpTarget::Checkout)
+            >"Merge into checkout"</button>
+            <button
+                class="link"
+                title="Push the session's branch to GitHub and open a pull request"
+                disabled=busy
+                on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
+            >"Open PR"</button>
+            <button class="link danger" on:click=delete>"Delete"</button>
+        </div>
     }
 }
 

@@ -514,7 +514,6 @@ textarea { width: 100%; resize: vertical; }
 
 .agent-header h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
 .agent-header p { margin: 4px 0; }
-.agent-actions { margin-left: 8px; }
 .agent-landed { color: var(--accent); }
 .agent-worktree { font-size: 12px; overflow-wrap: anywhere; }
 
@@ -562,7 +561,8 @@ textarea { width: 100%; resize: vertical; }
 .approval .question legend { padding: 0 4px; font-weight: 600; }
 .approval .question-other { font: inherit; }
 
-.composer { position: sticky; bottom: 0; background: var(--bg); padding: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.agent-footer { position: sticky; bottom: 0; background: var(--bg); }
+.composer { padding: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
 .composer .form-buttons { align-items: center; }
 .composer-status { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 .agent-model { font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
@@ -573,6 +573,7 @@ textarea { width: 100%; resize: vertical; }
 .context-fill.yellow { background: #d4a72c; }
 .context-fill.orange { background: #e8780c; }
 .context-fill.red { background: #cf222e; }
+.agent-actions { display: flex; justify-content: flex-end; gap: 12px; font-size: 13px; padding: 4px 0 8px; }
 
 @media (max-width: 800px) {
   .inboxes { padding: 12px 16px 48px; }
