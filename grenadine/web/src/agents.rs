@@ -1549,11 +1549,11 @@ fn Composer(
             <textarea
                 rows="3"
                 aria-label="Follow-up"
-                placeholder=move || if working() { "Queue a follow-up… (Ctrl+Enter sends)" } else { "Reply to Claude… (Ctrl+Enter sends)" }
+                placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)" } else { "Reply to Claude… (Enter sends, Shift+Enter for a new line)" }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:keydown=move |ev| {
-                    if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
+                    if ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing() {
                         ev.prevent_default();
                         send();
                     }

@@ -645,9 +645,14 @@ class AgentTest(ServerTestCase):
         follow_up = self.page.get_by_label("Follow-up")
         # A follow-up can switch models, which the composer then shows.
         model.select_option(label="Sonnet")
+        # Shift+Enter starts a new line and Enter sends.
         follow_up.fill("thanks")
-        follow_up.press("Control+Enter")
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks"])
+        follow_up.press("Shift+Enter")
+        follow_up.press_sequentially("so much")
+        expect(follow_up).to_have_value("thanks\nso much")
+        expect(transcript.locator(".turn-prompt")).to_have_count(1)
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much"])
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(follow_up).to_have_value("")
         expect(active).to_have_text("sonnet")
@@ -657,14 +662,14 @@ class AgentTest(ServerTestCase):
         expect(permissions).to_have_value("manual")
         permissions.select_option(label="Auto")
         follow_up.fill("write more")
-        follow_up.press("Control+Enter")
+        follow_up.press("Enter")
         expect(transcript.locator(".turn-end")).to_have_count(3)
         expect(transcript.locator(".approval")).to_have_count(1)
         self.assertEqual((worktree / "notes.txt").read_text(), "write more")
 
         # The transcript is stored, so a reload shows it all again.
         self.page.reload()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much", "write more"])
         expect(permissions).to_have_value("auto")
         expect(model).to_have_value("sonnet")
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
@@ -681,7 +686,7 @@ class AgentTest(ServerTestCase):
         # New sessions start with the model picked last.
         expect(model).to_have_value("sonnet")
         item.click()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks", "write more"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much", "write more"])
 
         # Opening a session that doesn't fit shows the end of its transcript.
         self.page.set_viewport_size({"width": 1000, "height": 300})
@@ -724,7 +729,7 @@ class AgentTest(ServerTestCase):
         # Then it proposes more work in a PR.
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill("write more")
-        follow_up.press("Control+Enter")
+        follow_up.press("Enter")
         expect(transcript.locator(".turn-end")).to_have_count(3)
         header.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up").nth(1)
