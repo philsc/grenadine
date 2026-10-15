@@ -1,0 +1,6 @@
+# Commits that only reformat code, for git blame to skip. GitHub reads this
+# file on its own. For git itself, run once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Format all files with `bazel run //:format`
+1b1c1027cc3f16790e34d22e317b1c424d5a0ba3
