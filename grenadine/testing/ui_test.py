@@ -33,7 +33,7 @@ STARTUP_TIMEOUT = 30
 # manual allow the write without asking. It runs the model `--model` names,
 # lists its models when asked like the Agent SDK does, and answers the scans
 # of deleted sessions with a container they left behind.
-FAKE_CLAUDE = r'''
+FAKE_CLAUDE = r"""
 import json
 import subprocess
 import sys
@@ -147,7 +147,7 @@ if mode == "plan":
     with open(name, "w") as f:
         f.write(decision["updatedPermissions"][0]["mode"])
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
-'''
+"""
 
 
 def free_port() -> int:
@@ -197,7 +197,15 @@ class ServerTestCase(unittest.TestCase):
             cls.clones[slug] = clone
             subprocess.run(["git", "init", "--quiet", clone], env=env, check=True)
             subprocess.run(
-                ["git", "-C", clone, "remote", "add", "origin", f"https://github.com/{slug}"],
+                [
+                    "git",
+                    "-C",
+                    clone,
+                    "remote",
+                    "add",
+                    "origin",
+                    f"https://github.com/{slug}",
+                ],
                 env=env,
                 check=True,
             )
@@ -220,7 +228,9 @@ class ServerTestCase(unittest.TestCase):
 
         cls.playwright = sync_playwright().start()
         cls.addClassCleanup(cls.playwright.stop)
-        cls.browser = cls.playwright.chromium.launch(executable_path=os.environ["CHROME"])
+        cls.browser = cls.playwright.chromium.launch(
+            executable_path=os.environ["CHROME"]
+        )
         cls.addClassCleanup(cls.browser.close)
 
     @classmethod
@@ -298,7 +308,9 @@ class ChromeTest(ServerTestCase):
         inboxes = self.page.locator("section.inbox")
         expect(inboxes).to_have_count(len(scenarios.default_inboxes()))
         expect(inboxes.locator(".none")).to_have_count(len(scenarios.default_inboxes()))
-        expect(inboxes.locator(".count")).to_have_text(["0"] * len(scenarios.default_inboxes()))
+        expect(inboxes.locator(".count")).to_have_text(
+            ["0"] * len(scenarios.default_inboxes())
+        )
 
 
 class InboxTest(ServerTestCase):
@@ -308,11 +320,15 @@ class InboxTest(ServerTestCase):
 
     def inbox(self, name: str) -> Locator:
         return self.page.locator("section.inbox").filter(
-            has=self.page.locator(".inbox-name", has_text=exactly(name)))
+            has=self.page.locator(".inbox-name", has_text=exactly(name))
+        )
 
     def row(self, title: str) -> Locator:
         return self.page.locator(".pr-list li").filter(
-            has=self.page.locator(".pr-title", has_text=re.compile(f"{re.escape(title)}$")))
+            has=self.page.locator(
+                ".pr-title", has_text=re.compile(f"{re.escape(title)}$")
+            )
+        )
 
     def expect_titles(self, inbox: Locator, titles: list[str]) -> None:
         """Checks that `inbox` lists exactly `titles`, in any order, each
@@ -321,7 +337,11 @@ class InboxTest(ServerTestCase):
         rows = inbox.locator(".pr-list li")
         expect(rows).to_have_count(len(titles))
         for title in titles:
-            row = rows.filter(has=self.page.locator(".pr-title", has_text=re.compile(f"{re.escape(title)}$")))
+            row = rows.filter(
+                has=self.page.locator(
+                    ".pr-title", has_text=re.compile(f"{re.escape(title)}$")
+                )
+            )
             expect(row).to_have_count(1)
             expect(row.locator(".pr-meta")).to_have_text(re.compile(r"· 1 versions$"))
 
@@ -334,15 +354,21 @@ class InboxTest(ServerTestCase):
     def test_prs_in_no_inbox_are_not_shown(self) -> None:
         self.page.goto(self.url)
         # Wait for the first poll.
-        expect(self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")).not_to_have_count(0)
+        expect(
+            self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")
+        ).not_to_have_count(0)
         for title, inbox in self.cases.expected.items():
             if inbox is None:
                 expect(self.row(title)).to_have_count(0)
 
     def test_badges(self) -> None:
         self.page.goto(self.url)
-        expect(self.inbox(scenarios.DRAFTS).locator(".pr-title .badge")).to_have_text("draft")
-        expect(self.inbox(scenarios.WAITING_FOR_REVIEWERS).locator(".pr-title .badge")).to_have_count(2)
+        expect(self.inbox(scenarios.DRAFTS).locator(".pr-title .badge")).to_have_text(
+            "draft"
+        )
+        expect(
+            self.inbox(scenarios.WAITING_FOR_REVIEWERS).locator(".pr-title .badge")
+        ).to_have_count(2)
         expect(self.row(scenarios.STACK_BASE).locator(".badge")).to_have_text("1/2")
         expect(self.row(scenarios.STACK_TOP).locator(".badge")).to_have_text("2/2")
         expect(self.row("Wait for reviewers").locator(".badge")).to_have_count(0)
@@ -374,22 +400,28 @@ class InboxTest(ServerTestCase):
         """Deletes an inbox a test added, so that it doesn't show up in the
         other tests."""
         with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
-            ids = [i["inbox"]["id"] for i in json.load(resp) if i["inbox"]["name"] == name]
+            ids = [
+                i["inbox"]["id"] for i in json.load(resp) if i["inbox"]["name"] == name
+            ]
         for id in ids:
             req = urllib.request.Request(f"{self.url}api/inboxes/{id}", method="DELETE")
             urllib.request.urlopen(req).close()
 
     def test_custom_inbox(self) -> None:
         self.page.goto(self.url)
-        inbox = self.add_inbox("By the other account", "state:open author:other sort:created-asc")
+        inbox = self.add_inbox(
+            "By the other account", "state:open author:other sort:created-asc"
+        )
         others = [
-            title for title, pr in self.cases.prs.items()
+            title
+            for title, pr in self.cases.prs.items()
             if pr.author == scenarios.OTHER and pr.state == "OPEN"
         ]
         self.expect_titles(inbox, others)
         # sort:created-asc reaches GitHub and orders the PRs.
         expect(inbox.locator(".pr-title")).to_have_text(
-            [re.compile(f"{re.escape(t)}$") for t in others])
+            [re.compile(f"{re.escape(t)}$") for t in others]
+        )
 
         empty = self.add_inbox("Nobody's", "author:nobody")
         expect(empty.locator(".none")).to_have_text("No PRs")
@@ -426,11 +458,13 @@ class InboxTest(ServerTestCase):
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{top.number}")
 
         rows = self.page.locator("section.stack .stack-label")
-        expect(rows).to_have_text([
-            f"#{top.number} {top.title} open",
-            f"#{base.number} {base.title} open",
-            "main",
-        ])
+        expect(rows).to_have_text(
+            [
+                f"#{top.number} {top.title} open",
+                f"#{base.number} {base.title} open",
+                "main",
+            ]
+        )
         # The PR itself is bold; the others link to GitHub.
         expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
         expect(rows.locator("a")).to_have_attribute("href", base.url)
@@ -445,7 +479,9 @@ class VersionsTest(ServerTestCase):
         pr = self.cases.prs[title]
         self.shas = self.cases.shas[title]
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
-        expect(self.page.locator(".pr-header h1")).to_have_text(f"{pr.title} #{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
 
     def choose(self, base: int, head: int) -> None:
         """Picks versions to diff; 0 is the base."""
@@ -457,11 +493,14 @@ class VersionsTest(ServerTestCase):
         rows.nth(base).locator("input[name=base]").check()
         self.page.keyboard.press("Escape")
         name = "Base" if base == 0 else f"v{base} ({self.shas[base - 1][:8]})"
-        expect(picker.locator("summary")).to_have_text(f"{name} → v{head} ({self.shas[head - 1][:8]})")
+        expect(picker.locator("summary")).to_have_text(
+            f"{name} → v{head} ({self.shas[head - 1][:8]})"
+        )
 
     def file(self, path: str) -> Locator:
         return self.page.locator("section.file").filter(
-            has=self.page.locator(".file-header .path", has_text=exactly(path)))
+            has=self.page.locator(".file-header .path", has_text=exactly(path))
+        )
 
     def test_versions_follow_the_pushes(self) -> None:
         self.open(scenarios.GROW)
@@ -474,8 +513,11 @@ class VersionsTest(ServerTestCase):
         expect(rows).to_have_count(len(shas) + 1)
         expect(rows.locator(".version code")).to_have_text([s[:8] for s in shas])
         expect(rows.locator(".vkind")).to_have_text(
-            ["opened", "push", "push", "push", "push", "force push"])
-        expect(rows.locator(".pushed-by")).to_have_text([""] + ["Me Myself"] * len(shas))
+            ["opened", "push", "push", "push", "push", "force push"]
+        )
+        expect(rows.locator(".pushed-by")).to_have_text(
+            [""] + ["Me Myself"] * len(shas)
+        )
         # Base can't be the latest version, and Head can't be the base.
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
@@ -494,13 +536,21 @@ class VersionsTest(ServerTestCase):
         file = self.file(scenarios.STEPS_PY)
         expect(file.locator(".status")).to_have_text("modified")
         expect(file.locator(".stats")).to_have_text("+1 −1")
-        expect(file.locator("table.diff.split td.code.del")).to_have_text("    return 6")
-        expect(file.locator("table.diff.split td.code.add")).to_have_text("    return 6 * 2")
+        expect(file.locator("table.diff.split td.code.del")).to_have_text(
+            "    return 6"
+        )
+        expect(file.locator("table.diff.split td.code.add")).to_have_text(
+            "    return 6 * 2"
+        )
 
         # The unified view shows the same change.
         self.page.get_by_label("Side by side").uncheck()
-        expect(file.locator("table.diff.unified tr.line.del .code")).to_have_text("    return 6")
-        expect(file.locator("table.diff.unified tr.line.add .code")).to_have_text("    return 6 * 2")
+        expect(file.locator("table.diff.unified tr.line.del .code")).to_have_text(
+            "    return 6"
+        )
+        expect(file.locator("table.diff.unified tr.line.add .code")).to_have_text(
+            "    return 6 * 2"
+        )
 
         # Three pushed commits became three versions, so v2 → v5 adds three
         # steps.
@@ -511,7 +561,8 @@ class VersionsTest(ServerTestCase):
         self.open(scenarios.REBASE)
         self.choose(1, 2)
         expect(self.page.locator(".diff-summary")).to_contain_text(
-            "1 files changed · 2 files changed only by the rebase are hidden")
+            "1 files changed · 2 files changed only by the rebase are hidden"
+        )
         expect(self.page.locator(".diff-summary .legend")).to_be_visible()
         expect(self.page.locator(".file-index li")).to_have_text(["rebase/shared.py"])
 
@@ -529,13 +580,17 @@ class VersionsTest(ServerTestCase):
         self.open(scenarios.REBASE_AND_EDIT)
         self.choose(1, 2)
         expect(self.page.locator(".diff-summary")).to_contain_text(
-            "1 files changed · 2 files changed only by the rebase are hidden")
+            "1 files changed · 2 files changed only by the rebase are hidden"
+        )
         file = self.file("rebase_and_edit/shared.py")
         expect(file.locator(".upstream-badge")).to_have_count(0)
         # The PR's own edit is a plain change; the upstream one is marked.
         expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_text(
-            [scenarios.EDITED_SETTING])
-        expect(file.locator("tr.line.upstream td.code.add")).to_contain_text(["changed upstream"])
+            [scenarios.EDITED_SETTING]
+        )
+        expect(file.locator("tr.line.upstream td.code.add")).to_contain_text(
+            ["changed upstream"]
+        )
 
     def test_rebased_version_against_the_base(self) -> None:
         # Against its own merge-base, the rebased version shows only the
@@ -558,7 +613,9 @@ class VersionsTest(ServerTestCase):
             with self.subTest(path=path):
                 expect(self.file(path).locator(".status")).to_have_text(status)
         expect(self.file("kinds/modified.txt").locator(".stats")).to_have_text("+1 −1")
-        expect(self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")).to_have_text("+0 −0")
+        expect(
+            self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")
+        ).to_have_text("+0 −0")
 
 
 class AgentTest(ServerTestCase):
@@ -574,16 +631,20 @@ class AgentTest(ServerTestCase):
 
     def section(self, repo: str) -> Locator:
         return self.page.locator(".agent-repo").filter(
-            has=self.page.locator(".agent-repo-name span", has_text=exactly(repo)))
+            has=self.page.locator(".agent-repo-name span", has_text=exactly(repo))
+        )
 
     def test_sidebar_has_a_section_per_repo(self) -> None:
         self.page.goto(self.url + "#/agents")
         expect(self.page.locator(".agent-repo-name span")).to_have_text(
-            sorted([scenarios.REPO, self.OTHER_REPO]))
+            sorted([scenarios.REPO, self.OTHER_REPO])
+        )
 
         # A repository without sessions says so and links to the form.
         other = self.section(self.OTHER_REPO)
-        expect(other.locator(".agent-none")).to_contain_text("No agents in this repository yet.")
+        expect(other.locator(".agent-none")).to_contain_text(
+            "No agents in this repository yet."
+        )
         other.get_by_role("link", name="Start one").click()
         expect(self.page).to_have_url(re.compile(f"#/agents/new/{self.OTHER_REPO}$"))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
@@ -599,17 +660,23 @@ class AgentTest(ServerTestCase):
         # The models are the ones Claude Code lists; its default comes first.
         model = self.page.get_by_label("Model")
         expect(model).to_have_value("default")
-        expect(model.locator("option")).to_have_text(["Default (recommended)", "Sonnet", "Haiku"])
+        expect(model.locator("option")).to_have_text(
+            ["Default (recommended)", "Sonnet", "Haiku"]
+        )
         self.page.get_by_label("Prompt").fill("please write a note")
         self.page.get_by_role("button", name="Start").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
 
         transcript = self.page.locator(".transcript")
         expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note"])
-        expect(transcript.locator(".turn-text strong")).to_have_text("please write a note")
+        expect(transcript.locator(".turn-text strong")).to_have_text(
+            "please write a note"
+        )
         approval = transcript.locator(".approval")
         expect(approval).to_contain_text("Claude wants to use Write notes.txt")
-        expect(approval.locator(".edit-diff tr.add .code")).to_have_text("please write a note")
+        expect(approval.locator(".edit-diff tr.add .code")).to_have_text(
+            "please write a note"
+        )
         approval.get_by_role("button", name="Allow").click()
         expect(approval).to_contain_text("Allowed Write")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
@@ -623,7 +690,9 @@ class AgentTest(ServerTestCase):
         send = self.page.get_by_role("button", name="Send").bounding_box()
         box = meter.bounding_box()
         assert buttons and send and box
-        self.assertAlmostEqual(box["x"] + box["width"], buttons["x"] + buttons["width"], delta=1)
+        self.assertAlmostEqual(
+            box["x"] + box["width"], buttons["x"] + buttons["width"], delta=1
+        )
         active = self.page.locator(".composer .agent-model")
         expect(active).to_have_text("claude-test")
         active_box = active.bounding_box()
@@ -653,7 +722,9 @@ class AgentTest(ServerTestCase):
         expect(follow_up).to_have_value("thanks\nso much")
         expect(transcript.locator(".turn-prompt")).to_have_count(1)
         follow_up.press("Enter")
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(
+            ["please write a note", "thanks\nso much"]
+        )
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(follow_up).to_have_value("")
         expect(active).to_have_text("sonnet")
@@ -670,12 +741,16 @@ class AgentTest(ServerTestCase):
 
         # The transcript is stored, so a reload shows it all again.
         self.page.reload()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much", "write more"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(
+            ["please write a note", "thanks\nso much", "write more"]
+        )
         expect(permissions).to_have_value("auto")
         expect(model).to_have_value("sonnet")
         expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
-        expect(self.page.get_by_role("meter", name="Context")).to_contain_text("41.5k / 200k")
+        expect(self.page.get_by_role("meter", name="Context")).to_contain_text(
+            "41.5k / 200k"
+        )
         expect(active).to_have_text("sonnet")
 
         # The sidebar lists the session under its repository and highlights it.
@@ -687,7 +762,9 @@ class AgentTest(ServerTestCase):
         # New sessions start with the model picked last.
         expect(model).to_have_value("sonnet")
         item.click()
-        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note", "thanks\nso much", "write more"])
+        expect(transcript.locator(".turn-prompt")).to_have_text(
+            ["please write a note", "thanks\nso much", "write more"]
+        )
 
         # Opening a session that doesn't fit shows the end of its transcript.
         self.page.set_viewport_size({"width": 1000, "height": 300})
@@ -710,7 +787,9 @@ class AgentTest(ServerTestCase):
         files = pane.locator("section.file")
         expect(files.locator(".path")).to_have_text(["notes.txt"])
         expect(files.locator(".status")).to_have_text(["added"])
-        expect(pane.locator("table.diff.unified tr.add .code")).to_have_text(["write a note"])
+        expect(pane.locator("table.diff.unified tr.add .code")).to_have_text(
+            ["write a note"]
+        )
 
         # Edits made since show up with the agent's next events.
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
@@ -744,8 +823,13 @@ class AgentTest(ServerTestCase):
         env = self.gh.git_env()
 
         def git(*args: str) -> str:
-            return subprocess.run(["git", "-C", clone, *args], env=env, check=True,
-                                  capture_output=True, text=True).stdout.strip()
+            return subprocess.run(
+                ["git", "-C", clone, *args],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
 
         git("fetch", "--quiet", "origin", "main")
         git("checkout", "--quiet", "-B", "main", "FETCH_HEAD")
@@ -763,8 +847,12 @@ class AgentTest(ServerTestCase):
         header = self.page.locator(".agent-header")
         actions = self.page.locator(".agent-actions")
         actions.get_by_role("button", name="Merge into checkout").click()
-        expect(transcript.locator(".turn-prompt").nth(1)).to_contain_text("Wrap up: commit")
-        expect(transcript.locator(".wrapped-up")).to_contain_text("Merged into the checkout at")
+        expect(transcript.locator(".turn-prompt").nth(1)).to_contain_text(
+            "Wrap up: commit"
+        )
+        expect(transcript.locator(".wrapped-up")).to_contain_text(
+            "Merged into the checkout at"
+        )
         sha = git("rev-parse", "HEAD")
         expect(transcript.locator(".wrapped-up code")).to_have_text(sha)
         expect(header).to_contain_text(f"merged {sha[:8]}")
@@ -780,7 +868,11 @@ class AgentTest(ServerTestCase):
         actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up").nth(1)
         expect(opened).to_contain_text(re.compile(r"Opened PR #\d+"))
-        pr = next(pr for pr in self.gh.repo(self.OTHER_REPO).prs.values() if pr.title == "Write notes")
+        pr = next(
+            pr
+            for pr in self.gh.repo(self.OTHER_REPO).prs.values()
+            if pr.title == "Write notes"
+        )
         expect(opened.get_by_role("link")).to_have_attribute("href", pr.url)
         expect(header.get_by_role("link", name=f"PR #{pr.number}")).to_be_visible()
         self.assertEqual(pr.base, "main")
@@ -855,7 +947,9 @@ class CleanupTest(ServerTestCase):
         expect(section).to_have_class(re.compile(r"\bselected\b"))
         item = self.page.locator(".cleanup-item")
         expect(item.locator(".cleanup-title")).to_have_text(["Container e2e"])
-        expect(item.locator(".cleanup-meta")).to_contain_text(f"From “run the e2e tests” in {scenarios.REPO}")
+        expect(item.locator(".cleanup-meta")).to_contain_text(
+            f"From “run the e2e tests” in {scenarios.REPO}"
+        )
         expect(item.locator(".cleanup-detail code")).to_have_text("docker rm -f e2e")
 
         # Picked items go to a new session that plans how to clean them up.
@@ -865,7 +959,9 @@ class CleanupTest(ServerTestCase):
         self.page.get_by_role("button", name="Clean up 1 item in a new session").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
         prompt = self.page.locator(".transcript .turn-prompt")
-        expect(prompt).to_contain_text("Clean up what deleted agent sessions left behind")
+        expect(prompt).to_contain_text(
+            "Clean up what deleted agent sessions left behind"
+        )
         expect(prompt).to_contain_text("Container e2e")
         expect(self.page.get_by_label("Permissions")).to_have_value("plan")
         session = self.page.url

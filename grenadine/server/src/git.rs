@@ -319,15 +319,18 @@ impl Repo {
                 "-z",
             ],
         )?;
-        changes.extend(untracked.split('\0').filter(|p| !p.is_empty()).map(|p| {
-            FileChange {
-                status: ChangeStatus::Added,
-                old_path: None,
-                new_path: Some(p.to_owned()),
-                old_blob: None,
-                new_blob: None,
-            }
-        }));
+        changes.extend(
+            untracked
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .map(|p| FileChange {
+                    status: ChangeStatus::Added,
+                    old_path: None,
+                    new_path: Some(p.to_owned()),
+                    old_blob: None,
+                    new_blob: None,
+                }),
+        );
         let ids: Vec<String> = changes.iter().filter_map(|c| c.old_blob.clone()).collect();
         let mut olds = self.blobs(&ids)?;
         let mut files = Vec::new();
@@ -872,7 +875,12 @@ pub(crate) mod tests {
         assert_eq!(
             summary,
             [
-                (ChangeStatus::Modified, "a".to_owned(), s("1\n"), s("1\n2\n")),
+                (
+                    ChangeStatus::Modified,
+                    "a".to_owned(),
+                    s("1\n"),
+                    s("1\n2\n")
+                ),
                 (ChangeStatus::Deleted, "b".to_owned(), s("b\n"), None),
                 (
                     ChangeStatus::Modified,
@@ -880,11 +888,20 @@ pub(crate) mod tests {
                     s("c\nstaged\n"),
                     s("c\nstaged\nunstaged\n")
                 ),
-                (ChangeStatus::Added, ".gitignore".to_owned(), None, s("ignored\n")),
+                (
+                    ChangeStatus::Added,
+                    ".gitignore".to_owned(),
+                    None,
+                    s("ignored\n")
+                ),
                 (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
                 (ChangeStatus::Added, "new".to_owned(), None, s("new\n")),
             ]
         );
-        assert!(files.iter().all(|w| w.change.old_blob.is_none() && w.change.new_blob.is_none()));
+        assert!(
+            files
+                .iter()
+                .all(|w| w.change.old_blob.is_none() && w.change.new_blob.is_none())
+        );
     }
 }

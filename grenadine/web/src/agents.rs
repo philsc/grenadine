@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, CleanupState,
-    Landed, NewAgent, NewCleanupSession, PatchHunk,
-    PermissionMode, PrKey, WorktreeFile, WrapUp, WrapUpTarget,
+    Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, WorktreeFile, WrapUp,
+    WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -919,15 +919,20 @@ fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
     });
     // Keeps the last changes while refetching so that the files don't
     // flicker.
-    let loaded = Memo::new(move |prev: Option<&Option<Result<Vec<WorktreeFile>, String>>>| {
-        match changes.get() {
+    let loaded = Memo::new(
+        move |prev: Option<&Option<Result<Vec<WorktreeFile>, String>>>| match changes.get() {
             Some(Ok(None)) => None,
             Some(r) => Some(r.map(Option::unwrap_or_default)),
             None => prev.cloned().flatten(),
-        }
-    });
+        },
+    );
     let files = Signal::derive(move || {
-        loaded.with(|l| l.as_ref().and_then(|r| r.as_ref().ok()).cloned().unwrap_or_default())
+        loaded.with(|l| {
+            l.as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .cloned()
+                .unwrap_or_default()
+        })
     });
 
     move || {

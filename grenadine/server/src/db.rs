@@ -8,8 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result};
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentSession, AgentStatus, CleanupItem, Inbox, InboxEdit, Landed,
-    Person,
-    PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
+    Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -877,8 +876,10 @@ impl Db {
     }
 
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<()> {
-        self.conn()
-            .execute("UPDATE agents SET model = ? WHERE id = ?", params![model, id])?;
+        self.conn().execute(
+            "UPDATE agents SET model = ? WHERE id = ?",
+            params![model, id],
+        )?;
         Ok(())
     }
 

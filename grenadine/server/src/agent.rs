@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, NewAgent, PatchHunk,
-    PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, NewAgent,
+    PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -249,7 +249,8 @@ fn stop_processes_in(dir: &Path) -> Vec<PathBuf> {
         .filter(|&pid| {
             pid != me
                 && proc_stat(pid).is_some_and(|(_, tty)| tty == 0)
-                && std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
+                && std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .is_ok_and(|cwd| cwd.starts_with(dir))
         })
         .collect();
     let output_bases = pids
@@ -421,7 +422,11 @@ impl Agents {
     /// The models Claude Code offers, listed once and kept; none while it
     /// can't list them.
     pub async fn models(&self) -> Vec<AgentModelInfo> {
-        match self.models.get_or_try_init(|| list_models(&self.claude)).await {
+        match self
+            .models
+            .get_or_try_init(|| list_models(&self.claude))
+            .await
+        {
             Ok(models) => models.clone(),
             Err(e) => {
                 tracing::warn!("listing Claude Code's models: {e:#}");
@@ -465,7 +470,9 @@ async fn list_models(claude: &Path) -> Result<Vec<AgentModelInfo>> {
         .with_context(|| format!("running {}", claude.display()))?;
     // Stdin stays open until the answer is in, so claude waits for more.
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(format!("{INITIALIZE}\n").as_bytes()).await?;
+    stdin
+        .write_all(format!("{INITIALIZE}\n").as_bytes())
+        .await?;
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let read = async {
         while let Some(line) = lines.next_line().await? {
@@ -745,7 +752,11 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     // default place. Removing several GB takes a while, so it goes on in
     // a thread, which unlike spawn_blocking doesn't hold up shutting down.
     let mut roots = bazel_output_user_roots();
-    roots.extend(stopped.iter().filter_map(|b| b.parent().map(Path::to_owned)));
+    roots.extend(
+        stopped
+            .iter()
+            .filter_map(|b| b.parent().map(Path::to_owned)),
+    );
     std::thread::spawn(move || {
         remove_output_bases(output_bases(&roots, |workspace| {
             workspace.starts_with(&worktree)
@@ -1065,7 +1076,10 @@ async fn turn(
     .arg(mcp.to_string())
     .current_dir(&session.worktree)
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
-    .env("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", MCP_TOOL_IDLE_TIMEOUT_MS)
+    .env(
+        "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
+        MCP_TOOL_IDLE_TIMEOUT_MS,
+    )
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -1669,7 +1683,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         );
         let mut events = state.agents.subscribe(&session.id);
         wait_for_turns(&state, &session.id, 1).await;
-        send(&state, &session.id, "second".into(), PermissionMode::Manual, None);
+        send(
+            &state,
+            &session.id,
+            "second".into(),
+            PermissionMode::Manual,
+            None,
+        );
         let transcript = wait_for_turns(&state, &session.id, 2).await;
 
         let turn = |prompt: &str| {
@@ -1740,7 +1760,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
 
     /// A session whose fake claude starts a container, and answers scans
     /// with `scan` after logging their arguments and input to `dir`.
-    async fn scanned_session(dir: &Path, scan: &str) -> (crate::git::tests::Fixture, Arc<State>, AgentSession) {
+    async fn scanned_session(
+        dir: &Path,
+        scan: &str,
+    ) -> (crate::git::tests::Fixture, Arc<State>, AgentSession) {
         let fx = crate::git::tests::fixture();
         let script = format!(
             r#"#!/bin/sh
@@ -1845,7 +1868,10 @@ esac
         wait_for_turns(&state, &cleaner.id, 1).await;
         let turns = std::fs::read_to_string(dir.path().join("turn_args")).unwrap();
         let last = turns.lines().last().unwrap();
-        assert!(last.contains(&format!("--session-id {}", cleaner.id)), "{last}");
+        assert!(
+            last.contains(&format!("--session-id {}", cleaner.id)),
+            "{last}"
+        );
         assert!(last.contains(" --permission-mode plan "), "{last}");
         let prompt = state.db.agent_events(&cleaner.id).unwrap();
         let AgentEventKind::Prompt(prompt) = &prompt[0].kind else {
@@ -1884,7 +1910,11 @@ esac
             items[0].title,
             "Couldn't scan \u{201c}Run the e2e tests\u{201d}"
         );
-        assert!(items[0].detail.contains("out of credit"), "{}", items[0].detail);
+        assert!(
+            items[0].detail.contains("out of credit"),
+            "{}",
+            items[0].detail
+        );
     }
 
     /// Deleting a session stops what claude left running in the worktree,
@@ -2157,7 +2187,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         // the new commit onto it.
         run(&clone, &["checkout", "-q", "--detach"]);
         let moved = commit(&clone, "c", "1\n");
-        send(&state, id, "commit b more".into(), PermissionMode::Auto, None);
+        send(
+            &state,
+            id,
+            "commit b more".into(),
+            PermissionMode::Auto,
+            None,
+        );
         wait_for_turns(&state, id, 3).await;
         let AgentEventKind::Landed(Landed::Checkout { sha }) =
             wrap(&state, id, WrapUpTarget::Checkout).await

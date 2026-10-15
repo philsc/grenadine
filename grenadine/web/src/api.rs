@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, InboxEdit, NewCleanupSession,
-    InboxWithPrs, NewAgent, PermissionMode, PrDetail, PrKey, PrMissing, SyncStatus, WorktreeChanges,
-    WrapUp,
+    AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
+    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PermissionMode,
+    PrDetail, PrKey, PrMissing, SyncStatus, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -201,11 +200,15 @@ pub async fn agent(id: &str) -> Result<Option<AgentSession>> {
 
 /// The unstaged changes in a session's worktree.
 pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
-    check(Request::get(&format!("/api/agents/{id}/changes")).send().await)
-        .await?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+    check(
+        Request::get(&format!("/api/agents/{id}/changes"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub async fn create_agent(req: &NewAgent) -> Result<AgentSession> {

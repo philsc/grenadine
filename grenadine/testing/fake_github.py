@@ -58,7 +58,9 @@ SCHEMA = build_schema(Path(__file__).with_name("github_schema.graphql").read_tex
 
 
 def iso(t: int) -> str:
-    return datetime.datetime.fromtimestamp(t, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.fromtimestamp(t, datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 @dataclasses.dataclass
@@ -171,14 +173,33 @@ class FakeRepo:
         if start is not None:
             self.git("checkout", "--quiet", "-B", branch, start)
         else:
-            exists = subprocess.run(
-                ["git", "-C", str(self.work), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-                env=self.gh.git_env(), capture_output=True, check=False,
-            ).returncode == 0
+            exists = (
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(self.work),
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{branch}",
+                    ],
+                    env=self.gh.git_env(),
+                    capture_output=True,
+                    check=False,
+                ).returncode
+                == 0
+            )
             self.git("checkout", "--quiet", *([] if exists else ["-b"]), branch)
 
-    def commit(self, message: str, files: dict[str, str | None], *, author: str = VIEWER,
-               amend: bool = False) -> str:
+    def commit(
+        self,
+        message: str,
+        files: dict[str, str | None],
+        *,
+        author: str = VIEWER,
+        amend: bool = False,
+    ) -> str:
         """Writes `files` (None deletes one) and commits them as `author`."""
         for path, content in files.items():
             p = self.work / path
@@ -218,30 +239,65 @@ class FakeRepo:
         before = self.tip(branch) or ZERO_SHA
         if after == before:
             return after
-        force = before != ZERO_SHA and subprocess.run(
-            ["git", "-C", str(self.work), "merge-base", "--is-ancestor", before, after],
-            env=self.gh.git_env(),
-            check=False,
-        ).returncode != 0
+        force = (
+            before != ZERO_SHA
+            and subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.work),
+                    "merge-base",
+                    "--is-ancestor",
+                    before,
+                    after,
+                ],
+                env=self.gh.git_env(),
+                check=False,
+            ).returncode
+            != 0
+        )
         if force:
             # Keep the old tip so it can still be fetched by SHA.
             self.git("push", "--quiet", "origin", f"{before}:refs/keep/{before}")
-        self.git("push", "--quiet", "--force", "origin", f"{branch}:refs/heads/{branch}")
+        self.git(
+            "push", "--quiet", "--force", "origin", f"{branch}:refs/heads/{branch}"
+        )
         self.pushes.setdefault(branch, []).append(
-            Push(before=before, after=after, at=self.gh.tick(), actor=actor, force=force))
+            Push(
+                before=before, after=after, at=self.gh.tick(), actor=actor, force=force
+            )
+        )
         for pr in self.prs.values():
             if pr.head == branch:
                 pr.touch()
         return after
 
-    def open_pr(self, title: str, *, head: str, base: str = "main", body: str = "",
-                author: str = VIEWER, draft: bool = False) -> PullRequest:
+    def open_pr(
+        self,
+        title: str,
+        *,
+        head: str,
+        base: str = "main",
+        body: str = "",
+        author: str = VIEWER,
+        draft: bool = False,
+    ) -> PullRequest:
         if not self.tip(head):
             raise ValueError(f"push {head} before opening a PR from it")
         number = self.gh.next_number()
         now = self.gh.tick()
-        pr = PullRequest(repo=self, number=number, title=title, body=body, author=author,
-                         base=base, head=head, created_at=now, updated_at=now, draft=draft)
+        pr = PullRequest(
+            repo=self,
+            number=number,
+            title=title,
+            body=body,
+            author=author,
+            base=base,
+            head=head,
+            created_at=now,
+            updated_at=now,
+            draft=draft,
+        )
         self.prs[number] = pr
         return pr
 
@@ -255,11 +311,27 @@ class FakeRepo:
         pr.state = CLOSED
         pr.touch()
 
-    def comment(self, pr: PullRequest, *, author: str, body: str, path: str, line: int,
-                commit: str | None = None, reply_to: Comment | None = None) -> Comment:
-        c = Comment(id=self.gh.next_comment_id(), author=author, body=body, path=path,
-                    commit=commit or pr.head_oid, line=line, created_at=self.gh.tick(),
-                    in_reply_to=reply_to.id if reply_to else None)
+    def comment(
+        self,
+        pr: PullRequest,
+        *,
+        author: str,
+        body: str,
+        path: str,
+        line: int,
+        commit: str | None = None,
+        reply_to: Comment | None = None,
+    ) -> Comment:
+        c = Comment(
+            id=self.gh.next_comment_id(),
+            author=author,
+            body=body,
+            path=path,
+            commit=commit or pr.head_oid,
+            line=line,
+            created_at=self.gh.tick(),
+            in_reply_to=reply_to.id if reply_to else None,
+        )
         pr.comments.append(c)
         pr.touch()
         return c
@@ -274,7 +346,9 @@ class FakeRepo:
     def commit_author(self, sha: str) -> tuple[str, str] | None:
         """The (name, login) of a commit's author, or None for an unknown SHA."""
         try:
-            out = self.gh.git("-C", str(self.bare), "log", "-1", "--format=%an%x00%ae", sha)
+            out = self.gh.git(
+                "-C", str(self.bare), "log", "-1", "--format=%an%x00%ae", sha
+            )
         except subprocess.CalledProcessError:
             return None
         name, email = out.strip().split("\0")
@@ -305,11 +379,18 @@ class FakeGitHub:
     def git_env(self) -> dict[str, str]:
         """The environment for git, the server's included: no system or user
         config, and fetches from github.com go to the bare repos."""
-        return dict(os.environ, GIT_CONFIG_GLOBAL=str(self.gitconfig), GIT_CONFIG_NOSYSTEM="1")
+        return dict(
+            os.environ, GIT_CONFIG_GLOBAL=str(self.gitconfig), GIT_CONFIG_NOSYSTEM="1"
+        )
 
     def git(self, *args: str, env: dict[str, str] | None = None) -> str:
-        return subprocess.run(["git", *args], env=dict(self.git_env(), **(env or {})),
-                              check=True, capture_output=True, text=True).stdout
+        return subprocess.run(
+            ["git", *args],
+            env=dict(self.git_env(), **(env or {})),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
 
     def tick(self) -> int:
         self.clock += 60
@@ -365,20 +446,29 @@ class FakeGitHub:
         body = req.rfile.read(int(req.headers.get("Content-Length") or 0))
         with self.lock:
             try:
-                status, payload = self._route(method, url.path, urllib.parse.parse_qs(url.query), body)
+                status, payload = self._route(
+                    method, url.path, urllib.parse.parse_qs(url.query), body
+                )
             except Exception as e:  # noqa: BLE001 - a fake should report, not hang up.
                 status, payload = 500, {"message": f"fake GitHub: {e!r}"}
         _reply(req, status, payload)
 
-    def _route(self, method: str, path: str, query: dict[str, list[str]],
-               body: bytes) -> tuple[int, Any]:
+    def _route(
+        self, method: str, path: str, query: dict[str, list[str]], body: bytes
+    ) -> tuple[int, Any]:
         if method == "POST" and path == "/graphql":
             return 200, self.graphql(json.loads(body))
-        if method == "GET" and (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/activity", path)):
+        if method == "GET" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/activity", path)
+        ):
             return self._activity(m[1], query)
-        if method == "GET" and (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)/comments", path)):
+        if method == "GET" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)/comments", path)
+        ):
             return self._review_comments(m[1], int(m[2]))
-        if method == "POST" and (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls", path)):
+        if method == "POST" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls", path)
+        ):
             return self._create_pr(m[1], json.loads(body))
         return 404, {"message": "Not Found"}
 
@@ -388,15 +478,29 @@ class FakeGitHub:
             return 404, {"message": "Not Found"}
         head = req["head"]
         try:
-            after = self.git("-C", str(repo.bare), "rev-parse", "--verify", f"refs/heads/{head}").strip()
+            after = self.git(
+                "-C", str(repo.bare), "rev-parse", "--verify", f"refs/heads/{head}"
+            ).strip()
         except subprocess.CalledProcessError:
-            return 422, {"message": "Validation Failed", "errors": [{"message": f"No commits on {head}"}]}
+            return 422, {
+                "message": "Validation Failed",
+                "errors": [{"message": f"No commits on {head}"}],
+            }
         # The branch was pushed straight to the bare repo; log it like a push.
         before = repo.tip(head) or ZERO_SHA
         if after != before:
             repo.pushes.setdefault(head, []).append(
-                Push(before=before, after=after, at=self.tick(), actor=VIEWER, force=False))
-        pr = repo.open_pr(req["title"], head=head, base=req["base"], body=req.get("body", ""))
+                Push(
+                    before=before,
+                    after=after,
+                    at=self.tick(),
+                    actor=VIEWER,
+                    force=False,
+                )
+            )
+        pr = repo.open_pr(
+            req["title"], head=head, base=req["base"], body=req.get("body", "")
+        )
         return 201, {"number": pr.number, "html_url": pr.url}
 
     def _activity(self, slug: str, query: dict[str, list[str]]) -> tuple[int, Any]:
@@ -406,15 +510,23 @@ class FakeGitHub:
             return 404, {"message": "Not Found"}
         out = []
         for p in repo.pushes.get(ref.removeprefix("refs/heads/"), []):
-            kind = "branch_creation" if p.before == ZERO_SHA else "force_push" if p.force else "push"
-            out.append({
-                "before": p.before,
-                "after": p.after,
-                "ref": ref,
-                "timestamp": iso(p.at),
-                "activity_type": kind,
-                "actor": {"login": p.actor, "avatar_url": None},
-            })
+            kind = (
+                "branch_creation"
+                if p.before == ZERO_SHA
+                else "force_push"
+                if p.force
+                else "push"
+            )
+            out.append(
+                {
+                    "before": p.before,
+                    "after": p.after,
+                    "ref": ref,
+                    "timestamp": iso(p.at),
+                    "activity_type": kind,
+                    "actor": {"login": p.actor, "avatar_url": None},
+                }
+            )
         if query.get("direction", ["desc"])[0] != "asc":
             out.reverse()
         return 200, out
@@ -424,66 +536,96 @@ class FakeGitHub:
         pr = repo and repo.prs.get(number)
         if pr is None:
             return 404, {"message": "Not Found"}
-        return 200, [{
-            "id": c.id,
-            "in_reply_to_id": c.in_reply_to,
-            "user": {"login": c.author, "avatar_url": None},
-            "body": c.body,
-            "path": c.path,
-            "commit_id": c.commit,
-            "original_commit_id": c.commit,
-            "original_line": c.line,
-            "original_start_line": None,
-            "line": c.line,
-            "start_line": None,
-            "side": c.side,
-            "subject_type": "line",
-            "created_at": iso(c.created_at),
-            "html_url": f"{pr.url}#discussion_r{c.id}",
-        } for c in pr.comments]
+        return 200, [
+            {
+                "id": c.id,
+                "in_reply_to_id": c.in_reply_to,
+                "user": {"login": c.author, "avatar_url": None},
+                "body": c.body,
+                "path": c.path,
+                "commit_id": c.commit,
+                "original_commit_id": c.commit,
+                "original_line": c.line,
+                "original_start_line": None,
+                "line": c.line,
+                "start_line": None,
+                "side": c.side,
+                "subject_type": "line",
+                "created_at": iso(c.created_at),
+                "html_url": f"{pr.url}#discussion_r{c.id}",
+            }
+            for c in pr.comments
+        ]
 
     # GraphQL.
 
     def graphql(self, request: dict[str, Any]) -> dict[str, Any]:
-        result = graphql_sync(SCHEMA, request["query"], root_value=self._root(),
-                              variable_values=request.get("variables"))
+        result = graphql_sync(
+            SCHEMA,
+            request["query"],
+            root_value=self._root(),
+            variable_values=request.get("variables"),
+        )
         out: dict[str, Any] = {"data": result.data}
         if result.errors:
             out["errors"] = [e.formatted for e in result.errors]
         return out
 
     def _root(self) -> dict[str, Any]:
-        def search(info: Any, type: str, query: str, first: int | None = None, **_: Any) -> Any:
+        def search(
+            info: Any, type: str, query: str, first: int | None = None, **_: Any
+        ) -> Any:
             hits = search_prs(self.prs(), query)[:first]
-            return {"issueCount": len(hits), "nodes": [self._pr_node(pr) for pr in hits]}
+            return {
+                "issueCount": len(hits),
+                "nodes": [self._pr_node(pr) for pr in hits],
+            }
 
         def repository(info: Any, owner: str, name: str) -> Any:
             repo = self.repos.get(f"{owner}/{name}")
             if repo is None:
-                raise LookupError(f"Could not resolve to a Repository with the name '{owner}/{name}'.")
+                raise LookupError(
+                    f"Could not resolve to a Repository with the name '{owner}/{name}'."
+                )
             return self._repo_node(repo)
 
         def user(info: Any, login: str) -> Any:
             if login not in self.users:
-                raise LookupError(f"Could not resolve to a User with the login of '{login}'.")
+                raise LookupError(
+                    f"Could not resolve to a User with the login of '{login}'."
+                )
             return self._user_node(login)
 
         return {"search": search, "repository": repository, "user": user}
 
     def _user_node(self, login: str) -> dict[str, Any]:
-        return {"__typename": "User", "login": login, "name": self.users.get(login), "avatarUrl": None}
+        return {
+            "__typename": "User",
+            "login": login,
+            "name": self.users.get(login),
+            "avatarUrl": None,
+        }
 
     def _repo_node(self, repo: FakeRepo) -> dict[str, Any]:
         def pull_request(info: Any, number: int) -> Any:
             pr = repo.prs.get(number)
             if pr is None:
-                raise LookupError(f"Could not resolve to a PullRequest with the number of {number}.")
+                raise LookupError(
+                    f"Could not resolve to a PullRequest with the number of {number}."
+                )
             return self._pr_node(pr)
 
-        def pull_requests(info: Any, headRefName: str | None = None, baseRefName: str | None = None,
-                          states: list[str] | None = None, first: int | None = None, **_: Any) -> Any:
+        def pull_requests(
+            info: Any,
+            headRefName: str | None = None,
+            baseRefName: str | None = None,
+            states: list[str] | None = None,
+            first: int | None = None,
+            **_: Any,
+        ) -> Any:
             found = [
-                pr for pr in repo.prs.values()
+                pr
+                for pr in repo.prs.values()
                 if (headRefName is None or pr.head == headRefName)
                 and (baseRefName is None or pr.base == baseRefName)
                 and (states is None or pr.state in states)
@@ -491,7 +633,11 @@ class FakeGitHub:
             return {"nodes": [self._pr_node(pr) for pr in found[:first]]}
 
         def object_(info: Any, oid: str | None = None, **_: Any) -> Any:
-            return self._commit_node(repo, oid) if oid and repo.commit_author(oid) else None
+            return (
+                self._commit_node(repo, oid)
+                if oid and repo.commit_author(oid)
+                else None
+            )
 
         return {
             "__typename": "Repository",
@@ -507,8 +653,11 @@ class FakeGitHub:
             if found is None:
                 return None
             name, login = found
-            return {"name": name, "email": f"{login}@users.noreply.github.com",
-                    "user": self._user_node(login) if login in self.users else None}
+            return {
+                "name": name,
+                "email": f"{login}@users.noreply.github.com",
+                "user": self._user_node(login) if login in self.users else None,
+            }
 
         return {
             "__typename": "Commit",
@@ -520,31 +669,48 @@ class FakeGitHub:
     def _pr_node(self, pr: PullRequest) -> dict[str, Any]:
         repo = pr.repo
 
-        def timeline(info: Any, itemTypes: list[str] | None = None, first: int | None = None,
-                     **_: Any) -> Any:
+        def timeline(
+            info: Any,
+            itemTypes: list[str] | None = None,
+            first: int | None = None,
+            **_: Any,
+        ) -> Any:
             nodes: list[dict[str, Any]] = []
             if itemTypes is None or "HEAD_REF_FORCE_PUSHED_EVENT" in itemTypes:
-                nodes += [{
-                    "__typename": "HeadRefForcePushedEvent",
-                    "createdAt": iso(p.at),
-                    "actor": self._user_node(p.actor),
-                    "beforeCommit": self._commit_node(repo, p.before),
-                    "afterCommit": self._commit_node(repo, p.after),
-                } for p in repo.pushes.get(pr.head, []) if p.force and p.at >= pr.created_at]
+                nodes += [
+                    {
+                        "__typename": "HeadRefForcePushedEvent",
+                        "createdAt": iso(p.at),
+                        "actor": self._user_node(p.actor),
+                        "beforeCommit": self._commit_node(repo, p.before),
+                        "afterCommit": self._commit_node(repo, p.after),
+                    }
+                    for p in repo.pushes.get(pr.head, [])
+                    if p.force and p.at >= pr.created_at
+                ]
             return {"nodes": nodes[:first]}
 
         def commits(info: Any, first: int | None = None, **_: Any) -> Any:
-            return {"nodes": [{"commit": self._commit_node(repo, sha)}
-                              for sha in repo.commits(pr)[:first]]}
+            return {
+                "nodes": [
+                    {"commit": self._commit_node(repo, sha)}
+                    for sha in repo.commits(pr)[:first]
+                ]
+            }
 
         def review_threads(info: Any, first: int | None = None, **_: Any) -> Any:
             roots = [c for c in pr.comments if c.in_reply_to is None]
             return {
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
-                "nodes": [{
-                    "isResolved": c.resolved,
-                    "comments": lambda info, c=c, **_: {"nodes": [{"databaseId": c.id}]},
-                } for c in roots[:first]],
+                "nodes": [
+                    {
+                        "isResolved": c.resolved,
+                        "comments": lambda info, c=c, **_: {
+                            "nodes": [{"databaseId": c.id}]
+                        },
+                    }
+                    for c in roots[:first]
+                ],
             }
 
         return {

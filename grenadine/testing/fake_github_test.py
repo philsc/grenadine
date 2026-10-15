@@ -85,8 +85,12 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(len(inboxes), 9)
         for name, filter in inboxes:
             with self.subTest(inbox=name):
-                found = search_prs(self.gh.prs(), scenarios.server_query(filter, [scenarios.REPO]))
-                self.assertEqual([pr.title for pr in found], self.inboxes.titles_in(name))
+                found = search_prs(
+                    self.gh.prs(), scenarios.server_query(filter, [scenarios.REPO])
+                )
+                self.assertEqual(
+                    [pr.title for pr in found], self.inboxes.titles_in(name)
+                )
         # Every expected inbox exists.
         names = {name for name, _ in inboxes}
         self.assertLessEqual(set(self.inboxes.expected.values()) - {None}, names)
@@ -106,7 +110,9 @@ class FakeGitHubTest(unittest.TestCase):
             matches(pr, "(state:open")
 
     def test_search_aliases_fail_independently(self) -> None:
-        out = self.query(SEARCH_QUERY, q0="is:pr author:other sort:updated-desc", q1="label:bug")
+        out = self.query(
+            SEARCH_QUERY, q0="is:pr author:other sort:updated-desc", q1="label:bug"
+        )
         titles = [n["title"] for n in out["data"]["s0"]["nodes"]]
         self.assertEqual(titles[-1], "Ask me for a review")
         self.assertIsNone(out["data"]["s1"])
@@ -129,42 +135,61 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(event["beforeCommit"]["oid"], first)
         self.assertEqual(event["afterCommit"]["oid"], second)
         self.assertEqual(event["actor"]["name"], "Me Myself")
-        self.assertEqual([n["commit"]["oid"] for n in data["commits"]["nodes"]], [second])
+        self.assertEqual(
+            [n["commit"]["oid"] for n in data["commits"]["nodes"]], [second]
+        )
 
     def test_unknown_fields_are_errors(self) -> None:
-        out = self.query("query { repository(owner: \"test\", name: \"test\") { nope } }")
+        out = self.query('query { repository(owner: "test", name: "test") { nope } }')
         self.assertIn("Cannot query field 'nope'", out["errors"][0]["message"])
 
     def test_threads_users_and_commit_authors(self) -> None:
         pr = self.inboxes.prs["Get changes requested"]
-        root = self.repo.comment(pr, author="other", body="Hmm", path="inbox/x.md", line=1)
-        self.repo.comment(pr, author="me", body="Fixed", path="inbox/x.md", line=1, reply_to=root)
+        root = self.repo.comment(
+            pr, author="other", body="Hmm", path="inbox/x.md", line=1
+        )
+        self.repo.comment(
+            pr, author="me", body="Fixed", path="inbox/x.md", line=1, reply_to=root
+        )
         root.resolved = True
         out = self.query(THREADS_QUERY, owner="test", name="test", number=pr.number)
         threads = out["data"]["repository"]["pullRequest"]["reviewThreads"]
-        self.assertEqual(threads["nodes"], [
-            {"isResolved": True, "comments": {"nodes": [{"databaseId": root.id}]}},
-        ])
+        self.assertEqual(
+            threads["nodes"],
+            [
+                {"isResolved": True, "comments": {"nodes": [{"databaseId": root.id}]}},
+            ],
+        )
 
-        out = self.query('query { u0: user(login: "other") { login name avatarUrl } '
-                         'u1: user(login: "nobody") { login } }')
-        self.assertEqual(out["data"]["u0"], {"login": "other", "name": "Other Person", "avatarUrl": None})
+        out = self.query(
+            'query { u0: user(login: "other") { login name avatarUrl } '
+            'u1: user(login: "nobody") { login } }'
+        )
+        self.assertEqual(
+            out["data"]["u0"],
+            {"login": "other", "name": "Other Person", "avatarUrl": None},
+        )
         self.assertIsNone(out["data"]["u1"])
 
         sha = self.inboxes.prs["Ask me for a review"].head_oid
         out = self.query(
-            "query($o0: GitObjectID!) { repository(owner: \"test\", name: \"test\") {"
+            'query($o0: GitObjectID!) { repository(owner: "test", name: "test") {'
             " c0: object(oid: $o0) { ... on Commit { author { name user { login } } } } } }",
-            o0=sha)
-        self.assertEqual(out["data"]["repository"]["c0"],
-                         {"author": {"name": "Other Person", "user": {"login": "other"}}})
+            o0=sha,
+        )
+        self.assertEqual(
+            out["data"]["repository"]["c0"],
+            {"author": {"name": "Other Person", "user": {"login": "other"}}},
+        )
 
     def test_rest_endpoints(self) -> None:
         base = self.gh.start()
         self.addCleanup(self.gh.stop)
 
         def get(path: str, token: str = TOKEN) -> object:
-            req = urllib.request.Request(base + path, headers={"Authorization": f"Bearer {token}"})
+            req = urllib.request.Request(
+                base + path, headers={"Authorization": f"Bearer {token}"}
+            )
             with urllib.request.urlopen(req) as resp:
                 return json.load(resp)
 
@@ -173,7 +198,9 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(e.exception.code, 401)
 
         pr = self.inboxes.prs[scenarios.STACK_TOP]
-        activity = get(f"/repos/test/test/activity?ref=refs/heads/{pr.head}&direction=asc")
+        activity = get(
+            f"/repos/test/test/activity?ref=refs/heads/{pr.head}&direction=asc"
+        )
         self.assertEqual([a["activity_type"] for a in activity], ["branch_creation"])
         self.assertEqual(activity[0]["after"], pr.head_oid)
 
@@ -183,8 +210,14 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(comment["original_commit_id"], pr.head_oid)
 
         def post(path: str, body: object) -> object:
-            req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={
-                "Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+            req = urllib.request.Request(
+                base + path,
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
             with urllib.request.urlopen(req) as resp:
                 return json.load(resp)
 
@@ -199,7 +232,9 @@ class FakeGitHubTest(unittest.TestCase):
         self.repo.git("push", "--quiet", "origin", "agent:refs/heads/agent")
         created = post("/repos/test/test/pulls", new)
         opened = self.repo.prs[created["number"]]
-        self.assertEqual((opened.title, opened.base, opened.head_oid), ("Agent work", "main", sha))
+        self.assertEqual(
+            (opened.title, opened.base, opened.head_oid), ("Agent work", "main", sha)
+        )
         self.assertEqual(created["html_url"], opened.url)
 
     def test_github_urls_resolve_to_the_bare_repo(self) -> None:
@@ -212,8 +247,19 @@ class FakeGitHubTest(unittest.TestCase):
         self.repo.commit("Amended", {}, amend=True)
         self.repo.push(pr.head)
         # A force-pushed-away commit can still be fetched by SHA.
-        subprocess.run(["git", "-C", str(clone), "fetch", "--quiet",
-                        "https://github.com/test/test.git", old], env=env, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(clone),
+                "fetch",
+                "--quiet",
+                "https://github.com/test/test.git",
+                old,
+            ],
+            env=env,
+            check=True,
+        )
 
 
 if __name__ == "__main__":

@@ -145,7 +145,13 @@ pub fn scan(state: &Arc<State>, session: AgentSession, events: Vec<AgentEvent>) 
         {
             tracing::warn!("recording cleanup items of {}: {e:#}", session.id);
         }
-        state.agents.scans.running.lock().unwrap().remove(&session.id);
+        state
+            .agents
+            .scans
+            .running
+            .lock()
+            .unwrap()
+            .remove(&session.id);
         state.send(ServerEvent::CleanupChanged);
     });
 }
@@ -350,7 +356,10 @@ fn digest(events: &[AgentEvent]) -> String {
         return out;
     }
     let half = DIGEST_LIMIT / 2;
-    let head = (0..=half).rev().find(|&i| out.is_char_boundary(i)).unwrap_or(0);
+    let head = (0..=half)
+        .rev()
+        .find(|&i| out.is_char_boundary(i))
+        .unwrap_or(0);
     let tail = (out.len() - half..out.len())
         .find(|&i| out.is_char_boundary(i))
         .unwrap_or(out.len());
@@ -439,11 +448,19 @@ mod tests {
         let events = [
             event(AgentEventKind::Prompt("Run the e2e tests".into())),
             event(AgentEventKind::Text("Starting a container.".into())),
-            tool("1", "Bash", json!({"command": "docker run -d --name e2e pg"})),
+            tool(
+                "1",
+                "Bash",
+                json!({"command": "docker run -d --name e2e pg"}),
+            ),
             result("1", "abc123\n", false),
             tool("2", "Read", json!({"file_path": "/etc/hosts"})),
             result("2", "127.0.0.1 localhost", false),
-            tool("3", "Write", json!({"file_path": "/tmp/notes.md", "content": "x"})),
+            tool(
+                "3",
+                "Write",
+                json!({"file_path": "/tmp/notes.md", "content": "x"}),
+            ),
             result("3", "", false),
             tool("4", "Bash", json!({"command": "rm /nope"})),
             result("4", "No such file", true),

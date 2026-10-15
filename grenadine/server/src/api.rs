@@ -12,9 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail, PrKey, PrMissing,
-    ServerEvent, WorktreeChanges, WrapUp,
+    AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
+    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail, PrKey,
+    PrMissing, ServerEvent, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -64,7 +64,10 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/cleanup", get(cleanup))
         .route("/api/cleanup/sessions", post(create_cleanup_session))
-        .route("/api/cleanup/{id}", axum::routing::delete(delete_cleanup_item))
+        .route(
+            "/api/cleanup/{id}",
+            axum::routing::delete(delete_cleanup_item),
+        )
         .route("/mcp/{id}/{secret}", post(mcp::handle))
         .fallback(get(assets::serve))
         .with_state(state)
@@ -531,9 +534,8 @@ mod tests {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
         });
-        let state = crate::sync::test_state_with(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-        );
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
         let id = "00000000-0000-0000-0000-000000000000";
         state
             .db
@@ -566,7 +568,10 @@ mod tests {
         let response = get(id).await.map_err(|e| e.0).unwrap();
         assert_eq!(body(response).await, r#"{"files":[]}"#);
 
-        let response = get("00000000-0000-0000-0000-000000000001").await.map_err(|e| e.0).unwrap();
+        let response = get("00000000-0000-0000-0000-000000000001")
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 

@@ -78,16 +78,27 @@ class Inboxes:
     def titles_in(self, inbox: str) -> list[str]:
         """The titles `inbox` should list, most recently updated first."""
         prs = [self.prs[t] for t, i in self.expected.items() if i == inbox]
-        return [pr.title for pr in sorted(prs, key=lambda pr: pr.updated_at, reverse=True)]
+        return [
+            pr.title for pr in sorted(prs, key=lambda pr: pr.updated_at, reverse=True)
+        ]
 
 
-def _simple_pr(repo: FakeRepo, case: str, title: str, *, author: str = VIEWER,
-               draft: bool = False, body: str = "") -> PullRequest:
+def _simple_pr(
+    repo: FakeRepo,
+    case: str,
+    title: str,
+    *,
+    author: str = VIEWER,
+    draft: bool = False,
+    body: str = "",
+) -> PullRequest:
     branch = f"case/{case}"
     repo.checkout(branch, "main")
     repo.commit(title, {f"inbox/{case}.md": f"# {title}\n"}, author=author)
     repo.push(branch, actor=author)
-    return repo.open_pr(title, head=branch, author=author, draft=draft, body=body or title)
+    return repo.open_pr(
+        title, head=branch, author=author, draft=draft, body=body or title
+    )
 
 
 def inbox_cases(gh: FakeGitHub) -> Inboxes:
@@ -106,37 +117,61 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         expected[pr.title] = inbox
         return pr
 
-    pr = add(_simple_pr(repo, "needs-review", "Ask me for a review", author=OTHER), NEEDS_REVIEW)
+    pr = add(
+        _simple_pr(repo, "needs-review", "Ask me for a review", author=OTHER),
+        NEEDS_REVIEW,
+    )
     pr.review_requests.add(VIEWER)
 
-    pr = add(_simple_pr(repo, "needs-team-review", "Ask my team for a review", author=OTHER),
-             NEEDS_TEAM_REVIEW)
+    pr = add(
+        _simple_pr(repo, "needs-team-review", "Ask my team for a review", author=OTHER),
+        NEEDS_TEAM_REVIEW,
+    )
     pr.team_review_requests.add(VIEWER)
 
     # GitHub counts a comment-only review as no review; see todo.md.
-    pr = add(_simple_pr(repo, "returned-commented", "Get a comment-only review"),
-             WAITING_FOR_REVIEWERS)
+    pr = add(
+        _simple_pr(repo, "returned-commented", "Get a comment-only review"),
+        WAITING_FOR_REVIEWERS,
+    )
     pr.reviews.append(Review(OTHER, COMMENTED))
 
     pr = add(_simple_pr(repo, "returned-changes", "Get changes requested"), RETURNED)
     pr.reviews.append(Review(OTHER, CHANGES_REQUESTED))
 
-    pr = add(_simple_pr(repo, "approved", "Get approved", body=DESCRIPTION), APPROVED_INBOX)
+    pr = add(
+        _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION), APPROVED_INBOX
+    )
     pr.reviews.append(Review(OTHER, APPROVED))
 
-    add(_simple_pr(repo, "waiting-reviewers", "Wait for reviewers"), WAITING_FOR_REVIEWERS)
+    add(
+        _simple_pr(repo, "waiting-reviewers", "Wait for reviewers"),
+        WAITING_FOR_REVIEWERS,
+    )
     add(_simple_pr(repo, "draft", "Stay a draft", draft=True), DRAFTS)
 
     pr = add(_simple_pr(repo, "merging", "Sit in the merge queue"), MERGING)
     pr.reviews.append(Review(OTHER, APPROVED))
     pr.queued = True
 
-    pr = add(_simple_pr(repo, "draft-needs-review", "Ask me to look at a draft", author=OTHER,
-                        draft=True), DRAFTS_NEEDING_REVIEW)
+    pr = add(
+        _simple_pr(
+            repo,
+            "draft-needs-review",
+            "Ask me to look at a draft",
+            author=OTHER,
+            draft=True,
+        ),
+        DRAFTS_NEEDING_REVIEW,
+    )
     pr.review_requests.add(VIEWER)
 
-    pr = add(_simple_pr(repo, "waiting-authors", "Wait for the author after my review",
-                        author=OTHER), WAITING_FOR_AUTHORS)
+    pr = add(
+        _simple_pr(
+            repo, "waiting-authors", "Wait for the author after my review", author=OTHER
+        ),
+        WAITING_FOR_AUTHORS,
+    )
     pr.reviews.append(Review(VIEWER, COMMENTED))
 
     pr = add(_simple_pr(repo, "closed", "Get closed"), None)
@@ -153,8 +188,10 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     repo.checkout("dev/stack-top")
     repo.commit(STACK_TOP, {"stack/top.txt": "top\n"})
     repo.push("dev/stack-top")
-    add(repo.open_pr(STACK_TOP, head="dev/stack-top", base="dev/stack-base"),
-        WAITING_FOR_REVIEWERS)
+    add(
+        repo.open_pr(STACK_TOP, head="dev/stack-top", base="dev/stack-base"),
+        WAITING_FOR_REVIEWERS,
+    )
 
     return Inboxes(prs, expected)
 
@@ -178,7 +215,9 @@ def steps(count: int, doubled: int = 0) -> str:
 
 
 SETTINGS = [f"SETTING_{i:02d} = {i}" for i in range(1, 61)]
-PR_SETTINGS = {i: f"SETTING_{i:02d} = {i} + 100  # changed by the PR" for i in (5, 6, 7)}
+PR_SETTINGS = {
+    i: f"SETTING_{i:02d} = {i} + 100  # changed by the PR" for i in (5, 6, 7)
+}
 UPSTREAM_SETTINGS = {50: "SETTING_50 = 50 - 1  # changed upstream"}
 EDITED_SETTING = "SETTING_06 = 6 + 200  # edited after the rebase"
 
@@ -224,7 +263,11 @@ def versions_cases(gh: FakeGitHub) -> Versions:
 
     for title, edit in ((REBASE, False), (REBASE_AND_EDIT, True)):
         d = "rebase_and_edit" if edit else "rebase"
-        shared, unrelated, upstream_only = f"{d}/shared.py", f"{d}/unrelated.txt", f"{d}/upstream_only.txt"
+        shared, unrelated, upstream_only = (
+            f"{d}/shared.py",
+            f"{d}/unrelated.txt",
+            f"{d}/upstream_only.txt",
+        )
         repo.checkout("main")
         repo.commit(f"Add {d}", {shared: settings({}), unrelated: "upstream, before\n"})
         repo.push("main")
@@ -235,35 +278,48 @@ def versions_cases(gh: FakeGitHub) -> Versions:
         pr = prs[title] = repo.open_pr(title, head=branch)
 
         repo.checkout("main")
-        repo.commit("Change things upstream", {
-            shared: settings(UPSTREAM_SETTINGS),
-            unrelated: "upstream, after\n",
-            upstream_only: "Only main added this file.\n",
-        })
+        repo.commit(
+            "Change things upstream",
+            {
+                shared: settings(UPSTREAM_SETTINGS),
+                unrelated: "upstream, after\n",
+                upstream_only: "Only main added this file.\n",
+            },
+        )
         repo.push("main")
         repo.checkout(branch)
         repo.rebase("main")
         if edit:
             edited = {**UPSTREAM_SETTINGS, **PR_SETTINGS, 6: EDITED_SETTING}
-            repo.commit("Change settings 5 to 7", {shared: settings(edited)}, amend=True)
+            repo.commit(
+                "Change settings 5 to 7", {shared: settings(edited)}, amend=True
+            )
         v.append(repo.push(branch))
         shas[title] = v
 
     repo.checkout("main")
-    repo.commit("Add files to change", {
-        "kinds/modified.txt": "one\ntwo\nthree\n",
-        "kinds/deleted.txt": "going away\n",
-        "kinds/old_name.txt": "a file that only moves\n" * 5,
-    })
+    repo.commit(
+        "Add files to change",
+        {
+            "kinds/modified.txt": "one\ntwo\nthree\n",
+            "kinds/deleted.txt": "going away\n",
+            "kinds/old_name.txt": "a file that only moves\n" * 5,
+        },
+    )
     repo.push("main")
     repo.checkout("case/file-kinds", "main")
-    v = [repo.commit(FILE_KINDS, {
-        "kinds/added.txt": "brand new\n",
-        "kinds/deleted.txt": None,
-        "kinds/modified.txt": "one\n2\nthree\n",
-        "kinds/old_name.txt": None,
-        "kinds/new_name.txt": "a file that only moves\n" * 5,
-    })]
+    v = [
+        repo.commit(
+            FILE_KINDS,
+            {
+                "kinds/added.txt": "brand new\n",
+                "kinds/deleted.txt": None,
+                "kinds/modified.txt": "one\n2\nthree\n",
+                "kinds/old_name.txt": None,
+                "kinds/new_name.txt": "a file that only moves\n" * 5,
+            },
+        )
+    ]
     repo.push("case/file-kinds")
     prs[FILE_KINDS] = repo.open_pr(FILE_KINDS, head="case/file-kinds")
     shas[FILE_KINDS] = v

@@ -169,7 +169,9 @@ async fn main() -> Result<()> {
     };
     let slices = agent::systemd_available();
     if !slices {
-        tracing::warn!("no systemd user manager: deleting a session only stops the processes still in its worktree");
+        tracing::warn!(
+            "no systemd user manager: deleting a session only stops the processes still in its worktree"
+        );
     }
     // A thread rather than spawn_blocking, which shutting down would wait for.
     std::thread::spawn({

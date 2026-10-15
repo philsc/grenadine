@@ -24,4 +24,19 @@ similar.workspace = true
 syntect.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
-web-sys = { workspace = true, features = ["Element", "HtmlElement", "Window", "Document", "Event", "EventTarget", "EventSource", "MessageEvent", "MouseEvent", "Location", "MediaQueryList", "IntersectionObserver", "IntersectionObserverEntry", "Storage"] }
+web-sys = { workspace = true, features = [
+  "Element",
+  "HtmlElement",
+  "Window",
+  "Document",
+  "Event",
+  "EventTarget",
+  "EventSource",
+  "MessageEvent",
+  "MouseEvent",
+  "Location",
+  "MediaQueryList",
+  "IntersectionObserver",
+  "IntersectionObserverEntry",
+  "Storage",
+] }

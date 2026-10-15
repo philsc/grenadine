@@ -18,18 +18,18 @@ Use plain `bazel` commands. `.bazelrc` already configures what this repo needs. 
 
 ## Commands
 
-| Task             | Command                                                  |
-| ---------------- | -------------------------------------------------------- |
-| Build everything | `bazel build //...`                                      |
-| Run all tests    | `bazel test //...`                                       |
-| Run one test     | `bazel test //grenadine/core:core_test`                  |
-| Run the UI tests | `bazel test //grenadine/testing:ui_test`               |
-| Run the server   | `bazel run //grenadine/server -- --repo=PATH[:REMOTE]`   |
-| Validate default inboxes | `bazel run //grenadine/server:validate_inboxes -- --repo=OWNER/NAME [--repo=...]` |
-| Rebuild the test repo | `bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]` |
-| Lint             | `bazel build --config=lint //...`                        |
-| Check formatting | `bazel run //:format.check`                              |
-| Format files (user only) | `bazel run //:format [-- PATH...]`               |
+| Task                     | Command                                                                                             |
+| ------------------------ | --------------------------------------------------------------------------------------------------- |
+| Build everything         | `bazel build //...`                                                                                 |
+| Run all tests            | `bazel test //...`                                                                                  |
+| Run one test             | `bazel test //grenadine/core:core_test`                                                             |
+| Run the UI tests         | `bazel test //grenadine/testing:ui_test`                                                            |
+| Run the server           | `bazel run //grenadine/server -- --repo=PATH[:REMOTE]`                                              |
+| Validate default inboxes | `bazel run //grenadine/server:validate_inboxes -- --repo=OWNER/NAME [--repo=...]`                   |
+| Rebuild the test repo    | `bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]` |
+| Lint                     | `bazel build --config=lint //...`                                                                   |
+| Check formatting         | `bazel run //:format.check`                                                                         |
+| Format files (user only) | `bazel run //:format [-- PATH...]`                                                                  |
 
 `--config=lint` runs clippy on the Rust targets and ruff on the Python targets.
 
