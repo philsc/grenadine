@@ -25,15 +25,18 @@ build --incompatible_default_to_explicit_init_py
 # is both huge (~30MB) and slow.
 build --compilation_mode=opt
 
-# Lint with clippy: bazel build --config=clippy //...
+# Lint with clippy and ruff: bazel build --config=lint //...
 # Warnings are errors so that a cached run can't hide them.
-build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
-build:clippy --output_groups=+clippy_checks
-build:clippy --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:lint --output_groups=+clippy_checks
+build:lint --@rules_rust//rust/settings:clippy_flags=-Dwarnings
+build:lint --aspects=//tools/lint:linters.bzl%ruff
+build:lint --output_groups=+rules_lint_human
+build:lint --@aspect_rules_lint//lint:fail_on_violation
 
-# Check formatting without rewriting any files: bazel build --config=rustfmt //...
-build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
-build:rustfmt --output_groups=+rustfmt_checks
+# Opt out of the usage reports that Aspect's rulesets (rules_lint, rules_js)
+# send. See https://github.com/aspect-build/tools_telemetry
+common --repo_env=DO_NOT_TRACK=1
 
 # User-specific settings
 try-import %workspace%/.bazelrc.user

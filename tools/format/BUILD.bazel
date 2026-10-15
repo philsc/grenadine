@@ -1,0 +1,34 @@
+load("@aspect_rules_lint//format:defs.bzl", "format_multirun")
+load("@npm//:@taplo/cli/package_json.bzl", taplo = "bin")
+load("@npm//:prettier/package_json.bzl", prettier = "bin")
+
+# Format all files:     bazel run //:format
+# Format some files:    bazel run //:format -- PATH...
+# Check without fixing: bazel run //:format.check
+format_multirun(
+    name = "format",
+    css = ":prettier",
+    graphql = ":prettier",
+    html = ":prettier",
+    # Also covers JSON.
+    javascript = ":prettier",
+    markdown = ":prettier",
+    python = "@aspect_rules_lint//format:ruff",
+    # The pinned toolchain's rustfmt. It reads the edition from //:rustfmt.toml.
+    rust = "@rules_rust//tools/upstream_wrapper:rustfmt",
+    starlark = "@buildifier_prebuilt//:buildifier",
+    toml = ":taplo",
+    visibility = ["//:__pkg__"],
+)
+
+prettier.prettier_binary(
+    name = "prettier",
+    # Run in the workspace rather than in bazel-bin, so that prettier finds
+    # .prettierignore and the files it's given.
+    env = {"BAZEL_BINDIR": "."},
+)
+
+taplo.taplo_binary(
+    name = "taplo",
+    env = {"BAZEL_BINDIR": "."},
+)

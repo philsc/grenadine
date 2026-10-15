@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "devDependencies": {
+    "@taplo/cli": "0.7.0",
+    "prettier": "3.6.2"
+  },
+  "packageManager": "pnpm@10.5.2",
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  }
+}

@@ -1,0 +1,9 @@
+# Generated lockfiles.
+cargo-bazel-lock.json
+pnpm-lock.yaml
+
+# Claude Code's configuration and helpers.
+.claude/
+
+# GitHub's schema, vendored as is.
+grenadine/testing/github_schema.graphql

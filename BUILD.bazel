@@ -1,4 +1,21 @@
+load("@npm//:defs.bzl", "npm_link_all_packages")
 load("@rules_uv//uv:pip.bzl", "pip_compile")
+
+exports_files(["ruff.toml"])
+
+npm_link_all_packages(name = "node_modules")
+
+# Format files with: bazel run //:format [-- PATH...]
+# Check them with:   bazel run //:format.check
+alias(
+    name = "format",
+    actual = "//tools/format",
+)
+
+alias(
+    name = "format.check",
+    actual = "//tools/format:format.check",
+)
 
 # Regenerate with: bazel run //:requirements
 # Check in CI with:  bazel test //:requirements_test

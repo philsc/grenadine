@@ -3,12 +3,19 @@ module(
     version = "0.0.0",
 )
 
+bazel_dep(name = "aspect_rules_js", version = "3.5.1")
+bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "bazel_lib", version = "3.7.2")
+bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.74.0")
 bazel_dep(name = "rules_uv", version = "0.89.2")
+
+# aspect_rules_lint, via rules_buf, asks for rules_go 0.42.0, which uses the
+# CcInfo symbol that Bazel 9 removed.
+bazel_dep(name = "rules_go", version = "0.60.0", repo_name = None)
 
 # rules_python ships the interpreter three times over in every py_binary's
 # runfiles: bin/python, bin/python3 and bin/python3.13 are all the same 110MB
@@ -88,6 +95,19 @@ crate.annotation(
     rustc_env = {"CARGO_MANIFEST_PATH": "wasm_split_helpers/Cargo.toml"},
 )
 use_repo(crate, "crates")
+
+# The npm packages, for now only formatters. After editing package.json, run:
+#   bazel run -- @pnpm//:pnpm --dir $PWD install --lockfile-only
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    npmrc = "//:.npmrc",
+    pnpm_lock = "//:pnpm-lock.yaml",
+)
+use_repo(npm, "npm")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+use_repo(pnpm, "pnpm")
 
 # The browser for the Playwright UI tests. Keep it at the chromium-headless-shell
 # browserVersion in playwright-core's browsers.json for the playwright pinned in
