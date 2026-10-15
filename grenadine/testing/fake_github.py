@@ -31,9 +31,10 @@ import re
 import subprocess
 import threading
 import urllib.parse
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from graphql import build_schema, graphql_sync
 
@@ -57,7 +58,7 @@ SCHEMA = build_schema(Path(__file__).with_name("github_schema.graphql").read_tex
 
 
 def iso(t: int) -> str:
-    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.datetime.fromtimestamp(t, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclasses.dataclass
@@ -172,7 +173,7 @@ class FakeRepo:
         else:
             exists = subprocess.run(
                 ["git", "-C", str(self.work), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-                env=self.gh.git_env(), capture_output=True,
+                env=self.gh.git_env(), capture_output=True, check=False,
             ).returncode == 0
             self.git("checkout", "--quiet", *([] if exists else ["-b"]), branch)
 
@@ -220,6 +221,7 @@ class FakeRepo:
         force = before != ZERO_SHA and subprocess.run(
             ["git", "-C", str(self.work), "merge-base", "--is-ancestor", before, after],
             env=self.gh.git_env(),
+            check=False,
         ).returncode != 0
         if force:
             # Keep the old tip so it can still be fetched by SHA.

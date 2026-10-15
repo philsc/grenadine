@@ -1,1 +1,6 @@
 target-version = "py313"
+
+[lint.isort]
+# The lint aspect runs ruff on one target's files at a time, so ruff can't
+# find the rest of the package to tell that it's first-party.
+known-first-party = ["grenadine"]

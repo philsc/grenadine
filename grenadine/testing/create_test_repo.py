@@ -109,6 +109,7 @@ def run(cmd: list[str], *, env: dict[str, str] | None = None, input: str | None 
         text=True,
         cwd=cwd,
         env={**os.environ, **(env or {})},
+        check=False,
     )
     if check and result.returncode != 0:
         raise Failure(

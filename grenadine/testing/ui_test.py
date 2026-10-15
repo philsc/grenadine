@@ -17,6 +17,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import ClassVar
 
 from playwright.sync_api import Locator, expect, sync_playwright
 
@@ -163,7 +164,7 @@ class ServerTestCase(unittest.TestCase):
     """Runs the server and a browser for the class's tests."""
 
     # The repositories the server is started with; `load` creates them.
-    REPOS = [scenarios.REPO]
+    REPOS: ClassVar[list[str]] = [scenarios.REPO]
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -562,7 +563,7 @@ class VersionsTest(ServerTestCase):
 
 class AgentTest(ServerTestCase):
     OTHER_REPO = "test/other"
-    REPOS = [scenarios.REPO, OTHER_REPO]
+    REPOS: ClassVar[list[str]] = [scenarios.REPO, OTHER_REPO]
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
