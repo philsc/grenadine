@@ -617,6 +617,43 @@ class VersionsTest(ServerTestCase):
             self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")
         ).to_have_text("+0 −0")
 
+    def test_comment_threads_collapse(self) -> None:
+        self.open(scenarios.GROW)
+        file = self.file(scenarios.STEPS_PY)
+
+        def thread(body: str) -> Locator:
+            return file.locator(".thread").filter(has_text=body.splitlines()[0])
+
+        # An open thread starts expanded.
+        t = thread(scenarios.OPEN_THREAD)
+        header = t.locator(".comment-meta.toggle")
+        expect(header).to_have_attribute("aria-expanded", "true")
+        expect(header.locator(".badge")).to_have_count(0)
+        expect(t.locator(".markdown")).to_have_count(2)
+        expect(t.locator(".markdown").first).to_be_visible()
+        expect(t.get_by_text("Will do.")).to_be_visible()
+        expect(header.locator(".thread-preview")).to_be_hidden()
+
+        # Clicking its header hides all but that header and the first line.
+        header.click()
+        expect(header).to_have_attribute("aria-expanded", "false")
+        expect(t.locator(".markdown").first).to_be_hidden()
+        expect(t.get_by_text("Will do.")).to_be_hidden()
+        expect(header.locator(".thread-preview")).to_have_text("Rename this step.")
+        header.click()
+        expect(t.get_by_text("Will do.")).to_be_visible()
+
+        # A resolved thread starts collapsed.
+        t = thread(scenarios.RESOLVED_THREAD)
+        header = t.locator(".comment-meta.toggle")
+        expect(header).to_have_attribute("aria-expanded", "false")
+        expect(header.locator(".badge")).to_have_text("Resolved")
+        expect(header.locator(".thread-preview")).to_have_text("Add a docstring.")
+        expect(t.locator(".markdown")).to_be_hidden()
+        header.click()
+        expect(t.locator(".markdown")).to_be_visible()
+        expect(header.locator(".thread-preview")).to_be_hidden()
+
 
 class AgentTest(ServerTestCase):
     OTHER_REPO = "test/other"

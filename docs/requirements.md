@@ -448,8 +448,10 @@ thread made on v3 is listed as "on v3".
 must stay when it is older than that version and must otherwise become
 the merge-base row.
 
-**VPICK-CMT-7.** A resolved thread must be shown collapsed to one line,
-"Resolved · author: first line of the first comment", inline and in the
-panel. Clicking it must expand it.
+**VPICK-CMT-7.** Clicking the header of a thread's first comment must
+collapse or expand the thread. A collapsed thread must show only that
+header, followed by the first line of the first comment. A resolved
+thread's header must say "Resolved", and the thread must start collapsed,
+inline and in the panel. Other threads must start expanded.
 _Why:_ the picker counts resolved threads, so the diff must show which
 ones they are, without them taking up space.
