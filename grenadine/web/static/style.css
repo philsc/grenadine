@@ -884,6 +884,27 @@ input[type="text"] {
 .comment-meta {
   font-size: 12px;
 }
+.comment-meta.toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.comment-meta.toggle .badge {
+  margin: 0 0 0 4px;
+}
+.thread-preview {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.thread.collapsed > .comment:first-child .markdown,
+.thread.collapsed > .comment + .comment {
+  display: none;
+}
 .comment .markdown p {
   margin: 4px 0;
 }
