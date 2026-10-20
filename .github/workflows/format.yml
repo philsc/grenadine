@@ -1,0 +1,28 @@
+name: Format
+
+on:
+  pull_request:
+  # Runs on main fill the caches that PR runs can read.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Ubuntu 24.04 blocks unprivileged user namespaces, which the
+      # linux-sandbox that .bazelrc forces needs.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - run: bazel run //:format
+      # Fail if the formatter changed anything, and show what it changed.
+      - run: git diff --exit-code
