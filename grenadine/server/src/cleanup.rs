@@ -291,7 +291,7 @@ fn parse_result(stdout: &[u8]) -> Result<Vec<(String, String)>> {
 }
 
 /// `s` cut to about `n` bytes.
-fn cut(s: &str, n: usize) -> String {
+pub(crate) fn cut(s: &str, n: usize) -> String {
     let s = s.trim();
     match (n..s.len()).find(|&i| s.is_char_boundary(i)) {
         Some(i) => format!("{}…", &s[..i]),
@@ -515,6 +515,7 @@ mod tests {
             repo: "o/n".into(),
             pr: None,
             title: "t".into(),
+            summary: None,
             branch: "b".into(),
             worktree: "/home/u/.local/share/w/o/n/id".into(),
             base_sha: "s".into(),

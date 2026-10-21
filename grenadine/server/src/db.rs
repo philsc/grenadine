@@ -219,6 +219,12 @@ const MIGRATIONS: &[Migration] = &[
     );
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Haiku's short summary of the first prompt, NULL until it's written.
+    ALTER TABLE agents ADD COLUMN summary TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -875,6 +881,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_agent_summary(&self, id: &str, summary: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET summary = ? WHERE id = ?",
+            params![summary, id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE agents SET model = ? WHERE id = ?",
@@ -1017,7 +1031,7 @@ impl Db {
 }
 
 const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
-     created_at, cost_usd, context_tokens, context_window, landed, model";
+     created_at, cost_usd, context_tokens, context_window, landed, model, summary";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -1037,6 +1051,7 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
             .get::<_, Option<String>>(12)?
             .and_then(|j| serde_json::from_str(&j).ok()),
         model: r.get(13)?,
+        summary: r.get(14)?,
     })
 }
 
@@ -1502,6 +1517,7 @@ mod tests {
             repo: "o/n".into(),
             pr: Some(7),
             title: "t".into(),
+            summary: None,
             branch: "b".into(),
             worktree: "/w".into(),
             base_sha: "s".into(),
@@ -1540,6 +1556,11 @@ mod tests {
         assert_eq!(
             (a.context_tokens, a.context_window),
             (Some(1_000), Some(200_000))
+        );
+        db.set_agent_summary("a", "Fix the flaky test").unwrap();
+        assert_eq!(
+            db.agent("a").unwrap().unwrap().summary.as_deref(),
+            Some("Fix the flaky test")
         );
         db.set_agent_model("a", "claude-opus-4-6").unwrap();
         assert_eq!(

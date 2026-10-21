@@ -31,7 +31,8 @@ STARTUP_TIMEOUT = 30
 # when the prompt asks it to write, asks grenadine for permission through
 # the MCP tool first, like Claude Code does. Permission modes other than
 # manual allow the write without asking. It runs the model `--model` names,
-# lists its models when asked like the Agent SDK does, and answers the scans
+# lists its models when asked like the Agent SDK does, summarizes a new
+# session's request as "Task: " and its first line, and answers the scans
 # of deleted sessions with a container they left behind.
 FAKE_CLAUDE = r"""
 import json
@@ -53,9 +54,15 @@ if "--input-format" in args:
     print(json.dumps({"type": "control_response", "response": response}), flush=True)
     sys.exit()
 if "--json-schema" in args:
-    sys.stdin.read()
-    item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
-    print(json.dumps({"type": "result", "is_error": False, "structured_output": {"items": [item]}}), flush=True)
+    schema = json.loads(args[args.index("--json-schema") + 1])
+    request = sys.stdin.read()
+    if "summary" in schema["properties"]:
+        first = request.split("# Request\n\n", 1)[1].strip().splitlines()[0]
+        output = {"summary": "Task: " + first}
+    else:
+        item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
+        output = {"items": [item]}
+    print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
 prompt = sys.stdin.read()
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
@@ -757,6 +764,28 @@ class AgentTest(ServerTestCase):
         item = self.section(scenarios.REPO).locator(".agent-item")
         expect(item).to_contain_text(["please write a note"])
         expect(item).to_have_class(re.compile(r"\bselected\b"))
+        # It's labelled with Haiku's summary of the first prompt, with the
+        # status under it and a button that deletes it on the right.
+        entry = self.section(scenarios.REPO).locator(".agent-entry")
+        title = entry.locator(".agent-title")
+        expect(title).to_have_text("Task: please write a note")
+        expect(title).to_have_attribute("title", "please write a note")
+        status = entry.locator(".agent-status")
+        expect(status).to_have_text("idle")
+        trash = entry.get_by_role("button", name="Delete session")
+        title_box = title.bounding_box()
+        status_box = status.bounding_box()
+        trash_box = trash.bounding_box()
+        entry_box = entry.bounding_box()
+        assert title_box and status_box and trash_box and entry_box
+        self.assertGreaterEqual(status_box["y"], title_box["y"] + title_box["height"])
+        self.assertAlmostEqual(status_box["x"], title_box["x"], delta=1)
+        self.assertGreaterEqual(trash_box["y"], title_box["y"] + title_box["height"])
+        self.assertAlmostEqual(
+            trash_box["x"] + trash_box["width"],
+            entry_box["x"] + entry_box["width"],
+            delta=16,
+        )
         self.page.get_by_role("link", name="Agents").click()
         expect(item).not_to_have_class(re.compile(r"\bselected\b"))
         # New sessions start with the model picked last.
@@ -772,6 +801,39 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_sidebar_delete(self) -> None:
+        sessions = self.section(scenarios.REPO).locator(".agent-entry")
+        for prompt in ["say one", "say two"]:
+            self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+            self.page.get_by_label("Permissions").select_option(label="Auto")
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+            expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        two = self.page.url
+        one = sessions.filter(has_text="say one")
+        trash = one.get_by_role("button", name="Delete session")
+
+        # The trash button asks first, like the session page's Delete.
+        self.page.once("dialog", lambda dialog: dialog.dismiss())
+        trash.click()
+        expect(one).to_have_count(1)
+
+        # Deleting another session leaves the open one on the page.
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        trash.click()
+        expect(one).to_have_count(0)
+        self.assertEqual(self.page.url, two)
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(["say two"])
+
+        # Deleting the open session goes back to the form.
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        sessions.filter(has_text="say two").get_by_role(
+            "button", name="Delete session"
+        ).click()
+        expect(self.page).to_have_url(re.compile(r"#/agents$"))
+        expect(sessions.filter(has_text="say two")).to_have_count(0)
 
     def test_unstaged_changes_pane(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})

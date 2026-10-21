@@ -186,6 +186,7 @@ mod tests {
                 repo: "o/n".into(),
                 pr: None,
                 title: "t".into(),
+                summary: None,
                 branch: "b".into(),
                 worktree: "/w".into(),
                 base_sha: "s".into(),

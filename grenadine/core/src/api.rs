@@ -401,6 +401,10 @@ pub struct AgentSession {
     pub pr: Option<u64>,
     /// The first line of the first prompt.
     pub title: String,
+    /// Haiku's short summary of the first prompt; `None` until it's
+    /// written, or if writing it failed.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// The local branch checked out in the worktree.
     pub branch: String,
     pub worktree: String,
