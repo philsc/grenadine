@@ -102,6 +102,49 @@ fn LandedBadge(landed: Landed) -> impl IntoView {
     }
 }
 
+/// Asks before deleting the session with `id`, then deletes it and calls
+/// `deleted`, or `failed` with what went wrong.
+fn delete_session(
+    id: String,
+    deleted: impl FnOnce() + 'static,
+    failed: impl FnOnce(String) + 'static,
+) {
+    let confirmed = window()
+        .confirm_with_message(
+            "Delete this session? Its worktree and branch are deleted too, with any changes that weren't pushed.",
+        )
+        .unwrap_or(false);
+    if !confirmed {
+        return;
+    }
+    spawn_local(async move {
+        match api::delete_agent(&id).await {
+            Ok(()) => deleted(),
+            Err(e) => failed(e),
+        }
+    });
+}
+
+#[component]
+fn TrashIcon() -> impl IntoView {
+    view! {
+        <svg
+            class="trash"
+            viewBox="0 0 16 16"
+            width="14"
+            height="14"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M2.5 4h11M6 4V2.5h4V4M3.8 4l.7 9.5h7l.7-9.5M6.6 6.5v4.5M9.4 6.5v4.5" />
+        </svg>
+    }
+}
+
 #[component]
 fn StatusBadge(status: AgentStatus) -> impl IntoView {
     view! { <span class=status_class(status)>{status_label(status)}</span> }
@@ -134,6 +177,8 @@ pub fn Sidebar(
         updates.agents.track();
         api::agents()
     });
+    // Deleting from the sidebar failed.
+    let error = RwSignal::new(None::<String>);
 
     view! {
         <aside class="agent-sidebar">
@@ -142,13 +187,14 @@ pub fn Sidebar(
                 class:selected=move || route.with(|r| matches!(r, Route::Agents { .. }))
                 href="#/agents"
             >"+ New session"</a>
+            {move || error.get().map(|e| view! { <p class="error pad">{e}</p> })}
             {move || match (repos.get(), sessions.get()) {
                 (Some(Err(e)), _) | (_, Some(Err(e))) => {
                     view! { <p class="error pad">{e}</p> }.into_any()
                 }
                 (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(repos, sessions)
                     .into_iter()
-                    .map(|(repo, list)| view! { <RepoSessions repo=repo list=list route=route /> })
+                    .map(|(repo, list)| view! { <RepoSessions repo=repo list=list route=route error=error /> })
                     .collect_view()
                     .into_any(),
                 _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
@@ -389,7 +435,12 @@ pub fn CleanupView() -> impl IntoView {
 }
 
 #[component]
-fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> impl IntoView {
+fn RepoSessions(
+    repo: String,
+    list: Vec<AgentSession>,
+    route: Signal<Route>,
+    error: RwSignal<Option<String>>,
+) -> impl IntoView {
     let new = format!("#/agents/new/{repo}");
     view! {
         <section class="agent-repo">
@@ -408,7 +459,25 @@ fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> 
                     <ul class="agent-list">
                         {list.into_iter().map(|a| {
                             let id = a.id.clone();
-                            let selected = move || route.with(|r| matches!(r, Route::Agent(s) if *s == id));
+                            let is_open = move |id: &str| {
+                                route.with_untracked(|r| matches!(r, Route::Agent(s) if s == id))
+                            };
+                            let selected = {
+                                let id = id.clone();
+                                move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
+                            };
+                            let delete = move |_| {
+                                let id = id.clone();
+                                error.set(None);
+                                // Its page can't show it any more.
+                                let leave = is_open(&id);
+                                delete_session(
+                                    id,
+                                    move || if leave { go("#/agents") },
+                                    move |e| error.set(Some(e)),
+                                );
+                            };
+                            let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
                             let mut meta = vec![a.branch.clone(), cost(a.cost_usd)];
                             if let Some(n) = a.pr {
                                 meta.insert(0, format!("#{n}"));
@@ -417,14 +486,22 @@ fn RepoSessions(repo: String, list: Vec<AgentSession>, route: Signal<Route>) -> 
                                 meta.push(landed_label(landed));
                             }
                             view! {
-                                <li>
+                                <li class="agent-entry">
                                     <a class="agent-item" class:selected=selected href=agent_hash(&a.id)>
-                                        <span class="agent-title">
+                                        <span class="agent-title" title=a.title.clone()>{label}</span>
+                                        <span class="agent-status-line">
                                             <StatusBadge status=a.status />
-                                            {a.title.clone()}
+                                            <span class="agent-meta muted">{meta.join(" · ")}</span>
                                         </span>
-                                        <span class="agent-meta muted">{meta.join(" · ")}</span>
                                     </a>
+                                    <button
+                                        class="icon agent-delete"
+                                        title="Delete session"
+                                        aria-label="Delete session"
+                                        on:click=delete
+                                    >
+                                        <TrashIcon />
+                                    </button>
                                 </li>
                             }
                         }).collect_view()}
@@ -1027,21 +1104,8 @@ fn AgentActions(
         });
     };
     let delete = move |_| {
-        let confirmed = window()
-            .confirm_with_message(
-                "Delete this session? Its worktree and branch are deleted too, with any changes that weren't pushed.",
-            )
-            .unwrap_or(false);
-        if !confirmed {
-            return;
-        }
         let id = session.with_untracked(|s| s.id.clone());
-        spawn_local(async move {
-            match api::delete_agent(&id).await {
-                Ok(()) => go("#/agents"),
-                Err(e) => error.set(Some(e)),
-            }
-        });
+        delete_session(id, || go("#/agents"), move |e| error.set(Some(e)));
     };
     view! {
         {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
@@ -1807,6 +1871,7 @@ mod tests {
             repo: repo.into(),
             pr: None,
             title: String::new(),
+            summary: None,
             branch: String::new(),
             worktree: String::new(),
             base_sha: String::new(),

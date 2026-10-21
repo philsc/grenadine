@@ -1045,6 +1045,40 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The status under the title, with room on the right for the delete
+   button. */
+.agent-status-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-right: 20px;
+}
+.agent-status-line .agent-status {
+  flex: none;
+  margin-right: 0;
+}
+.agent-status-line .agent-meta {
+  min-width: 0;
+}
+/* Beside the session's link rather than in it, since a button can't be
+   inside a link; placed over the link's bottom right corner. */
+.agent-entry {
+  position: relative;
+}
+.agent-delete {
+  position: absolute;
+  right: 12px;
+  bottom: 4px;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  line-height: 0;
+}
+.agent-delete:hover:not(:disabled) {
+  color: var(--del-fg);
+  background: none;
+}
 
 /* Cleanup */
 

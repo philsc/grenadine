@@ -102,6 +102,8 @@ pub struct Agents {
     models: OnceCell<Vec<AgentModelInfo>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
+    /// Whether Haiku summarizes each new session's first prompt.
+    pub summaries: std::sync::atomic::AtomicBool,
 }
 
 /// What only exists while the server runs: the event channel open pages
@@ -376,7 +378,8 @@ impl Agents {
     /// Marks the sessions that were running when the server last stopped as
     /// interrupted. With `slices`, each session's processes go into their
     /// own systemd user slice. With `scans`, deleting a session scans its
-    /// transcript for what it left behind.
+    /// transcript for what it left behind. With `summaries`, Haiku
+    /// summarizes each new session's first prompt.
     pub fn new(
         db: &crate::db::Db,
         claude: PathBuf,
@@ -384,6 +387,7 @@ impl Agents {
         base_url: String,
         slices: bool,
         scans: bool,
+        summaries: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
         Ok(Agents {
@@ -396,6 +400,7 @@ impl Agents {
             live: std::sync::Mutex::default(),
             models: OnceCell::new(),
             scans: crate::cleanup::Scans::new(scans),
+            summaries: summaries.into(),
         })
     }
 
@@ -591,6 +596,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         repo: req.repo,
         pr: req.pr,
         title: title(&req.prompt),
+        summary: None,
         branch,
         worktree: worktree.to_string_lossy().into_owned(),
         base_sha,
@@ -604,6 +610,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
+    crate::summary::start(state, &id, &req.prompt);
     send(state, &id, req.prompt, req.permission_mode, req.model);
     Ok(session)
 }
@@ -1756,6 +1763,68 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(!std::path::Path::new(&session.worktree).exists());
         assert_eq!(state.db.agent(id).unwrap(), None);
         assert!(!delete(&state, id).await.unwrap());
+    }
+
+    /// Haiku summarizes a new session's first prompt in the background,
+    /// without tools.
+    #[tokio::test]
+    async fn summarizes_the_first_prompt() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in
+*" --json-schema "*)
+  echo "$*" > {dir}/summary_args
+  cat > {dir}/summary_input
+  echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
+  ;;
+*)
+  cat > /dev/null
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+  ;;
+esac
+"#,
+            dir = dir.path().display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        state
+            .agents
+            .summaries
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = create(
+            &state,
+            NewAgent {
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "please write a note\nin notes.txt".into(),
+                permission_mode: PermissionMode::Auto,
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.summary, None);
+
+        let mut summary = None;
+        for _ in 0..100 {
+            summary = state.db.agent(&session.id).unwrap().unwrap().summary;
+            if summary.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(summary.as_deref(), Some("Write a note"));
+
+        let args = std::fs::read_to_string(dir.path().join("summary_args")).unwrap();
+        assert!(args.contains("--model haiku"), "{args}");
+        assert!(args.contains("--tools  --permission-mode"), "{args}");
+        let input = std::fs::read_to_string(dir.path().join("summary_input")).unwrap();
+        assert!(
+            input.ends_with("please write a note\nin notes.txt\n"),
+            "{input}"
+        );
+        wait_for_turns(&state, &session.id, 1).await;
     }
 
     /// A session whose fake claude starts a container, and answers scans

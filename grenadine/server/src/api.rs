@@ -544,6 +544,7 @@ mod tests {
                 repo: fx.clone.slug.clone(),
                 pr: None,
                 title: "t".into(),
+                summary: None,
                 branch: "x".into(),
                 worktree: worktree.to_string_lossy().into_owned(),
                 base_sha: "s".into(),

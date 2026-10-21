@@ -554,6 +554,7 @@ pub fn test_state_with_agents(
             "http://127.0.0.1:9".into(),
             false,
             false,
+            false,
         )
         .unwrap(),
         db,
