@@ -198,6 +198,11 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         }
     }
     state.send(ServerEvent::InboxesChanged);
+    // The sessions' PRs are secondary; failing to look them up doesn't
+    // fail the poll.
+    if let Err(e) = refresh_agent_prs(state).await {
+        tracing::warn!("can't look up the agent sessions' PRs: {e:#}");
+    }
 
     let stale: Vec<PrKey> = hits
         .into_values()
@@ -230,6 +235,22 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
             state.send(ServerEvent::InboxesChanged);
         })
         .await;
+    Ok(())
+}
+
+/// Looks up whether the PRs that agent sessions opened are still open.
+async fn refresh_agent_prs(state: &State) -> Result<()> {
+    let open = state.db.open_agent_prs()?;
+    if open.is_empty() {
+        return Ok(());
+    }
+    let mut changed = false;
+    for (key, pr_state) in state.github.pr_states(&open).await? {
+        changed |= state.db.set_agent_pr_state(&key, &pr_state)?;
+    }
+    if changed {
+        state.send(ServerEvent::AgentsChanged);
+    }
     Ok(())
 }
 

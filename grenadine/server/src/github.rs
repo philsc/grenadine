@@ -729,6 +729,47 @@ impl GitHub {
         Ok(out)
     }
 
+    /// The states of PRs: OPEN, CLOSED or MERGED. PRs GitHub can't find,
+    /// e.g. in a repository the token can't see, are missing from the
+    /// result.
+    pub async fn pr_states(&self, keys: &[PrKey]) -> Result<BTreeMap<PrKey, String>> {
+        let mut out = BTreeMap::new();
+        for chunk in keys.chunks(LOOKUP_BATCH) {
+            let params = (0..chunk.len())
+                .map(|i| format!("$o{i}: String!, $n{i}: String!, $x{i}: Int!"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let fields: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state }} }}\n"
+                    )
+                })
+                .collect();
+            let mut vars = serde_json::Map::new();
+            for (i, key) in chunk.iter().enumerate() {
+                let (owner, name) = split_repo(&key.repo)?;
+                vars.insert(format!("o{i}"), json!(owner));
+                vars.insert(format!("n{i}"), json!(name));
+                vars.insert(format!("x{i}"), json!(key.number));
+            }
+            // A PR that can't be found is an error for its alias only.
+            let (data, _) = self
+                .graphql(
+                    &format!("query({params}) {{\n{fields}}}"),
+                    Value::Object(vars),
+                )
+                .await?;
+            for (i, key) in chunk.iter().enumerate() {
+                let state = str_at(&data, &format!("/p{i}/pullRequest/state"));
+                if !state.is_empty() {
+                    out.insert(key.clone(), state.to_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The authors of commits by SHA. A commit whose author isn't linked to
     /// a GitHub user gets the name from the commit and no login. Commits
     /// GitHub doesn't have are missing from the result.

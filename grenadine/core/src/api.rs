@@ -426,6 +426,17 @@ pub struct AgentSession {
     /// Where the session's work was last landed by wrapping up.
     #[serde(default)]
     pub landed: Option<Landed>,
+    /// The PRs the session opened; `None` when it opened none.
+    #[serde(default)]
+    pub prs: Option<AgentPrs>,
+}
+
+/// How far the PRs an agent session opened have come. PRs closed without
+/// merging count in neither number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPrs {
+    pub merged: u32,
+    pub total: u32,
 }
 
 /// How Claude Code decides about tool uses during a turn; the user picks

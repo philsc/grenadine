@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, AgentStatus, CleanupItem, Inbox, InboxEdit, Landed,
-    Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
+    AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CleanupItem, Inbox, InboxEdit,
+    Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -16,6 +16,9 @@ enum Migration {
     Sql(&'static str),
     /// Replaces every inbox with the defaults.
     ResetInboxes,
+    /// Records the PRs that the sessions' transcripts show they opened, as
+    /// open; the next poll looks up their states.
+    BackfillAgentPrs,
 }
 
 /// Each entry upgrades the schema by one version.
@@ -225,6 +228,20 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agents ADD COLUMN summary TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The PRs each agent session opened, with their state as of the last
+    -- poll: OPEN, MERGED or CLOSED.
+    CREATE TABLE agent_prs (
+        agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        PRIMARY KEY (agent_id, repo, number)
+    );
+"#,
+    ),
+    Migration::BackfillAgentPrs,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -250,9 +267,37 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
                     )?;
                 }
             }
+            Migration::BackfillAgentPrs => backfill_agent_prs(&tx)?,
         }
         tx.pragma_update(None, "user_version", i + 1)?;
         tx.commit()?;
+    }
+    Ok(())
+}
+
+fn backfill_agent_prs(conn: &Connection) -> Result<()> {
+    let agents: Vec<(String, String)> = conn
+        .prepare("SELECT id, repo FROM agents")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut events =
+        conn.prepare("SELECT event FROM agent_events WHERE agent_id = ? ORDER BY seq")?;
+    for (id, repo) in agents {
+        let mut opened = crate::agent::OpenedPrs::default();
+        let mut prs = Vec::new();
+        for json in events.query_map([&id], |r| r.get::<_, String>(0))? {
+            // Events that no longer parse can't have opened a PR.
+            if let Ok(kind) = serde_json::from_str::<AgentEventKind>(&json?) {
+                prs.extend(opened.see(&repo, &kind));
+            }
+        }
+        for key in prs {
+            conn.execute(
+                "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
+                 VALUES (?, ?, ?, 'OPEN')",
+                params![id, key.repo, key.number],
+            )?;
+        }
     }
     Ok(())
 }
@@ -906,6 +951,40 @@ impl Db {
         Ok(())
     }
 
+    /// Records that the session opened the PR `key`, which is in `state`,
+    /// unless it's recorded already.
+    pub fn add_agent_pr(&self, id: &str, key: &PrKey, state: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state) VALUES (?, ?, ?, ?)",
+            params![id, key.repo, key.number, state],
+        )?;
+        Ok(())
+    }
+
+    /// The PRs that sessions opened that were open at the last poll.
+    pub fn open_agent_prs(&self) -> Result<Vec<PrKey>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT repo, number FROM agent_prs WHERE state = 'OPEN' ORDER BY repo, number",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PrKey {
+                repo: r.get(0)?,
+                number: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records the state of a PR that sessions opened. Returns whether it
+    /// changed.
+    pub fn set_agent_pr_state(&self, key: &PrKey, state: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE agent_prs SET state = ?1 WHERE repo = ?2 AND number = ?3 AND state != ?1",
+            params![state, key.repo, key.number],
+        )? > 0)
+    }
+
     /// Moves the commit that the session's own work starts after.
     pub fn set_agent_base(&self, id: &str, base_sha: &str) -> Result<()> {
         self.conn().execute(
@@ -1031,7 +1110,10 @@ impl Db {
 }
 
 const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
-     created_at, cost_usd, context_tokens, context_window, landed, model, summary";
+     created_at, cost_usd, context_tokens, context_window, landed, model, summary, \
+     (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state = 'MERGED'), \
+     (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state != 'CLOSED'), \
+     (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id)";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -1052,6 +1134,10 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
             .and_then(|j| serde_json::from_str(&j).ok()),
         model: r.get(13)?,
         summary: r.get(14)?,
+        prs: (r.get::<_, u32>(17)? > 0).then_some(AgentPrs {
+            merged: r.get(15)?,
+            total: r.get(16)?,
+        }),
     })
 }
 
@@ -1416,12 +1502,8 @@ mod tests {
         // away the inbox_prs row, but apply the later ones that the
         // listing's query needs.
         migrate(&mut conn, 3).unwrap();
-        for m in &MIGRATIONS[4..] {
-            let Migration::Sql(sql) = m else {
-                panic!("migrations after 4 are SQL")
-            };
-            conn.execute_batch(sql).unwrap();
-        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -1528,6 +1610,7 @@ mod tests {
             context_window: None,
             model: None,
             landed: None,
+            prs: None,
         }
     }
 
@@ -1614,6 +1697,101 @@ mod tests {
         assert!(db.delete_agent("a").unwrap());
         assert!(!db.delete_agent("a").unwrap());
         assert_eq!(db.agent_events("a").unwrap(), []);
+    }
+
+    #[test]
+    fn agent_prs() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
+        let prs = |id| db.agent(id).unwrap().unwrap().prs;
+        assert_eq!(prs("a"), None);
+
+        let key = |number| PrKey {
+            repo: "o/n".into(),
+            number,
+        };
+        for number in [1, 2, 3] {
+            db.add_agent_pr("a", &key(number), "OPEN").unwrap();
+        }
+        // Again, as a stale state, which changes nothing.
+        db.add_agent_pr("a", &key(1), "MERGED").unwrap();
+        db.add_agent_pr("b", &key(2), "OPEN").unwrap();
+        assert_eq!(
+            prs("a"),
+            Some(AgentPrs {
+                merged: 0,
+                total: 3
+            })
+        );
+        assert_eq!(db.open_agent_prs().unwrap(), [key(1), key(2), key(3)]);
+
+        assert!(db.set_agent_pr_state(&key(1), "MERGED").unwrap());
+        assert!(!db.set_agent_pr_state(&key(1), "MERGED").unwrap());
+        assert!(db.set_agent_pr_state(&key(2), "MERGED").unwrap());
+        // A PR closed without merging counts in neither number.
+        assert!(db.set_agent_pr_state(&key(3), "CLOSED").unwrap());
+        assert_eq!(
+            prs("a"),
+            Some(AgentPrs {
+                merged: 2,
+                total: 2
+            })
+        );
+        assert_eq!(
+            prs("b"),
+            Some(AgentPrs {
+                merged: 1,
+                total: 1
+            })
+        );
+        assert_eq!(db.open_agent_prs().unwrap(), []);
+
+        db.delete_agent("a").unwrap();
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM agent_prs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn backfills_agent_prs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let backfill = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::BackfillAgentPrs))
+            .unwrap();
+        migrate(&mut conn, backfill).unwrap();
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        let events = [
+            AgentEventKind::ToolUse {
+                id: "t".into(),
+                name: "Bash".into(),
+                input: r#"{"command":"gh pr create --fill"}"#.into(),
+            },
+            AgentEventKind::ToolResult {
+                id: "t".into(),
+                content: "https://github.com/o/n/pull/4".into(),
+                is_error: false,
+                patch: Vec::new(),
+            },
+        ];
+        for e in &events {
+            db.append_agent_event("a", e).unwrap();
+        }
+        migrate(&mut db.conn(), MIGRATIONS.len()).unwrap();
+        assert_eq!(
+            db.open_agent_prs().unwrap(),
+            [PrKey {
+                repo: "o/n".into(),
+                number: 4
+            }]
+        );
     }
 
     #[test]

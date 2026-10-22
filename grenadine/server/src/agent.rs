@@ -678,6 +678,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         context_window: None,
         model: None,
         landed: None,
+        prs: None,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
@@ -961,8 +962,17 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
 fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
     state.db.set_agent_landed(id, landed)?;
     // Wrapping up again lands only what came after.
-    if let Landed::Checkout { sha } = landed {
-        state.db.set_agent_base(id, sha)?;
+    match landed {
+        Landed::Checkout { sha } => state.db.set_agent_base(id, sha)?,
+        Landed::PullRequest { number, .. } => {
+            if let Some(session) = state.db.agent(id)? {
+                let key = PrKey {
+                    repo: session.repo,
+                    number: *number,
+                };
+                state.db.add_agent_pr(id, &key, "OPEN")?;
+            }
+        }
     }
     state.send(ServerEvent::AgentsChanged);
     Ok(())
@@ -1219,6 +1229,7 @@ async fn turn(
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut ended = None;
     let mut stopping = false;
+    let mut prs = OpenedPrs::default();
     loop {
         let line = tokio::select! {
             line = lines.next_line() => line?,
@@ -1257,7 +1268,9 @@ async fn turn(
                         }
                         ended = Some(error.is_none());
                     }
+                    let opened = prs.see(&session.repo, &kind);
                     emit(state, id, kind)?;
+                    record_prs(state, id, &opened)?;
                 }
             }
         }
@@ -1287,6 +1300,81 @@ async fn turn(
             AgentStatus::Failed
         }
     })
+}
+
+/// The PRs that GitHub URLs in `text` point to.
+fn pr_urls(text: &str) -> Vec<PrKey> {
+    text.match_indices("https://github.com/")
+        .filter_map(|(i, prefix)| {
+            let mut parts = text[i + prefix.len()..].splitn(4, '/');
+            let (owner, name) = (parts.next()?, parts.next()?);
+            if parts.next()? != "pull" || owner.is_empty() || name.is_empty() {
+                return None;
+            }
+            let rest = parts.next()?;
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            Some(PrKey {
+                repo: format!("{owner}/{name}"),
+                number: rest[..digits].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Picks out the PRs a session opens from its transcript's events: those
+/// that wrapping up opened, and those whose URL a `gh pr create` in Bash
+/// printed.
+#[derive(Default)]
+pub struct OpenedPrs {
+    /// The tool uses that run `gh pr create`, until their results come.
+    creating: std::collections::HashSet<String>,
+}
+
+impl OpenedPrs {
+    /// The PRs that `kind` shows were opened in a session in `repo`.
+    pub fn see(&mut self, repo: &str, kind: &AgentEventKind) -> Vec<PrKey> {
+        match kind {
+            AgentEventKind::ToolUse { id, name, input } if name == "Bash" => {
+                let command = serde_json::from_str::<Value>(input)
+                    .ok()
+                    .and_then(|v| v["command"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                if command.contains("gh pr create") {
+                    self.creating.insert(id.clone());
+                }
+                Vec::new()
+            }
+            AgentEventKind::ToolResult {
+                id,
+                content,
+                is_error,
+                ..
+            } if self.creating.remove(id) && !is_error => {
+                let mut prs = pr_urls(content);
+                prs.dedup();
+                prs
+            }
+            AgentEventKind::Landed(Landed::PullRequest { number, .. }) => vec![PrKey {
+                repo: repo.to_owned(),
+                number: *number,
+            }],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Records that the session opened `prs`, which are open.
+fn record_prs(state: &State, id: &str, prs: &[PrKey]) -> Result<()> {
+    if prs.is_empty() {
+        return Ok(());
+    }
+    for key in prs {
+        state.db.add_agent_pr(id, key, "OPEN")?;
+    }
+    state.send(ServerEvent::AgentsChanged);
+    Ok(())
 }
 
 /// What one line of `--output-format stream-json` means for the transcript.
@@ -2125,6 +2213,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             context_window: None,
             model: None,
             landed: None,
+            prs: None,
         }
     }
 
@@ -2331,6 +2420,59 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             pr_text("t", &["One\n\nx".into(), "Two".into()]),
             ("t".into(), "- One\n- Two".into())
         );
+    }
+
+    #[test]
+    fn finds_pr_urls() {
+        let key = |repo: &str, number| PrKey {
+            repo: repo.into(),
+            number,
+        };
+        assert_eq!(
+            pr_urls(
+                "https://github.com/o/n/pull/12\nsee https://github.com/a/b/pull/3/files \
+                 https://github.com/o/n/issues/4 https://github.com/o/n/pull/x"
+            ),
+            [key("o/n", 12), key("a/b", 3)]
+        );
+    }
+
+    #[test]
+    fn finds_opened_prs() {
+        let bash = |id: &str, command: &str| AgentEventKind::ToolUse {
+            id: id.into(),
+            name: "Bash".into(),
+            input: json!({ "command": command }).to_string(),
+        };
+        let result = |id: &str, content: &str, is_error| AgentEventKind::ToolResult {
+            id: id.into(),
+            content: content.into(),
+            is_error,
+            patch: Vec::new(),
+        };
+        let events = [
+            bash(
+                "1",
+                "git push origin HEAD:refs/heads/x && gh pr create --head x",
+            ),
+            bash("2", "gh pr view 5"),
+            // Only the results of `gh pr create` count.
+            result("2", "https://github.com/o/n/pull/5", false),
+            result("1", "https://github.com/o/n/pull/6\n", false),
+            bash("3", "gh pr create --head y"),
+            result("3", "https://github.com/o/n/pull/7 already exists", true),
+            AgentEventKind::Landed(Landed::PullRequest {
+                number: 8,
+                url: "https://github.com/o/n/pull/8".into(),
+            }),
+        ];
+        let mut opened = OpenedPrs::default();
+        let numbers: Vec<u64> = events
+            .iter()
+            .flat_map(|e| opened.see("o/n", e))
+            .map(|k| k.number)
+            .collect();
+        assert_eq!(numbers, [6, 8]);
     }
 
     /// A claude that changes the worktree as its prompts say: `write`

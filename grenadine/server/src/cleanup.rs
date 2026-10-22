@@ -526,6 +526,7 @@ mod tests {
             context_window: None,
             model: None,
             landed: None,
+            prs: None,
         };
         assert!(
             transcript_path(&session).ends_with("projects/-home-u--local-share-w-o-n-id/id.jsonl")

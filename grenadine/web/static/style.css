@@ -1058,6 +1058,17 @@ textarea {
   flex: none;
   margin-right: 0;
 }
+.agent-prs {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.agent-prs.done {
+  color: #8250df;
+}
 .agent-status-line .agent-meta {
   min-width: 0;
 }
