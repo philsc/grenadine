@@ -1199,9 +1199,14 @@ async fn turn(
         }
     }
     // The prompt goes through stdin so that one starting with `-` isn't
-    // taken for a flag.
+    // taken for a flag. If claude exits without reading it, its exit status
+    // and stderr below say why.
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(prompt.as_bytes()).await?;
+    if let Err(e) = stdin.write_all(prompt.as_bytes()).await
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e.into());
+    }
     drop(stdin);
 
     let mut stderr = child.stderr.take().unwrap();
