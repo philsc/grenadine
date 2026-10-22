@@ -656,15 +656,42 @@ fn VersionPicker(
     }
 }
 
+/// A comment. A thread's first comment gets `open`, which makes its header
+/// collapse and expand the thread.
 #[component]
-pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
+pub fn CommentBody(
+    comment: ReviewComment,
+    #[prop(optional)] open: Option<RwSignal<bool>>,
+) -> impl IntoView {
     let links = expect_context::<PrLinks>();
+    let chevron = open.map(|open| {
+        view! { <span class="chevron">{move || if open.get() { "▾" } else { "▸" }}</span> }
+    });
+    let resolved = (open.is_some() && comment.resolved)
+        .then(|| view! { <span class="badge">"Resolved"</span> });
+    let preview = open.map(|open| {
+        let first = comment.body.lines().map(str::trim).find(|l| !l.is_empty());
+        view! {
+            <span class="thread-preview muted" class:hidden=move || open.get()>
+                {first.unwrap_or_default().to_owned()}
+            </span>
+        }
+    });
     view! {
         <div class="comment">
-            <div class="comment-meta">
+            <div class="comment-meta" class:toggle=open.is_some()
+                role=open.map(|_| "button")
+                aria-expanded=move || open.map(|o| o.get().to_string())
+                on:click=move |_| { if let Some(o) = open { o.update(|o| *o = !*o) } }>
+                {chevron}
                 <strong>{comment.author.clone()}</strong>
                 " "
-                <a class="muted" href=comment.url.clone() target="_blank" rel="noopener">{comment.created_at.replace('T', " ").trim_end_matches('Z').to_owned()}</a>
+                <a class="muted" href=comment.url.clone() target="_blank" rel="noopener"
+                    on:click=|ev| ev.stop_propagation()>
+                    {comment.created_at.replace('T', " ").trim_end_matches('Z').to_owned()}
+                </a>
+                {resolved}
+                {preview}
             </div>
             <div class="markdown" inner_html=markdown::to_html(&comment.body, &links.repo)
                 on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
@@ -672,11 +699,13 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
     }
 }
 
+/// A thread, which starts collapsed when it's resolved.
 #[component]
 pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
+    let open = RwSignal::new(!thread.root.resolved);
     view! {
-        <div class="thread">
-            <CommentBody comment=thread.root.clone() />
+        <div class="thread" class:collapsed=move || !open.get()>
+            <CommentBody comment=thread.root.clone() open=open />
             {thread.replies.iter().map(|r| view! { <CommentBody comment=r.clone() /> }).collect_view()}
         </div>
     }
