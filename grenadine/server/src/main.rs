@@ -174,6 +174,11 @@ async fn main() -> Result<()> {
             "no systemd user manager: deleting a session only stops the processes still in its worktree"
         );
     }
+    // Before serving, since a session being created has a worktree but no
+    // row yet. The output bases of what it removes go next.
+    if let Err(e) = agent::remove_orphaned_worktrees(&db, &repos, &worktrees) {
+        tracing::warn!("can't remove orphaned worktrees: {e:#}");
+    }
     // A thread rather than spawn_blocking, which shutting down would wait for.
     std::thread::spawn({
         let worktrees = worktrees.clone();

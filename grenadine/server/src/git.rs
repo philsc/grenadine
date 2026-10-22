@@ -384,12 +384,24 @@ impl Repo {
     /// Removes a worktree, changes and all, and deletes its branch. Either
     /// may be gone already.
     pub fn worktree_remove(&self, path: &Path, branch: &str) -> Result<()> {
+        self.worktree_remove_only(path)?;
+        self.branch_delete(branch)
+    }
+
+    /// Removes a worktree, changes and all, but not its branch. It may be
+    /// gone already.
+    pub fn worktree_remove_only(&self, path: &Path) -> Result<()> {
         let path = path.to_str().context("the worktree path isn't UTF-8")?;
         if Path::new(path).exists() {
             self.git(&["worktree", "remove", "--force", "--force", path])?;
         } else {
             self.git(&["worktree", "prune"])?;
         }
+        Ok(())
+    }
+
+    /// Deletes a local branch, merged or not. It may be gone already.
+    pub fn branch_delete(&self, branch: &str) -> Result<()> {
         if self.git_ok(&[
             "rev-parse",
             "--verify",
@@ -399,6 +411,23 @@ impl Repo {
             self.git(&["branch", "-D", branch])?;
         }
         Ok(())
+    }
+
+    /// The clone's worktrees, the main one included, with the branch each
+    /// has checked out; `None` for a detached HEAD.
+    pub fn worktrees(&self) -> Result<Vec<(PathBuf, Option<String>)>> {
+        let out = self.git(&["worktree", "list", "--porcelain", "-z"])?;
+        let mut worktrees = Vec::new();
+        for line in out.split('\0') {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                worktrees.push((PathBuf::from(path), None));
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+                && let Some((_, b)) = worktrees.last_mut()
+            {
+                *b = Some(branch.to_owned());
+            }
+        }
+        Ok(worktrees)
     }
 
     pub fn merge_base(&self, a: &str, b: &str) -> Option<String> {
@@ -818,6 +847,25 @@ pub(crate) mod tests {
             run(&path, &["branch", "--show-current"]),
             "grenadine/agent/x"
         );
+        let detached = dir.path().join("detached");
+        run(
+            &f.clone.path,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                detached.to_str().unwrap(),
+            ],
+        );
+        let listed = f.clone.worktrees().unwrap();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert_eq!(listed[0].1.as_deref(), Some("main"));
+        assert!(listed.contains(&(
+            path.canonicalize().unwrap(),
+            Some("grenadine/agent/x".into())
+        )));
+        assert!(listed.contains(&(detached.canonicalize().unwrap(), None)));
 
         // Uncommitted changes don't stop the removal.
         std::fs::write(path.join("b"), "2\n").unwrap();

@@ -374,6 +374,77 @@ pub fn remove_orphaned_output_bases(worktrees: &Path) {
     }));
 }
 
+/// The branch a new session with `id` works on.
+fn session_branch(id: &str) -> String {
+    format!("grenadine/agent/{}", &id[..8])
+}
+
+/// Removes the worktrees in `worktrees` that no session owns, e.g. those
+/// of sessions whose repo wasn't configured when they were deleted, with
+/// their branches, then the directories that are left empty. Must run
+/// before sessions can be created, which add their worktree first.
+pub fn remove_orphaned_worktrees(
+    db: &crate::db::Db,
+    repos: &BTreeMap<String, Arc<crate::sync::ClonedRepo>>,
+    worktrees: &Path,
+) -> Result<()> {
+    let Ok(root) = worktrees.canonicalize() else {
+        return Ok(());
+    };
+    // Git keeps the path the worktree was added at, which needn't be the
+    // canonical one.
+    let added = std::path::absolute(worktrees)?;
+    let owned: std::collections::BTreeSet<String> =
+        db.agents()?.into_iter().map(|s| s.branch).collect();
+    for (slug, cloned) in repos {
+        let repo = &cloned.repo;
+        let dirs = [root.join(slug), added.join(slug)];
+        let listed = repo.worktrees()?;
+        let mut checked_out: std::collections::BTreeSet<String> =
+            listed.iter().filter_map(|(_, b)| b.clone()).collect();
+        for (path, branch) in listed {
+            let Some(id) = path.file_name().and_then(|id| id.to_str()).filter(|id| {
+                valid_id(id) && path.parent().is_some_and(|p| dirs.iter().any(|d| d == p))
+            }) else {
+                continue;
+            };
+            if db.agent(id)?.is_some() {
+                continue;
+            }
+            if let Err(e) = repo.worktree_remove_only(&path) {
+                tracing::warn!("can't remove worktree {}: {e:#}", path.display());
+                continue;
+            }
+            tracing::info!("removed orphaned worktree {}", path.display());
+            if let Some(branch) = branch {
+                checked_out.remove(&branch);
+            }
+            // Its agent may have switched it to another branch, or
+            // detached it; the session's branch is the one to delete.
+            let branch = session_branch(id);
+            if owned.contains(&branch) || checked_out.contains(&branch) {
+                continue;
+            }
+            match repo.branch_delete(&branch) {
+                Ok(()) => tracing::info!("deleted orphaned branch {branch}"),
+                Err(e) => tracing::warn!("can't delete branch {branch}: {e:#}"),
+            }
+        }
+    }
+    // Only the `owner/name` levels; the worktrees themselves are gone.
+    for owner in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for name in std::fs::read_dir(owner.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let _ = std::fs::remove_dir(name.path());
+        }
+        let _ = std::fs::remove_dir(owner.path());
+    }
+    Ok(())
+}
+
 impl Agents {
     /// Marks the sessions that were running when the server last stopped as
     /// interrupted. With `slices`, each session's processes go into their
@@ -571,7 +642,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     };
 
     let id = uuid();
-    let branch = format!("grenadine/agent/{}", &id[..8]);
+    let branch = session_branch(&id);
     let worktree = state.agents.worktrees.join(&req.repo).join(&id);
     let base_sha = {
         let _guard = cloned.git_lock.lock().await;
@@ -724,6 +795,15 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     let Some(session) = state.db.agent(id)? else {
         return Ok(false);
     };
+    // Without its clone the worktree and branch would stay behind with
+    // nothing left to find them by.
+    let cloned = state.repos.get(&session.repo).cloned();
+    if cloned.is_none() && Path::new(&session.worktree).exists() {
+        bail!(
+            "{repo} isn't configured; restart the server with --repo for {repo} to delete this session",
+            repo = session.repo
+        );
+    }
     // The transcript goes with the session; the scan reads it after.
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
@@ -746,7 +826,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         let worktree = worktree.clone();
         tokio::task::spawn_blocking(move || stop_processes_in(&worktree)).await?
     };
-    if let Some(cloned) = state.repos.get(&session.repo).cloned() {
+    if let Some(cloned) = cloned {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
         let worktree = PathBuf::from(&session.worktree);
@@ -2025,6 +2105,104 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
         assert!(delete(&state, &session.id).await.unwrap());
         assert!(!alive(pid));
+    }
+
+    /// A session row with its worktree at `worktree`, never started.
+    fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            repo: repo.into(),
+            pr: None,
+            title: "t".into(),
+            summary: None,
+            branch: session_branch(id),
+            worktree: worktree.to_string_lossy().into_owned(),
+            base_sha: "0".repeat(40),
+            status: AgentStatus::Idle,
+            created_at: now(),
+            cost_usd: 0.0,
+            context_tokens: None,
+            context_window: None,
+            model: None,
+            landed: None,
+        }
+    }
+
+    /// A session whose repo isn't configured can't be deleted while its
+    /// worktree is there, since nothing would remove it.
+    #[tokio::test]
+    async fn delete_keeps_a_session_whose_repo_isnt_configured() {
+        let state = crate::sync::test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let there = uuid();
+        state
+            .db
+            .create_agent(&session_row(&there, "owner/gone", dir.path()))
+            .unwrap();
+        let err = delete(&state, &there).await.unwrap_err().to_string();
+        assert!(err.contains("owner/gone isn't configured"), "{err}");
+        assert!(state.db.agent(&there).unwrap().is_some());
+
+        let gone = uuid();
+        state
+            .db
+            .create_agent(&session_row(&gone, "owner/gone", &dir.path().join("x")))
+            .unwrap();
+        assert!(delete(&state, &gone).await.unwrap());
+        assert!(state.db.agent(&gone).unwrap().is_none());
+    }
+
+    /// Worktrees no session owns go at startup with their branches, even
+    /// when detached; the sessions' worktrees and everything outside the
+    /// worktrees directory stay.
+    #[test]
+    fn removes_orphaned_worktrees() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let worktrees = dir.path().join("worktrees");
+        let repo_dir = worktrees.join("owner/name");
+        let db = crate::db::Db::in_memory();
+        let repos = [(
+            fx.clone.slug.clone(),
+            Arc::new(crate::sync::ClonedRepo {
+                repo: fx.clone.clone(),
+                git_lock: tokio::sync::Mutex::new(()),
+            }),
+        )]
+        .into_iter()
+        .collect();
+        let has_branch = |b: &str| {
+            let r = format!("refs/heads/{b}");
+            fx.clone.refs(&r).unwrap().contains_key(&r)
+        };
+
+        let (owned, orphan, detached) = (uuid(), uuid(), uuid());
+        for id in [&owned, &orphan, &detached] {
+            fx.clone
+                .worktree_add(&repo_dir.join(id), &session_branch(id), "HEAD")
+                .unwrap();
+        }
+        run(&repo_dir.join(&detached), &["checkout", "-q", "--detach"]);
+        db.create_agent(&session_row(&owned, "owner/name", &repo_dir.join(&owned)))
+            .unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fx.clone
+            .worktree_add(&elsewhere, "grenadine/agent/other", "HEAD")
+            .unwrap();
+        std::fs::create_dir_all(worktrees.join("owner/empty")).unwrap();
+
+        remove_orphaned_worktrees(&db, &repos, &worktrees).unwrap();
+        assert!(repo_dir.join(&owned).exists());
+        assert!(has_branch(&session_branch(&owned)));
+        for id in [&orphan, &detached] {
+            assert!(!repo_dir.join(id).exists(), "{id}");
+            assert!(!has_branch(&session_branch(id)), "{id}");
+        }
+        assert!(elsewhere.exists());
+        assert!(has_branch("grenadine/agent/other"));
+        assert!(!worktrees.join("owner/empty").exists());
+        assert_eq!(fx.clone.worktrees().unwrap().len(), 3);
     }
 
     /// A worktree's output bases are those of the workspaces in it, even
