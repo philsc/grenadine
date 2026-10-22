@@ -437,6 +437,9 @@ pub struct AgentSession {
 pub struct AgentPrs {
     pub merged: u32,
     pub total: u32,
+    /// How many of the open ones conflict with their bases.
+    #[serde(default)]
+    pub conflicting: u32,
 }
 
 /// How Claude Code decides about tool uses during a turn; the user picks

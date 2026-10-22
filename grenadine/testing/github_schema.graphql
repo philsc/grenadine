@@ -51,6 +51,12 @@ enum PullRequestState {
   MERGED
 }
 
+enum MergeableState {
+  MERGEABLE
+  CONFLICTING
+  UNKNOWN
+}
+
 type PullRequestConnection {
   nodes: [PullRequest]
 }
@@ -61,6 +67,7 @@ type PullRequest {
   body: String!
   url: URI!
   state: PullRequestState!
+  mergeable: MergeableState!
   isDraft: Boolean!
   createdAt: DateTime!
   updatedAt: DateTime!

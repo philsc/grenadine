@@ -242,6 +242,13 @@ const MIGRATIONS: &[Migration] = &[
 "#,
     ),
     Migration::BackfillAgentPrs,
+    Migration::Sql(
+        r#"
+    -- Whether the PR conflicted with its base at the last poll that could
+    -- tell.
+    ALTER TABLE agent_prs ADD COLUMN conflicting INTEGER NOT NULL DEFAULT 0;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -976,12 +983,20 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records the state of a PR that sessions opened. Returns whether it
-    /// changed.
-    pub fn set_agent_pr_state(&self, key: &PrKey, state: &str) -> Result<bool> {
+    /// Records the state of a PR that sessions opened and whether it
+    /// conflicts with its base; `None` keeps what's recorded. Returns
+    /// whether either changed.
+    pub fn set_agent_pr_state(
+        &self,
+        key: &PrKey,
+        state: &str,
+        conflicting: Option<bool>,
+    ) -> Result<bool> {
         Ok(self.conn().execute(
-            "UPDATE agent_prs SET state = ?1 WHERE repo = ?2 AND number = ?3 AND state != ?1",
-            params![state, key.repo, key.number],
+            "UPDATE agent_prs SET state = ?1, conflicting = COALESCE(?4, conflicting)
+             WHERE repo = ?2 AND number = ?3
+               AND (state != ?1 OR conflicting != COALESCE(?4, conflicting))",
+            params![state, key.repo, key.number, conflicting],
         )? > 0)
     }
 
@@ -1113,7 +1128,9 @@ const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_
      created_at, cost_usd, context_tokens, context_window, landed, model, summary, \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state = 'MERGED'), \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state != 'CLOSED'), \
-     (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id)";
+     (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id), \
+     (SELECT COUNT(*) FROM agent_prs p \
+      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting)";
 
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
@@ -1137,6 +1154,7 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         prs: (r.get::<_, u32>(17)? > 0).then_some(AgentPrs {
             merged: r.get(15)?,
             total: r.get(16)?,
+            conflicting: r.get(18)?,
         }),
     })
 }
@@ -1717,34 +1735,33 @@ mod tests {
         // Again, as a stale state, which changes nothing.
         db.add_agent_pr("a", &key(1), "MERGED").unwrap();
         db.add_agent_pr("b", &key(2), "OPEN").unwrap();
-        assert_eq!(
-            prs("a"),
+        let counts = |merged, total, conflicting| {
             Some(AgentPrs {
-                merged: 0,
-                total: 3
+                merged,
+                total,
+                conflicting,
             })
-        );
+        };
+        assert_eq!(prs("a"), counts(0, 3, 0));
         assert_eq!(db.open_agent_prs().unwrap(), [key(1), key(2), key(3)]);
 
-        assert!(db.set_agent_pr_state(&key(1), "MERGED").unwrap());
-        assert!(!db.set_agent_pr_state(&key(1), "MERGED").unwrap());
-        assert!(db.set_agent_pr_state(&key(2), "MERGED").unwrap());
+        // PR 2 conflicts, and it still does while GitHub can't tell.
+        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(true)).unwrap());
+        assert!(!db.set_agent_pr_state(&key(2), "OPEN", None).unwrap());
+        assert_eq!(prs("a"), counts(0, 3, 1));
+        assert_eq!(prs("b"), counts(0, 1, 1));
+        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(false)).unwrap());
+        assert_eq!(prs("a"), counts(0, 3, 0));
+        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(true)).unwrap());
+
+        assert!(db.set_agent_pr_state(&key(1), "MERGED", None).unwrap());
+        assert!(!db.set_agent_pr_state(&key(1), "MERGED", None).unwrap());
+        // Only open PRs count as conflicting.
+        assert!(db.set_agent_pr_state(&key(2), "MERGED", None).unwrap());
         // A PR closed without merging counts in neither number.
-        assert!(db.set_agent_pr_state(&key(3), "CLOSED").unwrap());
-        assert_eq!(
-            prs("a"),
-            Some(AgentPrs {
-                merged: 2,
-                total: 2
-            })
-        );
-        assert_eq!(
-            prs("b"),
-            Some(AgentPrs {
-                merged: 1,
-                total: 1
-            })
-        );
+        assert!(db.set_agent_pr_state(&key(3), "CLOSED", None).unwrap());
+        assert_eq!(prs("a"), counts(2, 2, 0));
+        assert_eq!(prs("b"), counts(1, 1, 0));
         assert_eq!(db.open_agent_prs().unwrap(), []);
 
         db.delete_agent("a").unwrap();

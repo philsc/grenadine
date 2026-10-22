@@ -1020,6 +1020,17 @@ class AgentTest(ServerTestCase):
         follow_up.press("Enter")
         expect(count).to_have_text("0/2")
 
+        # The count turns red while a PR conflicts with its base.
+        conflict = re.compile(r"\bconflict\b")
+        a.conflicting = True
+        expect(count).to_have_class(conflict, timeout=15_000)
+        expect(count).to_have_attribute(
+            "title", "0 of 2 PRs merged, 1 with conflicts"
+        )
+        a.conflicting = False
+        expect(count).not_to_have_class(conflict, timeout=15_000)
+        expect(count).to_have_attribute("title", "0 of 2 PRs merged")
+
         # The next poll sees the merge.
         repo.merge(a)
         expect(count).to_have_text("1/2", timeout=15_000)
