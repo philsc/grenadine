@@ -1067,6 +1067,31 @@ class AgentTest(ServerTestCase):
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
         expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
 
+    def test_approved_mode_survives_leaving_the_session(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("make a plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        question = transcript.locator(".approval.questions")
+        question.get_by_label("todo.txt").check()
+        question.get_by_role("button", name="Answer").click()
+        plan = transcript.locator(".approval.plan")
+        plan.get_by_label("After the plan").select_option(label="Accept edits")
+        plan.get_by_role("button", name="Approve plan").click()
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        permissions = self.page.get_by_label("Permissions")
+        expect(permissions).to_have_value("acceptEdits")
+        session = self.page.url
+
+        # The form for a new session starts out planning, but that doesn't
+        # change what the session's follow-ups go with.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(permissions).to_have_value("plan")
+        self.page.goto(session)
+        expect(permissions).to_have_value("acceptEdits")
+        self.page.reload()
+        expect(permissions).to_have_value("acceptEdits")
+
 
 class CleanupTest(ServerTestCase):
     @classmethod
