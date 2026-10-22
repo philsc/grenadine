@@ -726,6 +726,7 @@ pub fn interrupt(state: &State, id: &str) {
             AgentEventKind::ApprovalResolved {
                 id: tool_use,
                 allow: false,
+                message: None,
             },
         );
     }
@@ -772,6 +773,11 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
         return Ok(false);
     };
     let allow = decision.allow;
+    let message = if allow {
+        None
+    } else {
+        decision.message.clone()
+    };
     if tx.send(decision).is_err() {
         return Ok(false);
     }
@@ -781,6 +787,7 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
         AgentEventKind::ApprovalResolved {
             id: tool_use.to_owned(),
             allow,
+            message,
         },
     )?;
     if !still_pending {

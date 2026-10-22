@@ -1157,7 +1157,9 @@ fn Transcript(
             events
                 .iter()
                 .filter_map(|e| match &e.kind {
-                    AgentEventKind::ApprovalResolved { id, allow } => Some((id.clone(), *allow)),
+                    AgentEventKind::ApprovalResolved { id, allow, .. } => {
+                        Some((id.clone(), *allow))
+                    }
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>()
@@ -1228,7 +1230,8 @@ fn Transcript(
                     let repo = repo.clone();
                     let id = id.clone();
                     match e.kind {
-                        AgentEventKind::Prompt(p) => view! {
+                        AgentEventKind::Prompt(p)
+                        | AgentEventKind::ApprovalResolved { message: Some(p), .. } => view! {
                             <div class="turn-prompt">{p}</div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
@@ -1391,13 +1394,12 @@ fn PlanCard(
     let answer = {
         let tool = tool.clone();
         move |allow: bool| {
-            let message = Some(feedback.get_untracked())
-                .filter(|f| !f.trim().is_empty())
-                .unwrap_or_else(|| "The user wants you to keep planning.".into());
+            // Without feedback the server tells Claude to keep planning.
+            let message = Some(feedback.get_untracked()).filter(|f| !f.trim().is_empty());
             let approval = Approval {
                 id: tool.clone(),
                 allow,
-                message: (!allow).then_some(message),
+                message: message.filter(|_| !allow),
                 mode: allow.then(|| then.get_untracked()),
                 answers: None,
             };
@@ -1520,7 +1522,7 @@ fn QuestionCard(
             let approval = Approval {
                 id: tool.clone(),
                 allow,
-                message: (!allow).then(|| "The user didn't answer.".into()),
+                message: None,
                 mode: None,
                 answers: allow.then(answers),
             };
