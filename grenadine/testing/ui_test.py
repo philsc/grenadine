@@ -835,6 +835,39 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(re.compile(r"#/agents$"))
         expect(sessions.filter(has_text="say two")).to_have_count(0)
 
+    def test_follow_up_draft_survives_switching_sessions(self) -> None:
+        sessions = self.section(scenarios.REPO).locator(".agent-item")
+        transcript = self.page.locator(".transcript")
+        for prompt in ["say left", "say right"]:
+            self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+            self.page.get_by_label("Permissions").select_option(label="Auto")
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+            expect(transcript.locator(".turn-end")).to_have_count(1)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("half a thought")
+
+        # Each session keeps its own draft.
+        sessions.filter(has_text="say left").click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say left"])
+        expect(follow_up).to_have_value("")
+        sessions.filter(has_text="say right").click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say right"])
+        expect(follow_up).to_have_value("half a thought")
+
+        # The draft survives a reload too, until it's sent.
+        self.page.reload()
+        expect(follow_up).to_have_value("half a thought")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-prompt")).to_have_text(
+            ["say right", "half a thought"]
+        )
+        expect(follow_up).to_have_value("")
+        self.page.reload()
+        expect(transcript.locator(".turn-prompt")).to_have_count(2)
+        expect(follow_up).to_have_value("")
+
     def test_unstaged_changes_pane(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")

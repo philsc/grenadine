@@ -119,7 +119,12 @@ fn delete_session(
     }
     spawn_local(async move {
         match api::delete_agent(&id).await {
-            Ok(()) => deleted(),
+            Ok(()) => {
+                if let Some(s) = storage() {
+                    let _ = s.remove_item(&draft_key(&id));
+                }
+                deleted()
+            }
             Err(e) => failed(e),
         }
     });
@@ -583,6 +588,34 @@ fn model_signal() -> RwSignal<String> {
         }
     });
     model
+}
+
+/// Where a session's half-written follow-up is kept, so it survives
+/// switching to another session and back.
+fn draft_key(id: &str) -> String {
+    format!("grenadine.agent-draft.{id}")
+}
+
+/// The follow-up being written in session `id`: the draft left there last,
+/// kept as it changes and dropped once empty.
+fn draft_signal(id: &str) -> RwSignal<String> {
+    let key = draft_key(id);
+    let draft = RwSignal::new(
+        storage()
+            .and_then(|s| s.get_item(&key).ok().flatten())
+            .unwrap_or_default(),
+    );
+    Effect::new(move |_| {
+        let Some(s) = storage() else { return };
+        draft.with(|d| {
+            let _ = if d.trim().is_empty() {
+                s.remove_item(&key)
+            } else {
+                s.set_item(&key, d)
+            };
+        });
+    });
+    draft
 }
 
 /// The model a request asks for; `None` leaves it to Claude Code.
@@ -1688,7 +1721,8 @@ fn Composer(
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
 ) -> impl IntoView {
-    let prompt = RwSignal::new(String::new());
+    let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
+    let prompt = id.with_value(|id| draft_signal(id));
     let error = RwSignal::new(None::<String>);
     let working = move || {
         session.with(|s| {
@@ -1698,7 +1732,6 @@ fn Composer(
             )
         })
     };
-    let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
 
     let send = move || {
         let text = prompt.get_untracked();
