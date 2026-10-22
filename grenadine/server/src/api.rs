@@ -555,6 +555,7 @@ mod tests {
                 context_window: None,
                 model: None,
                 landed: None,
+                prs: None,
             })
             .unwrap();
         let get = |id: &str| agent_changes(AxState(state.clone()), Path(id.to_owned()));

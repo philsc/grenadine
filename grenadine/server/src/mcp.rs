@@ -197,6 +197,7 @@ mod tests {
                 context_window: None,
                 model: None,
                 landed: None,
+                prs: None,
             })
             .unwrap();
         state

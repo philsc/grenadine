@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Approval, CleanupState,
-    Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, WorktreeFile, WrapUp,
-    WrapUpTarget,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs, AgentSession, AgentStatus, Approval,
+    CleanupState, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
+    WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -147,6 +147,43 @@ fn TrashIcon() -> impl IntoView {
         >
             <path d="M2.5 4h11M6 4V2.5h4V4M3.8 4l.7 9.5h7l.7-9.5M6.6 6.5v4.5M9.4 6.5v4.5" />
         </svg>
+    }
+}
+
+#[component]
+fn PrIcon() -> impl IntoView {
+    view! {
+        <svg
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            <circle cx="4" cy="3.5" r="1.5" />
+            <circle cx="4" cy="12.5" r="1.5" />
+            <circle cx="12" cy="12.5" r="1.5" />
+            <path d="M4 5v6M12 11V6.5a2 2 0 0 0-2-2H7.5M9 3 7.5 4.5 9 6" />
+        </svg>
+    }
+}
+
+/// How many of the PRs a session opened are merged, e.g. "1/2". It turns
+/// purple once they all are, when the session is likely done.
+#[component]
+fn PrCount(prs: AgentPrs) -> impl IntoView {
+    let AgentPrs { merged, total } = prs;
+    let done = total > 0 && merged == total;
+    let noun = if total == 1 { "PR" } else { "PRs" };
+    view! {
+        <span class="agent-prs" class:done=done title=format!("{merged} of {total} {noun} merged")>
+            <PrIcon />
+            {format!("{merged}/{total}")}
+        </span>
     }
 }
 
@@ -487,7 +524,8 @@ fn RepoSessions(
                             if let Some(n) = a.pr {
                                 meta.insert(0, format!("#{n}"));
                             }
-                            if let Some(landed) = &a.landed {
+                            // The PR count covers a wrap-up's PR.
+                            if let Some(landed @ Landed::Checkout { .. }) = &a.landed {
                                 meta.push(landed_label(landed));
                             }
                             view! {
@@ -496,6 +534,7 @@ fn RepoSessions(
                                         <span class="agent-title" title=a.title.clone()>{label}</span>
                                         <span class="agent-status-line">
                                             <StatusBadge status=a.status />
+                                            {a.prs.map(|prs| view! { <PrCount prs /> })}
                                             <span class="agent-meta muted">{meta.join(" · ")}</span>
                                         </span>
                                     </a>
@@ -1915,6 +1954,7 @@ mod tests {
             context_window: None,
             model: None,
             landed: None,
+            prs: None,
         }
     }
 

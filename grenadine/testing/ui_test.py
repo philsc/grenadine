@@ -128,6 +128,10 @@ if "write" in prompt:
         result(tool_use, "Wrote notes.txt", patch=patch)
     else:
         result(tool_use, decision["message"], is_error=True)
+# `open pr URL` has it open a PR with gh, which prints the PR's URL.
+if prompt.startswith("open pr "):
+    tool_use = use("Bash", {"command": "gh pr create --fill"})
+    result(tool_use, prompt.removeprefix("open pr ") + "\n")
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -172,6 +176,8 @@ class ServerTestCase(unittest.TestCase):
 
     # The repositories the server is started with; `load` creates them.
     REPOS: ClassVar[list[str]] = [scenarios.REPO]
+    # Seconds between the server's polls of GitHub.
+    POLL_INTERVAL: ClassVar[int] = 60
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -227,6 +233,7 @@ class ServerTestCase(unittest.TestCase):
                 f"--port={port}",
                 f"--db={tmp / 'grenadine.db'}",
                 f"--github-api={api}",
+                f"--poll-interval={cls.POLL_INTERVAL}",
             ],
             env=env,
         )
@@ -628,6 +635,8 @@ class VersionsTest(ServerTestCase):
 class AgentTest(ServerTestCase):
     OTHER_REPO = "test/other"
     REPOS: ClassVar[list[str]] = [scenarios.REPO, OTHER_REPO]
+    # Sessions' PRs merge and close between polls.
+    POLL_INTERVAL: ClassVar[int] = 1
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -970,10 +979,55 @@ class AgentTest(ServerTestCase):
         )
         expect(opened.get_by_role("link")).to_have_attribute("href", pr.url)
         expect(header.get_by_role("link", name=f"PR #{pr.number}")).to_be_visible()
+        # The sidebar counts the PR, which isn't merged yet.
+        entry = (
+            self.section(self.OTHER_REPO)
+            .locator(".agent-entry")
+            .filter(has=self.page.locator(".agent-item.selected"))
+        )
+        expect(entry.locator(".agent-prs")).to_have_text("0/1")
         self.assertEqual(pr.base, "main")
         self.assertTrue(pr.head.startswith("grenadine/agent/"))
         # The checkout stays where the first wrap-up left it.
         self.assertEqual(git("rev-parse", "HEAD"), sha)
+
+    def test_sidebar_shows_merged_prs(self) -> None:
+        repo = self.gh.repo(self.OTHER_REPO)
+        prs = []
+        for name in ["count-a", "count-b"]:
+            repo.checkout(name, "main")
+            repo.commit(name, {f"{name}.txt": name})
+            repo.push(name)
+            prs.append(repo.open_pr(name, head=name))
+        a, b = prs
+
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill(f"open pr {a.url}")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        entry = (
+            self.section(self.OTHER_REPO)
+            .locator(".agent-entry")
+            .filter(has_text=f"open pr {a.url}")
+        )
+        count = entry.locator(".agent-prs")
+        expect(count).to_have_text("0/1")
+        expect(count).to_have_attribute("title", "0 of 1 PR merged")
+
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill(f"open pr {b.url}")
+        follow_up.press("Enter")
+        expect(count).to_have_text("0/2")
+
+        # The next poll sees the merge.
+        repo.merge(a)
+        expect(count).to_have_text("1/2", timeout=15_000)
+        expect(count).not_to_have_class(re.compile(r"\bdone\b"))
+        # A PR closed without merging counts in neither number.
+        repo.close(b)
+        expect(count).to_have_text("1/1", timeout=15_000)
+        expect(count).to_have_class(re.compile(r"\bdone\b"))
 
     def test_plan_mode(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
