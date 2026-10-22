@@ -894,6 +894,15 @@ class AgentTest(ServerTestCase):
         expect(pane.locator("table.diff.unified tr.add .code")).to_have_text(
             ["write a note"]
         )
+        # The sidebar counts the files too.
+        entry = (
+            self.section(self.OTHER_REPO)
+            .locator(".agent-entry")
+            .filter(has=self.page.locator(".agent-item.selected"))
+        )
+        count = entry.locator(".agent-unstaged")
+        expect(count).to_have_text("1")
+        expect(count).to_have_attribute("title", "1 file with unstaged changes")
 
         # Edits made since show up with the agent's next events.
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
@@ -904,6 +913,8 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
         expect(files.locator(".status")).to_have_text(["modified", "added"])
+        expect(count).to_have_text("2")
+        expect(count).to_have_attribute("title", "2 files with unstaged changes")
         expect(files.first.locator("tr.add .code")).to_have_text(["world"])
         expect(files.nth(1).locator("tr.add .code")).to_have_text(["write more"])
 
@@ -1014,6 +1025,8 @@ class AgentTest(ServerTestCase):
         count = entry.locator(".agent-prs")
         expect(count).to_have_text("0/1")
         expect(count).to_have_attribute("title", "0 of 1 PR merged")
+        # The session changed no files.
+        expect(entry.locator(".agent-unstaged")).to_have_count(0)
 
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill(f"open pr {b.url}")

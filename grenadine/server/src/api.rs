@@ -275,7 +275,30 @@ async fn repos(AxState(state): St) -> Json<Vec<String>> {
 }
 
 async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
-    Ok(Json(state.db.agents()?))
+    Ok(Json(with_unstaged(&state, state.db.agents()?).await?))
+}
+
+/// Counts the unstaged changes in the sessions' worktrees. A worktree git
+/// can't look at counts none, since the count isn't worth failing over.
+async fn with_unstaged(state: &State, sessions: Vec<AgentSession>) -> ApiResult<Vec<AgentSession>> {
+    let repos: Vec<_> = sessions.iter().map(|s| state.repo(&s.repo)).collect();
+    Ok(tokio::task::spawn_blocking(move || {
+        sessions
+            .into_iter()
+            .zip(repos)
+            .map(|(mut session, repo)| {
+                let worktree = std::path::Path::new(&session.worktree);
+                if let Some(repo) = repo.filter(|_| worktree.is_dir()) {
+                    match repo.worktree_unstaged_count(worktree) {
+                        Ok(n) => session.unstaged = n.try_into().unwrap_or(u32::MAX),
+                        Err(e) => tracing::warn!("agent {}: {e:#}", session.id),
+                    }
+                }
+                session
+            })
+            .collect()
+    })
+    .await?)
 }
 
 /// The models prompts may ask for, as Claude Code lists them.
@@ -338,7 +361,7 @@ fn find_agent(state: &State, id: &str) -> ApiResult<Option<AgentSession>> {
 
 async fn agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     Ok(match find_agent(&state, &id)? {
-        Some(a) => Json(a).into_response(),
+        Some(a) => Json(with_unstaged(&state, vec![a]).await?.remove(0)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     })
 }
@@ -556,6 +579,7 @@ mod tests {
                 model: None,
                 landed: None,
                 prs: None,
+                unstaged: 0,
             })
             .unwrap();
         let get = |id: &str| agent_changes(AxState(state.clone()), Path(id.to_owned()));
@@ -565,10 +589,20 @@ mod tests {
         let changes: WorktreeChanges = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(changes.files.len(), 1);
         assert_eq!(changes.files[0].change.path(), "a");
+        // The listing counts them.
+        let unstaged = || async {
+            let Json(list) = agents(AxState(state.clone()))
+                .await
+                .map_err(|e| e.0)
+                .unwrap();
+            list[0].unstaged
+        };
+        assert_eq!(unstaged().await, 1);
 
         std::fs::remove_dir_all(&worktree).unwrap();
         let response = get(id).await.map_err(|e| e.0).unwrap();
         assert_eq!(body(response).await, r#"{"files":[]}"#);
+        assert_eq!(unstaged().await, 0);
 
         let response = get("00000000-0000-0000-0000-000000000001")
             .await

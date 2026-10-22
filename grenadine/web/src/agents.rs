@@ -188,6 +188,39 @@ fn PrCount(prs: AgentPrs) -> impl IntoView {
 }
 
 #[component]
+fn FileDiffIcon() -> impl IntoView {
+    view! {
+        <svg
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z" />
+            <path d="M9.5 1.5V5H13M8 6.5v4M6 8.5h4M6 12.5h4" />
+        </svg>
+    }
+}
+
+/// How many files in the session's worktree have unstaged changes, i.e.
+/// work it hasn't committed yet.
+#[component]
+fn UnstagedCount(count: u32) -> impl IntoView {
+    let noun = if count == 1 { "file" } else { "files" };
+    view! {
+        <span class="agent-unstaged" title=format!("{count} {noun} with unstaged changes")>
+            <FileDiffIcon />
+            {count}
+        </span>
+    }
+}
+
+#[component]
 fn StatusBadge(status: AgentStatus) -> impl IntoView {
     view! { <span class=status_class(status)>{status_label(status)}</span> }
 }
@@ -534,6 +567,7 @@ fn RepoSessions(
                                         <span class="agent-title" title=a.title.clone()>{label}</span>
                                         <span class="agent-status-line">
                                             <StatusBadge status=a.status />
+                                            {(a.unstaged > 0).then(|| view! { <UnstagedCount count=a.unstaged /> })}
                                             {a.prs.map(|prs| view! { <PrCount prs /> })}
                                             <span class="agent-meta muted">{meta.join(" · ")}</span>
                                         </span>
@@ -1955,6 +1989,7 @@ mod tests {
             model: None,
             landed: None,
             prs: None,
+            unstaged: 0,
         }
     }
 

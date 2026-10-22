@@ -198,6 +198,7 @@ mod tests {
                 model: None,
                 landed: None,
                 prs: None,
+                unstaged: 0,
             })
             .unwrap();
         state

@@ -429,6 +429,10 @@ pub struct AgentSession {
     /// The PRs the session opened; `None` when it opened none.
     #[serde(default)]
     pub prs: Option<AgentPrs>,
+    /// How many files in the worktree have unstaged changes, as
+    /// `WorktreeChanges` has them; 0 once the worktree is gone.
+    #[serde(default)]
+    pub unstaged: u32,
 }
 
 /// How far the PRs an agent session opened have come. PRs closed without
