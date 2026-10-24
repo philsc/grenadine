@@ -360,6 +360,28 @@ impl Repo {
         Ok(files)
     }
 
+    /// How many files `worktree_changes` would list, roughly: it doesn't
+    /// read the files, so symlinks and submodules count too.
+    pub fn worktree_unstaged_count(&self, path: &Path) -> Result<usize> {
+        let changed = self.git_in(path, &["--no-optional-locks", "diff", "--name-only", "-z"])?;
+        let untracked = self.git_in(
+            path,
+            &[
+                "--no-optional-locks",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+        )?;
+        let paths: std::collections::HashSet<&str> = changed
+            .split('\0')
+            .chain(untracked.split('\0'))
+            .filter(|p| !p.is_empty())
+            .collect();
+        Ok(paths.len())
+    }
+
     /// Rebases the commits after `upstream` in the worktree at `path` onto
     /// `onto`. A rebase that stops, e.g. at a conflict, is aborted and
     /// returns false.
@@ -891,6 +913,7 @@ pub(crate) mod tests {
         commit(&path, "c", "c\n");
         commit(&path, "d", "d\n");
         assert!(f.clone.worktree_changes(&path).unwrap().is_empty());
+        assert_eq!(f.clone.worktree_unstaged_count(&path).unwrap(), 0);
 
         std::fs::write(path.join("a"), "1\n2\n").unwrap();
         std::fs::remove_file(path.join("b")).unwrap();
@@ -906,6 +929,8 @@ pub(crate) mod tests {
         std::fs::write(path.join("ignored"), "x\n").unwrap();
         std::os::unix::fs::symlink("a", path.join("link")).unwrap();
 
+        // The listed files, and the symlink.
+        assert_eq!(f.clone.worktree_unstaged_count(&path).unwrap(), 7);
         let files = f.clone.worktree_changes(&path).unwrap();
         let text = |b: &Option<Blob>| b.as_ref().map(|b| b.text.clone());
         let summary: Vec<_> = files

@@ -122,6 +122,7 @@ fn delete_session(
             Ok(()) => {
                 if let Some(s) = storage() {
                     let _ = s.remove_item(&draft_key(&id));
+                    let _ = s.remove_item(&mode_key(&id));
                 }
                 deleted()
             }
@@ -193,6 +194,39 @@ fn PrCount(prs: AgentPrs) -> impl IntoView {
         <span class="agent-prs" class:done=done class:conflict=conflict title=title>
             <PrIcon />
             {format!("{merged}/{total}")}
+        </span>
+    }
+}
+
+#[component]
+fn FileDiffIcon() -> impl IntoView {
+    view! {
+        <svg
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M9.5 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5z" />
+            <path d="M9.5 1.5V5H13M8 6.5v4M6 8.5h4M6 12.5h4" />
+        </svg>
+    }
+}
+
+/// How many files in the session's worktree have unstaged changes, i.e.
+/// work it hasn't committed yet.
+#[component]
+fn UnstagedCount(count: u32) -> impl IntoView {
+    let noun = if count == 1 { "file" } else { "files" };
+    view! {
+        <span class="agent-unstaged" title=format!("{count} {noun} with unstaged changes")>
+            <FileDiffIcon />
+            {count}
         </span>
     }
 }
@@ -384,7 +418,13 @@ pub fn CleanupView() -> impl IntoView {
         error.set(None);
         spawn_local(async move {
             match api::create_cleanup_session(&req).await {
-                Ok(session) => go(&agent_hash(&session.id)),
+                Ok(session) => {
+                    // The server starts it out planning.
+                    if let Some(s) = storage() {
+                        let _ = s.set_item(&mode_key(&session.id), PermissionMode::Plan.as_str());
+                    }
+                    go(&agent_hash(&session.id));
+                }
                 Err(e) => error.set(Some(e)),
             }
             busy.set(false);
@@ -544,6 +584,7 @@ fn RepoSessions(
                                         <span class="agent-title" title=a.title.clone()>{label}</span>
                                         <span class="agent-status-line">
                                             <StatusBadge status=a.status />
+                                            {(a.unstaged > 0).then(|| view! { <UnstagedCount count=a.unstaged /> })}
                                             {a.prs.map(|prs| view! { <PrCount prs /> })}
                                             <span class="agent-meta muted">{meta.join(" · ")}</span>
                                         </span>
@@ -566,21 +607,27 @@ fn RepoSessions(
     }
 }
 
-const MODE_KEY: &str = "grenadine.agent-permission-mode";
+/// Where the permission mode a session's next prompt goes with is kept.
+/// Each session has its own, so that starting one in plan mode doesn't
+/// change what the others go on with.
+fn mode_key(id: &str) -> String {
+    format!("grenadine.agent-permission-mode.{id}")
+}
 
-/// The permission mode the next prompt goes with: `initial` if given,
-/// otherwise the last one picked, Auto at first.
-fn mode_signal(initial: Option<PermissionMode>) -> RwSignal<PermissionMode> {
-    let mode = RwSignal::new(initial.unwrap_or_else(|| {
+/// The permission mode the session's next prompt goes with: the last one
+/// picked for it, Auto at first.
+fn mode_signal(id: &str) -> RwSignal<PermissionMode> {
+    let key = mode_key(id);
+    let mode = RwSignal::new(
         storage()
-            .and_then(|s| s.get_item(MODE_KEY).ok().flatten())
+            .and_then(|s| s.get_item(&key).ok().flatten())
             .and_then(|v| PermissionMode::parse(&v))
-            .unwrap_or(PermissionMode::Auto)
-    }));
+            .unwrap_or(PermissionMode::Auto),
+    );
     Effect::new(move |_| {
         let mode = mode.get();
         if let Some(s) = storage() {
-            let _ = s.set_item(MODE_KEY, mode.as_str());
+            let _ = s.set_item(&key, mode.as_str());
         }
     });
     mode
@@ -731,8 +778,8 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
     let repo = RwSignal::new(repo.unwrap_or_default());
     let number = RwSignal::new(pr.map(|n| n.to_string()).unwrap_or_default());
     let prompt = RwSignal::new(String::new());
-    // New sessions start out planning, whatever was picked last.
-    let mode = mode_signal(Some(PermissionMode::Plan));
+    // New sessions start out planning, whatever the others go on with.
+    let mode = RwSignal::new(PermissionMode::Plan);
     let model = model_signal();
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -772,7 +819,13 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
         error.set(None);
         spawn_local(async move {
             match api::create_agent(&req).await {
-                Ok(session) => go(&agent_hash(&session.id)),
+                Ok(session) => {
+                    // Its follow-ups go on in the mode it started in.
+                    if let Some(s) = storage() {
+                        let _ = s.set_item(&mode_key(&session.id), req.permission_mode.as_str());
+                    }
+                    go(&agent_hash(&session.id));
+                }
                 Err(e) => error.set(Some(e)),
             }
             busy.set(false);
@@ -981,7 +1034,7 @@ pub fn AgentView(id: String) -> impl IntoView {
     let live_model = RwSignal::new(None);
     follow(&id, events, streaming, live_usage, live_model);
     // Approving a plan also picks the mode the follow-ups go with.
-    let mode = mode_signal(None);
+    let mode = mode_signal(&id);
     let model = model_signal();
 
     view! {
@@ -1965,6 +2018,7 @@ mod tests {
             model: None,
             landed: None,
             prs: None,
+            unstaged: 0,
         }
     }
 

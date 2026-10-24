@@ -894,6 +894,15 @@ class AgentTest(ServerTestCase):
         expect(pane.locator("table.diff.unified tr.add .code")).to_have_text(
             ["write a note"]
         )
+        # The sidebar counts the files too.
+        entry = (
+            self.section(self.OTHER_REPO)
+            .locator(".agent-entry")
+            .filter(has=self.page.locator(".agent-item.selected"))
+        )
+        count = entry.locator(".agent-unstaged")
+        expect(count).to_have_text("1")
+        expect(count).to_have_attribute("title", "1 file with unstaged changes")
 
         # Edits made since show up with the agent's next events.
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
@@ -904,6 +913,8 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_count(2)
         expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
         expect(files.locator(".status")).to_have_text(["modified", "added"])
+        expect(count).to_have_text("2")
+        expect(count).to_have_attribute("title", "2 files with unstaged changes")
         expect(files.first.locator("tr.add .code")).to_have_text(["world"])
         expect(files.nth(1).locator("tr.add .code")).to_have_text(["write more"])
 
@@ -1014,6 +1025,8 @@ class AgentTest(ServerTestCase):
         count = entry.locator(".agent-prs")
         expect(count).to_have_text("0/1")
         expect(count).to_have_attribute("title", "0 of 1 PR merged")
+        # The session changed no files.
+        expect(entry.locator(".agent-unstaged")).to_have_count(0)
 
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill(f"open pr {b.url}")
@@ -1075,6 +1088,31 @@ class AgentTest(ServerTestCase):
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
         expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
+
+    def test_approved_mode_survives_leaving_the_session(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("make a plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        question = transcript.locator(".approval.questions")
+        question.get_by_label("todo.txt").check()
+        question.get_by_role("button", name="Answer").click()
+        plan = transcript.locator(".approval.plan")
+        plan.get_by_label("After the plan").select_option(label="Accept edits")
+        plan.get_by_role("button", name="Approve plan").click()
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        permissions = self.page.get_by_label("Permissions")
+        expect(permissions).to_have_value("acceptEdits")
+        session = self.page.url
+
+        # The form for a new session starts out planning, but that doesn't
+        # change what the session's follow-ups go with.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(permissions).to_have_value("plan")
+        self.page.goto(session)
+        expect(permissions).to_have_value("acceptEdits")
+        self.page.reload()
+        expect(permissions).to_have_value("acceptEdits")
 
 
 class CleanupTest(ServerTestCase):
