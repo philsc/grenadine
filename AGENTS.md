@@ -29,11 +29,13 @@ Use plain `bazel` commands. `.bazelrc` already configures what this repo needs. 
 | Rebuild the test repo    | `bazel run //grenadine/testing:create_test_repo -- --other-user=NAME --clone-dir=PATH [--recreate]` |
 | Lint                     | `bazel build --config=lint //...`                                                                   |
 | Check formatting         | `bazel run //:format.check`                                                                         |
-| Format files (user only) | `bazel run //:format [-- PATH...]`                                                                  |
+| Format files             | `bazel run //:format [-- PATH...]`                                                                  |
 
 `--config=lint` runs clippy on the Rust targets and ruff on the Python targets.
 
-`//:format.check` covers Rust, Python, Starlark, TOML, and, through prettier, HTML, CSS, Markdown, JSON, and GraphQL. It only reports problems. Report them instead of running `//:format`, since the user formats code themselves.
+`//:format` and `//:format.check` cover Rust, Python, Starlark, TOML, and, through prettier, HTML, CSS, Markdown, JSON, and GraphQL. `//:format.check` only reports problems.
+
+Before pushing commits for a PR, run `bazel run //:format`. If it changes any files, fold those changes into the commits before you push.
 
 ## Dependencies
 
