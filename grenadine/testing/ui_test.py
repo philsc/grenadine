@@ -1075,6 +1075,13 @@ class AgentTest(ServerTestCase):
         plans.get_by_role("button", name="Keep planning").click()
         expect(plans).to_have_count(2)
         expect(plans.first).to_contain_text("Plan sent back")
+        # The feedback stays in the transcript, between the two plans.
+        feedback = transcript.locator(".approval.plan ~ .turn-prompt")
+        expect(feedback).to_have_text("Add a title")
+        expect(transcript.locator(".turn-prompt ~ .approval.plan")).to_have_count(2)
+        expect(
+            transcript.locator(".approval.plan ~ .turn-prompt ~ .approval.plan")
+        ).to_have_count(1)
         revised = plans.nth(1)
         expect(revised.locator(".plan-text")).to_contain_text("Also: Add a title")
 

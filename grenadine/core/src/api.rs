@@ -625,6 +625,9 @@ pub enum AgentEventKind {
     ApprovalResolved {
         id: String,
         allow: bool,
+        /// What the user wrote when sending the request back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// A turn ended; `error` is set when it failed.
     TurnEnded {

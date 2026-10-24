@@ -64,6 +64,15 @@ fn allowed(
     answer
 }
 
+/// What Claude is told when the user denies a tool use without saying why.
+fn denied(tool_name: &str) -> &'static str {
+    match tool_name {
+        "ExitPlanMode" => "The user wants you to keep planning.",
+        "AskUserQuestion" => "The user didn't answer.",
+        _ => "The user denied this tool use.",
+    }
+}
+
 pub async fn handle(
     AxState(state): AxState<Arc<State>>,
     Path((id, secret)): Path<(String, String)>,
@@ -142,7 +151,7 @@ pub async fn handle(
                     ..
                 }) => json!({
                     "behavior": "deny",
-                    "message": message.unwrap_or_else(|| "The user denied this tool use.".into()),
+                    "message": message.unwrap_or_else(|| denied(tool_name).into()),
                 }),
                 None => json!({"behavior": "deny", "message": "Nobody answered the request."}),
             };
@@ -254,6 +263,21 @@ mod tests {
 
     /// Calls the tool the way Claude Code 2.1 does and answers on the page.
     async fn ask(state: &Arc<State>, tool_use: &str, allow: bool) -> Value {
+        let input = json!({"file_path": "/w/b.txt", "content": "hello\n"});
+        let decision = Decision {
+            allow,
+            ..Decision::default()
+        };
+        ask_with(state, tool_use, "Write", input, decision).await
+    }
+
+    async fn ask_with(
+        state: &Arc<State>,
+        tool_use: &str,
+        tool_name: &str,
+        input: Value,
+        decision: Decision,
+    ) -> Value {
         let secret = state.agents.secret(ID);
         let request = json!({
             "jsonrpc": "2.0",
@@ -262,8 +286,8 @@ mod tests {
             "params": {
                 "name": "approve",
                 "arguments": {
-                    "tool_name": "Write",
-                    "input": {"file_path": "/w/b.txt", "content": "hello\n"},
+                    "tool_name": tool_name,
+                    "input": input,
                     "tool_use_id": tool_use,
                 },
             },
@@ -278,10 +302,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let decision = Decision {
-            allow,
-            ..Decision::default()
-        };
         assert!(agent::approve(state, ID, tool_use, decision).unwrap());
         let (_, body) = task.await.unwrap();
         serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
@@ -323,7 +343,8 @@ mod tests {
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_1".into(),
-                    allow: true
+                    allow: true,
+                    message: None,
                 },
                 AgentEventKind::ApprovalRequested {
                     id: "toolu_2".into(),
@@ -332,10 +353,41 @@ mod tests {
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_2".into(),
-                    allow: false
+                    allow: false,
+                    message: None,
                 },
             ]
         );
+    }
+
+    /// A plan sent back keeps the user's feedback, and Claude hears to keep
+    /// planning when there is none.
+    #[tokio::test]
+    async fn plans_sent_back() {
+        let state = state();
+        let plan = json!({"plan": "# Plan"});
+        let feedback = Decision {
+            allow: false,
+            message: Some("Add a title".into()),
+            ..Decision::default()
+        };
+        let answer = ask_with(&state, "toolu_1", "ExitPlanMode", plan.clone(), feedback).await;
+        assert_eq!(answer["message"], "Add a title");
+        let silent = Decision::default();
+        let answer = ask_with(&state, "toolu_2", "ExitPlanMode", plan, silent).await;
+        assert_eq!(answer["message"], "The user wants you to keep planning.");
+
+        let resolved: Vec<_> = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::ApprovalResolved { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, [Some("Add a title".into()), None]);
     }
 
     /// The answers Claude Code 2.1 takes, as tried with a real `claude -p`.
