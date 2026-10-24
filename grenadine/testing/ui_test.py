@@ -1024,9 +1024,7 @@ class AgentTest(ServerTestCase):
         conflict = re.compile(r"\bconflict\b")
         a.conflicting = True
         expect(count).to_have_class(conflict, timeout=15_000)
-        expect(count).to_have_attribute(
-            "title", "0 of 2 PRs merged, 1 with conflicts"
-        )
+        expect(count).to_have_attribute("title", "0 of 2 PRs merged, 1 with conflicts")
         a.conflicting = False
         expect(count).not_to_have_class(conflict, timeout=15_000)
         expect(count).to_have_attribute("title", "0 of 2 PRs merged")
