@@ -679,6 +679,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         model: None,
         landed: None,
         prs: None,
+        unstaged: 0,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
@@ -2219,6 +2220,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             model: None,
             landed: None,
             prs: None,
+            unstaged: 0,
         }
     }
 

@@ -1138,6 +1138,8 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
             merged: r.get(15)?,
             total: r.get(16)?,
         }),
+        // The listing looks at the worktree for these.
+        unstaged: 0,
     })
 }
 
@@ -1611,6 +1613,7 @@ mod tests {
             model: None,
             landed: None,
             prs: None,
+            unstaged: 0,
         }
     }
 
