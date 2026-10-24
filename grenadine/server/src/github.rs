@@ -91,6 +91,16 @@ pub struct RefPr {
     pub merged_at: Option<String>,
 }
 
+/// Where a PR that `GitHub::pr_statuses` looked up stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrStatus {
+    /// OPEN, CLOSED or MERGED.
+    pub state: String,
+    /// Whether it conflicts with its base; `None` while GitHub is still
+    /// working that out.
+    pub conflicting: Option<bool>,
+}
+
 /// Parses an RFC 3339 timestamp into Unix seconds.
 pub fn unix(ts: &str) -> Result<i64> {
     Ok(DateTime::parse_from_rfc3339(ts)
@@ -729,10 +739,10 @@ impl GitHub {
         Ok(out)
     }
 
-    /// The states of PRs: OPEN, CLOSED or MERGED. PRs GitHub can't find,
-    /// e.g. in a repository the token can't see, are missing from the
-    /// result.
-    pub async fn pr_states(&self, keys: &[PrKey]) -> Result<BTreeMap<PrKey, String>> {
+    /// The states of PRs and whether they conflict with their bases. PRs
+    /// GitHub can't find, e.g. in a repository the token can't see, are
+    /// missing from the result.
+    pub async fn pr_statuses(&self, keys: &[PrKey]) -> Result<BTreeMap<PrKey, PrStatus>> {
         let mut out = BTreeMap::new();
         for chunk in keys.chunks(LOOKUP_BATCH) {
             let params = (0..chunk.len())
@@ -742,7 +752,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable }} }}\n"
                     )
                 })
                 .collect();
@@ -762,9 +772,22 @@ impl GitHub {
                 .await?;
             for (i, key) in chunk.iter().enumerate() {
                 let state = str_at(&data, &format!("/p{i}/pullRequest/state"));
-                if !state.is_empty() {
-                    out.insert(key.clone(), state.to_owned());
+                if state.is_empty() {
+                    continue;
                 }
+                // GitHub says UNKNOWN until it has tried merging.
+                let conflicting = match str_at(&data, &format!("/p{i}/pullRequest/mergeable")) {
+                    "CONFLICTING" => Some(true),
+                    "MERGEABLE" => Some(false),
+                    _ => None,
+                };
+                out.insert(
+                    key.clone(),
+                    PrStatus {
+                        state: state.to_owned(),
+                        conflicting,
+                    },
+                );
             }
         }
         Ok(out)

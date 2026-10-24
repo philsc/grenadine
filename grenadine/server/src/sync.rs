@@ -245,8 +245,10 @@ async fn refresh_agent_prs(state: &State) -> Result<()> {
         return Ok(());
     }
     let mut changed = false;
-    for (key, pr_state) in state.github.pr_states(&open).await? {
-        changed |= state.db.set_agent_pr_state(&key, &pr_state)?;
+    for (key, status) in state.github.pr_statuses(&open).await? {
+        changed |= state
+            .db
+            .set_agent_pr_state(&key, &status.state, status.conflicting)?;
     }
     if changed {
         state.send(ServerEvent::AgentsChanged);

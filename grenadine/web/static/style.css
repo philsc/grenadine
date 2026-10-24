@@ -1071,6 +1071,9 @@ textarea {
 .agent-prs.done {
   color: #8250df;
 }
+.agent-prs.conflict {
+  color: var(--error-fg);
+}
 .agent-unstaged {
   display: inline-flex;
   flex: none;

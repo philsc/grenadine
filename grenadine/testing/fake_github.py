@@ -106,6 +106,8 @@ class PullRequest:
     state: str = OPEN
     draft: bool = False
     merged_at: int | None = None
+    # Conflicts with its base.
+    conflicting: bool = False
     # In a merge queue.
     queued: bool = False
     # Users asked to review.
@@ -720,6 +722,7 @@ class FakeGitHub:
             "body": pr.body,
             "url": pr.url,
             "state": pr.state,
+            "mergeable": "CONFLICTING" if pr.conflicting else "MERGEABLE",
             "isDraft": pr.draft,
             "createdAt": iso(pr.created_at),
             "updatedAt": iso(pr.updated_at),
