@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
-use grenadine_core::api::{Person, PrKey, ReviewComment, Side, StackPr};
+use grenadine_core::api::{CiStatus, Person, PrKey, ReviewComment, Side, StackPr, ThreadCounts};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
@@ -47,6 +47,9 @@ pub struct Hit {
     pub url: String,
     pub updated_at: String,
     pub head_oid: String,
+    pub threads: ThreadCounts,
+    /// `None` when the head has no checks.
+    pub ci: Option<CiStatus>,
 }
 
 /// Everything about a PR that its sync needs from GraphQL.
@@ -134,6 +137,21 @@ pub fn search_query(filter: &str, repos: &[String]) -> String {
 }
 
 pub const SEARCH_LIMIT: usize = 100;
+
+/// What a search's PR fields are, beyond the PR's metadata: its review
+/// threads and the checks on its head.
+const SEARCH_STATUS_FIELDS: &str = "reviewThreads(first: 100) { totalCount nodes { isResolved } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
+
+/// Maps a `StatusState` of a commit's check rollup.
+fn ci_status(state: &str) -> Option<CiStatus> {
+    match state {
+        "SUCCESS" => Some(CiStatus::Passing),
+        "FAILURE" | "ERROR" => Some(CiStatus::Failing),
+        "PENDING" | "EXPECTED" => Some(CiStatus::Running),
+        _ => None,
+    }
+}
 
 const PR_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!) {
@@ -320,7 +338,7 @@ impl GitHub {
         for (i, q) in queries.iter().enumerate() {
             gql += &format!(
                 "s{i}: search(type: ISSUE_ADVANCED, query: $q{i}, first: {SEARCH_LIMIT}) {{
-                   nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner }} }} }}
+                   nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner }} {SEARCH_STATUS_FIELDS} }} }}
                  }}\n"
             );
             vars.insert(format!("q{i}"), json!(q));
@@ -372,6 +390,22 @@ impl GitHub {
                         url: str_at(n, "/url").to_owned(),
                         updated_at: str_at(n, "/updatedAt").to_owned(),
                         head_oid: str_at(n, "/headRefOid").to_owned(),
+                        threads: ThreadCounts {
+                            // Only the first 100 threads say whether
+                            // they're resolved; that's plenty in practice.
+                            resolved: n
+                                .pointer("/reviewThreads/nodes")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter(|t| t["isResolved"].as_bool() == Some(true))
+                                .count() as u32,
+                            total: n
+                                .pointer("/reviewThreads/totalCount")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default() as u32,
+                        },
+                        ci: ci_status(str_at(n, "/commits/nodes/0/commit/statusCheckRollup/state")),
                     })
                     .collect())
             })
@@ -896,6 +930,16 @@ mod tests {
             header::HeaderValue::from_static(r#"<https://x/?page=1>; rel="prev""#),
         );
         assert_eq!(next_link(&h), None);
+    }
+
+    #[test]
+    fn ci_states() {
+        assert_eq!(ci_status("SUCCESS"), Some(CiStatus::Passing));
+        assert_eq!(ci_status("FAILURE"), Some(CiStatus::Failing));
+        assert_eq!(ci_status("ERROR"), Some(CiStatus::Failing));
+        assert_eq!(ci_status("PENDING"), Some(CiStatus::Running));
+        assert_eq!(ci_status("EXPECTED"), Some(CiStatus::Running));
+        assert_eq!(ci_status(""), None);
     }
 
     #[test]

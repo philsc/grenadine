@@ -62,10 +62,14 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 SEARCH_QUERY = """
 query($q0: String!, $q1: String!) {
   s0: search(type: ISSUE_ADVANCED, query: $q0, first: 100) {
-    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner } } }
+    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner }
+      reviewThreads(first: 100) { totalCount nodes { isResolved } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } }
   }
   s1: search(type: ISSUE_ADVANCED, query: $q1, first: 100) {
-    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner } } }
+    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner }
+      reviewThreads(first: 100) { totalCount nodes { isResolved } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } }
   }
 }
 """
@@ -117,6 +121,38 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(titles[-1], "Ask me for a review")
         self.assertIsNone(out["data"]["s1"])
         self.assertEqual(out["errors"][0]["path"], ["s1"])
+
+    def test_search_reports_threads_and_checks(self) -> None:
+        pr = self.inboxes.prs["Get changes requested"]
+        root = self.repo.comment(
+            pr, author="other", body="Hmm", path="inbox/x.md", line=1
+        )
+        self.repo.comment(
+            pr, author="me", body="Fixed", path="inbox/x.md", line=1, reply_to=root
+        )
+        self.repo.comment(pr, author="other", body="And?", path="inbox/x.md", line=1)
+        root.resolved = True
+        pr.checks = "FAILURE"
+        out = self.query(
+            SEARCH_QUERY, q0=f"is:pr {pr.title}", q1="is:pr Wait for reviewers"
+        )
+        node = next(n for n in out["data"]["s0"]["nodes"] if n["number"] == pr.number)
+        self.assertEqual(
+            node["reviewThreads"],
+            {
+                "totalCount": 2,
+                "nodes": [{"isResolved": True}, {"isResolved": False}],
+            },
+        )
+        self.assertEqual(
+            node["commits"],
+            {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]},
+        )
+        [other] = out["data"]["s1"]["nodes"]
+        self.assertEqual(other["reviewThreads"], {"totalCount": 0, "nodes": []})
+        self.assertEqual(
+            other["commits"], {"nodes": [{"commit": {"statusCheckRollup": None}}]}
+        )
 
     def test_pr_query_reports_force_pushes(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]

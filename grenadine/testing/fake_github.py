@@ -116,6 +116,8 @@ class PullRequest:
     team_review_requests: set[str] = dataclasses.field(default_factory=set)
     reviews: list[Review] = dataclasses.field(default_factory=list)
     comments: list[Comment] = dataclasses.field(default_factory=list)
+    # The StatusState of the checks on the head; None when it has none.
+    checks: str | None = None
 
     @property
     def url(self) -> str:
@@ -649,7 +651,9 @@ class FakeGitHub:
             "object": object_,
         }
 
-    def _commit_node(self, repo: FakeRepo, sha: str) -> dict[str, Any]:
+    def _commit_node(
+        self, repo: FakeRepo, sha: str, checks: str | None = None
+    ) -> dict[str, Any]:
         def author(info: Any) -> Any:
             found = repo.commit_author(sha)
             if found is None:
@@ -666,6 +670,7 @@ class FakeGitHub:
             "oid": sha,
             "author": author,
             "checkSuites": lambda info, **_: {"nodes": []},
+            "statusCheckRollup": {"state": checks} if checks else None,
         }
 
     def _pr_node(self, pr: PullRequest) -> dict[str, Any]:
@@ -692,17 +697,28 @@ class FakeGitHub:
                 ]
             return {"nodes": nodes[:first]}
 
-        def commits(info: Any, first: int | None = None, **_: Any) -> Any:
+        def commits(
+            info: Any, first: int | None = None, last: int | None = None, **_: Any
+        ) -> Any:
+            shas = repo.commits(pr)[:first]
+            if last is not None:
+                shas = shas[-last:] if last else []
+            head = pr.head_oid
             return {
                 "nodes": [
-                    {"commit": self._commit_node(repo, sha)}
-                    for sha in repo.commits(pr)[:first]
+                    {
+                        "commit": self._commit_node(
+                            repo, sha, pr.checks if sha == head else None
+                        )
+                    }
+                    for sha in shas
                 ]
             }
 
         def review_threads(info: Any, first: int | None = None, **_: Any) -> Any:
             roots = [c for c in pr.comments if c.in_reply_to is None]
             return {
+                "totalCount": len(roots),
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
                 "nodes": [
                     {

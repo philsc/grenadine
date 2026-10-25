@@ -407,6 +407,8 @@ mod tests {
             synced: true,
             sync_error: None,
             stack: stack.and_then(|s| s.summary(number)),
+            threads: None,
+            ci: None,
         }
     }
 

@@ -122,12 +122,14 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         NEEDS_REVIEW,
     )
     pr.review_requests.add(VIEWER)
+    pr.checks = "SUCCESS"
 
     pr = add(
         _simple_pr(repo, "needs-team-review", "Ask my team for a review", author=OTHER),
         NEEDS_TEAM_REVIEW,
     )
     pr.team_review_requests.add(VIEWER)
+    pr.checks = "FAILURE"
 
     # GitHub counts a comment-only review as no review; see todo.md.
     pr = add(
@@ -173,6 +175,12 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         WAITING_FOR_AUTHORS,
     )
     pr.reviews.append(Review(VIEWER, COMMENTED))
+    pr.checks = "PENDING"
+    path = "inbox/waiting-authors.md"
+    root = repo.comment(pr, author=VIEWER, body="Why?", path=path, line=1)
+    repo.comment(pr, author=OTHER, body="Because.", path=path, line=1, reply_to=root)
+    root.resolved = True
+    repo.comment(pr, author=VIEWER, body="And this?", path=path, line=1)
 
     pr = add(_simple_pr(repo, "closed", "Get closed"), None)
     repo.close(pr)

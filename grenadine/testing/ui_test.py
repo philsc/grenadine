@@ -387,6 +387,33 @@ class InboxTest(ServerTestCase):
         expect(self.row(scenarios.STACK_TOP).locator(".badge")).to_have_text("2/2")
         expect(self.row("Wait for reviewers").locator(".badge")).to_have_count(0)
 
+    def test_threads_and_ci(self) -> None:
+        self.page.goto(self.url)
+        threads = self.row("Wait for the author after my review").locator(
+            ".pr-status .threads"
+        )
+        expect(threads).to_have_text("1/2")
+        expect(threads).to_have_attribute("title", "1 of 2 threads resolved")
+        expect(threads).not_to_have_class(re.compile(r"\bdone\b"))
+        # A PR without threads shows no count.
+        expect(
+            self.row("Ask me for a review").locator(".pr-status .threads")
+        ).to_have_count(0)
+
+        for title, state in [
+            ("Ask me for a review", "passing"),
+            ("Ask my team for a review", "failing"),
+            ("Wait for the author after my review", "running"),
+        ]:
+            with self.subTest(title=title):
+                ci = self.row(title).locator(".pr-status .ci")
+                expect(ci).to_have_class(re.compile(rf"\b{state}\b"))
+                expect(ci).to_have_attribute("title", f"CI {state}")
+        # A PR without checks shows no CI icon.
+        expect(self.row("Wait for reviewers").locator(".pr-status .ci")).to_have_count(
+            0
+        )
+
     def test_collapsing_an_inbox_survives_reload(self) -> None:
         self.page.goto(self.url)
         inbox = self.inbox(scenarios.APPROVED_INBOX)

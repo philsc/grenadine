@@ -773,6 +773,8 @@ mod tests {
                         url: "u".into(),
                         updated_at: "u".into(),
                         head_oid: "h".into(),
+                        threads: Default::default(),
+                        ci: None,
                     },
                     crate::github::Hit {
                         key: key(8),
@@ -783,6 +785,8 @@ mod tests {
                         url: "u".into(),
                         updated_at: "u".into(),
                         head_oid: "h".into(),
+                        threads: Default::default(),
+                        ci: None,
                     },
                 ]),
             )
@@ -857,6 +861,8 @@ mod tests {
                     url: "u".into(),
                     updated_at: "u".into(),
                     head_oid: "h".into(),
+                    threads: Default::default(),
+                    ci: None,
                 }]),
             )
             .unwrap();
