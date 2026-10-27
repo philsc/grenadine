@@ -614,6 +614,41 @@ pub enum Landed {
         number: u64,
         url: String,
     },
+    /// A stack of PRs, one per commit, bottom first.
+    Stack {
+        prs: Vec<LandedPr>,
+    },
+}
+
+/// One PR of a `Landed::Stack`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandedPr {
+    pub number: u64,
+    pub url: String,
+}
+
+impl Landed {
+    /// The PRs the work went into, bottom of the stack first.
+    pub fn prs(&self) -> Vec<LandedPr> {
+        match self {
+            Landed::Checkout { .. } => Vec::new(),
+            Landed::PullRequest { number, url } => vec![LandedPr {
+                number: *number,
+                url: url.clone(),
+            }],
+            Landed::Stack { prs } => prs.clone(),
+        }
+    }
+
+    /// `prs` as a `Landed`: a single PR stays a `PullRequest`.
+    pub fn from_prs(mut prs: Vec<LandedPr>) -> Landed {
+        if prs.len() == 1 {
+            let LandedPr { number, url } = prs.remove(0);
+            Landed::PullRequest { number, url }
+        } else {
+            Landed::Stack { prs }
+        }
+    }
 }
 
 /// The user's answer to an `ApprovalRequested` event.
