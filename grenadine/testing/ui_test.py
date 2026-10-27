@@ -699,6 +699,10 @@ class VersionsTest(ServerTestCase):
         ).to_have_text("+0 −0")
 
 
+# A new session's form; each is a draft of its own.
+DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"
+
+
 class AgentTest(ServerTestCase):
     OTHER_REPO = "test/other"
     REPOS: ClassVar[list[str]] = [scenarios.REPO, OTHER_REPO]
@@ -718,7 +722,8 @@ class AgentTest(ServerTestCase):
         )
 
     def test_sidebar_has_a_section_per_repo(self) -> None:
-        self.page.goto(self.url + "#/agents")
+        # The open form's draft is listed in its repository's section.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
         expect(self.page.locator(".agent-repo-name span")).to_have_text(
             sorted([scenarios.REPO, self.OTHER_REPO])
         )
@@ -729,7 +734,7 @@ class AgentTest(ServerTestCase):
             "No agents in this repository yet."
         )
         other.get_by_role("link", name="Start one").click()
-        expect(self.page).to_have_url(re.compile(f"#/agents/new/{self.OTHER_REPO}$"))
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
 
     def test_agent_session(self) -> None:
@@ -908,7 +913,7 @@ class AgentTest(ServerTestCase):
         sessions.filter(has_text="say two").get_by_role(
             "button", name="Delete session"
         ).click()
-        expect(self.page).to_have_url(re.compile(r"#/agents$"))
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(sessions.filter(has_text="say two")).to_have_count(0)
 
     def test_follow_up_draft_survives_switching_sessions(self) -> None:
@@ -943,6 +948,105 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(transcript.locator(".turn-prompt")).to_have_count(2)
         expect(follow_up).to_have_value("")
+
+    def test_new_session_drafts_survive_switching(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say started")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        new = self.page.get_by_role("link", name="+ New session")
+        prompt = self.page.get_by_label("Prompt")
+        repo = self.page.get_by_label("Repository")
+        permissions = self.page.get_by_label("Permissions")
+        is_draft = self.page.locator(".agent-draft")
+        entries = self.section(scenarios.REPO).locator(".agent-entry")
+        drafts = entries.filter(has=is_draft)
+        other_drafts = (
+            self.section(self.OTHER_REPO).locator(".agent-entry").filter(has=is_draft)
+        )
+
+        # Each new form is a draft of its own, listed first in its
+        # repository's section while it's open.
+        new.click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        repo.select_option(scenarios.REPO)
+        expect(drafts).to_have_count(1)
+        expect(drafts.locator(".agent-title")).to_have_text("New session")
+        expect(drafts.locator(".agent-status")).to_have_text("Draft")
+        prompt.fill("first draft\nwith more")
+        expect(drafts.locator(".agent-title")).to_have_text("first draft")
+        first = self.page.url
+        new.click()
+        expect(prompt).to_have_value("")
+        repo.select_option(scenarios.REPO)
+        prompt.fill("second draft")
+        permissions.select_option(label="Accept edits")
+        second = self.page.url
+        self.assertNotEqual(first, second)
+        expect(drafts.locator(".agent-title")).to_have_text(
+            ["second draft", "first draft"]
+        )
+        # Above the sessions, and set apart from them.
+        titles = entries.locator(".agent-title")
+        expect(titles.nth(0)).to_have_text("second draft")
+        expect(titles.nth(1)).to_have_text("first draft")
+        expect(entries.nth(2).locator(".agent-draft")).to_have_count(0)
+        expect(entries.nth(2).locator(".agent-item")).to_have_count(1)
+
+        # Picking another repository moves the draft to its section.
+        repo.select_option(self.OTHER_REPO)
+        expect(drafts.locator(".agent-title")).to_have_text(["first draft"])
+        expect(other_drafts.locator(".agent-title")).to_have_text(["second draft"])
+        expect(other_drafts.locator(".agent-draft")).to_have_class(
+            re.compile(r"\bselected\b")
+        )
+
+        # Going to a session and back keeps both drafts as they were.
+        started = self.section(scenarios.REPO).locator(".agent-item")
+        started.filter(has_text="say started").click()
+        expect(prompt).to_have_count(0)
+        drafts.click()
+        self.assertEqual(self.page.url, first)
+        expect(prompt).to_have_value("first draft\nwith more")
+        expect(repo).to_have_value(scenarios.REPO)
+        expect(permissions).to_have_value("plan")
+        other_drafts.click()
+        self.assertEqual(self.page.url, second)
+        expect(prompt).to_have_value("second draft")
+        expect(repo).to_have_value(self.OTHER_REPO)
+        expect(permissions).to_have_value("acceptEdits")
+
+        # They survive a reload too.
+        self.page.reload()
+        expect(prompt).to_have_value("second draft")
+        expect(drafts).to_have_count(1)
+        expect(other_drafts).to_have_count(1)
+
+        # Starting one turns its draft into a session.
+        drafts.click()
+        permissions.select_option(label="Auto")
+        prompt.fill("say from a draft")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(drafts).to_have_count(0)
+        expect(started.filter(has_text="say from a draft")).to_have_count(1)
+        expect(other_drafts).to_have_count(1)
+
+        # Discarding the open draft goes to a new one.
+        other_drafts.click()
+        other_drafts.get_by_role("button", name="Discard draft").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        self.assertNotEqual(self.page.url, second)
+        expect(other_drafts).to_have_count(0)
+
+        # A form that's left without writing anything isn't kept.
+        expect(is_draft.locator(".agent-title")).to_have_text(["New session"])
+        started.filter(has_text="say started").click()
+        expect(is_draft).to_have_count(0)
+        self.page.reload()
+        expect(is_draft).to_have_count(0)
 
     def test_unstaged_changes_pane(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})
@@ -1274,7 +1378,7 @@ class CleanupTest(ServerTestCase):
         expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
         self.page.once("dialog", lambda dialog: dialog.accept())
         self.page.locator(".agent-actions").get_by_role("button", name="Delete").click()
-        expect(self.page).to_have_url(re.compile(r"#/agents$"))
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
 
         # Scanning the deleted session finds what it left behind.
         expect(section).to_contain_text("1 item to clean up")
