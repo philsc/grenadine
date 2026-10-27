@@ -2147,6 +2147,98 @@ esac
         assert_eq!(none, None);
     }
 
+    /// Sonnet checks the cleanup items and the stale ones it names are
+    /// deleted, but only ones it was asked about.
+    #[tokio::test]
+    async fn prune_deletes_stale_cleanup_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = crate::git::tests::fixture();
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" > {dir}/prune_args
+cat > {dir}/prune_input
+cat {dir}/answer
+"#,
+            dir = dir.path().display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+
+        // No items, no Sonnet.
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 0);
+        assert!(!dir.path().join("prune_args").exists());
+
+        let session = AgentSession {
+            id: "gone".into(),
+            repo: "owner/name".into(),
+            pr: None,
+            title: "Run the e2e tests".into(),
+            summary: None,
+            branch: "b".into(),
+            worktree: "/w".into(),
+            base_sha: "s".into(),
+            status: AgentStatus::Idle,
+            created_at: 0,
+            cost_usd: 0.0,
+            context_tokens: None,
+            context_window: None,
+            model: None,
+            landed: None,
+            prs: None,
+            unstaged: 0,
+        };
+        state
+            .db
+            .add_cleanup_items(
+                &session,
+                &[
+                    ("Container e2e".into(), "`docker rm -f e2e`".into()),
+                    (
+                        "Branch dev/e2e".into(),
+                        "`git push -d origin dev/e2e`".into(),
+                    ),
+                ],
+                now(),
+            )
+            .unwrap();
+        let items = crate::cleanup::cleanup_state(&state).unwrap().items;
+        let container = items.iter().find(|i| i.title == "Container e2e").unwrap();
+        std::fs::write(
+            dir.path().join("answer"),
+            json!({
+                "type": "result",
+                "is_error": false,
+                "structured_output": {"stale": [
+                    {"id": container.id, "reason": "No such container"},
+                    {"id": 9999, "reason": "made up"},
+                ]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut events = state.events.subscribe();
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 1);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            grenadine_core::api::ServerEvent::CleanupChanged
+        );
+        let left = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "Branch dev/e2e");
+
+        let args = std::fs::read_to_string(dir.path().join("prune_args")).unwrap();
+        assert!(args.starts_with("-p --model sonnet "), "{args}");
+        assert!(args.contains(" --permission-mode dontAsk "), "{args}");
+        let input = std::fs::read_to_string(dir.path().join("prune_input")).unwrap();
+        for item in &items {
+            assert!(
+                input.contains(&format!("## Item {}: {}\n", item.id, item.title)),
+                "{input}"
+            );
+            assert!(input.contains(&item.detail), "{input}");
+        }
+    }
+
     /// A scan that fails leaves an item saying so.
     #[tokio::test]
     async fn a_failed_scan_leaves_an_item() {

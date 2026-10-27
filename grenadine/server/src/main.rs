@@ -212,6 +212,8 @@ async fn main() -> Result<()> {
         state.clone(),
         Duration::from_secs(args.poll_interval.max(1)),
     ));
+    // Shutting down doesn't wait for it; dropping it kills its claude.
+    tokio::spawn(cleanup::prune_loop(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

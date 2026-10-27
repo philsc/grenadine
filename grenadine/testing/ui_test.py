@@ -32,8 +32,9 @@ STARTUP_TIMEOUT = 30
 # the MCP tool first, like Claude Code does. Permission modes other than
 # manual allow the write without asking. It runs the model `--model` names,
 # lists its models when asked like the Agent SDK does, summarizes a new
-# session's request as "Task: " and its first line, and answers the scans
-# of deleted sessions with a container they left behind.
+# session's request as "Task: " and its first line, answers the scans of
+# deleted sessions with a container they left behind, and finds no stale
+# cleanup items.
 FAKE_CLAUDE = r"""
 import json
 import subprocess
@@ -59,6 +60,8 @@ if "--json-schema" in args:
     if "summary" in schema["properties"]:
         first = request.split("# Request\n\n", 1)[1].strip().splitlines()[0]
         output = {"summary": "Task: " + first}
+    elif "stale" in schema["properties"]:
+        output = {"stale": []}
     else:
         item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
         output = {"items": [item]}
