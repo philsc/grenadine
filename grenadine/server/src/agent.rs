@@ -104,6 +104,8 @@ pub struct Agents {
     pub scans: crate::cleanup::Scans,
     /// Whether Haiku summarizes each new session's first prompt.
     pub summaries: std::sync::atomic::AtomicBool,
+    /// The shells opened from the sessions' pages.
+    pub terminals: crate::terminal::Terminals,
 }
 
 /// What only exists while the server runs: the event channel open pages
@@ -472,7 +474,14 @@ impl Agents {
             models: OnceCell::new(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
+            terminals: crate::terminal::Terminals::default(),
         })
+    }
+
+    /// The systemd user slice the session's processes go into, if they go
+    /// into one.
+    pub fn slice_of(&self, id: &str) -> Option<String> {
+        self.slices.then(|| slice(id))
     }
 
     /// The `claude` executable.
@@ -817,6 +826,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
     interrupt(state, id);
+    // The worktree's processes that have a terminal are left alone below,
+    // but these shells go with the session.
+    state.agents.terminals.close_all(id).await;
     // Whatever claude started can outlive it, e.g. Bazel's server, which
     // would hold on to its memory for hours.
     if state.agents.slices {
@@ -860,6 +872,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     });
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
+    state.agents.terminals.forget(id);
     state.send(ServerEvent::AgentsChanged);
     crate::cleanup::scan(state, scanned, events);
     Ok(true)

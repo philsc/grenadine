@@ -12,6 +12,7 @@ mod mcp;
 mod stack;
 mod summary;
 mod sync;
+mod terminal;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -68,6 +69,11 @@ struct Args {
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
+
+    /// The shell that terminals in agent sessions run, as a login shell.
+    /// Defaults to the user's login shell.
+    #[arg(long)]
+    shell: Option<PathBuf>,
 
     /// Where agent sessions' git worktrees go. Defaults to a `worktrees`
     /// directory next to the database.
@@ -184,7 +190,7 @@ async fn main() -> Result<()> {
         let worktrees = worktrees.clone();
         move || agent::remove_orphaned_output_bases(&worktrees)
     });
-    let agents = agent::Agents::new(
+    let mut agents = agent::Agents::new(
         &db,
         args.claude,
         worktrees,
@@ -193,6 +199,9 @@ async fn main() -> Result<()> {
         true,
         true,
     )?;
+    if let Some(shell) = args.shell {
+        agents.terminals = terminal::Terminals::new(shell);
+    }
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

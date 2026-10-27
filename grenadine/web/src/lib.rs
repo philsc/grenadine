@@ -10,6 +10,7 @@ mod highlight;
 mod inboxes;
 mod markdown;
 mod pr;
+mod terminal;
 mod theme;
 mod topbar;
 
@@ -30,6 +31,8 @@ pub struct Updates {
     pub agents: RwSignal<u64>,
     /// Bumped when the cleanup items or the scans for them changed.
     pub cleanup: RwSignal<u64>,
+    /// Bumped when a session's terminal opened or closed.
+    pub terminals: RwSignal<u64>,
 }
 
 /// What the URL's hash shows.
@@ -118,6 +121,7 @@ fn listen(updates: Updates) {
         Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
         Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
         Ok(ServerEvent::CleanupChanged) => updates.cleanup.update(|n| *n += 1),
+        Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
         Err(_) => {}
     };
     // After a reconnect (e.g. the server restarted or the machine slept)
@@ -126,6 +130,7 @@ fn listen(updates: Updates) {
         updates.inboxes.update(|n| *n += 1);
         updates.agents.update(|n| *n += 1);
         updates.cleanup.update(|n| *n += 1);
+        updates.terminals.update(|n| *n += 1);
         refetch_sync(updates);
     };
     events::subscribe("/api/events".into(), on_message, on_open);
@@ -146,6 +151,7 @@ fn App() -> impl IntoView {
         sync: RwSignal::new(SyncStatus::default()),
         agents: RwSignal::new(0),
         cleanup: RwSignal::new(0),
+        terminals: RwSignal::new(0),
     };
     provide_context(updates);
     listen(updates);

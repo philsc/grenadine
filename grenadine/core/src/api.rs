@@ -356,6 +356,24 @@ pub enum ServerEvent {
     /// A cleanup item was found, deleted or handed off, or a scan started
     /// or ended.
     CleanupChanged,
+    /// A terminal was opened in the agent session with this ID, or one of
+    /// its terminals closed.
+    TerminalsChanged(String),
+}
+
+/// A login shell in an agent session's worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalInfo {
+    /// Counts up from 1 within the session.
+    pub id: u64,
+}
+
+/// The size a page fits a terminal to, sent as a WebSocket text message.
+/// Binary messages carry the terminal's input and output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Something a deleted agent session left behind outside its worktree,

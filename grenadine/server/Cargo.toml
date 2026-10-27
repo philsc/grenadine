@@ -22,6 +22,7 @@ fancy-regex.workspace = true
 futures.workspace = true
 grenadine_core = { path = "../core" }
 libc.workspace = true
+pty-process.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

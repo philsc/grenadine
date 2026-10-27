@@ -5,6 +5,8 @@ fake_github.py) that it loads with PRs first. A stub `gh` hands the server
 the fake's token, and a fake `claude` plays the agent.
 """
 
+import base64
+import http.client
 import json
 import os
 import re
@@ -234,6 +236,8 @@ class ServerTestCase(unittest.TestCase):
                 f"--db={tmp / 'grenadine.db'}",
                 f"--github-api={api}",
                 f"--poll-interval={cls.POLL_INTERVAL}",
+                # The sandbox's user has no login shell.
+                "--shell=/bin/sh",
             ],
             env=env,
         )
@@ -946,7 +950,7 @@ class AgentTest(ServerTestCase):
         expect(files.nth(1).locator("tr.add .code")).to_have_text(["write more"])
 
         # The transcript keeps most of the width.
-        main = self.page.locator(".agents-page > .main").bounding_box()
+        main = self.page.locator(".agent-panes > .main").bounding_box()
         side = pane.bounding_box()
         assert main and side
         self.assertGreaterEqual(main["width"], 720)
@@ -958,6 +962,72 @@ class AgentTest(ServerTestCase):
         expect(transcript).to_be_visible()
         self.page.set_viewport_size({"width": 1800, "height": 900})
         expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
+
+    def test_terminals(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        session = Path(self.page.locator(".agent-worktree").inner_text()).name
+        tabs = self.page.get_by_role("tab")
+        screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+
+        # Opening the panel starts a shell in the worktree. The output
+        # differs from the command line it echoes.
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        expect(tabs).to_have_text(["Terminal 1"])
+        self.page.keyboard.type('echo in-$(basename "$PWD")\n')
+        expect(screen).to_contain_text(f"in-{session}")
+
+        # Another tab gets its own shell, and the first keeps its output.
+        self.page.get_by_role("button", name="New terminal").click()
+        expect(tabs).to_have_text(["Terminal 1", "Terminal 2"])
+        expect(tabs.nth(1)).to_have_attribute("aria-selected", "true")
+        self.page.keyboard.type("echo second-$((6 * 7))\n")
+        expect(screen).to_contain_text("second-42")
+        tabs.nth(0).click()
+        expect(screen).to_contain_text(f"in-{session}")
+        expect(screen).not_to_contain_text("second-42")
+
+        # The shells outlive the page, and their output comes back.
+        self.page.reload()
+        expect(tabs).to_have_text(["Terminal 1", "Terminal 2"])
+        expect(screen).to_contain_text("second-42")
+
+        # Closing a tab hangs up on its shell; exiting a shell closes its tab.
+        self.page.get_by_role("button", name="Close terminal 2").click()
+        expect(tabs).to_have_text(["Terminal 1"])
+        expect(screen).to_contain_text(f"in-{session}")
+        self.page.keyboard.type("exit\n")
+        expect(tabs).to_have_count(0)
+
+        # Other sites' pages can't connect to a shell.
+        self.page.get_by_role("button", name="New terminal").click()
+        expect(tabs).to_have_text(["Terminal 3"])
+        session_id = self.page.url.rsplit("/", 1)[1]
+        port = int(self.url.rsplit(":", 1)[1].strip("/"))
+
+        def handshake(origin: str) -> int:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                conn.request(
+                    "GET",
+                    f"/api/agents/{session_id}/terminals/3/ws",
+                    headers={
+                        "Connection": "Upgrade",
+                        "Upgrade": "websocket",
+                        "Sec-WebSocket-Version": "13",
+                        "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(),
+                        "Origin": origin,
+                    },
+                )
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        self.assertEqual(handshake("http://evil.example"), 403)
+        self.assertEqual(handshake(f"http://127.0.0.1:{port}"), 101)
 
     def test_wrap_up(self) -> None:
         # The server's clone has main checked out, which the work lands on.

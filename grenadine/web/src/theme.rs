@@ -10,6 +10,10 @@ use crate::inboxes::storage;
 const KEY: &str = "theme";
 const DARK_QUERY: &str = "(prefers-color-scheme: dark)";
 
+/// Dispatched on the window when `data-theme` changed, for what CSS can't
+/// style, like the terminals.
+pub const CHANGED_EVENT: &str = "grenadine-theme";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     Auto,
@@ -60,6 +64,9 @@ fn prefers_dark() -> bool {
 fn apply(theme: Theme) {
     if let Some(el) = document().document_element() {
         let _ = el.set_attribute("data-theme", effective(theme, prefers_dark()));
+    }
+    if let Ok(e) = web_sys::Event::new(CHANGED_EVENT) {
+        let _ = window().dispatch_event(&e);
     }
 }
 

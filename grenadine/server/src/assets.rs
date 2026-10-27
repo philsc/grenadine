@@ -30,6 +30,21 @@ const ASSETS: &[Asset] = &[
         content_type: "application/wasm",
         bytes: include_bytes!(env!("GRENADINE_WEB_WASM")),
     },
+    Asset {
+        path: "/xterm.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!(env!("GRENADINE_XTERM_JS")),
+    },
+    Asset {
+        path: "/xterm.css",
+        content_type: "text/css; charset=utf-8",
+        bytes: include_bytes!(env!("GRENADINE_XTERM_CSS")),
+    },
+    Asset {
+        path: "/addon-fit.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!(env!("GRENADINE_XTERM_FIT_JS")),
+    },
 ];
 
 pub async fn serve(uri: Uri) -> Response {
