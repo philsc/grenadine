@@ -84,7 +84,7 @@ type PullRequest {
     after: String
     itemTypes: [PullRequestTimelineItemsItemType!]
   ): PullRequestTimelineItemsConnection!
-  commits(first: Int, after: String): PullRequestCommitConnection!
+  commits(first: Int, after: String, last: Int): PullRequestCommitConnection!
   reviewThreads(first: Int, after: String): PullRequestReviewThreadConnection!
 }
 
@@ -122,6 +122,19 @@ type Commit implements GitObject {
   oid: GitObjectID!
   author: GitActor
   checkSuites(first: Int, after: String): CheckSuiteConnection
+  statusCheckRollup: StatusCheckRollup
+}
+
+type StatusCheckRollup {
+  state: StatusState!
+}
+
+enum StatusState {
+  EXPECTED
+  ERROR
+  FAILURE
+  PENDING
+  SUCCESS
 }
 
 type GitActor {
@@ -155,6 +168,7 @@ type Bot implements Actor {
 }
 
 type PullRequestReviewThreadConnection {
+  totalCount: Int!
   pageInfo: PageInfo!
   nodes: [PullRequestReviewThread]
 }

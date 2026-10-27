@@ -52,6 +52,28 @@ pub struct PrSummary {
     /// Where the PR sits in its stack. `None` when it isn't stacked or
     /// hasn't synced.
     pub stack: Option<StackSummary>,
+    /// The PR's review threads as of the last inbox search; `None` when
+    /// unknown, e.g. outside an inbox.
+    #[serde(default)]
+    pub threads: Option<ThreadCounts>,
+    /// The checks on the PR's head as of the last inbox search; `None`
+    /// when it has none or when unknown.
+    #[serde(default)]
+    pub ci: Option<CiStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadCounts {
+    pub resolved: u32,
+    pub total: u32,
+}
+
+/// The combined state of the checks on a commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CiStatus {
+    Passing,
+    Failing,
+    Running,
 }
 
 /// One PR of a stack, as GitHub reported it when the stack was fetched.

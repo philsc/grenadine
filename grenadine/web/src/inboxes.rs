@@ -1,7 +1,7 @@
 //! The landing page: the list of inboxes, each with the PRs its filter
 //! matches. Inboxes can be added, edited, reordered and deleted in place.
 
-use grenadine_core::api::{Inbox, InboxEdit, InboxWithPrs, PrKey};
+use grenadine_core::api::{CiStatus, Inbox, InboxEdit, InboxWithPrs, PrKey, ThreadCounts};
 use grenadine_core::stack::{Link, group_inbox};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -176,20 +176,26 @@ fn InboxSection(
                                     class:selected=is_selected
                                     href=hash_for(&key)
                                 >
-                                    <span class="pr-title">
-                                        {badge}
-                                        {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
-                                        {pr.title.clone()}
+                                    <span class="pr-text">
+                                        <span class="pr-title">
+                                            {badge}
+                                            {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
+                                            {pr.title.clone()}
+                                        </span>
+                                        <span class="pr-meta muted" title=pr.sync_error.clone()>
+                                            {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
+                                            {if pr.synced {
+                                                format!("{} versions", pr.version_count).into_any()
+                                            } else if pr.sync_error.is_some() {
+                                                view! { <span class="error">"sync failed"</span> }.into_any()
+                                            } else {
+                                                view! { <span>"syncing…"</span> }.into_any()
+                                            }}
+                                        </span>
                                     </span>
-                                    <span class="pr-meta muted" title=pr.sync_error.clone()>
-                                        {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
-                                        {if pr.synced {
-                                            format!("{} versions", pr.version_count).into_any()
-                                        } else if pr.sync_error.is_some() {
-                                            view! { <span class="error">"sync failed"</span> }.into_any()
-                                        } else {
-                                            view! { <span>"syncing…"</span> }.into_any()
-                                        }}
+                                    <span class="pr-status">
+                                        {pr.threads.filter(|t| t.total > 0).map(|t| view! { <ThreadCount threads=t /> })}
+                                        {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
                                     </span>
                                 </a>
                             </li>
@@ -198,6 +204,63 @@ fn InboxSection(
                 }}
             </ul>
         </section>
+    }
+}
+
+/// How many of the PR's review threads are resolved, e.g. "1/3".
+#[component]
+fn ThreadCount(threads: ThreadCounts) -> impl IntoView {
+    let ThreadCounts { resolved, total } = threads;
+    let noun = if total == 1 { "thread" } else { "threads" };
+    view! {
+        <span
+            class="threads"
+            class:done=resolved == total
+            title=format!("{resolved} of {total} {noun} resolved")
+        >
+            <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                <path d="M2.5 3.5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7l-3 2.5V11h-.5a1 1 0 0 1-1-1z" />
+            </svg>
+            {format!("{resolved}/{total}")}
+        </span>
+    }
+}
+
+/// Whether the checks on the PR's head pass, fail or are still running.
+#[component]
+fn CiIcon(ci: CiStatus) -> impl IntoView {
+    let (class, title, path) = match ci {
+        CiStatus::Passing => ("ci passing", "CI passing", "M3.5 8.5l3 3 6-7"),
+        CiStatus::Failing => ("ci failing", "CI failing", "M4 4l8 8M12 4l-8 8"),
+        CiStatus::Running => ("ci running", "CI running", "M8 4.5V8l2.5 1.5"),
+    };
+    view! {
+        <span class=class title=title>
+            <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                {(ci == CiStatus::Running).then(|| view! { <circle cx="8" cy="8" r="6" /> })}
+                <path d=path />
+            </svg>
+        </span>
     }
 }
 

@@ -7,8 +7,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CleanupItem, Inbox, InboxEdit,
-    Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, Version, VersionKind,
+    AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus, CleanupItem, Inbox,
+    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, ThreadCounts,
+    Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -249,6 +250,16 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agent_prs ADD COLUMN conflicting INTEGER NOT NULL DEFAULT 0;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The search's review thread counts and the state of the checks on
+    -- the PR's head. The counts are NULL until a search fills them; ci is
+    -- NULL when the head has no checks.
+    ALTER TABLE inbox_prs ADD COLUMN threads_resolved INTEGER;
+    ALTER TABLE inbox_prs ADD COLUMN threads_total INTEGER;
+    ALTER TABLE inbox_prs ADD COLUMN ci TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -342,6 +353,23 @@ fn kind_str(k: VersionKind) -> &'static str {
         VersionKind::Initial => "initial",
         VersionKind::Push => "push",
         VersionKind::ForcePush => "force_push",
+    }
+}
+
+fn ci_str(c: CiStatus) -> &'static str {
+    match c {
+        CiStatus::Passing => "passing",
+        CiStatus::Failing => "failing",
+        CiStatus::Running => "running",
+    }
+}
+
+fn parse_ci(s: &str) -> Option<CiStatus> {
+    match s {
+        "passing" => Some(CiStatus::Passing),
+        "failing" => Some(CiStatus::Failing),
+        "running" => Some(CiStatus::Running),
+        _ => None,
     }
 }
 
@@ -452,12 +480,15 @@ impl Db {
                 for (rank, h) in hits.iter().enumerate() {
                     tx.execute(
                         "INSERT INTO inbox_prs
-                            (inbox_id, repo, number, rank, title, author, state, is_draft, url, updated_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (inbox_id, repo, number, rank, title, author, state, is_draft, url, updated_at,
+                             threads_resolved, threads_total, ci)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (inbox_id, repo, number) DO UPDATE SET
                             rank = excluded.rank, title = excluded.title, author = excluded.author,
                             state = excluded.state, is_draft = excluded.is_draft, url = excluded.url,
-                            updated_at = excluded.updated_at",
+                            updated_at = excluded.updated_at,
+                            threads_resolved = excluded.threads_resolved,
+                            threads_total = excluded.threads_total, ci = excluded.ci",
                         params![
                             id,
                             h.key.repo,
@@ -468,7 +499,10 @@ impl Db {
                             h.state,
                             h.is_draft,
                             h.url,
-                            h.updated_at
+                            h.updated_at,
+                            h.threads.resolved,
+                            h.threads.total,
+                            h.ci.map(ci_str)
                         ],
                     )?;
                 }
@@ -512,13 +546,22 @@ impl Db {
                     (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
                     p.repo IS NOT NULL,
                     CASE WHEN p.repo IS NULL THEN i.sync_error END,
-                    p.stack
+                    p.stack, i.threads_resolved, i.threads_total, i.ci
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
         let rows = stmt.query_map([id], |r| {
             let stack = parse_stack(r.get(11)?);
-            summary_from_row(r, r.get(9)?, r.get(10)?, stack.as_ref())
+            let mut summary = summary_from_row(r, r.get(9)?, r.get(10)?, stack.as_ref())?;
+            let (resolved, total): (Option<u32>, Option<u32>) = (r.get(12)?, r.get(13)?);
+            summary.threads = resolved
+                .zip(total)
+                .map(|(resolved, total)| ThreadCounts { resolved, total });
+            summary.ci = r
+                .get::<_, Option<String>>(14)?
+                .as_deref()
+                .and_then(parse_ci);
+            Ok(summary)
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1209,6 +1252,8 @@ fn summary_from_row(
         synced,
         sync_error,
         stack: stack.and_then(|s| s.summary(number)),
+        threads: None,
+        ci: None,
     })
 }
 
@@ -1228,6 +1273,11 @@ mod tests {
             url: "hu".into(),
             updated_at: "2026-01-02T00:00:00Z".into(),
             head_oid: "h".into(),
+            threads: ThreadCounts {
+                resolved: 1,
+                total: 3,
+            },
+            ci: Some(CiStatus::Failing),
         }
     }
 
@@ -1307,6 +1357,14 @@ mod tests {
         assert!(!prs[0].synced);
         assert_eq!(prs[0].title, "hit title");
         assert_eq!(prs[0].version_count, 0);
+        assert_eq!(
+            prs[0].threads,
+            Some(ThreadCounts {
+                resolved: 1,
+                total: 3
+            })
+        );
+        assert_eq!(prs[0].ci, Some(CiStatus::Failing));
 
         let versions = vec![
             Version {
