@@ -1024,8 +1024,10 @@ class AgentTest(ServerTestCase):
         expect(drafts).to_have_count(1)
         expect(other_drafts).to_have_count(1)
 
-        # Starting one turns its draft into a session.
+        # Starting one turns its draft into a session. Its form has to be
+        # showing before typing, or the text goes into the one before.
         drafts.click()
+        expect(prompt).to_have_value("first draft\nwith more")
         permissions.select_option(label="Auto")
         prompt.fill("say from a draft")
         self.page.get_by_role("button", name="Start").click()
@@ -1034,12 +1036,14 @@ class AgentTest(ServerTestCase):
         expect(started.filter(has_text="say from a draft")).to_have_count(1)
         expect(other_drafts).to_have_count(1)
 
-        # Discarding the open draft goes to a new one.
+        # Discarding the open draft goes to a new one, which may be listed
+        # in either section.
         other_drafts.click()
+        expect(prompt).to_have_value("second draft")
         other_drafts.get_by_role("button", name="Discard draft").click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
         self.assertNotEqual(self.page.url, second)
-        expect(other_drafts).to_have_count(0)
+        expect(is_draft.filter(has_text="second draft")).to_have_count(0)
 
         # A form that's left without writing anything isn't kept.
         expect(is_draft.locator(".agent-title")).to_have_text(["New session"])
