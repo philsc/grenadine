@@ -1026,17 +1026,39 @@ class AgentTest(ServerTestCase):
         expect(screen).to_contain_text(f"in-{session}")
         expect(screen).not_to_contain_text("second-42")
 
-        # The shells outlive the page, and their output comes back.
+        # The shells outlive the page, and their output comes back in the
+        # tab that was selected.
         self.page.reload()
         expect(tabs).to_have_text(["Terminal 1", "Terminal 2"])
+        expect(tabs.nth(0)).to_have_attribute("aria-selected", "true")
+        expect(screen).to_contain_text(f"in-{session}")
+
+        # Each session keeps its own panel: another session without
+        # terminals has it collapsed, and coming back shows the tab that
+        # was selected.
+        toggle = self.page.get_by_role("button", name="Terminal", exact=True)
+        first = self.page.url
+        tabs.nth(1).click()
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write another note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+        expect(tabs).to_have_count(0)
+        self.page.goto(first)
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(tabs.nth(1)).to_have_attribute("aria-selected", "true")
         expect(screen).to_contain_text("second-42")
 
-        # Closing a tab hangs up on its shell; exiting a shell closes its tab.
+        # Closing a tab hangs up on its shell; exiting a shell closes its tab,
+        # and the panel collapses without any.
         self.page.get_by_role("button", name="Close terminal 2").click()
         expect(tabs).to_have_text(["Terminal 1"])
         expect(screen).to_contain_text(f"in-{session}")
         self.page.keyboard.type("exit\n")
         expect(tabs).to_have_count(0)
+        expect(toggle).to_have_attribute("aria-expanded", "false")
 
         # Other sites' pages can't connect to a shell.
         self.page.get_by_role("button", name="New terminal").click()
