@@ -1218,16 +1218,9 @@ fn AgentActions(
     model: RwSignal<String>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
+    // A wrap-up asked for during a turn waits for the turn, so the buttons
+    // stay usable while Claude works.
     let wrapping = RwSignal::new(false);
-    let busy = Signal::derive(move || {
-        wrapping.get()
-            || session.with(|s| {
-                matches!(
-                    s.status,
-                    AgentStatus::Running | AgentStatus::AwaitingApproval
-                )
-            })
-    });
     // Claude may get prompts to commit or to resolve conflicts first;
     // they go with the mode and model the composer has picked.
     let wrap_up = move |target| {
@@ -1256,13 +1249,13 @@ fn AgentActions(
             <button
                 class="link"
                 title="Rebase the session's commits onto the server's checkout and fast-forward it"
-                disabled=busy
+                disabled=wrapping
                 on:click=move |_| wrap_up(WrapUpTarget::Checkout)
             >"Merge into checkout"</button>
             <button
                 class="link"
                 title="Push the session's branch to GitHub and open a pull request"
-                disabled=busy
+                disabled=wrapping
                 on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
             >"Open PR"</button>
             <button class="link danger" on:click=delete>"Delete"</button>
