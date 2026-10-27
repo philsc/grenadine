@@ -322,6 +322,10 @@ fn backfill_agent_prs(conn: &Connection) -> Result<()> {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Held for as long as the database is open, so that a second server
+    /// can't open it too. A second server would mark the first one's
+    /// running sessions as interrupted.
+    _lock: Option<std::fs::File>,
 }
 
 /// PR metadata from GitHub.
@@ -381,27 +385,53 @@ fn parse_kind(s: &str) -> VersionKind {
     }
 }
 
+/// Locks `<path>.lock`; the lock goes away with the process, however it
+/// ends.
+fn lock(path: &Path) -> Result<std::fs::File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let lock_path = Path::new(&name);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("can't open {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another server is using {}; give this one its own with --db",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("can't lock {}", lock_path.display()))
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let lock = lock(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("can't open {}", path.display()))?;
-        Self::init(conn)
+        Self::init(conn, Some(lock))
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Db {
-        Self::init(Connection::open_in_memory().unwrap()).unwrap()
+        Self::init(Connection::open_in_memory().unwrap(), None).unwrap()
     }
 
-    fn init(mut conn: Connection) -> Result<Db> {
+    fn init(mut conn: Connection, lock: Option<std::fs::File>) -> Result<Db> {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         migrate(&mut conn, MIGRATIONS.len())?;
         Ok(Db {
             conn: Mutex::new(conn),
+            _lock: lock,
         })
     }
 
@@ -1263,6 +1293,17 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_second_open_fails_until_the_first_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grenadine.db");
+        let db = Db::open(&path).unwrap();
+        let err = Db::open(&path).err().unwrap();
+        assert!(err.to_string().contains("another server"), "{err:#}");
+        drop(db);
+        Db::open(&path).unwrap();
+    }
+
     fn hit(key: &PrKey) -> crate::github::Hit {
         crate::github::Hit {
             key: key.clone(),
@@ -1584,6 +1625,7 @@ mod tests {
         migrate(&mut conn, MIGRATIONS.len()).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
+            _lock: None,
         };
         // Until the next poll rewrites the row, the listing takes the
         // fields from prs.
@@ -1655,7 +1697,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let db = Db::init(conn).unwrap();
+        let db = Db::init(conn, None).unwrap();
         let inboxes = db.inboxes().unwrap();
         assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
         for (inbox, (name, filter)) in inboxes.iter().zip(crate::inboxes::DEFAULT_INBOXES.iter()) {
@@ -1844,6 +1886,7 @@ mod tests {
         migrate(&mut conn, backfill).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
+            _lock: None,
         };
         db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
         let events = [
