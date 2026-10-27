@@ -1289,6 +1289,8 @@ fn summary_from_row(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use grenadine_core::api::Side;
 
     use super::*;
@@ -1301,7 +1303,13 @@ mod tests {
         let err = Db::open(&path).err().unwrap();
         assert!(err.to_string().contains("another server"), "{err:#}");
         drop(db);
-        Db::open(&path).unwrap();
+        // A process that another test spawns gets a copy of the lock's fd
+        // and holds the lock until it execs, so the release can lag the drop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(err) = Db::open(&path) {
+            assert!(Instant::now() < deadline, "{err:#}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn hit(key: &PrKey) -> crate::github::Hit {
