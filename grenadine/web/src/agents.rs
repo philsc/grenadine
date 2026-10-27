@@ -1037,39 +1037,47 @@ pub fn AgentView(id: String) -> impl IntoView {
     let mode = mode_signal(&id);
     let model = model_signal();
 
+    let terminal_id = id.clone();
     view! {
-        <main class="main">
-            <div class="agent">
-                {move || match load.get() {
-                    Load::Loading => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                    Load::Failed(e) => view! { <p class="error">{e}</p> }.into_any(),
-                    Load::Missing => view! {
-                        <p class="muted">"There is no such session. " <a href="#/agents">"Start a new one"</a></p>
-                    }.into_any(),
-                    Load::Ready => {
-                        // Ready means a session was loaded, and `current` keeps it.
-                        let session = Signal::derive(move || current.get().expect("a loaded session"));
-                        // The stream's values are newer than the loaded session's.
-                        let usage = Signal::derive(move || {
-                            let (tokens, window) = live_usage.get();
-                            session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
-                        });
-                        let active_model = Signal::derive(move || {
-                            live_model.get().or_else(|| session.with(|s| s.model.clone()))
-                        });
-                        view! {
-                            <AgentHeader session=session />
-                            <Transcript session=session events=events streaming=streaming mode=mode />
-                            <div class="agent-footer">
-                                <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                <AgentActions session=session mode=mode model=model />
-                            </div>
-                        }.into_any()
-                    }
-                }}
+        <div class="agent-page">
+            <div class="agent-panes">
+                <main class="main">
+                    <div class="agent">
+                        {move || match load.get() {
+                            Load::Loading => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                            Load::Failed(e) => view! { <p class="error">{e}</p> }.into_any(),
+                            Load::Missing => view! {
+                                <p class="muted">"There is no such session. " <a href="#/agents">"Start a new one"</a></p>
+                            }.into_any(),
+                            Load::Ready => {
+                                // Ready means a session was loaded, and `current` keeps it.
+                                let session = Signal::derive(move || current.get().expect("a loaded session"));
+                                // The stream's values are newer than the loaded session's.
+                                let usage = Signal::derive(move || {
+                                    let (tokens, window) = live_usage.get();
+                                    session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
+                                });
+                                let active_model = Signal::derive(move || {
+                                    live_model.get().or_else(|| session.with(|s| s.model.clone()))
+                                });
+                                view! {
+                                    <AgentHeader session=session />
+                                    <Transcript session=session events=events streaming=streaming mode=mode />
+                                    <div class="agent-footer">
+                                        <Composer session=session usage=usage active_model=active_model mode=mode model=model />
+                                        <AgentActions session=session mode=mode model=model />
+                                    </div>
+                                }.into_any()
+                            }
+                        }}
+                    </div>
+                </main>
+                {move || (load.get() == Load::Ready).then(|| view! { <ChangesPane id=id.clone() events=events /> })}
             </div>
-        </main>
-        {move || (load.get() == Load::Ready).then(|| view! { <ChangesPane id=id.clone() events=events /> })}
+            {move || (load.get() == Load::Ready).then(|| view! {
+                <crate::terminal::TerminalPanel id=terminal_id.clone() />
+            })}
+        </div>
     }
 }
 

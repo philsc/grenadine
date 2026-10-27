@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State as AxState};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -22,7 +23,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{self, Decision};
 use crate::sync::State;
-use crate::{assets, cleanup, mcp};
+use crate::{assets, cleanup, mcp, terminal};
 
 type St = AxState<Arc<State>>;
 
@@ -62,6 +63,18 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
+        .route(
+            "/api/agents/{id}/terminals",
+            get(terminals).post(open_terminal),
+        )
+        .route(
+            "/api/agents/{id}/terminals/{terminal}",
+            axum::routing::delete(close_terminal),
+        )
+        .route(
+            "/api/agents/{id}/terminals/{terminal}/ws",
+            get(terminal_socket),
+        )
         .route("/api/cleanup", get(cleanup))
         .route("/api/cleanup/sessions", post(create_cleanup_session))
         .route(
@@ -380,6 +393,62 @@ async fn agent_changes(AxState(state): St, Path(id): Path<String>) -> ApiResult<
     Ok(Json(WorktreeChanges { files }).into_response())
 }
 
+async fn terminals(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(state.agents.terminals.list(&id)).into_response())
+}
+
+async fn open_terminal(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    if !std::path::Path::new(&session.worktree).is_dir() {
+        return Ok((StatusCode::CONFLICT, "the session's worktree is gone").into_response());
+    }
+    Ok(Json(terminal::open(&state, &session)?).into_response())
+}
+
+async fn close_terminal(
+    AxState(state): St,
+    Path((id, terminal)): Path<(String, u64)>,
+) -> StatusCode {
+    if state.agents.terminals.close(&id, terminal) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// Whether the request comes from one of the server's own pages. Browsers
+/// let any page open a WebSocket to any server and only say where the
+/// page is from, so without this any website could open a shell here.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let value = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let (Some(origin), Some(host)) = (value(header::ORIGIN), value(header::HOST)) else {
+        return false;
+    };
+    origin
+        .split_once("://")
+        .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host))
+}
+
+async fn terminal_socket(
+    AxState(state): St,
+    Path((id, terminal)): Path<(String, u64)>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin terminal connection").into_response();
+    }
+    let Some(t) = state.agents.terminals.get(&id, terminal) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ws.on_upgrade(move |socket| terminal::attach(state, t, socket))
+}
+
 async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if find_agent(&state, &id)?.is_none() || !agent::delete(&state, &id).await? {
         return Ok(StatusCode::NOT_FOUND);
@@ -494,6 +563,36 @@ async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminals_only_open_from_the_servers_pages() {
+        let headers = |origin: Option<&str>, host: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::HOST, host.parse().unwrap());
+            if let Some(o) = origin {
+                h.insert(header::ORIGIN, o.parse().unwrap());
+            }
+            h
+        };
+        assert!(same_origin(&headers(
+            Some("http://127.0.0.1:8765"),
+            "127.0.0.1:8765"
+        )));
+        assert!(same_origin(&headers(
+            Some("https://Box.example"),
+            "box.example"
+        )));
+        assert!(!same_origin(&headers(
+            Some("http://evil.example"),
+            "127.0.0.1:8765"
+        )));
+        assert!(!same_origin(&headers(
+            Some("http://127.0.0.1:9999"),
+            "127.0.0.1:8765"
+        )));
+        assert!(!same_origin(&headers(Some("null"), "127.0.0.1:8765")));
+        assert!(!same_origin(&headers(None, "127.0.0.1:8765")));
+    }
 
     #[tokio::test]
     async fn events_stream_ends_on_shutdown() {

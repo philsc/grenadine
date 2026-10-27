@@ -39,4 +39,8 @@ web-sys = { workspace = true, features = [
   "IntersectionObserver",
   "IntersectionObserverEntry",
   "Storage",
+  "WebSocket",
+  "BinaryType",
+  "CloseEvent",
+  "ResizeObserver",
 ] }

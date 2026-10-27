@@ -12,6 +12,9 @@ WEB_FILES = {
     "GRENADINE_STYLE_CSS": "//grenadine/web:static/style.css",
     "GRENADINE_WEB_JS": "//grenadine/web:grenadine_web.js",
     "GRENADINE_WEB_WASM": "//grenadine/web:grenadine_web_bg.wasm",
+    "GRENADINE_XTERM_JS": "//grenadine/web:xterm.js",
+    "GRENADINE_XTERM_CSS": "//grenadine/web:xterm.css",
+    "GRENADINE_XTERM_FIT_JS": "//grenadine/web:addon-fit.js",
 }
 
 rust_binary(

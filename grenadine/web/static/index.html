@@ -19,7 +19,11 @@
         document.documentElement.dataset.theme = t;
       })();
     </script>
+    <link rel="stylesheet" href="/xterm.css" />
     <link rel="stylesheet" href="/style.css" />
+    <!-- The terminal panel's emulator; plain scripts run before the module. -->
+    <script src="/xterm.js"></script>
+    <script src="/addon-fit.js"></script>
   </head>
   <body>
     <script type="module">

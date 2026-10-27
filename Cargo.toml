@@ -10,7 +10,7 @@ publish = false
 [workspace.dependencies]
 ammonia = "4.2"
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = [
   "serde",
@@ -30,6 +30,7 @@ gloo-net = { version = "0.7", default-features = false, features = [
 js-sys = "0.3"
 leptos = { version = "0.8", features = ["csr"] }
 libc = "0.2"
+pty-process = { version = "0.5", features = ["async"] }
 linkify = "0.11"
 pulldown-cmark = { version = "0.13", default-features = false, features = [
   "html",

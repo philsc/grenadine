@@ -1417,6 +1417,104 @@ textarea {
   padding: 4px 0 8px;
 }
 
+/* A session's page: the transcript and the worktree's changes side by
+   side, and the terminal panel under both. */
+.agent-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.agent-panes {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.terminal-panel {
+  flex: none;
+  position: relative;
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+/* Straddles the panel's top border. */
+.terminal-resize {
+  position: absolute;
+  top: -4px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  z-index: 1;
+}
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 8px;
+  font-size: 13px;
+}
+.terminal-bar button {
+  font: inherit;
+  color: var(--fg-muted);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.terminal-bar button:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.terminal-toggle {
+  font-weight: 600;
+}
+.terminal-chevron {
+  display: inline-block;
+  width: 1.2em;
+}
+.terminal-tabs {
+  display: flex;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  border-radius: 4px;
+}
+.terminal-tab.selected {
+  background: var(--bg);
+  box-shadow: inset 0 -2px var(--accent);
+}
+.terminal-tab.selected .terminal-tab-name {
+  color: var(--fg);
+}
+.terminal-bar .terminal-tab-close {
+  padding: 3px 4px;
+}
+.terminal-bar .error {
+  margin-left: 8px;
+}
+.terminal-body {
+  position: relative;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.terminal-host {
+  position: absolute;
+  inset: 4px 0 0 8px;
+}
+.terminal-body[hidden],
+.terminal-host[hidden] {
+  display: none;
+}
+
 /* The worktree's changes only get room the transcript can spare; the
    width is CHANGES_PANE_QUERY in agents.rs. */
 .changes-pane {
@@ -1425,7 +1523,8 @@ textarea {
 @media (min-width: 1500px) {
   /* The transcript keeps its full width (that of .agent) when it
      can, and the pane gets the rest. */
-  .agents-page > .main {
+  .agents-page > .main,
+  .agent-panes > .main {
     flex: 0 1 960px;
     min-width: 720px;
   }

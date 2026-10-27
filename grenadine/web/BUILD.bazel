@@ -49,6 +49,28 @@ genrule(
     visibility = ["//grenadine/server:__pkg__"],
 )
 
+# xterm.js, which the terminal panel runs in, as plain scripts that define
+# the globals `Terminal` and `FitAddon`.
+genrule(
+    name = "xterm_files",
+    srcs = [
+        "//:node_modules/@xterm/addon-fit/dir",
+        "//:node_modules/@xterm/xterm/dir",
+    ],
+    outs = [
+        "addon-fit.js",
+        "xterm.css",
+        "xterm.js",
+    ],
+    cmd = """
+        cp $(execpath //:node_modules/@xterm/xterm/dir)/lib/xterm.js $(location xterm.js)
+        cp $(execpath //:node_modules/@xterm/xterm/dir)/css/xterm.css $(location xterm.css)
+        cp $(execpath //:node_modules/@xterm/addon-fit/dir)/lib/addon-fit.js $(location addon-fit.js)
+        sed -i '/^\\/\\/# sourceMappingURL=/d' $(location xterm.js) $(location addon-fit.js)
+    """,
+    visibility = ["//grenadine/server:__pkg__"],
+)
+
 exports_files(
     [
         "static/index.html",

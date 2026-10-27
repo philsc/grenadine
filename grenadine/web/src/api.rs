@@ -9,7 +9,7 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
     Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PermissionMode,
-    PrDetail, PrKey, PrMissing, SyncStatus, WorktreeChanges, WrapUp,
+    PrDetail, PrKey, PrMissing, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -209,6 +209,42 @@ pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     .json()
     .await
     .map_err(|e| e.to_string())
+}
+
+/// The session's open terminals, oldest first.
+pub async fn terminals(id: &str) -> Result<Vec<TerminalInfo>> {
+    check(
+        Request::get(&format!("/api/agents/{id}/terminals"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Starts a login shell in the session's worktree.
+pub async fn open_terminal(id: &str) -> Result<TerminalInfo> {
+    check(
+        Request::post(&format!("/api/agents/{id}/terminals"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub async fn close_terminal(id: &str, terminal: u64) -> Result<()> {
+    check(
+        Request::delete(&format!("/api/agents/{id}/terminals/{terminal}"))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub async fn create_agent(req: &NewAgent) -> Result<AgentSession> {
