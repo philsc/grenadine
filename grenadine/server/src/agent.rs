@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, NewAgent,
-    PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, LandedPr,
+    NewAgent, PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -49,6 +49,12 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
      messages that follow this repository's conventions. Don't change anything else.";
 
+/// What Claude is asked when there's uncommitted work to open PRs for.
+const PR_COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
+     messages that follow this repository's conventions. Each commit becomes its own pull \
+     request in a stack, so make each one a self-contained change that builds and passes the \
+     tests on its own. Don't change anything else.";
+
 /// A wrap-up in progress.
 #[derive(Clone, Debug)]
 struct Pending {
@@ -69,10 +75,12 @@ enum Step {
         reason: String,
         prompt: String,
     },
-    /// The branch is on GitHub; the PR is opened next.
+    /// Each commit is on GitHub on its own branch; the PRs that aren't
+    /// open yet are opened next, the bottom one into `base`.
     Pushed {
         base: String,
-        messages: Vec<String>,
+        /// The branch and message of each commit, oldest first.
+        commits: Vec<(String, String)>,
     },
 }
 
@@ -996,13 +1004,15 @@ fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
     // Wrapping up again lands only what came after.
     match landed {
         Landed::Checkout { sha } => state.db.set_agent_base(id, sha)?,
-        Landed::PullRequest { number, .. } => {
+        Landed::PullRequest { .. } | Landed::Stack { .. } => {
             if let Some(session) = state.db.agent(id)? {
-                let key = PrKey {
-                    repo: session.repo,
-                    number: *number,
-                };
-                state.db.add_agent_pr(id, &key, "OPEN")?;
+                for pr in landed.prs() {
+                    let key = PrKey {
+                        repo: session.repo.clone(),
+                        number: pr.number,
+                    };
+                    state.db.add_agent_pr(id, &key, "OPEN")?;
+                }
             }
         }
     }
@@ -1037,29 +1047,63 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
         }
         _ => None,
     };
+    // The PRs an earlier wrap-up opened stay the bottom of the stack.
+    let opened = session.landed.as_ref().map(Landed::prs).unwrap_or_default();
+    let count = opened.len();
     let step = {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
         let session = session.clone();
         tokio::task::spawn_blocking(move || match target {
             WrapUpTarget::Checkout => land_on_checkout(&repo, &session),
-            WrapUpTarget::PullRequest => push_branch(&repo, &session, pr_branch),
+            WrapUpTarget::PullRequest => push_stack(&repo, &session, pr_branch, count),
         })
         .await??
     };
-    let Step::Pushed { base, messages } = step else {
+    let Step::Pushed { base, commits } = step else {
         return Ok(step);
     };
-    // The push updated the PR that an earlier wrap-up opened.
-    if let Some(landed @ Landed::PullRequest { .. }) = session.landed {
-        return Ok(Step::Landed(landed));
+    // The push updated the PRs already open; each new commit gets a PR
+    // into the branch of the commit below it.
+    let mut prs = opened;
+    let before = prs.len();
+    let mut below = base;
+    for (i, (branch, message)) in commits.into_iter().enumerate() {
+        if i >= prs.len() {
+            let (title, body) = pr_text(&message);
+            match state
+                .github
+                .create_pr(&session.repo, &branch, &below, &title, &body)
+                .await
+            {
+                Ok((number, url)) => prs.push(LandedPr { number, url }),
+                Err(e) => {
+                    // The next wrap-up goes on from the PRs opened so far.
+                    if prs.len() > before {
+                        let numbers = prs
+                            .iter()
+                            .map(|pr| format!("#{}", pr.number))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        record_landed(state, id, &Landed::from_prs(prs))?;
+                        return Err(e.context(format!("opened only {numbers}")));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        below = branch;
     }
-    let (title, body) = pr_text(&session.title, &messages);
-    let (number, url) = state
-        .github
-        .create_pr(&session.repo, &session.branch, &base, &title, &body)
-        .await?;
-    Ok(Step::Landed(Landed::PullRequest { number, url }))
+    Ok(Step::Landed(Landed::from_prs(prs)))
+}
+
+/// The branch the `i`th commit of a session's stack, from 0, is pushed to:
+/// the session's own branch for the bottom one.
+fn stack_branch(branch: &str, i: usize) -> String {
+    match i {
+        0 => branch.to_owned(),
+        _ => format!("{branch}-{}", i + 1),
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -1113,42 +1157,58 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
     bail!("the checkout kept moving")
 }
 
-/// Pushes the session's branch to GitHub. The PR goes into `pr_branch`, or
-/// the default branch.
-fn push_branch(repo: &Repo, session: &AgentSession, pr_branch: Option<String>) -> Result<Step> {
+/// Pushes each of the session's commits to GitHub on its own branch. The
+/// bottom PR goes into `pr_branch`, or the default branch. `opened` PRs are
+/// open already, one for each of the bottom commits.
+fn push_stack(
+    repo: &Repo,
+    session: &AgentSession,
+    pr_branch: Option<String>,
+    opened: usize,
+) -> Result<Step> {
     let worktree = Path::new(&session.worktree);
     if let Some(reason) = repo.worktree_unfinished(worktree)? {
         return Ok(Step::Ask {
             reason,
-            prompt: COMMIT_PROMPT.into(),
+            prompt: PR_COMMIT_PROMPT.into(),
         });
     }
     let head = repo.worktree_head(worktree)?;
-    let messages = repo.messages(&session.base_sha, &head)?;
-    if messages.is_empty() {
+    let commits = repo.commits(&session.base_sha, &head)?;
+    if commits.is_empty() {
         bail!("there are no commits to push");
     }
-    repo.push_branch(&session.branch)?;
+    if commits.len() < opened {
+        bail!(
+            "the session has {} commits but opened {opened} PRs, one per commit",
+            commits.len()
+        );
+    }
+    let commits: Vec<(String, String, String)> = commits
+        .into_iter()
+        .enumerate()
+        .map(|(i, (sha, message))| (sha, stack_branch(&session.branch, i), message))
+        .collect();
+    let refs: Vec<(String, String)> = commits
+        .iter()
+        .map(|(sha, branch, _)| (sha.clone(), branch.clone()))
+        .collect();
+    repo.push_commits(&refs)?;
     let base = match pr_branch {
         Some(b) => b,
         None => repo.default_branch()?,
     };
-    Ok(Step::Pushed { base, messages })
+    let commits = commits
+        .into_iter()
+        .map(|(_, branch, message)| (branch, message))
+        .collect();
+    Ok(Step::Pushed { base, commits })
 }
 
-/// A PR's title and body for commits with `messages`: the commit's own for
-/// one commit, the session's title and the commits' subjects for more.
-fn pr_text(title: &str, messages: &[String]) -> (String, String) {
-    if let [message] = messages {
-        let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
-        return (subject.trim().to_owned(), body.trim().to_owned());
-    }
-    let subjects = messages
-        .iter()
-        .map(|m| format!("- {}", m.lines().next().unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (title.to_owned(), subjects)
+/// A PR's title and body for a commit with `message`.
+fn pr_text(message: &str) -> (String, String) {
+    let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
+    (subject.trim().to_owned(), body.trim().to_owned())
 }
 
 /// Runs one prompt and returns the status the session ends up in.
@@ -1393,10 +1453,14 @@ impl OpenedPrs {
                 prs.dedup();
                 prs
             }
-            AgentEventKind::Landed(Landed::PullRequest { number, .. }) => vec![PrKey {
-                repo: repo.to_owned(),
-                number: *number,
-            }],
+            AgentEventKind::Landed(landed) => landed
+                .prs()
+                .into_iter()
+                .map(|pr| PrKey {
+                    repo: repo.to_owned(),
+                    number: pr.number,
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -2543,13 +2607,17 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     #[test]
     fn pr_texts() {
         assert_eq!(
-            pr_text("t", &["Fix it\n\nBecause.".into()]),
+            pr_text("Fix it\n\nBecause."),
             ("Fix it".into(), "Because.".into())
         );
-        assert_eq!(
-            pr_text("t", &["One\n\nx".into(), "Two".into()]),
-            ("t".into(), "- One\n- Two".into())
-        );
+        assert_eq!(pr_text("Two"), ("Two".into(), "".into()));
+    }
+
+    #[test]
+    fn stack_branches() {
+        assert_eq!(stack_branch("grenadine/agent/x", 0), "grenadine/agent/x");
+        assert_eq!(stack_branch("grenadine/agent/x", 1), "grenadine/agent/x-2");
+        assert_eq!(stack_branch("grenadine/agent/x", 2), "grenadine/agent/x-3");
     }
 
     #[test]
@@ -2618,7 +2686,7 @@ set -- $prompt
 case "$1" in
   write) echo "$3" > "$2" ;;
   commit) echo "$3" > "$2" && git add -A && git commit -qm "Change $2" ;;
-  Wrap) case "$prompt" in "{COMMIT_PROMPT}") git add -A && git commit -qm "Wrapped up" ;; esac ;;
+  Wrap) case "$prompt" in "{COMMIT_PROMPT}"|"{PR_COMMIT_PROMPT}") git add -A && git commit -qm "Wrapped up" ;; esac ;;
 esac
 echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
@@ -2838,6 +2906,58 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 &fx.upstream,
                 &["rev-parse", &format!("refs/heads/{}", session.branch)]
             ),
+            run(worktree, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[tokio::test]
+    async fn pushes_a_branch_per_commit() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        send(
+            &state,
+            id,
+            "commit c more".into(),
+            PermissionMode::Auto,
+            None,
+        );
+        // What's left uncommitted becomes a third commit.
+        send(
+            &state,
+            id,
+            "write d last".into(),
+            PermissionMode::Auto,
+            None,
+        );
+        wait_for_turns(&state, id, 3).await;
+
+        // The test state's GitHub is unreachable, so only the push works.
+        let event = wrap(&state, id, WrapUpTarget::PullRequest).await;
+        assert!(
+            matches!(event, AgentEventKind::WrapUpFailed(_)),
+            "{event:?}"
+        );
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(log.contains(PR_COMMIT_PROMPT), "{log}");
+        let worktree = Path::new(&session.worktree);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+        let branch = &session.branch;
+        assert_eq!(tip(branch), run(worktree, &["rev-parse", "HEAD~2"]));
+        assert_eq!(
+            tip(&format!("{branch}-2")),
+            run(worktree, &["rev-parse", "HEAD~"])
+        );
+        assert_eq!(
+            tip(&format!("{branch}-3")),
             run(worktree, &["rev-parse", "HEAD"])
         );
     }

@@ -1793,6 +1793,15 @@ mod tests {
         db.set_agent_base("a", "t").unwrap();
         let a = db.agent("a").unwrap().unwrap();
         assert_eq!((a.landed, a.base_sha.as_str()), (Some(landed), "t"));
+        let pr = |number| grenadine_core::api::LandedPr {
+            number,
+            url: format!("https://github.com/o/n/pull/{number}"),
+        };
+        let landed = Landed::Stack {
+            prs: vec![pr(3), pr(4)],
+        };
+        db.set_agent_landed("a", &landed).unwrap();
+        assert_eq!(db.agent("a").unwrap().unwrap().landed, Some(landed));
 
         db.interrupt_agents().unwrap();
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();

@@ -228,11 +228,18 @@ impl Repo {
         self.fetch_branch(&self.default_branch()?, local_ref)
     }
 
-    /// Pushes a local branch over HTTPS to the GitHub repository's branch
-    /// of the same name, replacing what's there.
-    pub fn push_branch(&self, branch: &str) -> Result<()> {
-        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
-        self.git(&["push", "--quiet", &self.fetch_url(), &refspec])?;
+    /// Pushes each of `refs`, a commit and a branch, over HTTPS to the
+    /// GitHub repository's branch, replacing what's there. All or none of
+    /// them are pushed.
+    pub fn push_commits(&self, refs: &[(String, String)]) -> Result<()> {
+        let url = self.fetch_url();
+        let mut args = vec!["push".to_owned(), "--quiet".into(), "--atomic".into(), url];
+        args.extend(
+            refs.iter()
+                .map(|(sha, branch)| format!("+{sha}:refs/heads/{branch}")),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.git(&args)?;
         Ok(())
     }
 
@@ -252,20 +259,20 @@ impl Repo {
         self.git_ok(&["merge-base", "--is-ancestor", ancestor, of])
     }
 
-    /// The messages of the commits in `from..to`, oldest first.
-    pub fn messages(&self, from: &str, to: &str) -> Result<Vec<String>> {
+    /// The SHAs and messages of the commits in `from..to`, oldest first.
+    pub fn commits(&self, from: &str, to: &str) -> Result<Vec<(String, String)>> {
         let out = self.git(&[
             "log",
             "--reverse",
-            "--format=%B%x00",
+            "--format=%H%x00%B%x00",
             &format!("{from}..{to}"),
         ])?;
-        Ok(out
-            .split('\0')
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_owned)
-            .collect())
+        let mut fields = out.split('\0').map(str::trim);
+        let mut commits = Vec::new();
+        while let (Some(sha), Some(message)) = (fields.next(), fields.next()) {
+            commits.push((sha.to_owned(), message.to_owned()));
+        }
+        Ok(commits)
     }
 
     /// Runs git in the worktree at `path` and returns its stdout.

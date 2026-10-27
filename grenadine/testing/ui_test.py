@@ -36,7 +36,7 @@ STARTUP_TIMEOUT = 30
 # lists its models when asked like the Agent SDK does, summarizes a new
 # session's request as "Task: " and its first line, answers the scans of
 # deleted sessions with a container they left behind, and finds no stale
-# cleanup items.
+# cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME".
 FAKE_CLAUDE = r"""
 import json
 import subprocess
@@ -133,6 +133,12 @@ if "write" in prompt:
         result(tool_use, "Wrote notes.txt", patch=patch)
     else:
         result(tool_use, decision["message"], is_error=True)
+if prompt.startswith("commit "):
+    name = prompt.removeprefix("commit ")
+    with open(name + ".txt", "w") as f:
+        f.write(name)
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "Add " + name], check=True)
 # `open pr URL` has it open a PR with gh, which prints the PR's URL.
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
@@ -1156,6 +1162,59 @@ class AgentTest(ServerTestCase):
         self.assertTrue(pr.head.startswith("grenadine/agent/"))
         # The checkout stays where the first wrap-up left it.
         self.assertEqual(git("rev-parse", "HEAD"), sha)
+
+    def test_wrap_up_stack(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("commit stack-a")
+        prompt.press("Enter")
+        transcript = self.page.locator(".transcript")
+        done = transcript.locator(".turn-end.muted")
+        expect(done).to_have_count(1)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+
+        # Each commit gets its own PR, into the branch of the one below.
+        actions = self.page.locator(".agent-actions")
+        actions.get_by_role("button", name="Open PR").click()
+        opened = transcript.locator(".wrapped-up")
+        expect(opened.get_by_role("link")).to_have_count(2)
+        repo = self.gh.repo(self.OTHER_REPO)
+
+        def pr(title: str):
+            return next(pr for pr in repo.prs.values() if pr.title == title)
+
+        a, b = pr("Add stack-a"), pr("Add stack-b")
+        self.assertEqual(a.base, "main")
+        self.assertTrue(a.head.startswith("grenadine/agent/"))
+        self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
+        expect(opened.get_by_role("link").nth(0)).to_have_attribute("href", a.url)
+        expect(opened.get_by_role("link").nth(1)).to_have_attribute("href", b.url)
+        header = self.page.locator(".agent-header")
+        badge = header.get_by_role("link", name=f"PRs #{a.number}–#{b.number}")
+        expect(badge).to_have_attribute("href", b.url)
+        entry = (
+            self.section(self.OTHER_REPO)
+            .locator(".agent-entry")
+            .filter(has=self.page.locator(".agent-item.selected"))
+        )
+        expect(entry.locator(".agent-prs")).to_have_text("0/2")
+
+        # More work goes on top of the stack; the PRs below stay.
+        follow_up.fill("commit stack-c")
+        follow_up.press("Enter")
+        expect(done).to_have_count(3)
+        actions.get_by_role("button", name="Open PR").click()
+        expect(opened.nth(1).get_by_role("link")).to_have_count(3)
+        c = pr("Add stack-c")
+        self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
+        self.assertEqual(
+            sum(pr.title.startswith("Add stack-") for pr in repo.prs.values()), 3
+        )
+        expect(entry.locator(".agent-prs")).to_have_text("0/3")
 
     def test_sidebar_shows_merged_prs(self) -> None:
         repo = self.gh.repo(self.OTHER_REPO)

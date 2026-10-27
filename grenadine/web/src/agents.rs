@@ -86,17 +86,21 @@ fn landed_label(landed: &Landed) -> String {
     match landed {
         Landed::Checkout { sha } => format!("merged {}", &sha[..sha.len().min(8)]),
         Landed::PullRequest { number, .. } => format!("PR #{number}"),
+        Landed::Stack { prs } => match (prs.first(), prs.last()) {
+            (Some(bottom), Some(top)) => format!("PRs #{}–#{}", bottom.number, top.number),
+            _ => "no PRs".into(),
+        },
     }
 }
 
-/// `landed_label`, linking to the PR.
+/// `landed_label`, linking to the PR, or the top PR of a stack.
 #[component]
 fn LandedBadge(landed: Landed) -> impl IntoView {
     let label = landed_label(&landed);
-    match landed {
-        Landed::Checkout { .. } => view! { <span class="agent-landed">{label}</span> }.into_any(),
-        Landed::PullRequest { url, .. } => view! {
-            <a class="agent-landed" href=url target="_blank">{label}</a>
+    match landed.prs().pop() {
+        None => view! { <span class="agent-landed">{label}</span> }.into_any(),
+        Some(top) => view! {
+            <a class="agent-landed" href=top.url target="_blank">{label}</a>
         }
         .into_any(),
     }
@@ -1255,7 +1259,7 @@ fn AgentActions(
             >"Merge into checkout"</button>
             <button
                 class="link"
-                title="Push the session's branch to GitHub and open a pull request"
+                title="Push each of the session's commits to GitHub and open a stack of pull requests, one per commit"
                 disabled=wrapping
                 on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
             >"Open PR"</button>
@@ -1469,11 +1473,21 @@ fn Transcript(
                                 "Merged into the checkout at " <code>{sha}</code>
                             </p>
                         }.into_any(),
-                        AgentEventKind::Landed(Landed::PullRequest { number, url }) => view! {
-                            <p class="turn-end wrapped-up">
-                                "Opened " <a href=url target="_blank">{format!("PR #{number}")}</a>
-                            </p>
-                        }.into_any(),
+                        AgentEventKind::Landed(landed) => {
+                            let links = landed
+                                .prs()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, pr)| view! {
+                                    {(i > 0).then_some(", ")}
+                                    <a href=pr.url target="_blank">
+                                        {format!("PR #{}", pr.number)}
+                                    </a>
+                                })
+                                .collect_view();
+                            view! { <p class="turn-end wrapped-up">"Opened " {links}</p> }
+                                .into_any()
+                        }
                         AgentEventKind::WrapUpFailed(e) => view! {
                             <pre class="turn-error">{format!("Couldn't wrap up: {e}")}</pre>
                         }.into_any(),
