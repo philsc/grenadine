@@ -1280,14 +1280,11 @@ async fn turn(
         };
         let Some(line) = line else { break };
         match parse_line(&line) {
-            Parsed::Started { window, model } => {
+            Parsed::Started { model } => {
                 state.db.set_agent_started(id)?;
-                // A resumed session keeps the window its result reported,
-                // unless it switched models.
-                let before = state.db.agent(id)?;
-                if before.is_some_and(|s| s.context_window.is_none() || s.model != model) {
-                    record_usage(state, id, None, Some(window))?;
-                }
+                // The window is only known once a turn's result reports it;
+                // the model's name doesn't tell, since Claude Code leaves
+                // `[1m]` off it.
                 if let Some(model) = model {
                     state.db.set_agent_model(id, &model)?;
                     emit(state, id, AgentEventKind::Model(model))?;
@@ -1417,10 +1414,8 @@ fn record_prs(state: &State, id: &str, prs: &[PrKey]) -> Result<()> {
 /// What one line of `--output-format stream-json` means for the transcript.
 #[derive(Debug, PartialEq)]
 enum Parsed {
-    /// Claude Code created (or resumed) its session with `model`; `window`
-    /// is the context window that the model likely has.
+    /// Claude Code created (or resumed) its session with `model`.
     Started {
-        window: u64,
         model: Option<String>,
     },
     Events(Vec<AgentEventKind>),
@@ -1465,15 +1460,6 @@ fn patch(result: &Value) -> Vec<PatchHunk> {
         .collect()
 }
 
-/// The context window of a model by its name, until a turn's result tells.
-fn guess_window(model: &str) -> u64 {
-    if model.ends_with("[1m]") {
-        1_000_000
-    } else {
-        200_000
-    }
-}
-
 /// How many tokens the context holds after an assistant message.
 fn context_tokens(usage: &Value) -> Option<u64> {
     if !usage.is_object() {
@@ -1503,7 +1489,6 @@ fn parse_line(line: &str) -> Parsed {
         Some("system") if v["subtype"] == "init" => {
             let model = v["model"].as_str().unwrap_or_default();
             return Parsed::Started {
-                window: guess_window(model),
                 model: (!model.is_empty()).then(|| model.to_owned()),
             };
         }
@@ -1628,7 +1613,6 @@ mod tests {
                 r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
             ),
             Parsed::Started {
-                window: 200_000,
                 model: Some("claude-opus-4-6".into())
             }
         );
@@ -1637,7 +1621,6 @@ mod tests {
                 r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
             ),
             Parsed::Started {
-                window: 1_000_000,
                 model: Some("claude-opus-4-6[1m]".into())
             }
         );
@@ -1870,7 +1853,7 @@ echo "$* | $prompt | $(cat a)" >> {log}
 echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
 echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"Hi"}}}},"parent_tool_use_id":null}}'
 echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Hi there"}}],"usage":{{"input_tokens":10,"output_tokens":5}}}},"parent_tool_use_id":null}}'
-echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there","total_cost_usd":0.25}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there","total_cost_usd":0.25,"modelUsage":{{"claude-test":{{"contextWindow":200000}}}}}}'
 "#,
             log = log.display()
         );
