@@ -3,10 +3,12 @@
 //! session can also leave containers, files elsewhere, pushed branches
 //! and the like. A Haiku run reads the deleted session's transcript in the
 //! background and reports those as cleanup items, which the user can
-//! delete or hand off to a new session that cleans them up.
+//! delete or hand off to a new session that cleans them up. Every five
+//! minutes, a Sonnet run checks the items and deletes the ones that are
+//! gone or taken care of already.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +16,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, CleanupState, NewAgent, NewCleanupSession,
-    PermissionMode, ServerEvent,
+    AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, NewAgent,
+    NewCleanupSession, PermissionMode, ServerEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -27,6 +29,15 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What a scan may spend, in USD.
 const SCAN_BUDGET_USD: &str = "0.50";
+
+/// How often the cleanup items are checked for stale ones.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How long a check for stale items may take before it's killed.
+const PRUNE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What a check for stale items may spend, in USD.
+const PRUNE_BUDGET_USD: &str = "0.25";
 
 /// About how much of the transcript a scan gets, in bytes. Its beginning
 /// and end are kept, and the full transcript is there to read.
@@ -76,6 +87,21 @@ own files, and things the session removed again itself. Report each finding \
 with a one-line title and a markdown detail that names exactly what it is \
 and where, quotes the evidence from the transcript, and says how to remove \
 it. If there's nothing, report no items.";
+
+const PRUNE_INSTRUCTIONS: &str = "\
+Scans of deleted coding agent sessions reported the cleanup items below as \
+things the sessions may have left behind on this machine or on remotes. \
+Some of them may be stale: the thing no longer exists, it was cleaned up \
+already (for example by the cleanup session an item was handed off to), or \
+it isn't something to clean up after all (for example it was inside the \
+session's worktree, which is removed, or it's a shared cache, or Claude \
+Code's own files).
+
+Find the items that can be deleted from the list. Check with the tools \
+whether each thing still exists rather than guessing from its description. \
+You can only look; never try to change or remove anything. Keep an item \
+when you aren't sure. Report each item to delete with its id and a short \
+reason. If none can be deleted, report none.";
 
 /// The scans: whether deleting a session starts one, and the ones running.
 pub struct Scans {
@@ -210,10 +236,50 @@ async fn run(
         },
         "required": ["items"],
     });
-    // The worktree is gone, so the scan runs in a directory of its own.
-    let dir = scan_dir(&session.id)?;
+    let projects = transcript.parent().filter(|_| transcript.exists());
+    let output = ask(state, &SCAN, &session.id, &schema, &input, projects).await?;
+    parse_items(&output)
+}
+
+/// How a background run of claude goes.
+struct Job {
+    /// What it's called in errors.
+    name: &'static str,
+    model: &'static str,
+    /// What it may spend, in USD.
+    budget_usd: &'static str,
+    /// How long it may take before it's killed.
+    timeout: Duration,
+}
+
+const SCAN: Job = Job {
+    name: "scan",
+    model: "haiku",
+    budget_usd: SCAN_BUDGET_USD,
+    timeout: SCAN_TIMEOUT,
+};
+
+const PRUNE: Job = Job {
+    name: "prune",
+    model: "sonnet",
+    budget_usd: PRUNE_BUDGET_USD,
+    timeout: PRUNE_TIMEOUT,
+};
+
+/// Runs `job` on `input` with only the read-only tools, in a directory
+/// of its own named after `id`, and returns its output as `schema` has
+/// it. `add_dir` is a directory it may read too.
+async fn ask(
+    state: &State,
+    job: &Job,
+    id: &str,
+    schema: &Value,
+    input: &str,
+    add_dir: Option<&Path>,
+) -> Result<Value> {
+    let dir = scan_dir(id)?;
     let mut cmd = tokio::process::Command::new(state.agents.claude());
-    cmd.args(["-p", "--model", "haiku", "--output-format", "json"])
+    cmd.args(["-p", "--model", job.model, "--output-format", "json"])
         .arg("--json-schema")
         .arg(schema.to_string())
         .args([
@@ -224,10 +290,10 @@ async fn run(
             "--permission-mode",
             "dontAsk",
             "--max-budget-usd",
-            SCAN_BUDGET_USD,
+            job.budget_usd,
         ]);
-    if let Some(projects) = transcript.parent().filter(|_| transcript.exists()) {
-        cmd.arg("--add-dir").arg(projects);
+    if let Some(add_dir) = add_dir {
+        cmd.arg("--add-dir").arg(add_dir);
     }
     // Last, since it takes every value up to the next flag.
     cmd.arg("--allowedTools")
@@ -244,10 +310,16 @@ async fn run(
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(input.as_bytes()).await?;
         drop(stdin);
-        let out = tokio::time::timeout(SCAN_TIMEOUT, child.wait_with_output())
+        let out = tokio::time::timeout(job.timeout, child.wait_with_output())
             .await
-            .map_err(|_| anyhow!("the scan took longer than {}s", SCAN_TIMEOUT.as_secs()))??;
-        parse_result(&out.stdout).with_context(|| {
+            .map_err(|_| {
+                anyhow!(
+                    "the {} took longer than {}s",
+                    job.name,
+                    job.timeout.as_secs()
+                )
+            })??;
+        structured_output(job, &out.stdout).with_context(|| {
             let stderr = String::from_utf8_lossy(&out.stderr);
             format!("claude exited with {}: {}", out.status, stderr.trim())
         })
@@ -263,17 +335,23 @@ fn scan_dir(id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The items in `claude -p --output-format json --json-schema` output.
-fn parse_result(stdout: &[u8]) -> Result<Vec<(String, String)>> {
-    let result: Value = serde_json::from_slice(stdout).context("no result")?;
+/// The structured output in `claude -p --output-format json --json-schema`
+/// output.
+fn structured_output(job: &Job, stdout: &[u8]) -> Result<Value> {
+    let mut result: Value = serde_json::from_slice(stdout).context("no result")?;
     if result["is_error"].as_bool() != Some(false) {
         let why = result["result"]
             .as_str()
             .or(result["subtype"].as_str())
             .unwrap_or("unknown error");
-        bail!("the scan failed: {why}");
+        bail!("the {} failed: {why}", job.name);
     }
-    let items = result["structured_output"]["items"]
+    Ok(result["structured_output"].take())
+}
+
+/// The `(title, detail)` pairs in a scan's output.
+fn parse_items(output: &Value) -> Result<Vec<(String, String)>> {
+    let items = output["items"]
         .as_array()
         .ok_or_else(|| anyhow!("the result has no items"))?;
     Ok(items
@@ -288,6 +366,98 @@ fn parse_result(stdout: &[u8]) -> Result<Vec<(String, String)>> {
             })
         })
         .collect())
+}
+
+/// Checks the cleanup items every `PRUNE_INTERVAL` and deletes the stale
+/// ones, until the server shuts down.
+pub async fn prune_loop(state: Arc<State>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(PRUNE_INTERVAL) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
+        if let Err(e) = prune(&state).await {
+            tracing::warn!("pruning cleanup items: {e:#}");
+        }
+    }
+}
+
+/// Asks Sonnet which cleanup items are gone or taken care of already,
+/// deletes those and returns how many it deleted. Doesn't run Sonnet when
+/// there are no items.
+pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
+    let items = state.db.cleanup_items()?;
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let now = crate::agent::now();
+    let mut input = format!("{PRUNE_INSTRUCTIONS}\n\n# Items\n");
+    for item in &items {
+        input += &format!(
+            "\n## Item {}: {}\n\nFrom the session \u{201c}{}\u{201d} in {}, deleted about {} \
+             minutes ago.\n",
+            item.id,
+            item.title,
+            item.session_title,
+            item.repo,
+            (now - item.created_at).max(0) / 60,
+        );
+        if let Some(cleaner) = &item.handed_off_to {
+            input += &format!("It was handed off to the cleanup session {cleaner}.\n");
+        }
+        input += &format!("\n{}\n", item.detail);
+    }
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "stale": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["id", "reason"],
+                },
+            },
+        },
+        "required": ["stale"],
+    });
+    let output = ask(state, &PRUNE, "prune", &schema, &input, None).await?;
+    let mut deleted = 0;
+    for (id, reason) in parse_stale(&output, &items) {
+        if state.db.delete_cleanup_item(id)? {
+            let title = &items.iter().find(|i| i.id == id).unwrap().title;
+            tracing::info!("deleted the stale cleanup item \u{201c}{title}\u{201d}: {reason}");
+            deleted += 1;
+        }
+    }
+    if deleted > 0 {
+        state.send(ServerEvent::CleanupChanged);
+    }
+    Ok(deleted)
+}
+
+/// The `(id, reason)` pairs in a prune's output, of the `items` it was
+/// asked about only.
+fn parse_stale(output: &Value, items: &[CleanupItem]) -> Vec<(i64, String)> {
+    let stale = output["stale"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    stale
+        .iter()
+        .filter_map(|s| {
+            let id = s["id"].as_i64()?;
+            items.iter().any(|i| i.id == id).then(|| {
+                (
+                    id,
+                    s["reason"].as_str().unwrap_or_default().trim().to_owned(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// `s` cut to about `n` bytes.
@@ -372,7 +542,7 @@ fn digest(events: &[AgentEvent]) -> String {
 }
 
 /// The prompt that hands `items` off to a cleanup session.
-fn hand_off_prompt(items: &[grenadine_core::api::CleanupItem]) -> String {
+fn hand_off_prompt(items: &[CleanupItem]) -> String {
     let mut prompt = String::from(
         "Clean up what deleted agent sessions left behind\n\n\
          A scan of the sessions' transcripts found the items below. Check that each one \
@@ -498,14 +668,41 @@ mod tests {
                 {"title": "", "detail": "dropped"},
             ]},
         });
+        let output = structured_output(&SCAN, ok.to_string().as_bytes()).unwrap();
         assert_eq!(
-            parse_result(ok.to_string().as_bytes()).unwrap(),
+            parse_items(&output).unwrap(),
             [("Container e2e".to_owned(), "`docker rm -f e2e`".to_owned())]
         );
+        assert!(parse_items(&json!({})).is_err());
         let failed = json!({"is_error": true, "subtype": "error_max_budget_usd"});
-        let e = parse_result(failed.to_string().as_bytes()).unwrap_err();
+        let e = structured_output(&SCAN, failed.to_string().as_bytes()).unwrap_err();
         assert!(format!("{e:#}").contains("error_max_budget_usd"), "{e:#}");
-        assert!(parse_result(b"").is_err());
+        assert!(structured_output(&SCAN, b"").is_err());
+    }
+
+    #[test]
+    fn parses_stale_items() {
+        let item = |id| CleanupItem {
+            id,
+            repo: "o/n".into(),
+            session_id: "s".into(),
+            session_title: "t".into(),
+            title: "x".into(),
+            detail: "d".into(),
+            created_at: 0,
+            handed_off_to: None,
+        };
+        let output = json!({"stale": [
+            {"id": 1, "reason": " gone "},
+            {"id": 9, "reason": "made up"},
+            {"reason": "no id"},
+            {"id": 2},
+        ]});
+        assert_eq!(
+            parse_stale(&output, &[item(1), item(2), item(3)]),
+            [(1, "gone".to_owned()), (2, String::new())]
+        );
+        assert_eq!(parse_stale(&json!({}), &[item(1)]), []);
     }
 
     #[test]
