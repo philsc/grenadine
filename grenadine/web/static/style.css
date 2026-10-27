@@ -678,13 +678,13 @@ input[type="text"] {
   margin-left: 8px;
   font-size: 12px;
 }
-.pusher {
+.person {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
 }
-.pusher.guess {
+.person.guess {
   opacity: 0.55;
   font-style: italic;
 }
@@ -907,6 +907,49 @@ input[type="text"] {
   background: var(--bg);
   margin: 4px 0;
   max-width: 900px;
+}
+.thread-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  background: var(--bg-subtle);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.thread.collapsed .thread-header {
+  border-bottom: none;
+  border-radius: 6px;
+}
+.thread.resolved .thread-header {
+  color: var(--fg-muted);
+}
+.thread-toggle {
+  width: 1ch;
+  flex: none;
+}
+.thread-snippet {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.thread-resolved {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex: none;
+  color: var(--add-fg);
 }
 .comment {
   padding: 6px 12px;

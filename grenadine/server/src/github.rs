@@ -1,7 +1,7 @@
 //! The GitHub API: searches, PR details, PRs by branch, the head branch's
 //! activity log and review comments.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -185,7 +185,11 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+        nodes {
+          isResolved
+          resolvedBy { login name avatarUrl }
+          comments(first: 1) { nodes { databaseId } }
+        }
       }
     }
   }
@@ -691,14 +695,16 @@ impl GitHub {
                 created_at: c.created_at,
                 url: c.html_url,
                 resolved: false,
+                resolved_by: None,
             })
             .collect())
     }
 
-    /// The IDs of the first comments of the PR's resolved review threads.
-    pub async fn resolved_threads(&self, key: &PrKey) -> Result<BTreeSet<u64>> {
+    /// The PR's resolved review threads: the ID of each one's first comment
+    /// and who resolved it, if known.
+    pub async fn resolved_threads(&self, key: &PrKey) -> Result<BTreeMap<u64, Option<Person>>> {
         let (owner, name) = split_repo(&key.repo)?;
-        let mut resolved = BTreeSet::new();
+        let mut resolved = BTreeMap::new();
         let mut after: Option<String> = None;
         loop {
             let (data, errors) = self
@@ -727,7 +733,10 @@ impl GitHub {
                     .into_iter()
                     .flatten()
                     .filter(|t| t["isResolved"].as_bool() == Some(true))
-                    .filter_map(|t| t.pointer("/comments/nodes/0/databaseId")?.as_u64()),
+                    .filter_map(|t| {
+                        let id = t.pointer("/comments/nodes/0/databaseId")?.as_u64()?;
+                        Some((id, person_at(&t["resolvedBy"])))
+                    }),
             );
             if threads
                 .pointer("/pageInfo/hasNextPage")

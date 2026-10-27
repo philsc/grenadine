@@ -177,6 +177,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
     let pr_links = RwSignal::new(load_flag("pr-links-in-app", true));
     let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
+    // Kept here, outside what syncs and version changes rebuild.
+    provide_context(Folded(RwSignal::new(HashMap::new())));
 
     move || {
         match pr.get() {
@@ -197,6 +199,11 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     }
     }
 }
+
+/// Threads the user folded or unfolded, by root comment ID. Threads not in
+/// here are folded exactly when they're resolved.
+#[derive(Clone, Copy)]
+struct Folded(RwSignal<HashMap<u64, bool>>);
 
 /// What the markdown of one PR needs: its repo for links, and whether PR
 /// links open in grenadine (inverting Shift+click's meaning).
@@ -495,8 +502,10 @@ fn kind_label(v: &Version) -> &'static str {
     }
 }
 
+/// A person's avatar and name. `guess` marks a pusher that is only the
+/// commit's author.
 #[component]
-fn Pusher(person: Person, guess: bool) -> impl IntoView {
+fn PersonChip(person: Person, guess: bool) -> impl IntoView {
     let label = person
         .name
         .clone()
@@ -513,7 +522,7 @@ fn Pusher(person: Person, guess: bool) -> impl IntoView {
             .unwrap_or_else(|| label.clone())
     };
     view! {
-        <span class="pusher" class:guess=guess title=title>
+        <span class="person" class:guess=guess title=title>
             {match person.avatar_url {
                 Some(url) => view! { <img class="avatar" src=url alt="" /> }.into_any(),
                 None => view! { <span class="avatar avatar-generic"></span> }.into_any(),
@@ -603,7 +612,7 @@ fn VersionPicker(
                 let guess = v.pushed_by_is_guess;
                 v.pushed_by
                     .clone()
-                    .map(|person| view! { <Pusher person=person guess=guess /> })
+                    .map(|person| view! { <PersonChip person=person guess=guess /> })
             });
             let threads = counts.get(&n).map(|&(resolved, total)| {
                 view! {
@@ -672,12 +681,60 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
     }
 }
 
+/// A thread under a header that folds and unfolds it. Resolved threads
+/// start out folded.
 #[component]
 pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
+    let Folded(folded) = expect_context::<Folded>();
+    let root = &thread.root;
+    let (id, resolved) = (root.id, root.resolved);
+    let collapsed = move || folded.with(|m| m.get(&id).copied().unwrap_or(resolved));
+    let count = 1 + thread.replies.len();
+    let snippet = root
+        .body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_owned();
+    let status = resolved.then(|| match root.resolved_by.clone() {
+        Some(person) => view! {
+            <span class="thread-resolved">"Resolved by " <PersonChip person=person guess=false /></span>
+        }
+        .into_any(),
+        None => view! { <span class="thread-resolved">"Resolved"</span> }.into_any(),
+    });
+    let comments = {
+        let thread = thread.clone();
+        move || {
+            (!collapsed()).then(|| {
+                view! {
+                    <CommentBody comment=thread.root.clone() />
+                    {thread.replies.iter().map(|r| view! { <CommentBody comment=r.clone() /> }).collect_view()}
+                }
+            })
+        }
+    };
     view! {
-        <div class="thread">
-            <CommentBody comment=thread.root.clone() />
-            {thread.replies.iter().map(|r| view! { <CommentBody comment=r.clone() /> }).collect_view()}
+        <div class="thread" class:resolved=resolved class:collapsed=collapsed>
+            <button
+                type="button"
+                class="thread-header"
+                aria-expanded=move || (!collapsed()).to_string()
+                on:click=move |_| {
+                    let fold = !collapsed();
+                    folded.update(|m| {
+                        m.insert(id, fold);
+                    });
+                }
+            >
+                <span class="thread-toggle">{move || if collapsed() { "▸" } else { "▾" }}</span>
+                <strong>{root.author.clone()}</strong>
+                <span class="muted">{if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") }}</span>
+                {move || collapsed().then(|| view! { <span class="muted thread-snippet">{snippet.clone()}</span> })}
+                {status}
+            </button>
+            {comments}
         </div>
     }
 }
@@ -770,6 +827,7 @@ mod tests {
             created_at: String::new(),
             url: String::new(),
             resolved: false,
+            resolved_by: None,
         }
     }
 

@@ -268,6 +268,18 @@ def versions_cases(gh: FakeGitHub) -> Versions:
     v.append(repo.commit("Add step 6", {STEPS_PY: steps(6, doubled=6)}, amend=True))
     repo.push(pr.head)
     shas[GROW] = v
+    # An open thread with a reply, and a thread the other account resolved.
+    root = repo.comment(
+        pr, author=OTHER, body="Why a docstring?", path=STEPS_PY, line=1
+    )
+    repo.comment(
+        pr, author=VIEWER, body="To explain.", path=STEPS_PY, line=1, reply_to=root
+    )
+    done = repo.comment(
+        pr, author=OTHER, body="Rename this.\n\nIt's vague.", path=STEPS_PY, line=4
+    )
+    done.resolved = True
+    done.resolved_by = OTHER
 
     for title, edit in ((REBASE, False), (REBASE_AND_EDIT, True)):
         d = "rebase_and_edit" if edit else "rebase"

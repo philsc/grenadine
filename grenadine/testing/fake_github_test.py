@@ -52,7 +52,11 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+        nodes {
+          isResolved
+          resolvedBy { login name avatarUrl }
+          comments(first: 1) { nodes { databaseId } }
+        }
       }
     }
   }
@@ -188,12 +192,21 @@ class FakeGitHubTest(unittest.TestCase):
             pr, author="me", body="Fixed", path="inbox/x.md", line=1, reply_to=root
         )
         root.resolved = True
+        root.resolved_by = "other"
         out = self.query(THREADS_QUERY, owner="test", name="test", number=pr.number)
         threads = out["data"]["repository"]["pullRequest"]["reviewThreads"]
         self.assertEqual(
             threads["nodes"],
             [
-                {"isResolved": True, "comments": {"nodes": [{"databaseId": root.id}]}},
+                {
+                    "isResolved": True,
+                    "resolvedBy": {
+                        "login": "other",
+                        "name": "Other Person",
+                        "avatarUrl": None,
+                    },
+                    "comments": {"nodes": [{"databaseId": root.id}]},
+                },
             ],
         )
 

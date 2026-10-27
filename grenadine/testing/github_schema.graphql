@@ -180,6 +180,7 @@ type PageInfo {
 
 type PullRequestReviewThread {
   isResolved: Boolean!
+  resolvedBy: User
   comments(first: Int, after: String): PullRequestReviewCommentConnection!
 }
 

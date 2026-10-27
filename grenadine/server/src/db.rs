@@ -1457,6 +1457,11 @@ mod tests {
             created_at: "c".into(),
             url: "u".into(),
             resolved: true,
+            resolved_by: Some(Person {
+                login: Some("o".into()),
+                name: None,
+                avatar_url: None,
+            }),
         }];
         db.store_sync(&meta(&key), &versions, &comments, None, false, None)
             .unwrap();
@@ -1688,6 +1693,7 @@ mod tests {
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert!(!pr.comments[0].resolved);
+        assert!(pr.comments[0].resolved_by.is_none());
     }
 
     #[test]

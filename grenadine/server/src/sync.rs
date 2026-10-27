@@ -289,7 +289,10 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
     let mut comments = state.github.review_comments(key).await?;
     let resolved = state.github.resolved_threads(key).await?;
     for c in &mut comments {
-        c.resolved = resolved.contains(&c.id);
+        if let Some(by) = resolved.get(&c.id) {
+            c.resolved = true;
+            c.resolved_by = by.clone();
+        }
     }
 
     let created_at = github::unix(&data.created_at)?;
