@@ -124,6 +124,7 @@ fn delete_session(
                     let _ = s.remove_item(&draft_key(&id));
                     let _ = s.remove_item(&mode_key(&id));
                 }
+                crate::terminal::forget(&id);
                 deleted()
             }
             Err(e) => failed(e),

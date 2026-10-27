@@ -59,8 +59,26 @@ extern "C" {
     fn fit(this: &Fit);
 }
 
-/// Whether the panel is open, for all sessions.
-const OPEN_KEY: &str = "grenadine.terminal-open";
+/// Where whether session `id`'s panel is open is kept. Each session has its
+/// own, so that a terminal open in one doesn't open the panel in the others.
+fn open_key(id: &str) -> String {
+    format!("grenadine.terminal-open.{id}")
+}
+
+/// Where the tab last selected in session `id` is kept, so that switching
+/// to another session and back shows the same terminal.
+fn selected_key(id: &str) -> String {
+    format!("grenadine.terminal-selected.{id}")
+}
+
+/// Drops what's kept for session `id`'s panel, once the session is deleted.
+pub fn forget(id: &str) {
+    if let Some(s) = storage() {
+        let _ = s.remove_item(&open_key(id));
+        let _ = s.remove_item(&selected_key(id));
+    }
+}
+
 /// The panel's height in pixels, for all sessions.
 const HEIGHT_KEY: &str = "grenadine.terminal-height";
 const DEFAULT_HEIGHT: f64 = 320.0;
@@ -379,8 +397,9 @@ fn TerminalView(session: String, terminal: u64, active: Signal<bool>) -> impl In
 #[component]
 pub fn TerminalPanel(id: String) -> impl IntoView {
     let updates = expect_context::<Updates>();
-    let open = RwSignal::new(load_flag(OPEN_KEY, false));
-    Effect::new(move |_| save_flag(OPEN_KEY, open.get()));
+    let open_key = open_key(&id);
+    let open = RwSignal::new(load_flag(&open_key, false));
+    Effect::new(move |_| save_flag(&open_key, open.get()));
     let height = RwSignal::new(
         storage()
             .and_then(|s| s.get_item(HEIGHT_KEY).ok().flatten())
@@ -402,12 +421,27 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
     };
     let terminals = RwSignal::new(Vec::<u64>::new());
     let selected = RwSignal::new(None::<u64>);
+    let selected_key = selected_key(&id);
+    let stored = storage()
+        .and_then(|s| s.get_item(&selected_key).ok().flatten())
+        .and_then(|t| t.parse::<u64>().ok());
+    Effect::new(move |_| {
+        if let (Some(t), Some(s)) = (selected.get(), storage()) {
+            let _ = s.set_item(&selected_key, &t.to_string());
+        }
+    });
     let error = RwSignal::new(None::<String>);
     Effect::new(move |_| match listed.get() {
         Some(Ok(list)) => {
             let ids: Vec<u64> = list.iter().map(|t| t.id).collect();
             if !selected.get_untracked().is_some_and(|s| ids.contains(&s)) {
-                selected.set(ids.last().copied());
+                let kept = stored.filter(|s| ids.contains(s));
+                selected.set(kept.or_else(|| ids.last().copied()));
+            }
+            // Without terminals there's nothing to show, so the panel
+            // doesn't come back open on an empty body.
+            if ids.is_empty() {
+                open.set(false);
             }
             terminals.set(ids);
         }
