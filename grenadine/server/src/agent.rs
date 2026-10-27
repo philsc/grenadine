@@ -2180,6 +2180,7 @@ esac
         let script = format!(
             r#"#!/bin/sh
 echo "$*" > {dir}/prune_args
+pwd > {dir}/prune_cwd
 cat > {dir}/prune_input
 cat {dir}/answer
 "#,
@@ -2253,7 +2254,19 @@ cat {dir}/answer
         let args = std::fs::read_to_string(dir.path().join("prune_args")).unwrap();
         assert!(args.starts_with("-p --model sonnet "), "{args}");
         assert!(args.contains(" --permission-mode dontAsk "), "{args}");
+        assert!(args.contains(" --setting-sources user "), "{args}");
+        assert!(args.contains(" Bash(gh pr view:*) "), "{args}");
+        // In the repo's clone, so that git and gh find the repo.
+        let cwd = std::fs::read_to_string(dir.path().join("prune_cwd")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(cwd.trim()).unwrap(),
+            std::fs::canonicalize(&fx.clone.path).unwrap()
+        );
         let input = std::fs::read_to_string(dir.path().join("prune_input")).unwrap();
+        assert!(
+            input.contains("The working directory is the clone of owner/name"),
+            "{input}"
+        );
         for item in &items {
             assert!(
                 input.contains(&format!("## Item {}: {}\n", item.id, item.title)),

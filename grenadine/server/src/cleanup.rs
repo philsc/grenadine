@@ -48,7 +48,8 @@ const PROMPT_LIMIT: usize = 2_000;
 const TEXT_LIMIT: usize = 300;
 const RESULT_LIMIT: usize = 300;
 
-/// Read-only tools, so that a scan can only look.
+/// Read-only tools, so that a scan can only look. Not `gh api` or bare
+/// `git branch`, which can change things too.
 const ALLOWED_TOOLS: &[&str] = &[
     "Read",
     "Glob",
@@ -65,7 +66,23 @@ const ALLOWED_TOOLS: &[&str] = &[
     "Bash(podman images:*)",
     "Bash(systemctl --user list-units:*)",
     "Bash(git ls-remote:*)",
+    "Bash(git cat-file:*)",
+    "Bash(git log:*)",
+    "Bash(git branch --contains:*)",
+    "Bash(git branch --list:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh pr list:*)",
+    "Bash(gh repo view:*)",
 ];
+
+/// How to use the tools, for both scans and checks for stale items.
+const TOOL_NOTES: &str = "\
+Run each shell command on its own, without pipes, `&&`, `;`, redirections \
+or `$(...)`: anything else is denied. The shell commands you can run are \
+`ls`, `stat`, `du`, `file`, `docker`/`podman` listings, `systemctl --user \
+list-units`, `git ls-remote`, `git cat-file`, `git log`, `git branch \
+--contains`, `git branch --list`, `gh pr view`, `gh pr list` and `gh repo \
+view`.";
 
 const INSTRUCTIONS: &str = "\
 A coding agent session was just deleted. Its git worktree has been removed, \
@@ -88,6 +105,23 @@ with a one-line title and a markdown detail that names exactly what it is \
 and where, quotes the evidence from the transcript, and says how to remove \
 it. If there's nothing, report no items.";
 
+/// Where a job runs, for `repo`: its clone, or an empty directory when the
+/// server has none.
+fn where_note(repo: &str, clone: Option<&Path>) -> String {
+    match clone {
+        Some(clone) => format!(
+            "The working directory is the clone of {repo} at {}, with `origin` on \
+             GitHub, so `git ls-remote origin` and `gh pr view NUMBER --json \
+             state,headRefName` work as they are.",
+            clone.display()
+        ),
+        None => "There is no clone here. The repos are on GitHub as `owner/name`: use \
+                 `git ls-remote https://github.com/OWNER/NAME` and `gh pr view NUMBER \
+                 --repo OWNER/NAME --json state,headRefName`."
+            .to_owned(),
+    }
+}
+
 const PRUNE_INSTRUCTIONS: &str = "\
 Scans of deleted coding agent sessions reported the cleanup items below as \
 things the sessions may have left behind on this machine or on remotes. \
@@ -101,7 +135,12 @@ Find the items that can be deleted from the list. Check with the tools \
 whether each thing still exists rather than guessing from its description. \
 You can only look; never try to change or remove anything. Keep an item \
 when you aren't sure. Report each item to delete with its id and a short \
-reason. If none can be deleted, report none.";
+reason. If none can be deleted, report none.
+
+A pull request that's merged or closed needs no cleaning up, and neither \
+does its branch once the branch is gone from the remote. A commit that \
+was never pushed needs none once `git cat-file -t` can't find it, or once \
+a branch on the remote contains it.";
 
 /// The scans: whether deleting a session starts one, and the ones running.
 pub struct Scans {
@@ -209,9 +248,14 @@ async fn run(
     events: &[AgentEvent],
 ) -> Result<Vec<(String, String)>> {
     let transcript = transcript_path(session);
+    let clone = state.repo(&session.repo).map(|r| r.path);
     let mut input = format!(
-        "{INSTRUCTIONS}\n\nThe session \u{201c}{}\u{201d} worked on {} in the worktree {}.\n",
-        session.title, session.repo, session.worktree
+        "{INSTRUCTIONS}\n\n{TOOL_NOTES} {}\n\n\
+         The session \u{201c}{}\u{201d} worked on {} in the worktree {}.\n",
+        where_note(&session.repo, clone.as_deref()),
+        session.title,
+        session.repo,
+        session.worktree
     );
     if transcript.exists() {
         input += &format!("Its full transcript is {}.\n", transcript.display());
@@ -237,7 +281,16 @@ async fn run(
         "required": ["items"],
     });
     let projects = transcript.parent().filter(|_| transcript.exists());
-    let output = ask(state, &SCAN, &session.id, &schema, &input, projects).await?;
+    let output = ask(
+        state,
+        &SCAN,
+        &session.id,
+        &schema,
+        &input,
+        clone.as_deref(),
+        projects,
+    )
+    .await?;
     parse_items(&output)
 }
 
@@ -266,15 +319,16 @@ const PRUNE: Job = Job {
     timeout: PRUNE_TIMEOUT,
 };
 
-/// Runs `job` on `input` with only the read-only tools, in a directory
-/// of its own named after `id`, and returns its output as `schema` has
-/// it. `add_dir` is a directory it may read too.
+/// Runs `job` on `input` with only the read-only tools, in `cwd` or else
+/// a directory of its own named after `id`, and returns its output as
+/// `schema` has it. `add_dir` is a directory it may read too.
 async fn ask(
     state: &State,
     job: &Job,
     id: &str,
     schema: &Value,
     input: &str,
+    cwd: Option<&Path>,
     add_dir: Option<&Path>,
 ) -> Result<Value> {
     let dir = scan_dir(id)?;
@@ -285,6 +339,10 @@ async fn ask(
         .args([
             "--no-session-persistence",
             "--strict-mcp-config",
+            // Not the project settings of a clone it runs in, which could
+            // allow more tools or add hooks.
+            "--setting-sources",
+            "user",
             "--tools",
             "Read,Glob,Grep,Bash",
             "--permission-mode",
@@ -298,7 +356,7 @@ async fn ask(
     // Last, since it takes every value up to the next flag.
     cmd.arg("--allowedTools")
         .args(ALLOWED_TOOLS)
-        .current_dir(&dir)
+        .current_dir(cwd.unwrap_or(&dir))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -383,16 +441,41 @@ pub async fn prune_loop(state: Arc<State>) {
 }
 
 /// Asks Sonnet which cleanup items are gone or taken care of already,
-/// deletes those and returns how many it deleted. Doesn't run Sonnet when
-/// there are no items.
+/// deletes those and returns how many it deleted. Checks the items of each
+/// repo in its clone, and doesn't run Sonnet when there are no items.
 pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     let items = state.db.cleanup_items()?;
-    if items.is_empty() {
-        return Ok(0);
-    }
-    let now = crate::agent::now();
-    let mut input = format!("{PRUNE_INSTRUCTIONS}\n\n# Items\n");
+    let mut by_clone: BTreeMap<Option<PathBuf>, Vec<&CleanupItem>> = BTreeMap::new();
     for item in &items {
+        let clone = state.repo(&item.repo).map(|r| r.path);
+        by_clone.entry(clone).or_default().push(item);
+    }
+    let mut deleted = 0;
+    let mut failed = None;
+    for (clone, items) in by_clone {
+        match prune_in(state, clone.as_deref(), &items).await {
+            Ok(n) => deleted += n,
+            Err(e) => failed = Some(e),
+        }
+    }
+    if deleted > 0 {
+        state.send(ServerEvent::CleanupChanged);
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(deleted),
+    }
+}
+
+/// Asks Sonnet, in `clone`, which of `items` are stale, deletes those and
+/// returns how many it deleted.
+async fn prune_in(state: &State, clone: Option<&Path>, items: &[&CleanupItem]) -> Result<usize> {
+    let now = crate::agent::now();
+    let mut input = format!(
+        "{PRUNE_INSTRUCTIONS}\n\n{TOOL_NOTES} {}\n\n# Items\n",
+        where_note(&items[0].repo, clone)
+    );
+    for item in items {
         input += &format!(
             "\n## Item {}: {}\n\nFrom the session \u{201c}{}\u{201d} in {}, deleted about {} \
              minutes ago.\n",
@@ -424,24 +507,21 @@ pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
         },
         "required": ["stale"],
     });
-    let output = ask(state, &PRUNE, "prune", &schema, &input, None).await?;
+    let output = ask(state, &PRUNE, "prune", &schema, &input, clone, None).await?;
     let mut deleted = 0;
-    for (id, reason) in parse_stale(&output, &items) {
+    for (id, reason) in parse_stale(&output, items) {
         if state.db.delete_cleanup_item(id)? {
             let title = &items.iter().find(|i| i.id == id).unwrap().title;
             tracing::info!("deleted the stale cleanup item \u{201c}{title}\u{201d}: {reason}");
             deleted += 1;
         }
     }
-    if deleted > 0 {
-        state.send(ServerEvent::CleanupChanged);
-    }
     Ok(deleted)
 }
 
 /// The `(id, reason)` pairs in a prune's output, of the `items` it was
 /// asked about only.
-fn parse_stale(output: &Value, items: &[CleanupItem]) -> Vec<(i64, String)> {
+fn parse_stale(output: &Value, items: &[&CleanupItem]) -> Vec<(i64, String)> {
     let stale = output["stale"]
         .as_array()
         .map(Vec::as_slice)
@@ -699,10 +779,10 @@ mod tests {
             {"id": 2},
         ]});
         assert_eq!(
-            parse_stale(&output, &[item(1), item(2), item(3)]),
+            parse_stale(&output, &[&item(1), &item(2), &item(3)]),
             [(1, "gone".to_owned()), (2, String::new())]
         );
-        assert_eq!(parse_stale(&json!({}), &[item(1)]), []);
+        assert_eq!(parse_stale(&json!({}), &[&item(1)]), []);
     }
 
     #[test]
