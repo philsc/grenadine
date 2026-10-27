@@ -90,6 +90,7 @@ class Comment:
     in_reply_to: int | None = None
     side: str = "RIGHT"
     resolved: bool = False
+    resolved_by: str | None = None
 
 
 @dataclasses.dataclass
@@ -723,6 +724,11 @@ class FakeGitHub:
                 "nodes": [
                     {
                         "isResolved": c.resolved,
+                        "resolvedBy": (
+                            self._user_node(c.resolved_by)
+                            if c.resolved and c.resolved_by
+                            else None
+                        ),
                         "comments": lambda info, c=c, **_: {
                             "nodes": [{"databaseId": c.id}]
                         },

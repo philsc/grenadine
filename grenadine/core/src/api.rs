@@ -206,6 +206,10 @@ pub struct ReviewComment {
     /// on a thread's root comment.
     #[serde(default)]
     pub resolved: bool,
+    /// Who resolved the thread this comment starts, if known. Only
+    /// meaningful on a thread's root comment.
+    #[serde(default)]
+    pub resolved_by: Option<Person>,
 }
 
 /// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.

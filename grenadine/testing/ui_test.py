@@ -570,6 +570,39 @@ class VersionsTest(ServerTestCase):
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
 
+    def test_threads_fold(self) -> None:
+        self.open(scenarios.GROW)
+        threads = self.file(scenarios.STEPS_PY).locator(".thread")
+        expect(threads).to_have_count(2)
+        open_thread, resolved = threads.nth(0), threads.nth(1)
+
+        # Open threads start unfolded, resolved ones folded.
+        expect(open_thread.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "true"
+        )
+        expect(open_thread.locator(".comment")).to_have_count(2)
+        expect(open_thread.locator(".thread-resolved")).to_have_count(0)
+        header = resolved.locator(".thread-header")
+        expect(header).to_have_attribute("aria-expanded", "false")
+        expect(resolved.locator(".comment")).to_have_count(0)
+        expect(header.locator(".thread-snippet")).to_have_text("Rename this.")
+        expect(header.locator(".thread-resolved")).to_have_text(
+            "Resolved by Other Person"
+        )
+
+        # The header folds and unfolds.
+        header.click()
+        expect(resolved.locator(".comment")).to_have_count(1)
+        expect(header.locator(".thread-snippet")).to_have_count(0)
+        open_thread.locator(".thread-header").click()
+        expect(open_thread.locator(".comment")).to_have_count(0)
+
+        # Rebuilding the diff keeps what the user folded.
+        self.choose(5, 6)
+        threads = self.file(scenarios.STEPS_PY).locator(".thread")
+        expect(threads.nth(0).locator(".comment")).to_have_count(0)
+        expect(threads.nth(1).locator(".comment")).to_have_count(1)
+
     def test_diff_against_the_base(self) -> None:
         self.open(scenarios.GROW)
         expect(self.page.locator(".diff-summary")).to_have_text("1 files changed")
