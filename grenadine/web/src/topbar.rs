@@ -77,7 +77,7 @@ pub fn Topbar(
                 <a class="topbar-brand" href="#/">"grenadine"</a>
                 <nav class="topbar-tabs">
                     <a href="#/" class:active=move || route.with(|r| matches!(r, Route::Inboxes | Route::Pr(_)))>"Inboxes"</a>
-                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Agent(_)))>"Agents"</a>
+                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_)))>"Agents"</a>
                 </nav>
             </span>
             <span class="topbar-right">

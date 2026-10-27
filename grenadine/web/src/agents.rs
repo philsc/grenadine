@@ -17,6 +17,7 @@ use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use crate::diffview::{EditDiff, WorktreeDiff};
+use crate::drafts::{self, Draft, Drafts};
 use crate::inboxes::storage;
 use crate::{Route, Updates, api, hash_for, markdown};
 
@@ -153,6 +154,25 @@ fn TrashIcon() -> impl IntoView {
 }
 
 #[component]
+fn PencilIcon() -> impl IntoView {
+    view! {
+        <svg
+            viewBox="0 0 16 16"
+            width="10"
+            height="10"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+        >
+            <path d="M10.5 2.5l3 3-8 8h-3v-3zM8.5 4.5l3 3" />
+        </svg>
+    }
+}
+
+#[component]
 fn PrIcon() -> impl IntoView {
     view! {
         <svg
@@ -237,16 +257,47 @@ fn StatusBadge(status: AgentStatus) -> impl IntoView {
     view! { <span class=status_class(status)>{status_label(status)}</span> }
 }
 
-/// The sessions grouped by repository: every configured repository in
-/// order, even without sessions, then any other repository a session is in.
-fn by_repo(repos: Vec<String>, sessions: Vec<AgentSession>) -> Vec<(String, Vec<AgentSession>)> {
-    let mut groups: Vec<(String, Vec<AgentSession>)> =
-        repos.into_iter().map(|r| (r, Vec::new())).collect();
-    for s in sessions {
-        match groups.iter_mut().find(|(r, _)| *r == s.repo) {
-            Some((_, list)) => list.push(s),
-            None => groups.push((s.repo.clone(), vec![s])),
+/// A repository's section in the sidebar: the ids of the drafts in it,
+/// then its sessions.
+struct RepoGroup {
+    repo: String,
+    drafts: Vec<String>,
+    sessions: Vec<AgentSession>,
+}
+
+/// The group for `repo`, added at the end if there's none yet.
+fn group<'a>(groups: &'a mut Vec<RepoGroup>, repo: &str) -> &'a mut RepoGroup {
+    let i = match groups.iter().position(|g| g.repo == repo) {
+        Some(i) => i,
+        None => {
+            groups.push(RepoGroup {
+                repo: repo.to_owned(),
+                drafts: Vec::new(),
+                sessions: Vec::new(),
+            });
+            groups.len() - 1
         }
+    };
+    &mut groups[i]
+}
+
+/// The sessions, and the drafts given as `(repo, id)`, grouped by
+/// repository: every configured repository in order, even without either,
+/// then any other repository a session or draft is in.
+fn by_repo(
+    repos: Vec<String>,
+    sessions: Vec<AgentSession>,
+    drafts: Vec<(String, String)>,
+) -> Vec<RepoGroup> {
+    let mut groups = Vec::new();
+    for r in repos {
+        group(&mut groups, &r);
+    }
+    for s in sessions {
+        group(&mut groups, &s.repo.clone()).sessions.push(s);
+    }
+    for (repo, id) in drafts {
+        group(&mut groups, &repo).drafts.push(id);
     }
     groups
 }
@@ -264,24 +315,32 @@ pub fn Sidebar(
         updates.agents.track();
         api::agents()
     });
+    let drafts = expect_context::<Drafts>();
+    // Only changes when a draft is added, removed or moved, so typing in
+    // one doesn't redraw the sidebar.
+    let listed = Memo::new(move |_| {
+        route.with(|r| {
+            let open = match r {
+                Route::Draft(id) => Some(id.as_str()),
+                _ => None,
+            };
+            drafts.listed(open)
+        })
+    });
     // Deleting from the sidebar failed.
     let error = RwSignal::new(None::<String>);
 
     view! {
         <aside class="agent-sidebar">
-            <a
-                class="agent-new"
-                class:selected=move || route.with(|r| matches!(r, Route::Agents { .. }))
-                href="#/agents"
-            >"+ New session"</a>
+            <a class="agent-new" href="#/agents">"+ New session"</a>
             {move || error.get().map(|e| view! { <p class="error pad">{e}</p> })}
             {move || match (repos.get(), sessions.get()) {
                 (Some(Err(e)), _) | (_, Some(Err(e))) => {
                     view! { <p class="error pad">{e}</p> }.into_any()
                 }
-                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(repos, sessions)
+                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(repos, sessions, listed.get())
                     .into_iter()
-                    .map(|(repo, list)| view! { <RepoSessions repo=repo list=list route=route error=error /> })
+                    .map(|g| view! { <RepoSessions group=g route=route error=error /> })
                     .collect_view()
                     .into_any(),
                 _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
@@ -527,13 +586,18 @@ pub fn CleanupView() -> impl IntoView {
     }
 }
 
+/// A repository's drafts, then its sessions.
 #[component]
 fn RepoSessions(
-    repo: String,
-    list: Vec<AgentSession>,
+    group: RepoGroup,
     route: Signal<Route>,
     error: RwSignal<Option<String>>,
 ) -> impl IntoView {
+    let RepoGroup {
+        repo,
+        drafts,
+        sessions: list,
+    } = group;
     let new = format!("#/agents/new/{repo}");
     view! {
         <section class="agent-repo">
@@ -541,7 +605,7 @@ fn RepoSessions(
                 <span>{repo.clone()}</span>
                 <a href=new.clone() title=format!("New session in {repo}")>"+"</a>
             </h2>
-            {if list.is_empty() {
+            {if list.is_empty() && drafts.is_empty() {
                 view! {
                     <p class="agent-none muted">
                         "No agents in this repository yet. " <a href=new>"Start one"</a>
@@ -550,6 +614,7 @@ fn RepoSessions(
             } else {
                 view! {
                     <ul class="agent-list">
+                        {drafts.into_iter().map(|id| view! { <DraftEntry id=id route=route /> }).collect_view()}
                         {list.into_iter().map(|a| {
                             let id = a.id.clone();
                             let is_open = move |id: &str| {
@@ -605,6 +670,72 @@ fn RepoSessions(
                 }.into_any()
             }}
         </section>
+    }
+}
+
+/// A new session still being written, linking to its form. It looks
+/// unlike the sessions so that it's clear it hasn't started.
+#[component]
+fn DraftEntry(id: String, route: Signal<Route>) -> impl IntoView {
+    let drafts = expect_context::<Drafts>();
+    let href = drafts::hash(&id);
+    // The prompt's first line, if anything was written yet.
+    let title = {
+        let id = id.clone();
+        move || {
+            drafts
+                .with(&id, |d| d.prompt.trim().lines().next().map(str::to_owned))
+                .flatten()
+        }
+    };
+    let meta = {
+        let id = id.clone();
+        move || {
+            drafts
+                .with(&id, |d| {
+                    let mut meta = vec![d.mode.label().to_owned()];
+                    let pr = d.pr.trim().trim_start_matches('#');
+                    if !pr.is_empty() {
+                        meta.insert(0, format!("#{pr}"));
+                    }
+                    meta.join(" · ")
+                })
+                .unwrap_or_default()
+        }
+    };
+    let selected = {
+        let id = id.clone();
+        move || route.with(|r| matches!(r, Route::Draft(s) if *s == id))
+    };
+    let discard = move |_| {
+        let open = route.with_untracked(|r| matches!(r, Route::Draft(s) if *s == id));
+        drafts.remove(&id);
+        // Its form can't show it any more.
+        if open {
+            go("#/agents");
+        }
+    };
+    view! {
+        <li class="agent-entry">
+            <a class="agent-draft" class:selected=selected href=href>
+                {move || match title() {
+                    Some(t) => view! { <span class="agent-title" title=t.clone()>{t.clone()}</span> }.into_any(),
+                    None => view! { <span class="agent-title muted">"New session"</span> }.into_any(),
+                }}
+                <span class="agent-status-line">
+                    <span class="agent-status draft"><PencilIcon />"Draft"</span>
+                    <span class="agent-meta muted">{meta}</span>
+                </span>
+            </a>
+            <button
+                class="icon agent-delete"
+                title="Discard draft"
+                aria-label="Discard draft"
+                on:click=discard
+            >
+                <TrashIcon />
+            </button>
+        </li>
     }
 }
 
@@ -671,19 +802,24 @@ const MODEL_KEY: &str = "grenadine.agent-model";
 /// What the model picker shows for Claude Code's configured default.
 const DEFAULT_MODEL: &str = "default";
 
-/// The model the next prompt goes with, an `AgentModelInfo::value`: the
-/// last one picked, Claude Code's default at first.
+/// The model picked last, an `AgentModelInfo::value`; Claude Code's
+/// default at first.
+pub(crate) fn last_model() -> String {
+    storage()
+        .and_then(|s| s.get_item(MODEL_KEY).ok().flatten())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_owned())
+}
+
+fn save_model(model: &str) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(MODEL_KEY, model);
+    }
+}
+
+/// The model the next prompt goes with: the last one picked.
 fn model_signal() -> RwSignal<String> {
-    let model = RwSignal::new(
-        storage()
-            .and_then(|s| s.get_item(MODEL_KEY).ok().flatten())
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
-    );
-    Effect::new(move |_| {
-        if let Some(s) = storage() {
-            let _ = s.set_item(MODEL_KEY, &model.get());
-        }
-    });
+    let model = RwSignal::new(last_model());
+    Effect::new(move |_| model.with(|m| save_model(m)));
     model
 }
 
@@ -772,17 +908,44 @@ fn submits(ev: &web_sys::KeyboardEvent) -> bool {
     ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing()
 }
 
-/// The form that starts a session, filled in with `repo` and `pr` if given.
+/// The form that starts a session, filled in from the draft with id
+/// `draft` and kept in it as it changes.
 #[component]
-pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
+pub fn NewSession(draft: String) -> impl IntoView {
+    let drafts = expect_context::<Drafts>();
     let repos = LocalResource::new(api::repos);
-    let repo = RwSignal::new(repo.unwrap_or_default());
-    let number = RwSignal::new(pr.map(|n| n.to_string()).unwrap_or_default());
-    let prompt = RwSignal::new(String::new());
-    // New sessions start out planning, whatever the others go on with.
-    let mode = RwSignal::new(PermissionMode::Plan);
-    let model = model_signal();
+    let saved = drafts.open(&draft);
+    let repo = RwSignal::new(saved.repo);
+    let number = RwSignal::new(saved.pr);
+    let prompt = RwSignal::new(saved.prompt);
+    let mode = RwSignal::new(saved.mode);
+    let model = RwSignal::new(saved.model);
     let error = RwSignal::new(None::<String>);
+    let id = StoredValue::new(draft.clone());
+
+    Effect::new(move |_| {
+        let (repo, pr, prompt, mode, model) = (
+            repo.get(),
+            number.get(),
+            prompt.get(),
+            mode.get(),
+            model.get(),
+        );
+        drafts.update(&id.get_value(), |d| {
+            *d = Draft {
+                repo,
+                pr,
+                prompt,
+                mode,
+                model,
+                ..d.clone()
+            }
+        });
+    });
+    // The model picked is the one the next draft starts with.
+    Effect::watch(move || model.get(), |m, _, _| save_model(m), false);
+    // A form left without writing anything isn't worth keeping.
+    on_cleanup(move || drafts.remove_if_blank(&draft));
     let busy = RwSignal::new(false);
 
     // Default to the first repository once they're known.
@@ -816,11 +979,13 @@ pub fn NewSession(repo: Option<String>, pr: Option<u64>) -> impl IntoView {
             permission_mode: mode.get_untracked(),
             model: model_arg(model),
         };
+        let id = id.get_value();
         busy.set(true);
         error.set(None);
         spawn_local(async move {
             match api::create_agent(&req).await {
                 Ok(session) => {
+                    drafts.remove(&id);
                     // Its follow-ups go on in the mode it started in.
                     if let Some(s) = storage() {
                         let _ = s.set_item(&mode_key(&session.id), req.permission_mode.as_str());
@@ -2035,17 +2200,29 @@ mod tests {
                 session("2", "o/gone"),
                 session("3", "o/b"),
             ],
+            vec![
+                ("o/b".into(), "d1".into()),
+                ("o/new".into(), "d2".into()),
+                ("o/b".into(), "d3".into()),
+            ],
         );
-        let ids: Vec<(&str, Vec<&str>)> = groups
+        let ids: Vec<(&str, Vec<&str>, Vec<&str>)> = groups
             .iter()
-            .map(|(r, l)| (r.as_str(), l.iter().map(|s| s.id.as_str()).collect()))
+            .map(|g| {
+                (
+                    g.repo.as_str(),
+                    g.drafts.iter().map(String::as_str).collect(),
+                    g.sessions.iter().map(|s| s.id.as_str()).collect(),
+                )
+            })
             .collect();
         assert_eq!(
             ids,
             [
-                ("o/a", vec![]),
-                ("o/b", vec!["1", "3"]),
-                ("o/gone", vec!["2"])
+                ("o/a", vec![], vec![]),
+                ("o/b", vec!["d1", "d3"], vec!["1", "3"]),
+                ("o/gone", vec![], vec!["2"]),
+                ("o/new", vec!["d2"], vec![]),
             ]
         );
     }

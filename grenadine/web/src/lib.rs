@@ -5,6 +5,7 @@
 mod agents;
 mod api;
 mod diffview;
+mod drafts;
 mod events;
 mod highlight;
 mod inboxes;
@@ -43,10 +44,13 @@ pub enum Route {
     Pr(PrKey),
     /// `#/agents`, `#/agents/new/owner/name` to start a session in a
     /// repository, or `#/agents/new/owner/name/number` to start one on a PR.
+    /// Each opens a new draft.
     Agents {
         repo: Option<String>,
         pr: Option<u64>,
     },
+    /// `#/agents/draft/<id>`: a new session's form.
+    Draft(String),
     /// `#/agents/<id>`.
     Agent(String),
     /// `#/agents/cleanup`: what deleted sessions left behind.
@@ -80,6 +84,7 @@ fn route_from_hash(hash: &str) -> Route {
                 pr: Some(k.number),
             })
         }
+        ["agents", "draft", id] if !id.is_empty() => Some(Route::Draft(id.to_owned())),
         ["agents", "cleanup"] => Some(Route::Cleanup),
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
@@ -94,6 +99,17 @@ pub fn hash_for(key: &PrKey) -> String {
 
 fn current_hash() -> String {
     window().location().hash().unwrap_or_default()
+}
+
+/// The form's links open a new draft each, in place of the link in the
+/// history, so that going back skips them.
+fn open_draft(route: Route, drafts: drafts::Drafts) -> Route {
+    let Route::Agents { repo, pr } = route else {
+        return route;
+    };
+    let id = drafts.create(repo, pr);
+    let _ = window().location().replace(&drafts::hash(&id));
+    Route::Draft(id)
 }
 
 /// Fetches the sync status; the server's lag fallback sends InboxesChanged,
@@ -156,11 +172,17 @@ fn App() -> impl IntoView {
     provide_context(updates);
     listen(updates);
 
-    let route = RwSignal::new(route_from_hash(&current_hash()));
+    let initial = route_from_hash(&current_hash());
+    let drafts = drafts::Drafts::load(match &initial {
+        Route::Draft(id) => Some(id.as_str()),
+        _ => None,
+    });
+    provide_context(drafts);
+    let route = RwSignal::new(open_draft(initial, drafts));
     // The PR shown most recently, highlighted when going back to the inboxes.
     let last = RwSignal::new(route.with_untracked(pr_of));
     let handle = window_event_listener_untyped("hashchange", move |_| {
-        let r = route_from_hash(&current_hash());
+        let r = open_draft(route_from_hash(&current_hash()), drafts);
         if let Some(key) = pr_of(&r) {
             last.set(Some(key));
         }
@@ -171,7 +193,7 @@ fn App() -> impl IntoView {
     let selected = Memo::new(move |_| route.with(pr_of));
     let agents = Memo::new(move |_| {
         route.with(|r| match r {
-            Route::Agents { .. } | Route::Agent(_) | Route::Cleanup => Some(r.clone()),
+            Route::Draft(_) | Route::Agent(_) | Route::Cleanup => Some(r.clone()),
             _ => None,
         })
     });
@@ -215,8 +237,8 @@ fn App() -> impl IntoView {
                     {move || agents.get().map(|r| match r {
                         // It has its own main, next to the worktree's changes.
                         Route::Agent(id) => view! { <agents::AgentView id=id /> }.into_any(),
-                        Route::Agents { repo, pr } => view! {
-                            <main class="main"><agents::NewSession repo=repo pr=pr /></main>
+                        Route::Draft(id) => view! {
+                            <main class="main"><agents::NewSession draft=id /></main>
                         }.into_any(),
                         Route::Cleanup => view! { <main class="main"><agents::CleanupView /></main> }.into_any(),
                         _ => ().into_any(),
@@ -278,6 +300,10 @@ mod tests {
                 repo: Some("o/n".into()),
                 pr: Some(7)
             }
+        );
+        assert_eq!(
+            route_from_hash("#/agents/draft/abc"),
+            Route::Draft("abc".into())
         );
         assert_eq!(route_from_hash("#/agents/abc"), Route::Agent("abc".into()));
         assert_eq!(route_from_hash("#/agents/cleanup"), Route::Cleanup);

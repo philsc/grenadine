@@ -1013,10 +1013,6 @@ input[type="text"] {
   background: var(--bg-hover);
   text-decoration: none;
 }
-.agent-new.selected {
-  background: var(--accent-bg);
-  box-shadow: inset 3px 0 var(--accent);
-}
 .agent-repo {
   border-top: 1px solid var(--border);
 }
@@ -1158,6 +1154,33 @@ textarea {
 }
 .agent-status-line .agent-meta {
   min-width: 0;
+}
+/* A new session still being written: outlined rather than filled, so it
+   doesn't pass for one that's started. */
+.agent-draft {
+  display: block;
+  margin: 2px 8px;
+  padding: 3px 7px;
+  color: var(--fg);
+  border: 1px dashed var(--fg-muted);
+  border-radius: 6px;
+}
+.agent-draft:hover {
+  background: var(--bg-hover);
+  text-decoration: none;
+}
+.agent-draft.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+.agent-draft .agent-title {
+  font-style: italic;
+}
+.agent-status.draft {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-style: dashed;
 }
 /* Beside the session's link rather than in it, since a button can't be
    inside a link; placed over the link's bottom right corner. */
