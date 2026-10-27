@@ -28,7 +28,7 @@ use crate::sync::State;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What a scan may spend, in USD.
-const SCAN_BUDGET_USD: &str = "0.50";
+const SCAN_BUDGET_USD: &str = "2.00";
 
 /// How often the cleanup items are checked for stale ones.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -37,7 +37,7 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PRUNE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What a check for stale items may spend, in USD.
-const PRUNE_BUDGET_USD: &str = "0.25";
+const PRUNE_BUDGET_USD: &str = "1.00";
 
 /// About how much of the transcript a scan gets, in bytes. Its beginning
 /// and end are kept, and the full transcript is there to read.
