@@ -482,8 +482,8 @@ async fn interrupt_agent(AxState(state): St, Path(id): Path<String>) -> ApiResul
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Lands the session's work; the outcome shows up in its transcript. 409
-/// while the session is busy.
+/// Lands the session's work once its turns are done; the outcome shows up
+/// in its transcript. 409 while it is already wrapping up.
 async fn wrap_up_agent(
     AxState(state): St,
     Path(id): Path<String>,
@@ -496,11 +496,7 @@ async fn wrap_up_agent(
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
     if !agent::wrap_up(&state, &id, req).await {
-        return Ok((
-            StatusCode::CONFLICT,
-            "the session is busy; wrap up once it's done",
-        )
-            .into_response());
+        return Ok((StatusCode::CONFLICT, "the session is already wrapping up").into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

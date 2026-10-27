@@ -883,13 +883,18 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
 async fn run(state: Arc<State>, id: String) {
     let mut last = AgentStatus::Idle;
     loop {
-        let prompt = state.agents.with_live(&id, |l| {
+        // Only a wrap-up that waited for this task is the task's to go on
+        // with; one that comes once it stops running is wrap_up's.
+        let (prompt, waiting) = state.agents.with_live(&id, |l| {
             let prompt = l.queue.pop_front();
             l.running = prompt.is_some();
             l.interrupted = false;
-            prompt
+            (prompt, l.wrap_up.is_some())
         });
         let Some((prompt, mode, model)) = prompt else {
+            if !waiting {
+                return;
+            }
             if last == AgentStatus::Idle {
                 continue_wrap_up(&state, &id).await;
             } else if state.agents.with_live(&id, |l| l.wrap_up.take()).is_some() {
@@ -926,12 +931,12 @@ async fn run(state: Arc<State>, id: String) {
     }
 }
 
-/// Starts landing the session's work. Returns false when the session is
-/// busy with a turn or another wrap-up.
+/// Starts landing the session's work, after the turns already queued.
+/// Returns false when the session is busy with another wrap-up.
 pub async fn wrap_up(state: &Arc<State>, id: &str, req: WrapUp) -> bool {
     let start = state.agents.with_live(id, |l| {
-        if l.running || l.wrap_up.is_some() {
-            return false;
+        if l.wrap_up.is_some() {
+            return None;
         }
         l.wrap_up = Some(Pending {
             target: req.target,
@@ -939,12 +944,18 @@ pub async fn wrap_up(state: &Arc<State>, id: &str, req: WrapUp) -> bool {
             model: req.model,
             asked: false,
         });
-        true
+        // A running task goes on with the wrap-up once its turns are done.
+        Some(!l.running)
     });
-    if start {
-        continue_wrap_up(state, id).await;
+    match start {
+        None => false,
+        Some(start) => {
+            if start {
+                continue_wrap_up(state, id).await;
+            }
+            true
+        }
     }
-    start
 }
 
 /// Tries to land the work of the session's wrap-up, if one is in
@@ -2653,6 +2664,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             model: None,
         };
         assert!(wrap_up(state, id, req).await);
+        wrapped(state, id).await
+    }
+
+    /// Waits for the session's wrap-up and returns how it ended.
+    async fn wrapped(state: &Arc<State>, id: &str) -> AgentEventKind {
         for _ in 0..100 {
             let done = state
                 .agents
@@ -2664,6 +2680,40 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("the wrap-up didn't finish");
+    }
+
+    #[tokio::test]
+    async fn wraps_up_after_the_running_turn() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+
+        // The wrap-up waits for the turn and lands what it committed.
+        send(
+            &state,
+            id,
+            "commit b more".into(),
+            PermissionMode::Auto,
+            None,
+        );
+        let req = || WrapUp {
+            target: WrapUpTarget::Checkout,
+            permission_mode: PermissionMode::Auto,
+            model: None,
+        };
+        assert!(wrap_up(&state, id, req()).await);
+        // One wrap-up at a time.
+        assert!(!wrap_up(&state, id, req()).await);
+        let AgentEventKind::Landed(Landed::Checkout { sha }) = wrapped(&state, id).await else {
+            panic!("{:?}", state.db.agent_events(id));
+        };
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "more\n");
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(!log.contains(COMMIT_PROMPT), "{log}");
     }
 
     #[tokio::test]
