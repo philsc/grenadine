@@ -1,5 +1,5 @@
 {
-  "checksum": "23e111e8179a40c19747cc302ee9a18080065d5add8f81ecfbf9c256ee7b223b",
+  "checksum": "1d557ffd6a6a1d4d461caa9be8a6cf8d0e5baf4f8177ca7ed016c3f82be2a28d",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -557,6 +557,35 @@
         }
       ],
       "version": "1.0.104"
+    },
+    "arrayvec 0.7.8": {
+      "common_attrs": {
+        "edition": "2018"
+      },
+      "library_target_name": "arrayvec",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "arrayvec",
+      "package_url": "https://github.com/bluss/arrayvec",
+      "repository": {
+        "Http": {
+          "sha256": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56",
+          "url": "https://static.crates.io/crates/arrayvec/0.7.8/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "arrayvec",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.7.8"
     },
     "async-lock 3.4.2": {
       "common_attrs": {
@@ -4735,6 +4764,10 @@
           {
             "id": "tracing-subscriber 0.3.23",
             "target": "tracing_subscriber"
+          },
+          {
+            "id": "vt100 0.18.1",
+            "target": "vt100"
           }
         ],
         "deps_dev": [
@@ -15519,6 +15552,39 @@
       ],
       "version": "1.13.3"
     },
+    "unicode-width 0.2.3": {
+      "common_attrs": {
+        "crate_features": [
+          "cjk",
+          "default"
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "unicode_width",
+      "license": "MIT OR Apache-2.0",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "unicode-width",
+      "package_url": "https://github.com/unicode-rs/unicode-width",
+      "repository": {
+        "Http": {
+          "sha256": "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557",
+          "url": "https://static.crates.io/crates/unicode-width/0.2.3/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "unicode_width",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.2.3"
+    },
     "unicode-xid 0.2.6": {
       "common_attrs": {
         "crate_features": [
@@ -15822,6 +15888,94 @@
         }
       ],
       "version": "0.9.5"
+    },
+    "vt100 0.18.1": {
+      "common_attrs": {
+        "crate_features": [
+          "default",
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "itoa 1.0.18",
+            "target": "itoa"
+          },
+          {
+            "id": "unicode-width 0.2.3",
+            "target": "unicode_width"
+          },
+          {
+            "id": "vte 0.15.0",
+            "target": "vte"
+          }
+        ],
+        "edition": "2024"
+      },
+      "library_target_name": "vt100",
+      "license": "MIT",
+      "license_file": "LICENSE",
+      "license_ids": [
+        "MIT"
+      ],
+      "name": "vt100",
+      "package_url": "https://github.com/doy/vt100-rust",
+      "repository": {
+        "Http": {
+          "sha256": "eb05cdd19ae8707bf6a0a269972c07e6358103a7079faec749dec318a5b3dc23",
+          "url": "https://static.crates.io/crates/vt100/0.18.1/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "vt100",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.18.1"
+    },
+    "vte 0.15.0": {
+      "common_attrs": {
+        "crate_features": [
+          "std"
+        ],
+        "deps": [
+          {
+            "id": "arrayvec 0.7.8",
+            "target": "arrayvec"
+          },
+          {
+            "id": "memchr 2.8.3",
+            "target": "memchr"
+          }
+        ],
+        "edition": "2021"
+      },
+      "library_target_name": "vte",
+      "license": "Apache-2.0 OR MIT",
+      "license_file": "LICENSE-APACHE",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "name": "vte",
+      "package_url": "https://github.com/alacritty/vte",
+      "repository": {
+        "Http": {
+          "sha256": "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd",
+          "url": "https://static.crates.io/crates/vte/0.15.0/download"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "vte",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
+      "version": "0.15.0"
     },
     "walkdir 2.5.0": {
       "common_attrs": {
@@ -18165,6 +18319,7 @@
     "tokio-util 0.7.19",
     "tracing 0.1.44",
     "tracing-subscriber 0.3.23",
+    "vt100 0.18.1",
     "wasm-bindgen 0.2.121",
     "wasm-bindgen-futures 0.4.71",
     "web-sys 0.3.98"

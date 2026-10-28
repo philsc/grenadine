@@ -1,13 +1,18 @@
 //! A minimal MCP server (JSON-RPC over streamable HTTP, JSON responses
-//! only) with one tool, `approve`, that Claude Code calls through
+//! only). Its tool `approve` is what Claude Code calls through
 //! `--permission-prompt-tool` before it uses a tool. The call waits until
 //! the user allows or denies the tool use on the page. The user's answers
 //! to `AskUserQuestion` and the mode an approved plan goes on in come back
 //! with the approval.
+//!
+//! The other tools let Claude read the session's terminal tabs, e.g. to see
+//! what a command it asked the user to run printed.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context, bail};
 use axum::Json;
 use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
@@ -17,6 +22,19 @@ use serde_json::{Value, json};
 
 use crate::agent::{self, Decision};
 use crate::sync::State;
+
+/// How many lines of a terminal Claude gets unless it asks for more.
+const LINES: usize = 200;
+
+/// How long a wait for a terminal lasts unless Claude says otherwise.
+const WAIT: Duration = Duration::from_secs(600);
+
+/// The longest a wait for a terminal lasts.
+const MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// How long a terminal at its prompt has to be quiet for a wait without
+/// `until` to end, unless Claude says otherwise.
+const IDLE: Duration = Duration::from_secs(3);
 
 /// Forgets the permission request when Claude Code hangs up without an
 /// answer, e.g. because the turn was interrupted.
@@ -111,6 +129,70 @@ pub async fn handle(
                     },
                     "required": ["tool_name", "input"],
                 },
+            }, {
+                "name": "list_terminals",
+                "description": "Lists the terminal tabs open in this session's page, with the \
+                    last line of each, usually its prompt. They are login shells in the \
+                    session's working directory that the user types into.",
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {"readOnlyHint": true},
+            }, {
+                "name": "read_terminal",
+                "description": "Reads what a terminal tab shows, as plain text, including its \
+                    scrollback. Use it to see a command's output after asking the user to run \
+                    it in a terminal, instead of asking them to paste it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "terminal": {
+                            "type": "integer",
+                            "description": "The terminal's number, N in its tab's name \
+                                \"Terminal N\". Defaults to the newest terminal.",
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "How many of the last lines to read. Defaults to 200.",
+                        },
+                    },
+                },
+                "annotations": {"readOnlyHint": true},
+            }, {
+                "name": "wait_for_terminal",
+                "description": "Waits until a command run in a terminal tab finishes, then \
+                    reads the terminal like read_terminal. Call it right after asking the \
+                    user to run a command there; it also covers a command that is already \
+                    running. It ends at the first of: the output since the call matches \
+                    `until`; a command finished and the shell is back at its prompt; the \
+                    shell is at its prompt and quiet for `idle_seconds` after a line of \
+                    output, for commands too quick to see run; the shell exits; the timeout. \
+                    The result says which.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "terminal": {
+                            "type": "integer",
+                            "description": "The terminal's number, N in its tab's name \
+                                \"Terminal N\". Defaults to the newest terminal.",
+                        },
+                        "until": {
+                            "type": "string",
+                            "description": "A regex for the output since the call to match.",
+                        },
+                        "idle_seconds": {
+                            "type": "number",
+                            "description": "Defaults to 3 without `until`, else unset.",
+                        },
+                        "timeout_seconds": {
+                            "type": "number",
+                            "description": "Defaults to 600, at most 3600.",
+                        },
+                        "lines": {
+                            "type": "integer",
+                            "description": "How many of the last lines to read. Defaults to 200.",
+                        },
+                    },
+                },
+                "annotations": {"readOnlyHint": true},
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -160,8 +242,90 @@ pub async fn handle(
                 json!({"content": [{"type": "text", "text": answer.to_string()}]}),
             )
         }
+        "tools/call" => {
+            let name = params["name"].as_str().unwrap_or_default();
+            let (text, failed) = match terminal_tool(&state, &id, name, &params["arguments"]).await
+            {
+                Ok(text) => (text, false),
+                Err(e) => (format!("{e:#}"), true),
+            };
+            reply(
+                rpc_id,
+                json!({"content": [{"type": "text", "text": text}], "isError": failed}),
+            )
+        }
         method => error(rpc_id, -32601, &format!("unknown method {method}")),
     }
+}
+
+/// A non-negative number of seconds.
+fn seconds(value: &Value) -> Option<Duration> {
+    value
+        .as_f64()
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+}
+
+/// Runs one of the tools that read the session's terminals.
+async fn terminal_tool(
+    state: &State,
+    id: &str,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<String> {
+    let terminals = &state.agents.terminals;
+    let open = terminals.list(id);
+    if name == "list_terminals" {
+        if open.is_empty() {
+            return Ok("No terminals are open.".into());
+        }
+        let list: Vec<_> = open
+            .iter()
+            .filter_map(|t| {
+                let last = terminals.get(id, t.id)?.text(1);
+                Some(format!("Terminal {}: {last}", t.id))
+            })
+            .collect();
+        return Ok(list.join("\n"));
+    }
+    let number = match args["terminal"].as_u64() {
+        Some(n) => n,
+        None => {
+            open.last()
+                .context("No terminals are open. The user opens them below the transcript.")?
+                .id
+        }
+    };
+    let terminal = terminals
+        .get(id, number)
+        .with_context(|| format!("Terminal {number} isn't open."))?;
+    let lines = args["lines"]
+        .as_u64()
+        .map_or(LINES, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let text = match name {
+        "read_terminal" => terminal.text(lines),
+        "wait_for_terminal" => {
+            let until = args["until"]
+                .as_str()
+                .map(fancy_regex::Regex::new)
+                .transpose()
+                .context("`until` isn't a valid regex")?;
+            let idle = seconds(&args["idle_seconds"]).or(until.is_none().then_some(IDLE));
+            let timeout = seconds(&args["timeout_seconds"])
+                .unwrap_or(WAIT)
+                .min(MAX_WAIT);
+            let end = tokio::select! {
+                end = terminal.wait(until.as_ref(), idle, timeout) => end,
+                _ = state.shutdown.cancelled() => bail!("The server is shutting down."),
+            };
+            format!("{}\n\n{}", end.describe(), terminal.text(lines))
+        }
+        _ => bail!("There is no tool {name}."),
+    };
+    Ok(if text.is_empty() {
+        "The terminal shows nothing yet.".into()
+    } else {
+        text
+    })
 }
 
 #[cfg(test)]
@@ -251,7 +415,21 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
         )
         .await;
-        assert_eq!(body["result"]["tools"][0]["name"], "approve");
+        let names: Vec<_> = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "approve",
+                "list_terminals",
+                "read_terminal",
+                "wait_for_terminal"
+            ]
+        );
         let (_, body) = call(
             &state,
             &secret,
@@ -388,6 +566,107 @@ mod tests {
             })
             .collect();
         assert_eq!(resolved, [Some("Add a title".into()), None]);
+    }
+
+    /// Calls a terminal tool and returns its text and whether it failed.
+    async fn tool(state: &Arc<State>, name: &str, arguments: Value) -> (String, bool) {
+        let secret = state.agents.secret(ID);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        });
+        let (_, body) = call(state, &secret, request).await;
+        let result = &body["result"];
+        let text = result["content"][0]["text"].as_str().unwrap().to_owned();
+        (text, result["isError"].as_bool().unwrap())
+    }
+
+    #[tokio::test]
+    async fn reads_and_waits_for_terminals() {
+        let mut state = state();
+        Arc::get_mut(&mut state).unwrap().agents.terminals =
+            crate::terminal::Terminals::new("/bin/sh".into());
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = state.db.agent(ID).unwrap().unwrap();
+        session.worktree = dir.path().to_str().unwrap().into();
+
+        assert_eq!(
+            tool(&state, "list_terminals", json!({})).await,
+            ("No terminals are open.".into(), false)
+        );
+        let (text, failed) = tool(&state, "read_terminal", json!({})).await;
+        assert!(
+            failed && text.starts_with("No terminals are open."),
+            "{text}"
+        );
+
+        let id = crate::terminal::open(&state, &session).unwrap().id;
+        let terminal = state.agents.terminals.get(ID, id).unwrap();
+        let (text, failed) = tool(&state, "read_terminal", json!({"terminal": id + 1})).await;
+        assert!(
+            failed && text == format!("Terminal {} isn't open.", id + 1),
+            "{text}"
+        );
+
+        // A command started after the wait began, and one already running.
+        for already_running in [false, true] {
+            let run = || async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                terminal
+                    .write(b"sleep 1; echo done-$((6 * 7))\n")
+                    .await
+                    .unwrap();
+            };
+            if already_running {
+                run().await;
+            }
+            let wait = tokio::spawn({
+                let state = state.clone();
+                async move { tool(&state, "wait_for_terminal", json!({})).await }
+            });
+            if !already_running {
+                run().await;
+            }
+            let (text, failed) = wait.await.unwrap();
+            assert!(!failed, "{text}");
+            assert!(
+                text.starts_with("A command finished and the shell is back at its prompt."),
+                "{text}"
+            );
+            assert!(text.contains("\ndone-42\n"), "{text}");
+        }
+
+        let wait = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let args = json!({"terminal": id, "until": r"ready-\d+", "lines": 1});
+                tool(&state, "wait_for_terminal", args).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        terminal
+            .write(b"echo ready-$((1 + 1)); sleep 30\n")
+            .await
+            .unwrap();
+        let (text, _) = wait.await.unwrap();
+        assert_eq!(text, "The output matched.\n\nready-2");
+        let (text, _) = tool(&state, "read_terminal", json!({"lines": 2})).await;
+        assert!(text.ends_with("\nready-2"), "{text}");
+
+        let args = json!({"timeout_seconds": 0.3, "until": "never"});
+        let (text, _) = tool(&state, "wait_for_terminal", args).await;
+        assert!(text.starts_with("The wait timed out."), "{text}");
+
+        // Another session doesn't see the terminal.
+        let other = "99999999-2222-4333-8444-555555555555";
+        let err = terminal_tool(&state, other, "read_terminal", &json!({"terminal": id}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), format!("Terminal {id} isn't open."));
+
+        state.agents.terminals.close_all(ID).await;
     }
 
     /// The answers Claude Code 2.1 takes, as tried with a real `claude -p`.
