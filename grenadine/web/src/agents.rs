@@ -1232,7 +1232,7 @@ pub fn AgentView(id: String) -> impl IntoView {
                                 });
                                 view! {
                                     <AgentHeader session=session />
-                                    <Transcript session=session events=events streaming=streaming mode=mode />
+                                    <Transcript session=session events=events streaming=streaming mode=mode model=model />
                                     <div class="agent-footer">
                                         <Composer session=session usage=usage active_model=active_model mode=mode model=model />
                                         <AgentActions session=session mode=mode model=model />
@@ -1439,6 +1439,7 @@ fn Transcript(
     events: RwSignal<Vec<AgentEvent>>,
     streaming: RwSignal<String>,
     mode: RwSignal<PermissionMode>,
+    model: RwSignal<String>,
 ) -> impl IntoView {
     // Tool results and approval answers are shown with the event they
     // belong to.
@@ -1469,6 +1470,23 @@ fn Transcript(
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>()
+        })
+    });
+    // The plan the last turn ended on, unanswered. Only it can still be
+    // answered: once a server restart cuts the turn off, by starting a new
+    // turn.
+    let open_plan = Memo::new(move |_| {
+        events.with(|events| {
+            events.iter().fold(None, |plan, e| match &e.kind {
+                AgentEventKind::ApprovalRequested { id, tool_name, .. }
+                    if tool_name == "ExitPlanMode" =>
+                {
+                    Some(id.clone())
+                }
+                AgentEventKind::ApprovalResolved { id, .. } if plan.as_ref() == Some(id) => None,
+                AgentEventKind::Prompt(_) => None,
+                _ => plan,
+            })
         })
     });
     // The page may hear of a request before it refetches the status.
@@ -1582,14 +1600,20 @@ fn Transcript(
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "ExitPlanMode" => {
                             let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
                             let plan = value["plan"].as_str().unwrap_or_default();
+                            let open = {
+                                let tool = tool.clone();
+                                Signal::derive(move || open_plan.with(|p| p.as_ref() == Some(&tool)))
+                            };
                             view! {
                                 <PlanCard
                                     agent=id
                                     tool=tool
                                     plan=markdown::to_html(plan, &repo)
                                     resolved=resolved
+                                    open=open
                                     waiting=waiting
                                     mode=mode
+                                    model=model
                                 />
                             }.into_any()
                         }
@@ -1699,63 +1723,88 @@ fn PlanCard(
     /// The plan as HTML.
     plan: String,
     resolved: Memo<HashMap<String, bool>>,
+    /// Whether this is the plan the last turn ended on, still unanswered.
+    open: Signal<bool>,
     waiting: Signal<bool>,
     /// The composer's mode, which moves on from planning with an approval.
     mode: RwSignal<PermissionMode>,
+    /// The composer's model, for the turn that answers a stranded plan.
+    model: RwSignal<String>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
     let then = RwSignal::new(PermissionMode::Auto);
-    let answer = {
+    let state = {
         let tool = tool.clone();
-        move |allow: bool| {
+        Signal::derive(move || resolved.with(|r| r.get(&tool).copied()))
+    };
+    let answer = move |allow: bool| {
+        let message = Some(feedback.get_untracked()).filter(|f| !f.trim().is_empty());
+        let next = if allow {
+            then.get_untracked()
+        } else {
+            PermissionMode::Plan
+        };
+        if allow && mode.get_untracked() == PermissionMode::Plan {
+            mode.set(next);
+        }
+        if waiting.get_untracked() {
             // Without feedback the server tells Claude to keep planning.
-            let message = Some(feedback.get_untracked()).filter(|f| !f.trim().is_empty());
             let approval = Approval {
                 id: tool.clone(),
                 allow,
                 message: message.filter(|_| !allow),
-                mode: allow.then(|| then.get_untracked()),
+                mode: allow.then_some(next),
                 answers: None,
             };
-            if allow && mode.get_untracked() == PermissionMode::Plan {
-                mode.set(then.get_untracked());
-            }
             send_approval(agent.clone(), approval, busy, error);
+            return;
         }
+        // The turn that asked is gone, so the answer starts a new one.
+        let prompt = if allow {
+            "I approve the plan. Carry it out.".to_string()
+        } else {
+            message.unwrap_or_else(|| "Keep planning.".to_string())
+        };
+        let (agent, model) = (agent.clone(), model_arg(model));
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            if let Err(e) = api::send_agent_message(&agent, prompt, next, model).await {
+                error.set(Some(e));
+            }
+            busy.set(false);
+        });
     };
-    let keep = answer.clone();
-    let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
-    let pending = move || state.get().is_none() && waiting.get();
+    let answer = StoredValue::new(answer);
+    let pending = move || state.get().is_none() && open.get();
     view! {
         <div class="approval plan" class:pending=pending>
             <p>
                 {move || match state.get() {
                     Some(true) => "Plan approved",
                     Some(false) => "Plan sent back",
+                    None if !open.get() => "Unanswered plan",
                     None if waiting.get() => "Claude's plan is waiting for your approval",
-                    None => "Unanswered plan",
+                    None => "The turn ended before the plan was answered. Answering it continues the session.",
                 }}
             </p>
             <div class="plan-text markdown" inner_html=plan></div>
-            {move || pending().then(|| {
-                let (approve, keep) = (answer.clone(), keep.clone());
-                view! {
-                    <textarea
-                        class="plan-feedback"
-                        rows="2"
-                        aria-label="Feedback"
-                        placeholder="What should change? Claude gets this when it keeps planning."
-                        prop:value=move || feedback.get()
-                        on:input=move |ev| feedback.set(event_target_value(&ev))
-                    ></textarea>
-                    <div class="form-buttons">
-                        <label>"Then " <ModeSelect mode=then modes=&AFTER_PLAN label="After the plan" /></label>
-                        <button class="primary" disabled=move || busy.get() on:click=move |_| approve(true)>"Approve plan"</button>
-                        <button disabled=move || busy.get() on:click=move |_| keep(false)>"Keep planning"</button>
-                    </div>
-                }
+            {move || pending().then(|| view! {
+                <textarea
+                    class="plan-feedback"
+                    rows="2"
+                    aria-label="Feedback"
+                    placeholder="What should change? Claude gets this when it keeps planning."
+                    prop:value=move || feedback.get()
+                    on:input=move |ev| feedback.set(event_target_value(&ev))
+                ></textarea>
+                <div class="form-buttons">
+                    <label>"Then " <ModeSelect mode=then modes=&AFTER_PLAN label="After the plan" /></label>
+                    <button class="primary" disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(true))>"Approve plan"</button>
+                    <button disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(false))>"Keep planning"</button>
+                </div>
             })}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
         </div>
