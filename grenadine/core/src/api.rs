@@ -553,6 +553,11 @@ pub struct AgentModelInfo {
     pub description: String,
 }
 
+/// The `repo` of the sessions that aren't in any repository, which work in
+/// a plain directory of their own, with no git. Repositories are
+/// `owner/name`, so it can't name one.
+pub const GENERAL: &str = "general";
+
 /// The body of a request that starts an agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgent {

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, Landed, LandedPr,
-    NewAgent, PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
+    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, GENERAL, Landed,
+    LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -391,7 +391,8 @@ fn session_branch(id: &str) -> String {
 
 /// Removes the worktrees in `worktrees` that no session owns, e.g. those
 /// of sessions whose repo wasn't configured when they were deleted, with
-/// their branches, then the directories that are left empty. Must run
+/// their branches, and the general sessions' directories that no session
+/// owns, then the directories that are left empty. Must run
 /// before sessions can be created, which add their worktree first.
 pub fn remove_orphaned_worktrees(
     db: &crate::db::Db,
@@ -441,8 +442,35 @@ pub fn remove_orphaned_worktrees(
             }
         }
     }
-    // Only the `owner/name` levels; the worktrees themselves are gone.
+    // General sessions' directories aren't worktrees of any clone.
+    for dir in std::fs::read_dir(root.join(GENERAL))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = dir.path();
+        let Some(id) = path
+            .file_name()
+            .and_then(|id| id.to_str())
+            .filter(|id| valid_id(id))
+        else {
+            continue;
+        };
+        if db.agent(id)?.is_some() {
+            continue;
+        }
+        match remove_tree(&path) {
+            Ok(()) => tracing::info!("removed orphaned directory {}", path.display()),
+            Err(e) => tracing::warn!("can't remove {}: {e}", path.display()),
+        }
+    }
+    // Only the `owner/name` levels; the worktrees themselves are gone. A
+    // general session's directory may well be empty, and isn't one of them.
     for owner in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        if owner.file_name() == GENERAL {
+            let _ = std::fs::remove_dir(owner.path());
+            continue;
+        }
         for name in std::fs::read_dir(owner.path())
             .into_iter()
             .flatten()
@@ -627,56 +655,24 @@ pub fn set_status(state: &State, id: &str, status: AgentStatus) {
     state.send(ServerEvent::AgentsChanged);
 }
 
-/// Creates the session's worktree and starts working on its first prompt.
+/// Creates the session's worktree, or a plain directory for a general
+/// session, and starts working on its first prompt.
 pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     if req.prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
-    let cloned = state
-        .repos
-        .get(&req.repo)
-        .ok_or_else(|| anyhow!("{} is not a configured repository", req.repo))?
-        .clone();
-    let pr_head = match req.pr {
-        Some(number) => {
-            let key = PrKey {
-                repo: req.repo.clone(),
-                number,
-            };
-            let pr = state
-                .db
-                .pr(&key)?
-                .ok_or_else(|| anyhow!("{}#{number} hasn't synced yet", req.repo))?;
-            let head = pr
-                .versions
-                .iter()
-                .rev()
-                .find(|v| !v.missing)
-                .ok_or_else(|| anyhow!("{}#{number} has no commits", req.repo))?;
-            Some(head.sha.clone())
-        }
-        None => None,
-    };
-
     let id = uuid();
-    let branch = session_branch(&id);
     let worktree = state.agents.worktrees.join(&req.repo).join(&id);
-    let base_sha = {
-        let _guard = cloned.git_lock.lock().await;
-        let repo = cloned.repo.clone();
-        let (branch, worktree) = (branch.clone(), worktree.clone());
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let base = match pr_head {
-                Some(sha) => sha,
-                None => repo.fetch_default_branch(TRUNK_REF)?,
-            };
-            if let Some(parent) = worktree.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            repo.worktree_add(&worktree, &branch, &base)?;
-            Ok(base)
-        })
-        .await??
+    let (branch, base_sha) = if req.repo == GENERAL {
+        if req.pr.is_some() {
+            bail!("a general session can't start from a PR");
+        }
+        tokio::fs::create_dir_all(&worktree).await?;
+        (String::new(), String::new())
+    } else {
+        let branch = session_branch(&id);
+        let base_sha = add_worktree(state, &req, &branch, &worktree).await?;
+        (branch, base_sha)
     };
 
     let session = AgentSession {
@@ -703,6 +699,58 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     crate::summary::start(state, &id, &req.prompt);
     send(state, &id, req.prompt, req.permission_mode, req.model);
     Ok(session)
+}
+
+/// Adds the worktree of a new session in `req.repo` at `worktree`, with
+/// `branch` checked out at the trunk or the PR's head, and returns the
+/// commit it starts from.
+async fn add_worktree(
+    state: &State,
+    req: &NewAgent,
+    branch: &str,
+    worktree: &Path,
+) -> Result<String> {
+    let cloned = state
+        .repos
+        .get(&req.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", req.repo))?
+        .clone();
+    let pr_head = match req.pr {
+        Some(number) => {
+            let key = PrKey {
+                repo: req.repo.clone(),
+                number,
+            };
+            let pr = state
+                .db
+                .pr(&key)?
+                .ok_or_else(|| anyhow!("{}#{number} hasn't synced yet", req.repo))?;
+            let head = pr
+                .versions
+                .iter()
+                .rev()
+                .find(|v| !v.missing)
+                .ok_or_else(|| anyhow!("{}#{number} has no commits", req.repo))?;
+            Some(head.sha.clone())
+        }
+        None => None,
+    };
+
+    let _guard = cloned.git_lock.lock().await;
+    let repo = cloned.repo.clone();
+    let (branch, worktree) = (branch.to_owned(), worktree.to_owned());
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let base = match pr_head {
+            Some(sha) => sha,
+            None => repo.fetch_default_branch(TRUNK_REF)?,
+        };
+        if let Some(parent) = worktree.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        repo.worktree_add(&worktree, &branch, &base)?;
+        Ok(base)
+    })
+    .await?
 }
 
 /// Queues a prompt; it runs once the turns before it are done, with
@@ -815,16 +863,18 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
     Ok(true)
 }
 
-/// Stops the session and removes it along with its worktree and branch.
-/// Returns false when there is no such session.
+/// Stops the session and removes it along with its worktree and branch, or
+/// a general session's directory. Returns false when there is no such
+/// session.
 pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     let Some(session) = state.db.agent(id)? else {
         return Ok(false);
     };
     // Without its clone the worktree and branch would stay behind with
     // nothing left to find them by.
+    let general = session.repo == GENERAL;
     let cloned = state.repos.get(&session.repo).cloned();
-    if cloned.is_none() && Path::new(&session.worktree).exists() {
+    if !general && cloned.is_none() && Path::new(&session.worktree).exists() {
         bail!(
             "{repo} isn't configured; restart the server with --repo for {repo} to delete this session",
             repo = session.repo
@@ -861,6 +911,14 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         let worktree = PathBuf::from(&session.worktree);
         tokio::task::spawn_blocking(move || repo.worktree_remove(&worktree, &session.branch))
             .await??;
+    } else if general {
+        let dir = PathBuf::from(&session.worktree);
+        match tokio::task::spawn_blocking(move || remove_tree(&dir)).await? {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(anyhow!(e).context(format!("can't remove {}", session.worktree)));
+            }
+            _ => {}
+        }
     }
     // Bazel keeps each workspace's build in an output base outside the
     // worktree, and workspaces can be anywhere in it. The stopped servers
@@ -1026,6 +1084,9 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
         .db
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
+    if session.repo == GENERAL {
+        bail!("a general session isn't in a repository, so it has nothing to land");
+    }
     let cloned = state
         .repos
         .get(&session.repo)
@@ -1225,6 +1286,11 @@ async fn turn(
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
     set_status(state, id, AgentStatus::Running);
+    // Nothing of a general session's is lost with its directory, so one
+    // that went away comes back.
+    if session.repo == GENERAL {
+        tokio::fs::create_dir_all(&session.worktree).await?;
+    }
 
     let mcp = json!({
         "mcpServers": {
@@ -2017,6 +2083,58 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(!delete(&state, id).await.unwrap());
     }
 
+    /// A general session runs in an empty directory of its own, outside any
+    /// clone, has nothing to land, and takes its directory when deleted.
+    #[tokio::test]
+    async fn runs_a_general_session_in_a_plain_directory() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let script = format!(
+            r#"#!/bin/sh
+cat > /dev/null
+echo "$(pwd) $(ls -A | wc -l) $(git rev-parse --is-inside-work-tree 2>/dev/null || echo none)" >> {log}
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_cost_usd":0.25}}'
+"#,
+            log = log.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let new = |pr| NewAgent {
+            repo: GENERAL.into(),
+            pr,
+            prompt: "what's a monad?".into(),
+            permission_mode: PermissionMode::Auto,
+            model: None,
+        };
+        let err = create(&state, new(Some(1))).await.unwrap_err().to_string();
+        assert!(err.contains("can't start from a PR"), "{err}");
+
+        let session = create(&state, new(None)).await.unwrap();
+        assert_eq!(
+            (session.branch.as_str(), session.base_sha.as_str()),
+            ("", "")
+        );
+        let worktree = PathBuf::from(&session.worktree);
+        assert_eq!(
+            worktree,
+            state.agents.worktrees.join(GENERAL).join(&session.id)
+        );
+        wait_for_turns(&state, &session.id, 1).await;
+        let log = std::fs::read_to_string(&log).unwrap();
+        let cwd = worktree.canonicalize().unwrap();
+        assert_eq!(log.trim(), format!("{} 0 none", cwd.display()));
+
+        let err = land(&state, &session.id, WrapUpTarget::Checkout)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing to land"), "{err}");
+
+        assert!(delete(&state, &session.id).await.unwrap());
+        assert!(!worktree.exists());
+        assert_eq!(state.db.agent(&session.id).unwrap(), None);
+    }
+
     /// Haiku summarizes a new session's first prompt in the background,
     /// without tools.
     #[tokio::test]
@@ -2470,8 +2588,20 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             .worktree_add(&elsewhere, "grenadine/agent/other", "HEAD")
             .unwrap();
         std::fs::create_dir_all(worktrees.join("owner/empty")).unwrap();
+        // General sessions' directories aren't worktrees, and an owned one
+        // stays even when empty.
+        let (general, general_orphan) = (uuid(), uuid());
+        let general_dir = worktrees.join(GENERAL);
+        for id in [&general, &general_orphan] {
+            std::fs::create_dir_all(general_dir.join(id)).unwrap();
+        }
+        std::fs::write(general_dir.join(&general_orphan).join("f"), "").unwrap();
+        db.create_agent(&session_row(&general, GENERAL, &general_dir.join(&general)))
+            .unwrap();
 
         remove_orphaned_worktrees(&db, &repos, &worktrees).unwrap();
+        assert!(general_dir.join(&general).exists());
+        assert!(!general_dir.join(&general_orphan).exists());
         assert!(repo_dir.join(&owned).exists());
         assert!(has_branch(&session_branch(&owned)));
         for id in [&orphan, &detached] {
