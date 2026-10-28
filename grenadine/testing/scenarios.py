@@ -374,6 +374,15 @@ LEFT_LINE = "Comment on a removed line"
 KEEP = "Keep boxes through refetches"
 REPLY_NOW = "Reply now during a review"
 COMMENT_REVIEW = "Submit comments without a summary"
+SQUASH = "Squash and merge me"
+STALE_HEAD = "Move on before merging"
+BLOCKED = "Wait for the rules"
+BYPASS = "Merge past the rules"
+KEEP_BRANCH = "Keep my branch"
+AUTO_DELETE = "Leave the branch to GitHub"
+SETTLE = "Wait for GitHub to decide"
+STACK_PARENT = "Carry another PR"
+STACK_CHILD = "Sit on another PR"
 REVIEW_CASES = [
     REPLY,
     RESOLVE,
@@ -389,6 +398,15 @@ REVIEW_CASES = [
     KEEP,
     REPLY_NOW,
     COMMENT_REVIEW,
+    SQUASH,
+    STALE_HEAD,
+    BLOCKED,
+    BYPASS,
+    KEEP_BRANCH,
+    AUTO_DELETE,
+    SETTLE,
+    STACK_PARENT,
+    STACK_CHILD,
 ]
 # A file on main, which LEFT_LINE removes the third line of.
 OLD_PATH = "review/old.md"
@@ -398,7 +416,8 @@ OLD_LINES = [f"Old line {i}" for i in range(1, 6)]
 def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     """One PR per review action, each with an unresolved thread on line 2,
     so that the tests don't see each other's changes. All are by the other
-    account but OWN, which is the viewer's."""
+    account but OWN, which is the viewer's. All target main but
+    STACK_CHILD, which is stacked on STACK_PARENT."""
     repo = gh.repo(REPO)
     repo.checkout("main")
     repo.commit(
@@ -408,8 +427,11 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     repo.push("main")
     prs = {}
     for i, title in enumerate(REVIEW_CASES):
-        branch = f"review/{i}"
-        repo.checkout(branch, "main")
+        # Only dev/ branches stack.
+        stacked = title in (STACK_PARENT, STACK_CHILD)
+        branch = f"dev/review/{i}" if stacked else f"review/{i}"
+        base = prs[STACK_PARENT].head if title == STACK_CHILD else "main"
+        repo.checkout(branch, base)
         lines = [f"{line} of {title}" for line in REVIEW_LINES]
         author = VIEWER if title == OWN else OTHER
         files = {REVIEW_PATH: "\n".join(lines) + "\n"}
@@ -418,10 +440,17 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
             files[OLD_PATH] = "\n".join(kept) + "\n"
         repo.commit(title, files, author=author)
         repo.push(branch, actor=author)
-        pr = repo.open_pr(title, head=branch, author=author)
+        pr = repo.open_pr(title, head=branch, base=base, author=author)
         root = repo.comment(
             pr, author=OTHER, body="Is this right?", path=REVIEW_PATH, line=2
         )
         root.can_resolve = title != LOCKED
+        if title in (BLOCKED, BYPASS):
+            pr.merge_state = "BLOCKED"
+        if title == BYPASS:
+            pr.review_required = True
+            pr.can_merge_as_admin = True
+        if title == KEEP_BRANCH:
+            repo.undeletable_branches.add(branch)
         prs[title] = pr
     return prs
