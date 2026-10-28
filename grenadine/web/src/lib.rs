@@ -15,7 +15,7 @@ mod terminal;
 mod theme;
 mod topbar;
 
-use grenadine_core::api::{PrKey, ServerEvent, SyncStatus};
+use grenadine_core::api::{GENERAL, PrKey, ServerEvent, SyncStatus};
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 
@@ -43,7 +43,8 @@ pub enum Route {
     /// `#/owner/name/number`.
     Pr(PrKey),
     /// `#/agents`, `#/agents/new/owner/name` to start a session in a
-    /// repository, or `#/agents/new/owner/name/number` to start one on a PR.
+    /// repository, `#/agents/new/general` to start one in none, or
+    /// `#/agents/new/owner/name/number` to start one on a PR.
     /// Each opens a new draft.
     Agents {
         repo: Option<String>,
@@ -70,6 +71,10 @@ fn route_from_hash(hash: &str) -> Route {
     let route = match parts[..] {
         ["agents"] => Some(Route::Agents {
             repo: None,
+            pr: None,
+        }),
+        ["agents", "new", GENERAL] => Some(Route::Agents {
+            repo: Some(GENERAL.to_owned()),
             pr: None,
         }),
         ["agents", "new", owner, name] if !owner.is_empty() && !name.is_empty() => {
@@ -291,6 +296,13 @@ mod tests {
             route_from_hash("#/agents/new/o/n"),
             Route::Agents {
                 repo: Some("o/n".into()),
+                pr: None
+            }
+        );
+        assert_eq!(
+            route_from_hash("#/agents/new/general"),
+            Route::Agents {
+                repo: Some(GENERAL.into()),
                 pr: None
             }
         );

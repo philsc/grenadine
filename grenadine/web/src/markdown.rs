@@ -148,8 +148,17 @@ fn repo_ref_at(rest: &str) -> Option<(usize, Event<'static>)> {
     Some((owner.len() + 1 + name_len + 1 + dlen, link))
 }
 
-/// `#123` at the start of `rest` (which starts with `#`).
+/// Whether `repo` is an `owner/name` rather than `GENERAL`.
+fn is_repo(repo: &str) -> bool {
+    repo.contains('/')
+}
+
+/// `#123` at the start of `rest` (which starts with `#`). Never in text
+/// that belongs to no repository.
 fn issue_ref_at(rest: &str, repo: &str) -> Option<(usize, Event<'static>)> {
+    if !is_repo(repo) {
+        return None;
+    }
     let s = &rest[1..];
     let dlen = digits_len(s);
     if dlen == 0 || s[dlen..].chars().next().is_some_and(is_word) {
@@ -166,8 +175,11 @@ fn issue_ref_at(rest: &str, repo: &str) -> Option<(usize, Event<'static>)> {
 
 /// A commit SHA at the start of `rest`: 7-40 lowercase hex chars with at
 /// least one digit and one letter, so issue numbers and words like
-/// `deadbeef` aren't linked.
+/// `deadbeef` aren't linked. Never in text that belongs to no repository.
 fn sha_at(rest: &str, repo: &str) -> Option<(usize, Event<'static>)> {
+    if !is_repo(repo) {
+        return None;
+    }
     let len = rest
         .bytes()
         .take_while(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
@@ -313,7 +325,7 @@ fn code_block_html(lang: &str, code: &str) -> String {
 }
 
 /// Markdown to sanitized HTML. `repo` is the `owner/name` the text belongs
-/// to, for `#123` and commit links.
+/// to, for `#123` and commit links, or `GENERAL` for none.
 pub fn to_html(markdown: &str, repo: &str) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -502,6 +514,17 @@ mod tests {
         let h = html("x/y#34");
         assert!(h.contains(r#"href="https://github.com/x/y/issues/34""#));
         assert!(h.contains(r##"data-grenadine="#/x/y/34""##));
+    }
+
+    #[test]
+    fn text_in_no_repository_links_only_full_references() {
+        let h = to_html(
+            "#12 and 1a2b3c4d5e but x/y#34",
+            grenadine_core::api::GENERAL,
+        );
+        assert!(!h.contains("github.com/general"));
+        assert!(!h.contains("<code>"));
+        assert!(h.contains(r#"href="https://github.com/x/y/issues/34""#));
     }
 
     #[test]
