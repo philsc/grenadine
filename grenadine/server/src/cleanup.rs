@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, NewAgent,
+    AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL, NewAgent,
     NewCleanupSession, PermissionMode, ServerEvent,
 };
 use serde_json::{Value, json};
@@ -249,13 +249,19 @@ async fn run(
 ) -> Result<Vec<(String, String)>> {
     let transcript = transcript_path(session);
     let clone = state.repo(&session.repo).map(|r| r.path);
+    let place = if session.repo == GENERAL {
+        format!(
+            "in the directory {}, outside any repository",
+            session.worktree
+        )
+    } else {
+        format!("on {} in the worktree {}", session.repo, session.worktree)
+    };
     let mut input = format!(
         "{INSTRUCTIONS}\n\n{TOOL_NOTES} {}\n\n\
-         The session \u{201c}{}\u{201d} worked on {} in the worktree {}.\n",
+         The session \u{201c}{}\u{201d} worked {place}.\n",
         where_note(&session.repo, clone.as_deref()),
         session.title,
-        session.repo,
-        session.worktree
     );
     if transcript.exists() {
         input += &format!("Its full transcript is {}.\n", transcript.display());

@@ -14,8 +14,8 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail, PrKey,
-    PrMissing, ServerEvent, WorktreeChanges, WrapUp,
+    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail,
+    PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -321,6 +321,12 @@ async fn agent_models(AxState(state): St) -> Json<Vec<AgentModelInfo>> {
 
 const UNKNOWN_MODEL: &str = "Claude Code doesn't offer that model";
 
+/// Whether sessions can start in `repo`: a configured repository, or
+/// none for a general session.
+fn can_start_in(state: &State, repo: &str) -> bool {
+    repo == GENERAL || state.repos.contains_key(repo)
+}
+
 async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResult<Response> {
     if req.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
@@ -328,7 +334,7 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
     if !state.agents.offers(req.model.as_deref()).await {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
-    if !state.repos.contains_key(&req.repo) {
+    if !can_start_in(&state, &req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
     }
     Ok(Json(agent::create(&state, req).await?).into_response())
@@ -355,7 +361,7 @@ async fn create_cleanup_session(
     if !state.agents.offers(req.model.as_deref()).await {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
-    if !state.repos.contains_key(&req.repo) {
+    if !can_start_in(&state, &req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
     }
     Ok(match cleanup::hand_off(&state, req).await? {
