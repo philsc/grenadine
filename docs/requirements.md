@@ -609,6 +609,40 @@ The reason for BLOCKED must be "it needs an approving review" when a
 review is required, "changes were requested" when changes were requested,
 and "required checks or rules aren't satisfied" otherwise.
 
+**REVIEW-MERGE-5.** The merge box must offer the merge methods the
+repository allows, labelled "Create a merge commit", "Squash and merge"
+and "Rebase and merge". The first one picked must be the one last used in
+the repository from this browser, else GitHub's default for the viewer,
+else the first allowed one.
+
+**REVIEW-MERGE-6.** Merge must be disabled, with the reason shown, when
+the PR is a draft, conflicts with its base, isn't known to be mergeable
+yet, or the branch's rules block it or require it to be up to date. When
+GitHub says the viewer may bypass the rules, the button must instead read
+"Merge, bypassing rules" and look dangerous. Conflicts can't be bypassed.
+
+**REVIEW-MERGE-7.** Merge must ask first, naming the method, the PR and
+the branch it goes into.
+
+**REVIEW-MERGE-8.** The merge must only go through when the PR's head is
+still the latest version the page shows. Otherwise GitHub's refusal must
+be shown and the PR left open.
+_Why:_ a push after the viewer looked must not be merged unseen.
+
+**REVIEW-MERGE-9.** Squash merges must offer to edit the commit message,
+starting from "_title_ (#_number_)" and the description. Without edits,
+GitHub's default message must be used.
+
+**REVIEW-MERGE-10.** Unless the repository deletes merged branches
+itself, the merge box must offer to delete the head branch, checked
+unless other open PRs target it. A merge whose branch couldn't be deleted
+must still count as merged, with a warning.
+_Why:_ deleting a branch that other PRs target closes them.
+
+**REVIEW-MERGE-11.** When the PR targets another open PR's branch, the
+merge box must warn that merging puts its changes there, not into the
+stack's base branch.
+
 **REVIEW-MERGE-4.** Reviews, the conversation, checks and the merge state
 must be fetched with each sync of the PR, in the same GraphQL request as
 its other metadata.

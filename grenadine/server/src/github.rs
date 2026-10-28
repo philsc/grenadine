@@ -7,8 +7,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, NewThread, Person, PrKey, Review,
-    ReviewComment, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview, ThreadCounts,
+    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeRequest, NewThread, Person, PrKey,
+    Review, ReviewComment, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview,
+    ThreadCounts,
 };
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
@@ -751,6 +752,63 @@ impl GitHub {
             }
         };
         Ok(())
+    }
+
+    /// Merges the PR. Returns a warning when it merged but its head branch
+    /// couldn't be deleted.
+    pub async fn merge(&self, key: &PrKey, m: &MergeRequest) -> Result<Option<String>> {
+        let (owner, name) = split_repo(&key.repo)?;
+        let data = self
+            .mutate(
+                "query($owner: String!, $name: String!, $number: Int!) {
+                   repository(owner: $owner, name: $name) {
+                     pullRequest(number: $number) { id headRef { id } }
+                   }
+                 }",
+                json!({ "owner": owner, "name": name, "number": key.number }),
+            )
+            .await?;
+        let pr = data
+            .pointer("/repository/pullRequest")
+            .filter(|v| !v.is_null())
+            .ok_or_else(|| anyhow!("can't find {}#{}", key.repo, key.number))?;
+        let method = match m.method {
+            MergeMethod::Merge => "MERGE",
+            MergeMethod::Squash => "SQUASH",
+            MergeMethod::Rebase => "REBASE",
+        };
+        self.mutate(
+            "mutation($pr: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!,
+                      $title: String, $body: String) {
+               mergePullRequest(input: {
+                 pullRequestId: $pr, mergeMethod: $method, expectedHeadOid: $head,
+                 commitHeadline: $title, commitBody: $body
+               }) {
+                 clientMutationId
+               }
+             }",
+            json!({
+                "pr": str_at(pr, "/id"),
+                "method": method,
+                "head": m.head_oid,
+                "title": m.title,
+                "body": m.body,
+            }),
+        )
+        .await?;
+        let head_ref = str_at(pr, "/headRef/id");
+        if !m.delete_branch || head_ref.is_empty() {
+            return Ok(None);
+        }
+        let deleted = self
+            .mutate(
+                "mutation($ref: ID!) { deleteRef(input: { refId: $ref }) { clientMutationId } }",
+                json!({ "ref": head_ref }),
+            )
+            .await;
+        Ok(deleted
+            .err()
+            .map(|e| format!("Merged, but the branch wasn't deleted: {e:#}")))
     }
 
     /// Discards the viewer's pending review and its comments.

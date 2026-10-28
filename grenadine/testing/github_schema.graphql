@@ -35,6 +35,27 @@ type Mutation {
   ): MutationPayload
   submitPullRequestReview(input: SubmitPullRequestReviewInput!): MutationPayload
   deletePullRequestReview(input: DeletePullRequestReviewInput!): MutationPayload
+  mergePullRequest(input: MergePullRequestInput!): MutationPayload
+  deleteRef(input: DeleteRefInput!): MutationPayload
+}
+
+input MergePullRequestInput {
+  pullRequestId: ID!
+  mergeMethod: PullRequestMergeMethod
+  expectedHeadOid: GitObjectID
+  commitHeadline: String
+  commitBody: String
+  clientMutationId: String
+}
+
+input DeleteRefInput {
+  refId: ID!
+  clientMutationId: String
+}
+
+type Ref {
+  id: ID!
+  name: String!
 }
 
 type AddPullRequestReviewPayload {
@@ -219,6 +240,7 @@ type PullRequest {
   baseRefName: String!
   headRefName: String!
   headRefOid: GitObjectID!
+  headRef: Ref
   headRepository: Repository
   isCrossRepository: Boolean!
   timelineItems(

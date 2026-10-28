@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import ClassVar
 
-from playwright.sync_api import Locator, expect, sync_playwright
+from playwright.sync_api import Dialog, Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import TOKEN, FakeGitHub
@@ -752,6 +752,63 @@ class ReviewTest(ServerTestCase):
         expect(panel.get_by_label("Approve")).to_be_disabled()
         expect(panel.get_by_label("Request changes")).to_be_disabled()
         expect(panel.get_by_label("Comment")).to_be_enabled()
+
+    def merge_box(self) -> Locator:
+        return self.page.locator(".merge-box")
+
+    def test_squash_and_merge(self) -> None:
+        pr = self.prs[scenarios.SQUASH]
+        self.open(scenarios.SQUASH)
+        box = self.merge_box()
+        method = box.get_by_label("Merge method")
+        # GitHub's default for the viewer comes first.
+        expect(method).to_have_value("Merge")
+        method.select_option(label="Squash and merge")
+        box.get_by_role("button", name="Edit the commit message").click()
+        title = box.get_by_label("Commit title")
+        expect(title).to_have_value(f"{pr.title} (#{pr.number})")
+        title.fill("Squash it all")
+        expect(box.get_by_label("Delete the branch")).to_be_checked()
+
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        box.get_by_role("button", name="Merge").click()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        expect(self.merge_box()).to_have_count(0)
+        self.assertEqual(messages, [f"Squash and merge #{pr.number} into main?"])
+        self.assertEqual(pr.merged_with, ("SQUASH", "Squash it all", pr.body))
+        self.assertIn(pr.head, pr.repo.deleted_branches)
+
+    def test_merge_refuses_a_head_it_did_not_show(self) -> None:
+        pr = self.prs[scenarios.STALE_HEAD]
+        self.open(scenarios.STALE_HEAD)
+        expect(self.merge_box().get_by_role("button", name="Merge")).to_be_enabled()
+        # Someone pushes; the page doesn't know yet.
+        pr.repo.checkout(pr.head)
+        pr.repo.commit(
+            "Sneak in", {"review/sneaky.md": "boo\n"}, author=scenarios.OTHER
+        )
+        pr.repo.push(pr.head, actor=scenarios.OTHER)
+
+        self.page.once("dialog", lambda d: d.accept())
+        self.merge_box().get_by_role("button", name="Merge").click()
+        expect(self.merge_box().locator(".error")).to_contain_text(
+            "Head branch was modified"
+        )
+        self.assertEqual(pr.state, "OPEN")
+
+    def test_blocked_prs_cannot_be_merged(self) -> None:
+        self.open(scenarios.BLOCKED)
+        box = self.merge_box()
+        expect(box.locator(".merge-blocked")).to_have_text(
+            "The branch's rules block merging."
+        )
+        expect(box.get_by_role("button", name="Merge")).to_be_disabled()
 
     def test_reply_to_a_thread(self) -> None:
         self.open(scenarios.REPLY)

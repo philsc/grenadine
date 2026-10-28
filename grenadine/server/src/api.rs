@@ -14,9 +14,9 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession,
-    NewComment, NewThread, PrDetail, PrKey, PrMissing, ServerEvent, SubmitReview, WorktreeChanges,
-    WrapUp,
+    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
+    NewCleanupSession, NewComment, NewThread, PrDetail, PrKey, PrMissing, ServerEvent,
+    SubmitReview, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -76,6 +76,7 @@ pub fn router(state: Arc<State>) -> Router {
             "/api/pr/{owner}/{name}/{number}/review",
             post(submit_review).delete(discard_review),
         )
+        .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
         .route(
             "/api/pr/{owner}/{name}/{number}/review/comments",
             post(add_review_thread),
@@ -341,6 +342,20 @@ async fn submit_review(
     state.github.submit_review(&key, &s).await?;
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn merge(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(m): Json<MergeRequest>,
+) -> ApiResult<Json<Merged>> {
+    let key = writable(owner, name, number, &state)?;
+    if !is_sha(&m.head_oid) {
+        return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
+    }
+    let warning = state.github.merge(&key, &m).await?;
+    state.resync(key);
+    Ok(Json(Merged { warning }))
 }
 
 async fn discard_review(
