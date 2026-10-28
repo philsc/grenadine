@@ -9,6 +9,7 @@ from grenadine.testing.fake_github import (
     CHANGES_REQUESTED,
     COMMENTED,
     VIEWER,
+    CheckRun,
     FakeGitHub,
     FakeRepo,
     PullRequest,
@@ -123,6 +124,8 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     )
     pr.review_requests.add(VIEWER)
     pr.checks = "SUCCESS"
+    pr.review_required = True
+    pr.merge_state = "BLOCKED"
 
     pr = add(
         _simple_pr(repo, "needs-team-review", "Ask my team for a review", author=OTHER),
@@ -130,6 +133,11 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     )
     pr.team_review_requests.add(VIEWER)
     pr.checks = "FAILURE"
+    pr.check_runs = [
+        CheckRun("lint"),
+        CheckRun("test", conclusion="FAILURE"),
+        CheckRun("docs", conclusion="SKIPPED"),
+    ]
 
     # GitHub counts a comment-only review as no review; see todo.md.
     pr = add(
@@ -139,7 +147,9 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     pr.reviews.append(Review(OTHER, COMMENTED))
 
     pr = add(_simple_pr(repo, "returned-changes", "Get changes requested"), RETURNED)
-    pr.reviews.append(Review(OTHER, CHANGES_REQUESTED))
+    pr.reviews.append(Review(OTHER, CHANGES_REQUESTED, body="Please split this up."))
+    repo.issue_comment(pr, author=VIEWER, body="Will do, thanks!")
+    pr.review_requests.add("third")
 
     pr = add(
         _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION), APPROVED_INBOX
@@ -186,7 +196,8 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     repo.close(pr)
     pr = add(_simple_pr(repo, "merged", "Get merged"), None)
     repo.merge(pr)
-    add(_simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER), None)
+    pr = add(_simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER), None)
+    pr.conflicting = True
 
     # Stacks only form on non-trunk branches, which are dev/ ones by default.
     repo.checkout("dev/stack-base", "main")

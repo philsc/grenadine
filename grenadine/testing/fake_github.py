@@ -49,6 +49,9 @@ EPOCH = 1_767_225_600  # 2026-01-01T00:00:00Z
 APPROVED = "APPROVED"
 CHANGES_REQUESTED = "CHANGES_REQUESTED"
 COMMENTED = "COMMENTED"
+REVIEW_REQUIRED = "REVIEW_REQUIRED"
+# The name of the team whose members `team_review_requests` holds.
+TEAM = "Reviewers"
 
 OPEN = "OPEN"
 CLOSED = "CLOSED"
@@ -76,6 +79,26 @@ class Push:
 class Review:
     author: str
     state: str
+    body: str = ""
+    # When it was submitted; 0 means at EPOCH.
+    submitted_at: int = 0
+
+
+@dataclasses.dataclass
+class IssueComment:
+    """A comment on the PR itself rather than on its code."""
+
+    author: str
+    body: str
+    created_at: int
+
+
+@dataclasses.dataclass
+class CheckRun:
+    name: str
+    # A CheckStatusState; only COMPLETED runs have a conclusion.
+    status: str = "COMPLETED"
+    conclusion: str | None = "SUCCESS"
 
 
 @dataclasses.dataclass
@@ -113,12 +136,19 @@ class PullRequest:
     queued: bool = False
     # Users asked to review.
     review_requests: set[str] = dataclasses.field(default_factory=set)
-    # Members of the teams asked to review.
+    # Members of the teams asked to review; a request goes to TEAM.
     team_review_requests: set[str] = dataclasses.field(default_factory=set)
+    # Branch protection requires an approving review.
+    review_required: bool = False
     reviews: list[Review] = dataclasses.field(default_factory=list)
     comments: list[Comment] = dataclasses.field(default_factory=list)
     # The StatusState of the checks on the head; None when it has none.
     checks: str | None = None
+    # The individual checks behind `checks`.
+    check_runs: list[CheckRun] = dataclasses.field(default_factory=list)
+    issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
+    # GitHub's MergeStateStatus; None works it out from the PR.
+    merge_state: str | None = None
 
     @property
     def url(self) -> str:
@@ -132,8 +162,9 @@ class PullRequest:
         self.updated_at = self.repo.gh.tick()
 
     def review_decision(self) -> str | None:
-        """APPROVED, CHANGES_REQUESTED or None, from each reviewer's latest
-        verdict. Comment-only reviews carry no verdict."""
+        """APPROVED or CHANGES_REQUESTED from each reviewer's latest
+        verdict, else REVIEW_REQUIRED when a review is required, else None.
+        Comment-only reviews carry no verdict."""
         latest: dict[str, str] = {}
         for r in self.reviews:
             if r.state != COMMENTED:
@@ -142,7 +173,18 @@ class PullRequest:
             return CHANGES_REQUESTED
         if APPROVED in latest.values():
             return APPROVED
-        return None
+        return REVIEW_REQUIRED if self.review_required else None
+
+    def merge_state_status(self) -> str:
+        if self.merge_state is not None:
+            return self.merge_state
+        if self.conflicting:
+            return "DIRTY"
+        if self.draft:
+            return "DRAFT"
+        if self.checks in ("FAILURE", "ERROR"):
+            return "UNSTABLE"
+        return "CLEAN"
 
 
 class FakeRepo:
@@ -156,6 +198,10 @@ class FakeRepo:
         self.work = gh.root / "work" / slug
         self.pushes: dict[str, list[Push]] = {}
         self.prs: dict[int, PullRequest] = {}
+        # The PullRequestMergeMethods the repository allows, the first one
+        # being the viewer's default.
+        self.merge_methods = ["MERGE", "SQUASH", "REBASE"]
+        self.delete_branch_on_merge = False
         self.bare.parent.mkdir(parents=True, exist_ok=True)
         self.work.parent.mkdir(parents=True, exist_ok=True)
         gh.git("init", "--quiet", "--bare", "--initial-branch=main", str(self.bare))
@@ -315,6 +361,21 @@ class FakeRepo:
     def close(self, pr: PullRequest) -> None:
         pr.state = CLOSED
         pr.touch()
+
+    def review(
+        self, pr: PullRequest, *, author: str, state: str, body: str = ""
+    ) -> Review:
+        r = Review(author=author, state=state, body=body, submitted_at=self.gh.tick())
+        pr.reviews.append(r)
+        pr.review_requests.discard(author)
+        pr.touch()
+        return r
+
+    def issue_comment(self, pr: PullRequest, *, author: str, body: str) -> IssueComment:
+        c = IssueComment(author=author, body=body, created_at=self.gh.tick())
+        pr.issue_comments.append(c)
+        pr.touch()
+        return c
 
     def comment(
         self,
@@ -601,7 +662,12 @@ class FakeGitHub:
                 )
             return self._user_node(login)
 
-        return {"search": search, "repository": repository, "user": user}
+        return {
+            "search": search,
+            "repository": repository,
+            "user": user,
+            "viewer": lambda info: self._user_node(VIEWER),
+        }
 
     def _user_node(self, login: str) -> dict[str, Any]:
         return {
@@ -650,11 +716,18 @@ class FakeGitHub:
             "pullRequest": pull_request,
             "pullRequests": pull_requests,
             "object": object_,
+            "mergeCommitAllowed": "MERGE" in repo.merge_methods,
+            "squashMergeAllowed": "SQUASH" in repo.merge_methods,
+            "rebaseMergeAllowed": "REBASE" in repo.merge_methods,
+            "viewerDefaultMergeMethod": repo.merge_methods[0],
+            "deleteBranchOnMerge": repo.delete_branch_on_merge,
         }
 
     def _commit_node(
-        self, repo: FakeRepo, sha: str, checks: str | None = None
+        self, repo: FakeRepo, sha: str, pr: PullRequest | None = None
     ) -> dict[str, Any]:
+        """A commit; with `pr`, the PR's head and its checks."""
+
         def author(info: Any) -> Any:
             found = repo.commit_author(sha)
             if found is None:
@@ -671,7 +744,25 @@ class FakeGitHub:
             "oid": sha,
             "author": author,
             "checkSuites": lambda info, **_: {"nodes": []},
-            "statusCheckRollup": {"state": checks} if checks else None,
+            "statusCheckRollup": (
+                {
+                    "state": pr.checks,
+                    "contexts": lambda info, **_: {
+                        "nodes": [
+                            {
+                                "__typename": "CheckRun",
+                                "name": r.name,
+                                "status": r.status,
+                                "conclusion": r.conclusion,
+                                "detailsUrl": f"{pr.url}/checks?name={r.name}",
+                            }
+                            for r in pr.check_runs
+                        ]
+                    },
+                }
+                if pr and pr.checks
+                else None
+            ),
         }
 
     def _pr_node(self, pr: PullRequest) -> dict[str, Any]:
@@ -709,10 +800,55 @@ class FakeGitHub:
                 "nodes": [
                     {
                         "commit": self._commit_node(
-                            repo, sha, pr.checks if sha == head else None
+                            repo, sha, pr if sha == head else None
                         )
                     }
                     for sha in shas
+                ]
+            }
+
+        def reviews(
+            info: Any,
+            first: int | None = None,
+            last: int | None = None,
+            states: list[str] | None = None,
+            **_: Any,
+        ) -> Any:
+            found = [
+                (i, r)
+                for i, r in enumerate(pr.reviews)
+                if states is None or r.state in states
+            ][:first]
+            if last is not None:
+                found = found[-last:] if last else []
+            return {
+                "nodes": [
+                    {
+                        "state": r.state,
+                        "body": r.body,
+                        "submittedAt": iso(r.submitted_at or EPOCH),
+                        "url": f"{pr.url}#pullrequestreview-{i}",
+                        "author": self._user_node(r.author),
+                    }
+                    for i, r in found
+                ]
+            }
+
+        def comments(
+            info: Any, first: int | None = None, last: int | None = None, **_: Any
+        ) -> Any:
+            found = pr.issue_comments[:first]
+            if last is not None:
+                found = found[-last:] if last else []
+            return {
+                "nodes": [
+                    {
+                        "body": c.body,
+                        "createdAt": iso(c.created_at),
+                        "url": f"{pr.url}#issuecomment-{i}",
+                        "author": self._user_node(c.author),
+                    }
+                    for i, c in enumerate(found)
                 ]
             }
 
@@ -723,6 +859,7 @@ class FakeGitHub:
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
                 "nodes": [
                     {
+                        "id": f"PRRT_{c.id}",
                         "isResolved": c.resolved,
                         "resolvedBy": (
                             self._user_node(c.resolved_by)
@@ -759,6 +896,22 @@ class FakeGitHub:
             "timelineItems": timeline,
             "commits": commits,
             "reviewThreads": review_threads,
+            "reviewDecision": pr.review_decision(),
+            "mergeStateStatus": pr.merge_state_status(),
+            "viewerCanMergeAsAdmin": False,
+            "reviews": reviews,
+            "reviewRequests": lambda info, **_: {
+                "nodes": [
+                    {"requestedReviewer": self._user_node(login)}
+                    for login in sorted(pr.review_requests)
+                ]
+                + (
+                    [{"requestedReviewer": {"__typename": "Team", "name": TEAM}}]
+                    if pr.team_review_requests
+                    else []
+                )
+            },
+            "comments": comments,
         }
 
 

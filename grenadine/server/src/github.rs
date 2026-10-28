@@ -6,7 +6,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
-use grenadine_core::api::{CiStatus, Person, PrKey, ReviewComment, Side, StackPr, ThreadCounts};
+use grenadine_core::api::{
+    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeState, Person, PrKey, Review,
+    ReviewComment, ReviewDecision, ReviewInfo, ReviewState, Side, StackPr, ThreadCounts,
+};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
@@ -73,6 +76,22 @@ pub struct PrData {
     /// The PR's commits in order, each with the time its first check suite
     /// was created (a stand-in for when it was pushed).
     pub commits: Vec<(String, Option<i64>)>,
+    /// The combined state of the checks on the head, the same that a
+    /// search reports as `Hit::ci`.
+    pub ci: Option<CiStatus>,
+    /// `None` when GitHub failed to report some of it; `review_error` then
+    /// says why.
+    pub review: Option<ReviewInfo>,
+    pub review_error: Option<String>,
+}
+
+/// A review thread of a PR, as `GitHub::review_threads` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadState {
+    /// The thread's GraphQL ID.
+    pub id: String,
+    pub resolved: bool,
+    pub resolved_by: Option<Person>,
 }
 
 /// Which branch of a PR `GitHub::prs_by_ref` matches.
@@ -143,6 +162,63 @@ pub const SEARCH_LIMIT: usize = 100;
 const SEARCH_STATUS_FIELDS: &str = "reviewThreads(first: 100) { totalCount nodes { isResolved } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
 
+/// Maps a check run's `CheckStatusState` and `CheckConclusionState`.
+/// Checks that finished without passing or failing, e.g. skipped ones,
+/// have no status.
+fn check_run_status(status: &str, conclusion: &str) -> Option<CiStatus> {
+    if status != "COMPLETED" {
+        return Some(CiStatus::Running);
+    }
+    match conclusion {
+        "SUCCESS" => Some(CiStatus::Passing),
+        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
+            Some(CiStatus::Failing)
+        }
+        _ => None,
+    }
+}
+
+fn merge_method(s: &str) -> Option<MergeMethod> {
+    match s {
+        "MERGE" => Some(MergeMethod::Merge),
+        "SQUASH" => Some(MergeMethod::Squash),
+        "REBASE" => Some(MergeMethod::Rebase),
+        _ => None,
+    }
+}
+
+/// Maps a `PullRequestReviewDecision`; `None` for none.
+fn review_decision(s: &str) -> Option<ReviewDecision> {
+    match s {
+        "" => None,
+        "APPROVED" => Some(ReviewDecision::Approved),
+        "CHANGES_REQUESTED" => Some(ReviewDecision::ChangesRequested),
+        "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
+        _ => {
+            tracing::warn!("unknown review decision {s:?}");
+            Some(ReviewDecision::Unknown)
+        }
+    }
+}
+
+/// Maps a `MergeStateStatus`.
+fn merge_state(s: &str) -> MergeState {
+    match s {
+        "BEHIND" => MergeState::Behind,
+        "BLOCKED" => MergeState::Blocked,
+        "CLEAN" => MergeState::Clean,
+        "DIRTY" => MergeState::Dirty,
+        "DRAFT" => MergeState::Draft,
+        "HAS_HOOKS" => MergeState::HasHooks,
+        "UNSTABLE" => MergeState::Unstable,
+        "UNKNOWN" => MergeState::Unknown,
+        _ => {
+            tracing::warn!("unknown merge state {s:?}");
+            MergeState::Unknown
+        }
+    }
+}
+
 /// Maps a `StatusState` of a commit's check rollup.
 fn ci_status(state: &str) -> Option<CiStatus> {
     match state {
@@ -174,9 +250,46 @@ query($owner: String!, $name: String!, $number: Int!) {
       commits(first: 100) {
         nodes { commit { oid checkSuites(first: 10) { nodes { createdAt } } } }
       }
+      reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
+      reviews(last: 100) {
+        nodes { state body submittedAt url author { ...Who } }
+      }
+      reviewRequests(first: 20) {
+        nodes {
+          requestedReviewer {
+            ... on User { login }
+            ... on Team { name }
+            ... on Bot { login }
+            ... on Mannequin { login }
+          }
+        }
+      }
+      comments(last: 100) {
+        nodes { body createdAt url author { ...Who } }
+      }
+      head: commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                nodes {
+                  ... on CheckRun { name status conclusion detailsUrl }
+                  ... on StatusContext { context state targetUrl }
+                }
+              }
+            }
+          }
+        }
+      }
     }
+    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
+    viewerDefaultMergeMethod deleteBranchOnMerge
   }
+  viewer { login }
 }
+
+fragment Who on Actor { login avatarUrl ... on User { name } }
 "#;
 
 const THREADS_QUERY: &str = r#"
@@ -186,6 +299,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
+          id
           isResolved
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -195,6 +309,165 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
   }
 }
 "#;
+
+/// The nodes of the connection at `ptr`.
+fn nodes<'a>(v: &'a Value, ptr: &str) -> impl Iterator<Item = &'a Value> {
+    v.pointer(ptr)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+/// The login of the author of a PR, review or comment; GitHub reports
+/// deleted users as `null`, and shows them as "ghost".
+fn author_login(v: &Value) -> &str {
+    Some(str_at(v, "/author/login"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ghost")
+}
+
+/// The author of a review or comment, see `author_login`.
+fn author_at(v: &Value) -> Person {
+    person_at(&v["author"]).unwrap_or_else(|| Person {
+        login: Some(author_login(v).to_owned()),
+        ..Person::default()
+    })
+}
+
+/// The fields of `PR_QUERY` that `review_info` reads, as the start of the
+/// `path` of an error in them.
+const REVIEW_FIELDS: &[&[&str]] = &[
+    &["viewer"],
+    &["repository", "mergeCommitAllowed"],
+    &["repository", "squashMergeAllowed"],
+    &["repository", "rebaseMergeAllowed"],
+    &["repository", "viewerDefaultMergeMethod"],
+    &["repository", "deleteBranchOnMerge"],
+    &["repository", "pullRequest", "reviewDecision"],
+    &["repository", "pullRequest", "mergeable"],
+    &["repository", "pullRequest", "mergeStateStatus"],
+    &["repository", "pullRequest", "viewerCanMergeAsAdmin"],
+    &["repository", "pullRequest", "reviews"],
+    &["repository", "pullRequest", "reviewRequests"],
+    &["repository", "pullRequest", "comments"],
+    &["repository", "pullRequest", "head"],
+];
+
+/// The message of the first of `errors` in a field that `review_info`
+/// reads. GitHub leaves such fields `null` and still returns the rest.
+fn review_error(errors: &[Value]) -> Option<String> {
+    errors
+        .iter()
+        .find(|e| {
+            let path: Vec<&str> = nodes(e, "/path").filter_map(Value::as_str).collect();
+            REVIEW_FIELDS.iter().any(|f| path.starts_with(f))
+        })
+        .map(|e| {
+            Some(str_at(e, "/message"))
+                .filter(|m| !m.is_empty())
+                .unwrap_or("unknown error")
+                .to_owned()
+        })
+}
+
+/// The reviews, the conversation, the checks and the merge state from a
+/// `PR_QUERY` response; `data` is the whole response, `pr` its pull
+/// request.
+fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
+    let reviews = nodes(pr, "/reviews/nodes")
+        .filter_map(|r| {
+            let state = match str_at(r, "/state") {
+                "APPROVED" => ReviewState::Approved,
+                "CHANGES_REQUESTED" => ReviewState::ChangesRequested,
+                "COMMENTED" => ReviewState::Commented,
+                "DISMISSED" => ReviewState::Dismissed,
+                // Pending reviews haven't been submitted yet.
+                _ => return None,
+            };
+            Some(Review {
+                author: author_at(r),
+                state,
+                body: str_at(r, "/body").to_owned(),
+                submitted_at: str_at(r, "/submittedAt").to_owned(),
+                url: str_at(r, "/url").to_owned(),
+            })
+        })
+        .collect();
+    let requested = nodes(pr, "/reviewRequests/nodes")
+        .filter_map(|n| {
+            let r = &n["requestedReviewer"];
+            Some(str_at(r, "/login"))
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(str_at(r, "/name")).filter(|s| !s.is_empty()))
+                .map(str::to_owned)
+        })
+        .collect();
+    let comments = nodes(pr, "/comments/nodes")
+        .map(|c| IssueComment {
+            author: author_at(c),
+            body: str_at(c, "/body").to_owned(),
+            created_at: str_at(c, "/createdAt").to_owned(),
+            url: str_at(c, "/url").to_owned(),
+        })
+        .collect();
+    let rollup = pr
+        .pointer("/head/nodes/0/commit/statusCheckRollup")
+        .unwrap_or(&Value::Null);
+    let checks = nodes(rollup, "/contexts/nodes")
+        .filter_map(|c| {
+            let opt = |ptr: &str| {
+                Some(str_at(c, ptr))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            if let Some(name) = opt("/name") {
+                Some(Check {
+                    name,
+                    status: check_run_status(str_at(c, "/status"), str_at(c, "/conclusion")),
+                    url: opt("/detailsUrl"),
+                })
+            } else {
+                Some(Check {
+                    name: opt("/context")?,
+                    status: ci_status(str_at(c, "/state")),
+                    url: opt("/targetUrl"),
+                })
+            }
+        })
+        .collect();
+    let repo = &data["repository"];
+    let methods = [
+        ("/mergeCommitAllowed", MergeMethod::Merge),
+        ("/squashMergeAllowed", MergeMethod::Squash),
+        ("/rebaseMergeAllowed", MergeMethod::Rebase),
+    ]
+    .into_iter()
+    .filter(|(ptr, _)| repo.pointer(ptr).and_then(Value::as_bool) == Some(true))
+    .map(|(_, m)| m)
+    .collect();
+    ReviewInfo {
+        viewer: str_at(data, "/viewer/login").to_owned(),
+        decision: review_decision(str_at(pr, "/reviewDecision")),
+        reviews,
+        requested,
+        comments,
+        checks,
+        ci: ci_status(str_at(rollup, "/state")),
+        merge: MergeInfo {
+            // GitHub says UNKNOWN until it has tried merging.
+            conflicting: match str_at(pr, "/mergeable") {
+                "CONFLICTING" => Some(true),
+                "MERGEABLE" => Some(false),
+                _ => None,
+            },
+            state: merge_state(str_at(pr, "/mergeStateStatus")),
+            methods,
+            default_method: merge_method(str_at(repo, "/viewerDefaultMergeMethod")),
+            delete_branch_on_merge: repo["deleteBranchOnMerge"].as_bool().unwrap_or(false),
+            can_merge_as_admin: pr["viewerCanMergeAsAdmin"].as_bool().unwrap_or(false),
+        },
+    }
+}
 
 /// How many users or commits one batched GraphQL lookup asks for.
 const LOOKUP_BATCH: usize = 50;
@@ -366,7 +639,7 @@ impl GitHub {
         Ok((0..queries.len())
             .map(|i| {
                 let alias = format!("s{i}");
-                let Some(nodes) = data
+                let Some(found) = data
                     .pointer(&format!("/{alias}/nodes"))
                     .and_then(Value::as_array)
                 else {
@@ -376,7 +649,7 @@ impl GitHub {
                         .cloned()
                         .unwrap_or_else(|| "search failed".to_owned()));
                 };
-                Ok(nodes
+                Ok(found
                     .iter()
                     .filter(|n| n.get("number").is_some())
                     .map(|n| Hit {
@@ -385,10 +658,7 @@ impl GitHub {
                             number: n["number"].as_u64().unwrap_or_default(),
                         },
                         title: str_at(n, "/title").to_owned(),
-                        author: Some(str_at(n, "/author/login"))
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("ghost")
-                            .to_owned(),
+                        author: author_login(n).to_owned(),
                         state: str_at(n, "/state").to_owned(),
                         is_draft: n["isDraft"].as_bool().unwrap_or_default(),
                         url: str_at(n, "/url").to_owned(),
@@ -397,11 +667,7 @@ impl GitHub {
                         threads: ThreadCounts {
                             // Only the first 100 threads say whether
                             // they're resolved; that's plenty in practice.
-                            resolved: n
-                                .pointer("/reviewThreads/nodes")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
+                            resolved: nodes(n, "/reviewThreads/nodes")
                                 .filter(|t| t["isResolved"].as_bool() == Some(true))
                                 .count() as u32,
                             total: n
@@ -516,13 +782,13 @@ impl GitHub {
                 )
             })?;
 
+        for e in &errors {
+            tracing::warn!("{}#{}: GitHub reported {e}", key.repo, key.number);
+        }
+        let review_error = review_error(&errors);
+
         let mut force_pushes = Vec::new();
-        for n in pr
-            .pointer("/timelineItems/nodes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        for n in nodes(pr, "/timelineItems/nodes") {
             let after = str_at(n, "/afterCommit/oid");
             if after.is_empty() {
                 continue;
@@ -536,17 +802,9 @@ impl GitHub {
                 actor: n.get("actor").and_then(person_at),
             });
         }
-        let commits = pr
-            .pointer("/commits/nodes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let commits = nodes(pr, "/commits/nodes")
             .map(|n| {
-                let first_suite = n
-                    .pointer("/commit/checkSuites/nodes")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
+                let first_suite = nodes(n, "/commit/checkSuites/nodes")
                     .filter_map(|s| unix(str_at(s, "/createdAt")).ok())
                     .min();
                 (str_at(n, "/commit/oid").to_owned(), first_suite)
@@ -556,10 +814,7 @@ impl GitHub {
         Ok(PrData {
             title: str_at(pr, "/title").to_owned(),
             body: str_at(pr, "/body").to_owned(),
-            author: Some(str_at(pr, "/author/login"))
-                .filter(|s| !s.is_empty())
-                .unwrap_or("ghost")
-                .to_owned(),
+            author: author_login(pr).to_owned(),
             state: str_at(pr, "/state").to_owned(),
             is_draft: pr["isDraft"].as_bool().unwrap_or(false),
             url: str_at(pr, "/url").to_owned(),
@@ -573,6 +828,9 @@ impl GitHub {
                 .map(str::to_owned),
             force_pushes,
             commits,
+            ci: ci_status(str_at(pr, "/head/nodes/0/commit/statusCheckRollup/state")),
+            review: review_error.is_none().then(|| review_info(&data, pr)),
+            review_error,
         })
     }
 
@@ -696,15 +954,15 @@ impl GitHub {
                 url: c.html_url,
                 resolved: false,
                 resolved_by: None,
+                thread_id: None,
             })
             .collect())
     }
 
-    /// The PR's resolved review threads: the ID of each one's first comment
-    /// and who resolved it, if known.
-    pub async fn resolved_threads(&self, key: &PrKey) -> Result<BTreeMap<u64, Option<Person>>> {
+    /// The PR's review threads, keyed by the ID of each one's first comment.
+    pub async fn review_threads(&self, key: &PrKey) -> Result<BTreeMap<u64, ThreadState>> {
         let (owner, name) = split_repo(&key.repo)?;
-        let mut resolved = BTreeMap::new();
+        let mut out = BTreeMap::new();
         let mut after: Option<String> = None;
         loop {
             let (data, errors) = self
@@ -727,23 +985,24 @@ impl GitHub {
                             .unwrap_or("not found")
                     )
                 })?;
-            resolved.extend(
-                threads["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|t| t["isResolved"].as_bool() == Some(true))
-                    .filter_map(|t| {
-                        let id = t.pointer("/comments/nodes/0/databaseId")?.as_u64()?;
-                        Some((id, person_at(&t["resolvedBy"])))
-                    }),
-            );
+            out.extend(nodes(threads, "/nodes").filter_map(|t| {
+                let id = t.pointer("/comments/nodes/0/databaseId")?.as_u64()?;
+                let resolved = t["isResolved"].as_bool() == Some(true);
+                Some((
+                    id,
+                    ThreadState {
+                        id: str_at(t, "/id").to_owned(),
+                        resolved,
+                        resolved_by: resolved.then(|| person_at(&t["resolvedBy"])).flatten(),
+                    },
+                ))
+            }));
             if threads
                 .pointer("/pageInfo/hasNextPage")
                 .and_then(Value::as_bool)
                 != Some(true)
             {
-                return Ok(resolved);
+                return Ok(out);
             }
             after = Some(str_at(threads, "/pageInfo/endCursor").to_owned());
         }
@@ -949,6 +1208,164 @@ mod tests {
         assert_eq!(ci_status("PENDING"), Some(CiStatus::Running));
         assert_eq!(ci_status("EXPECTED"), Some(CiStatus::Running));
         assert_eq!(ci_status(""), None);
+    }
+
+    #[test]
+    fn review_decisions() {
+        assert_eq!(review_decision(""), None);
+        assert_eq!(review_decision("APPROVED"), Some(ReviewDecision::Approved));
+        assert_eq!(
+            review_decision("CHANGES_REQUESTED"),
+            Some(ReviewDecision::ChangesRequested)
+        );
+        assert_eq!(
+            review_decision("REVIEW_REQUIRED"),
+            Some(ReviewDecision::ReviewRequired)
+        );
+        assert_eq!(review_decision("NEW"), Some(ReviewDecision::Unknown));
+    }
+
+    #[test]
+    fn merge_states() {
+        for (s, state) in [
+            ("BEHIND", MergeState::Behind),
+            ("BLOCKED", MergeState::Blocked),
+            ("CLEAN", MergeState::Clean),
+            ("DIRTY", MergeState::Dirty),
+            ("DRAFT", MergeState::Draft),
+            ("HAS_HOOKS", MergeState::HasHooks),
+            ("UNSTABLE", MergeState::Unstable),
+            ("UNKNOWN", MergeState::Unknown),
+            ("NEW", MergeState::Unknown),
+            ("", MergeState::Unknown),
+        ] {
+            assert_eq!(merge_state(s), state, "{s}");
+        }
+    }
+
+    #[test]
+    fn new_github_values_read_as_unknown() {
+        let decision: ReviewDecision = serde_json::from_value(json!("Whatever")).unwrap();
+        assert_eq!(decision, ReviewDecision::Unknown);
+        let state: MergeState = serde_json::from_value(json!("Whatever")).unwrap();
+        assert_eq!(state, MergeState::Unknown);
+    }
+
+    #[test]
+    fn errors_in_review_fields_are_review_errors() {
+        let error = |path: Value| json!({ "message": "FORBIDDEN", "path": path });
+        assert_eq!(review_error(&[]), None);
+        // Errors elsewhere in the query don't touch the reviews.
+        assert_eq!(
+            review_error(&[
+                error(json!(["repository", "pullRequest", "timelineItems"])),
+                json!({ "message": "no path" }),
+            ]),
+            None
+        );
+        assert_eq!(
+            review_error(&[error(json!([
+                "repository",
+                "pullRequest",
+                "reviewRequests",
+                "nodes",
+                0,
+                "requestedReviewer"
+            ]))])
+            .as_deref(),
+            Some("FORBIDDEN")
+        );
+        assert_eq!(
+            review_error(&[error(json!(["viewer", "login"]))]).as_deref(),
+            Some("FORBIDDEN")
+        );
+        assert_eq!(
+            review_error(&[json!({ "path": ["repository", "pullRequest", "head"] })]).as_deref(),
+            Some("unknown error")
+        );
+    }
+
+    #[test]
+    fn reads_reviews_checks_and_the_merge_state() {
+        let data = json!({
+            "viewer": { "login": "me" },
+            "repository": {
+                "mergeCommitAllowed": false,
+                "squashMergeAllowed": true,
+                "rebaseMergeAllowed": true,
+                "viewerDefaultMergeMethod": "REBASE",
+                "deleteBranchOnMerge": true,
+                "pullRequest": {
+                    "reviewDecision": "REVIEW_REQUIRED",
+                    "mergeable": "UNKNOWN",
+                    "mergeStateStatus": "BLOCKED",
+                    "viewerCanMergeAsAdmin": true,
+                    "reviews": { "nodes": [
+                        { "state": "PENDING", "body": "", "submittedAt": null, "url": "u0",
+                          "author": { "login": "me" } },
+                        { "state": "CHANGES_REQUESTED", "body": "No", "submittedAt": "t1",
+                          "url": "u1", "author": null },
+                    ] },
+                    "reviewRequests": { "nodes": [
+                        { "requestedReviewer": { "login": "a" } },
+                        { "requestedReviewer": { "name": "team" } },
+                        { "requestedReviewer": { "login": "copilot" } },
+                        { "requestedReviewer": {} },
+                        { "requestedReviewer": null },
+                    ] },
+                    "comments": { "nodes": [
+                        { "body": "hi", "createdAt": "t2", "url": "u2",
+                          "author": { "login": "b", "name": "B", "avatarUrl": "av" } },
+                    ] },
+                    "head": { "nodes": [ { "commit": { "statusCheckRollup": {
+                        "state": "PENDING",
+                        "contexts": { "nodes": [
+                            { "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS",
+                              "detailsUrl": "d" },
+                            { "name": "test", "status": "IN_PROGRESS", "conclusion": null },
+                            { "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED" },
+                            { "context": "ci/legacy", "state": "ERROR", "targetUrl": null },
+                        ] },
+                    } } } ] },
+                },
+            },
+        });
+        let info = review_info(&data, &data["repository"]["pullRequest"]);
+        assert_eq!(info.viewer, "me");
+        assert_eq!(info.decision, Some(ReviewDecision::ReviewRequired));
+        let [review] = &info.reviews[..] else {
+            panic!("{:?}", info.reviews)
+        };
+        assert_eq!(review.state, ReviewState::ChangesRequested);
+        assert_eq!(review.author.login.as_deref(), Some("ghost"));
+        assert_eq!(info.requested, ["a", "team", "copilot"]);
+        assert_eq!(info.comments[0].author.name.as_deref(), Some("B"));
+        let checks: Vec<_> = info
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.status, c.url.as_deref()))
+            .collect();
+        assert_eq!(
+            checks,
+            [
+                ("lint", Some(CiStatus::Passing), Some("d")),
+                ("test", Some(CiStatus::Running), None),
+                ("docs", None, None),
+                ("ci/legacy", Some(CiStatus::Failing), None),
+            ]
+        );
+        assert_eq!(info.ci, Some(CiStatus::Running));
+        assert_eq!(
+            info.merge,
+            MergeInfo {
+                conflicting: None,
+                state: MergeState::Blocked,
+                methods: vec![MergeMethod::Squash, MergeMethod::Rebase],
+                default_method: Some(MergeMethod::Rebase),
+                delete_branch_on_merge: true,
+                can_merge_as_admin: true,
+            }
+        );
     }
 
     #[test]

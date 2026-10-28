@@ -238,7 +238,7 @@ fn ThreadCount(threads: ThreadCounts) -> impl IntoView {
 
 /// Whether the checks on the PR's head pass, fail or are still running.
 #[component]
-fn CiIcon(ci: CiStatus) -> impl IntoView {
+pub(crate) fn CiIcon(ci: CiStatus) -> impl IntoView {
     let (class, title, path) = match ci {
         CiStatus::Passing => ("ci passing", "CI passing", "M3.5 8.5l3 3 6-7"),
         CiStatus::Failing => ("ci failing", "CI failing", "M4 4l8 8M12 4l-8 8"),

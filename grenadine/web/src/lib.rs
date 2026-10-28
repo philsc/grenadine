@@ -12,6 +12,7 @@ mod images;
 mod inboxes;
 mod markdown;
 mod pr;
+mod review;
 mod terminal;
 mod theme;
 mod topbar;
