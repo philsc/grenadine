@@ -478,7 +478,10 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
         format!("{} (#{})", target.title, key.number),
         target.body.clone(),
     );
-    let editing = move || message.with(Option::is_some);
+    // Only whether it's being edited: the fields must not be rebuilt as
+    // the message changes.
+    let editing = Memo::new(move |_| message.with(Option::is_some));
+    let editing = move || editing.get();
     let methods = info.merge.methods.clone();
     let admin = allowed == Ok(true);
     let blocked = allowed.err();
@@ -565,11 +568,13 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
                     }
                 })}
             </div>
-            {move || (chosen() == Some(MergeMethod::Squash)).then(|| message.get()).flatten().map(|(t, b)| view! {
+            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| view! {
                 <div class="merge-message">
-                    <input type="text" aria-label="Commit title" prop:value=t
+                    <input type="text" aria-label="Commit title"
+                        prop:value=move || message.with(|m| m.as_ref().map(|m| m.0.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.0 = event_target_value(&ev) }) />
-                    <textarea rows="6" aria-label="Commit message" prop:value=b
+                    <textarea rows="6" aria-label="Commit message"
+                        prop:value=move || message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.1 = event_target_value(&ev) })></textarea>
                 </div>
             })}
