@@ -287,11 +287,12 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         None => Vec::new(),
     };
     let mut comments = state.github.review_comments(key).await?;
-    let resolved = state.github.resolved_threads(key).await?;
+    let threads = state.github.review_threads(key).await?;
     for c in &mut comments {
-        if let Some(by) = resolved.get(&c.id) {
-            c.resolved = true;
-            c.resolved_by = by.clone();
+        if let Some(t) = threads.get(&c.id) {
+            c.resolved = t.resolved;
+            c.resolved_by = t.resolved_by.clone();
+            c.thread_id = Some(t.id.clone());
         }
     }
 
@@ -373,6 +374,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         base_ref: data.base_ref,
         head_ref: data.head_ref,
         head_oid: data.head_oid,
+        review: Some(data.review),
     };
     state.db.store_sync(
         &meta,

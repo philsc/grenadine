@@ -11,6 +11,7 @@ type Query {
   search(type: SearchType!, query: String!, first: Int, after: String): SearchResultItemConnection
   repository(owner: String!, name: String!): Repository
   user(login: String!): User
+  viewer: User!
 }
 
 enum SearchType {
@@ -43,6 +44,34 @@ type Repository {
     after: String
   ): PullRequestConnection!
   object(oid: GitObjectID, expression: String): GitObject
+  mergeCommitAllowed: Boolean!
+  squashMergeAllowed: Boolean!
+  rebaseMergeAllowed: Boolean!
+  viewerDefaultMergeMethod: PullRequestMergeMethod!
+  deleteBranchOnMerge: Boolean!
+}
+
+enum PullRequestMergeMethod {
+  MERGE
+  SQUASH
+  REBASE
+}
+
+enum PullRequestReviewDecision {
+  APPROVED
+  CHANGES_REQUESTED
+  REVIEW_REQUIRED
+}
+
+enum MergeStateStatus {
+  BEHIND
+  BLOCKED
+  CLEAN
+  DIRTY
+  DRAFT
+  HAS_HOOKS
+  UNKNOWN
+  UNSTABLE
 }
 
 enum PullRequestState {
@@ -86,6 +115,61 @@ type PullRequest {
   ): PullRequestTimelineItemsConnection!
   commits(first: Int, after: String, last: Int): PullRequestCommitConnection!
   reviewThreads(first: Int, after: String): PullRequestReviewThreadConnection!
+  reviewDecision: PullRequestReviewDecision
+  mergeStateStatus: MergeStateStatus!
+  viewerCanMergeAsAdmin: Boolean!
+  reviews(
+    first: Int
+    after: String
+    states: [PullRequestReviewState!]
+  ): PullRequestReviewConnection
+  reviewRequests(first: Int, after: String): ReviewRequestConnection
+  comments(first: Int, after: String, last: Int): IssueCommentConnection!
+}
+
+enum PullRequestReviewState {
+  PENDING
+  COMMENTED
+  APPROVED
+  CHANGES_REQUESTED
+  DISMISSED
+}
+
+type PullRequestReviewConnection {
+  nodes: [PullRequestReview]
+}
+
+type PullRequestReview {
+  state: PullRequestReviewState!
+  body: String!
+  submittedAt: DateTime
+  url: URI!
+  author: Actor
+}
+
+type ReviewRequestConnection {
+  nodes: [ReviewRequest]
+}
+
+type ReviewRequest {
+  requestedReviewer: RequestedReviewer
+}
+
+union RequestedReviewer = User | Team
+
+type Team {
+  name: String!
+}
+
+type IssueCommentConnection {
+  nodes: [IssueComment]
+}
+
+type IssueComment {
+  body: String!
+  createdAt: DateTime!
+  url: URI!
+  author: Actor
 }
 
 enum PullRequestTimelineItemsItemType {
@@ -127,6 +211,47 @@ type Commit implements GitObject {
 
 type StatusCheckRollup {
   state: StatusState!
+  contexts(first: Int, after: String): StatusCheckRollupContextConnection!
+}
+
+type StatusCheckRollupContextConnection {
+  nodes: [StatusCheckRollupContext]
+}
+
+union StatusCheckRollupContext = CheckRun | StatusContext
+
+type CheckRun {
+  name: String!
+  status: CheckStatusState!
+  conclusion: CheckConclusionState
+  detailsUrl: URI
+}
+
+enum CheckStatusState {
+  QUEUED
+  IN_PROGRESS
+  COMPLETED
+  WAITING
+  PENDING
+  REQUESTED
+}
+
+enum CheckConclusionState {
+  ACTION_REQUIRED
+  TIMED_OUT
+  CANCELLED
+  FAILURE
+  SUCCESS
+  NEUTRAL
+  SKIPPED
+  STARTUP_FAILURE
+  STALE
+}
+
+type StatusContext {
+  context: String!
+  state: StatusState!
+  targetUrl: URI
 }
 
 enum StatusState {
@@ -179,6 +304,7 @@ type PageInfo {
 }
 
 type PullRequestReviewThread {
+  id: ID!
   isResolved: Boolean!
   resolvedBy: User
   comments(first: Int, after: String): PullRequestReviewCommentConnection!

@@ -12,6 +12,7 @@ use wasm_bindgen::JsCast;
 
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
+use crate::review::{Conversation, MergeBox, ReviewSummary};
 use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.
@@ -208,16 +209,16 @@ struct Folded(RwSignal<HashMap<u64, bool>>);
 /// What the markdown of one PR needs: its repo for links, and whether PR
 /// links open in grenadine (inverting Shift+click's meaning).
 #[derive(Clone)]
-struct PrLinks {
-    repo: String,
-    invert: RwSignal<bool>,
+pub(crate) struct PrLinks {
+    pub(crate) repo: String,
+    pub(crate) invert: RwSignal<bool>,
 }
 
 /// Routes clicks on the `data-grenadine` links that markdown rendering put
 /// on PR references and that the stack list has. Shift+click — or a plain
 /// click when the invert flag is on — navigates in-app; anything else
 /// opens GitHub in a tab.
-fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
+pub(crate) fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
     if ev.button() != 0 || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
         return;
     }
@@ -365,6 +366,7 @@ fn PrBody(
                     {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
                     " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
                 </p>
+                {pr.review.clone().map(|info| view! { <ReviewSummary info=info author=s.author.clone() /> })}
                 {pr.approximate.then(|| view! {
                     <p class="banner warn">"GitHub has no push log for this PR, so its versions were reconstructed from force-push events and may not match every push."</p>
                 })}
@@ -376,6 +378,8 @@ fn PrBody(
             })}
             <section class="description markdown" inner_html=body_html
                 on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
+            {pr.review.clone().map(|info| view! { <Conversation info=info /> })}
+            {pr.review.clone().filter(|_| s.state == "OPEN").map(|info| view! { <MergeBox info=info /> })}
             <div class="toolbar">
                 <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
                 <label class="toggle">
@@ -505,7 +509,7 @@ fn kind_label(v: &Version) -> &'static str {
 /// A person's avatar and name. `guess` marks a pusher that is only the
 /// commit's author.
 #[component]
-fn PersonChip(person: Person, guess: bool) -> impl IntoView {
+pub(crate) fn PersonChip(person: Person, guess: bool) -> impl IntoView {
     let label = person
         .name
         .clone()
@@ -828,6 +832,7 @@ mod tests {
             url: String::new(),
             resolved: false,
             resolved_by: None,
+            thread_id: None,
         }
     }
 

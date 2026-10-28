@@ -9,6 +9,7 @@ from grenadine.testing.fake_github import (
     CHANGES_REQUESTED,
     COMMENTED,
     VIEWER,
+    CheckRun,
     FakeGitHub,
     FakeRepo,
     PullRequest,
@@ -130,6 +131,11 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     )
     pr.team_review_requests.add(VIEWER)
     pr.checks = "FAILURE"
+    pr.check_runs = [
+        CheckRun("lint"),
+        CheckRun("test", conclusion="FAILURE"),
+        CheckRun("docs", conclusion="SKIPPED"),
+    ]
 
     # GitHub counts a comment-only review as no review; see todo.md.
     pr = add(
@@ -139,7 +145,9 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     pr.reviews.append(Review(OTHER, COMMENTED))
 
     pr = add(_simple_pr(repo, "returned-changes", "Get changes requested"), RETURNED)
-    pr.reviews.append(Review(OTHER, CHANGES_REQUESTED))
+    pr.reviews.append(Review(OTHER, CHANGES_REQUESTED, body="Please split this up."))
+    repo.issue_comment(pr, author=VIEWER, body="Will do, thanks!")
+    pr.review_requests.add("third")
 
     pr = add(
         _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION), APPROVED_INBOX
