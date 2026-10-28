@@ -450,6 +450,19 @@ class InboxTest(ServerTestCase):
                 ci = self.row(title).locator(".pr-status .ci")
                 expect(ci).to_have_class(re.compile(rf"\b{state}\b"))
                 expect(ci).to_have_attribute("title", f"CI {state}")
+        for title, state, label in [
+            ("Get approved", "approved", "Approved"),
+            ("Get changes requested", "changes", "Changes requested"),
+        ]:
+            with self.subTest(title=title):
+                review = self.row(title).locator(".pr-status .review")
+                expect(review).to_have_class(re.compile(rf"\b{state}\b"))
+                expect(review).to_have_attribute("title", label)
+        # GitHub has no decision for a repository that doesn't require
+        # reviews and a PR nobody reviewed.
+        expect(
+            self.row("Wait for reviewers").locator(".pr-status .review")
+        ).to_have_count(0)
         # A PR without checks shows no CI icon.
         expect(self.row("Wait for reviewers").locator(".pr-status .ci")).to_have_count(
             0

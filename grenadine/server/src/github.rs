@@ -54,6 +54,9 @@ pub struct Hit {
     pub threads: ThreadCounts,
     /// `None` when the head has no checks.
     pub ci: Option<CiStatus>,
+    /// APPROVED, CHANGES_REQUESTED or REVIEW_REQUIRED; `None` when GitHub
+    /// has no decision.
+    pub review_decision: Option<String>,
 }
 
 /// Everything about a PR that its sync needs from GraphQL.
@@ -158,8 +161,9 @@ pub fn search_query(filter: &str, repos: &[String]) -> String {
 pub const SEARCH_LIMIT: usize = 100;
 
 /// What a search's PR fields are, beyond the PR's metadata: its review
-/// threads and the checks on its head.
-const SEARCH_STATUS_FIELDS: &str = "reviewThreads(first: 100) { totalCount nodes { isResolved } }
+/// decision, its review threads and the checks on its head.
+const SEARCH_STATUS_FIELDS: &str = "reviewDecision
+    reviewThreads(first: 100) { totalCount nodes { isResolved } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
 
 /// Maps a check run's `CheckStatusState` and `CheckConclusionState`.
@@ -944,6 +948,9 @@ impl GitHub {
                                 .unwrap_or_default() as u32,
                         },
                         ci: ci_status(str_at(n, "/commits/nodes/0/commit/statusCheckRollup/state")),
+                        review_decision: Some(str_at(n, "/reviewDecision"))
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
                     })
                     .collect())
             })

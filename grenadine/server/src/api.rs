@@ -1123,6 +1123,7 @@ mod tests {
                         head_oid: "h".into(),
                         threads: Default::default(),
                         ci: None,
+                        review_decision: None,
                     },
                     crate::github::Hit {
                         key: key(8),
@@ -1135,6 +1136,7 @@ mod tests {
                         head_oid: "h".into(),
                         threads: Default::default(),
                         ci: None,
+                        review_decision: None,
                     },
                 ]),
             )
@@ -1212,6 +1214,7 @@ mod tests {
                     head_oid: "h".into(),
                     threads: Default::default(),
                     ci: None,
+                    review_decision: None,
                 }]),
             )
             .unwrap();
