@@ -1205,6 +1205,39 @@ fn push_stack(
     Ok(Step::Pushed { base, commits })
 }
 
+/// What Claude is told about the session's work that wrapping up already
+/// landed. Wrapping up runs outside Claude's turns, so without it Claude
+/// doesn't know about the PRs it opened.
+fn landed_note(session: &AgentSession) -> Option<String> {
+    let note = match session.landed.as_ref()? {
+        Landed::Checkout { sha } => format!(
+            "The user had Grenadine, the app running this session, land this session's commits \
+             on their checkout, up to {sha}. Later commits land when the user wraps up again."
+        ),
+        landed => {
+            let prs = landed
+                .prs()
+                .iter()
+                .enumerate()
+                .map(|(i, pr)| {
+                    let branch = stack_branch(&session.branch, i);
+                    format!("- #{} {} from branch `{branch}`", pr.number, pr.url)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "The user had Grenadine, the app running this session, open these pull requests \
+                 from this session's commits, one per commit, each stacked on the one before \
+                 it:\n{prs}\nThese are this session's PRs. Don't open other PRs for this work or \
+                 push it to other branches. To put new commits on them, ask the user to click \
+                 Open PR again: that pushes each commit to its PR's branch and opens a PR for \
+                 each new commit."
+            )
+        }
+    };
+    Some(note)
+}
+
 /// A PR's title and body for a commit with `message`.
 fn pr_text(message: &str) -> (String, String) {
     let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
@@ -1263,6 +1296,11 @@ async fn turn(
     ])
     .arg("--mcp-config")
     .arg(mcp.to_string())
+    .args(
+        landed_note(&session)
+            .into_iter()
+            .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
+    )
     .current_dir(&session.worktree)
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
     .env(
@@ -2672,10 +2710,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     /// A claude that changes the worktree as its prompts say: `write`
     /// leaves `file` with `contents` uncommitted, `commit` commits it too,
     /// and the wrap-up's commit prompt commits everything. It ignores
-    /// other prompts. Prompts are logged to `log`.
+    /// other prompts. Prompts are logged to `log`, and the arguments to
+    /// `log`.args.
     fn wrap_up_claude(log: &Path) -> String {
         format!(
             r#"#!/bin/sh
+echo "$@" >> {log}.args
 prompt=$(cat)
 echo "$prompt" >> {log}
 set -- $prompt
@@ -2955,6 +2995,71 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(
             tip(&format!("{branch}-3")),
             run(worktree, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn notes_what_landed() {
+        let pr = |number| LandedPr {
+            number,
+            url: format!("https://github.com/o/n/pull/{number}"),
+        };
+        let session = |landed| AgentSession {
+            branch: "grenadine/agent/abc".into(),
+            landed,
+            ..session_row("abcdef01-2345", "o/n", Path::new("/w"))
+        };
+        assert_eq!(landed_note(&session(None)), None);
+
+        let note = landed_note(&session(Some(Landed::Checkout { sha: "f00".into() }))).unwrap();
+        assert!(note.contains("checkout, up to f00"), "{note}");
+
+        let note = landed_note(&session(Some(Landed::from_prs(vec![pr(4)])))).unwrap();
+        assert!(
+            note.contains("- #4 https://github.com/o/n/pull/4 from branch `grenadine/agent/abc`\n"),
+            "{note}"
+        );
+
+        let note = landed_note(&session(Some(Landed::from_prs(vec![pr(4), pr(5)])))).unwrap();
+        assert!(
+            note.contains("#4 https://github.com/o/n/pull/4 from branch `grenadine/agent/abc`\n")
+        );
+        assert!(
+            note.contains("#5 https://github.com/o/n/pull/5 from branch `grenadine/agent/abc-2`\n"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tells_claude_about_the_prs_it_opened() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let args = || std::fs::read_to_string(dir.path().join("log.args")).unwrap();
+        assert!(!args().contains("--append-system-prompt"), "{}", args());
+
+        // The test state's GitHub is unreachable, so the PR is recorded as
+        // wrapping up would have.
+        let landed = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+        };
+        record_landed(&state, id, &landed).unwrap();
+        send(&state, id, "what PR?".into(), PermissionMode::Auto, None);
+        wait_for_turns(&state, id, 2).await;
+        let args = args();
+        let last = args
+            .split("--append-system-prompt")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            last.contains(&format!(
+                "#24 https://github.com/owner/name/pull/24 from branch `{}`",
+                session.branch
+            )),
+            "{args}"
         );
     }
 }
