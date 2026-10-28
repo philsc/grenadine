@@ -10,6 +10,7 @@ use grenadine_core::api::{
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::composer::{ComposerToggle, OpenBoxes, sender};
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
 use crate::review::{conversation, merge_box, review_summary};
@@ -180,6 +181,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
+    provide_context(OpenBoxes::new());
 
     move || {
         match pr.get() {
@@ -213,6 +215,11 @@ pub(crate) struct PrLinks {
     pub(crate) repo: String,
     pub(crate) invert: RwSignal<bool>,
 }
+
+/// The PR whose page this is, for the comments and actions that change it
+/// on GitHub. Missing on pages that only show diffs, e.g. an agent's.
+#[derive(Clone)]
+pub(crate) struct ReviewTarget(pub(crate) PrKey);
 
 /// Routes clicks on the `data-grenadine` links that markdown rendering put
 /// on PR references and that the stack list has. Shift+click — or a plain
@@ -282,6 +289,7 @@ fn PrBody(
         repo: pr.summary.key.repo.clone(),
         invert: pr_links,
     });
+    provide_context(ReviewTarget(pr.summary.key.clone()));
     let latest = pr.versions.len() as u32;
     let selection = {
         let pr = pr.clone();
@@ -742,6 +750,7 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
                 view! {
                     <CommentBody comment=thread.root.clone() />
                     {thread.replies.iter().map(|r| view! { <CommentBody comment=r.clone() /> }).collect_view()}
+                    <ThreadActions root=thread.root.clone() />
                 }
             })
         }
@@ -768,6 +777,56 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
             {comments}
         </div>
     }
+}
+
+/// Replying to a thread and resolving it, under its comments.
+#[component]
+fn ThreadActions(root: ReviewComment) -> impl IntoView {
+    let (Some(ReviewTarget(key)), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id)
+    else {
+        return ().into_any();
+    };
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let resolved = root.resolved;
+    let toggle = {
+        let (key, thread) = (key.clone(), thread.clone());
+        move |_| {
+            let (key, thread) = (key.clone(), thread.clone());
+            busy.set(true);
+            error.set(None);
+            leptos::task::spawn_local(async move {
+                // On success the page is rebuilt once the PR has synced,
+                // and until then the button stays busy. This component
+                // may be gone by the time the answer comes.
+                if let Err(e) = api::set_thread_resolved(&key, &thread, !resolved).await {
+                    error.try_set(Some(e));
+                    busy.try_set(false);
+                }
+            });
+        }
+    };
+    let send = {
+        let (key, thread) = (key.clone(), thread.clone());
+        sender(move |body| {
+            let (key, thread) = (key.clone(), thread.clone());
+            async move { api::reply_to_thread(&key, &thread, body).await }
+        })
+    };
+    let can_resolve = root.can_resolve;
+    view! {
+        <div class="thread-actions">
+            <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…" send=send>
+                {can_resolve.then(|| view! {
+                    <button type="button" disabled=move || busy.get() on:click=toggle.clone()>
+                        {if resolved { "Unresolve" } else { "Resolve" }}
+                    </button>
+                })}
+            </ComposerToggle>
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
@@ -860,6 +919,7 @@ mod tests {
             resolved: false,
             resolved_by: None,
             thread_id: None,
+            can_resolve: false,
         }
     }
 

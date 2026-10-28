@@ -958,6 +958,15 @@ impl Db {
         }))
     }
 
+    /// Whether `thread` is the GraphQL ID of one of the PR's review
+    /// threads, as of its last sync.
+    pub fn has_thread(&self, key: &PrKey, thread: &str) -> Result<bool> {
+        Ok(self
+            .comments(key)?
+            .iter()
+            .any(|c| c.thread_id.as_deref() == Some(thread)))
+    }
+
     fn comments(&self, key: &PrKey) -> Result<Vec<ReviewComment>> {
         let conn = self.conn();
         let mut stmt =
@@ -1544,6 +1553,7 @@ mod tests {
                 avatar_url: None,
             }),
             thread_id: Some("T3".into()),
+            can_resolve: true,
         }];
         let review = ReviewInfo {
             viewer: "me".into(),
@@ -1584,6 +1594,8 @@ mod tests {
         let pr = db.pr(&key).unwrap().unwrap();
         assert_eq!(pr.versions, versions);
         assert_eq!(pr.comments, comments);
+        assert!(db.has_thread(&key, "T3").unwrap());
+        assert!(!db.has_thread(&key, "T4").unwrap());
         assert_eq!(pr.review.as_ref(), Some(&review));
         assert_eq!(pr.summary.version_count, 2);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));

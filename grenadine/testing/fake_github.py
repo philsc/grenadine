@@ -114,6 +114,9 @@ class Comment:
     side: str = "RIGHT"
     resolved: bool = False
     resolved_by: str | None = None
+    # Whether the viewer may resolve the thread this comment starts, or
+    # unresolve it.
+    can_resolve: bool = True
 
 
 @dataclasses.dataclass
@@ -434,6 +437,9 @@ class FakeGitHub:
         self.lock = threading.Lock()
         # Every request served, as "METHOD path", to help debug failures.
         self.requests: list[str] = []
+        # When set, the next mutation fails with this message and changes
+        # nothing.
+        self.fail_next_mutation: str | None = None
         self.gitconfig = root / "gitconfig"
         self.gitconfig.write_text(
             f'[url "file://{root / "remotes"}/"]\n'
@@ -662,12 +668,73 @@ class FakeGitHub:
                 )
             return self._user_node(login)
 
+        def mutation(f: Callable[..., Any]) -> Callable[..., Any]:
+            def run(info: Any, input: dict[str, Any]) -> Any:
+                error, self.fail_next_mutation = self.fail_next_mutation, None
+                if error is not None:
+                    raise PermissionError(error)
+                return f(info, input)
+
+            return run
+
+        def add_comment(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["subjectId"])
+            pr.repo.issue_comment(pr, author=VIEWER, body=input["body"])
+            return {"clientMutationId": input.get("clientMutationId")}
+
+        def add_reply(info: Any, input: dict[str, Any]) -> Any:
+            pr, root = self._thread(input["pullRequestReviewThreadId"])
+            pr.repo.comment(
+                pr,
+                author=VIEWER,
+                body=input["body"],
+                path=root.path,
+                line=root.line,
+                commit=root.commit,
+                reply_to=root,
+            )
+            return {"clientMutationId": input.get("clientMutationId")}
+
+        def resolve(resolved: bool) -> Callable[..., Any]:
+            def mutation(info: Any, input: dict[str, Any]) -> Any:
+                pr, root = self._thread(input["threadId"])
+                if not root.can_resolve:
+                    raise PermissionError("Resource not accessible by integration")
+                root.resolved = resolved
+                root.resolved_by = VIEWER if resolved else None
+                pr.touch()
+                return {"clientMutationId": input.get("clientMutationId")}
+
+            return mutation
+
         return {
             "search": search,
             "repository": repository,
             "user": user,
             "viewer": lambda info: self._user_node(VIEWER),
+            "addComment": mutation(add_comment),
+            "addPullRequestReviewThreadReply": mutation(add_reply),
+            "resolveReviewThread": mutation(resolve(True)),
+            "unresolveReviewThread": mutation(resolve(False)),
         }
+
+    def _pr_by_id(self, node_id: str) -> PullRequest:
+        for pr in self.prs():
+            if _pr_id(pr) == node_id:
+                return pr
+        raise LookupError(
+            f"Could not resolve to a node with the global id of '{node_id}'"
+        )
+
+    def _thread(self, node_id: str) -> tuple[PullRequest, Comment]:
+        """The PR and the root comment of the review thread `node_id`."""
+        for pr in self.prs():
+            for c in pr.comments:
+                if c.in_reply_to is None and f"PRRT_{c.id}" == node_id:
+                    return pr, c
+        raise LookupError(
+            f"Could not resolve to a node with the global id of '{node_id}'"
+        )
 
     def _user_node(self, login: str) -> dict[str, Any]:
         return {
@@ -861,6 +928,8 @@ class FakeGitHub:
                     {
                         "id": f"PRRT_{c.id}",
                         "isResolved": c.resolved,
+                        "viewerCanResolve": c.can_resolve and not c.resolved,
+                        "viewerCanUnresolve": c.can_resolve and c.resolved,
                         "resolvedBy": (
                             self._user_node(c.resolved_by)
                             if c.resolved and c.resolved_by
@@ -876,6 +945,7 @@ class FakeGitHub:
 
         return {
             "__typename": "PullRequest",
+            "id": _pr_id(pr),
             "number": pr.number,
             "title": pr.title,
             "body": pr.body,
@@ -913,6 +983,10 @@ class FakeGitHub:
             },
             "comments": comments,
         }
+
+
+def _pr_id(pr: PullRequest) -> str:
+    return f"PR_{pr.repo.slug}/{pr.number}"
 
 
 def _reply(req: BaseHTTPRequestHandler, status: int, payload: Any) -> None:

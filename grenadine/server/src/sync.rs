@@ -35,6 +35,12 @@ const FOLLOW_UPS: [Duration; 3] = [
     Duration::from_secs(90),
 ];
 
+/// How long `resync` waits for another sync of the PR to finish, and how
+/// often it looks. A sync takes a few GitHub requests and a fetch, so one
+/// that runs longer than this is stuck and the poll will catch up.
+const RESYNC_WAIT: Duration = Duration::from_secs(120);
+const RESYNC_POLL: Duration = Duration::from_millis(200);
+
 /// A configured clone and the lock that serializes sync's writes to it.
 pub struct ClonedRepo {
     pub repo: Repo,
@@ -126,22 +132,48 @@ impl State {
     /// `on_demand`). Unlike the poller it doesn't touch the sync status:
     /// `remaining` counts only the current poll's PRs.
     pub fn sync_once(self: &Arc<State>, key: PrKey) {
-        {
-            let status = self.sync_status.lock().unwrap();
-            if status.in_flight.iter().any(|p| p.key == key) {
-                return;
-            }
-        }
-        if !self.on_demand.lock().unwrap().insert(key.clone()) {
+        if !self.claim(&key) {
             return;
         }
         let state = self.clone();
         tokio::spawn(async move {
             let result = sync_pr(&state, &key).await;
-            state.on_demand.lock().unwrap().remove(&key);
-            state.synced(&key, result);
-            state.send(ServerEvent::PrChanged(key));
+            state.finish(&key, result);
         });
+    }
+
+    /// Claims `key` for a sync outside the poll, in `on_demand`, unless
+    /// the poll or another such sync is syncing it.
+    fn claim(&self, key: &PrKey) -> bool {
+        let polling = {
+            let status = self.sync_status.lock().unwrap();
+            status.in_flight.iter().any(|p| &p.key == key)
+        };
+        !polling && self.on_demand.lock().unwrap().insert(key.clone())
+    }
+
+    /// Ends a sync that `claim` let run: releases `key`, records the
+    /// outcome and has pages showing the PR fetch it again.
+    fn finish(self: &Arc<State>, key: &PrKey, result: Result<bool>) {
+        self.on_demand.lock().unwrap().remove(key);
+        self.synced(key, result);
+        self.send(ServerEvent::PrChanged(key.clone()));
+    }
+
+    /// Waits until `claim` gets `key`. False if that took longer than
+    /// `limit` or the server is shutting down.
+    async fn wait_to_claim(&self, key: &PrKey, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !self.claim(key) {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(RESYNC_POLL) => {}
+                _ = self.shutdown.cancelled() => return false,
+            }
+        }
+        true
     }
 
     /// Records the outcome of a sync of `key`, and has it synced again
@@ -172,31 +204,43 @@ impl State {
                     _ = tokio::time::sleep(delay) => {}
                     _ = state.shutdown.cancelled() => break,
                 }
-                let busy = state
-                    .sync_status
-                    .lock()
-                    .unwrap()
-                    .in_flight
-                    .iter()
-                    .any(|p| p.key == key)
-                    || state.on_demand.lock().unwrap().contains(&key);
-                if busy {
+                // Claimed, so that a `resync` waits for this sync.
+                if !state.claim(&key) {
                     continue;
                 }
                 let result = sync_pr(&state, &key).await;
-                state.send(ServerEvent::PrChanged(key.clone()));
+                let again = matches!(result, Ok(true));
+                // While this runs, `synced` doesn't start more follow-ups.
+                state.finish(&key, result);
                 state.send(ServerEvent::InboxesChanged);
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(e) => {
-                        tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
-                        let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
-                        break;
-                    }
+                if !again {
+                    break;
                 }
             }
             state.following_up.lock().unwrap().remove(&key);
+        });
+    }
+
+    /// Syncs a PR after grenadine changed it on GitHub, so the page shows
+    /// the change. Unlike `sync_once`, a sync that's already running
+    /// doesn't make this one redundant, since it may have read the PR
+    /// before the change: this one waits for it and then runs.
+    pub fn resync(self: &Arc<State>, key: PrKey) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            if !state.wait_to_claim(&key, RESYNC_WAIT).await {
+                if !state.shutdown.is_cancelled() {
+                    tracing::warn!(
+                        "{}#{}: gave up waiting for another sync to resync",
+                        key.repo,
+                        key.number
+                    );
+                }
+                return;
+            }
+            let result = sync_pr(&state, &key).await;
+            state.finish(&key, result);
+            state.send(ServerEvent::InboxesChanged);
         });
     }
 
@@ -353,6 +397,7 @@ fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadS
             c.resolved = t.resolved;
             c.resolved_by = t.resolved_by.clone();
             c.thread_id = Some(t.id.clone());
+            c.can_resolve = t.can_resolve;
         }
     }
 }
@@ -685,6 +730,67 @@ pub fn test_state_with_agents(
 mod tests {
     use super::*;
 
+    fn key() -> PrKey {
+        PrKey {
+            repo: "o/n".into(),
+            number: 1,
+        }
+    }
+
+    fn poll_syncs(state: &State, key: &PrKey) {
+        let pr = SyncingPr {
+            key: key.clone(),
+            title: None,
+        };
+        state.sync_status.lock().unwrap().in_flight.push(pr);
+    }
+
+    #[tokio::test]
+    async fn resync_waits_for_the_running_sync() {
+        let state = test_state();
+        let key = key();
+        poll_syncs(&state, &key);
+        let mut events = state.events.subscribe();
+        state.resync(key.clone());
+        let early = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+        assert!(early.is_err(), "resynced while the poll was syncing");
+        assert!(!state.on_demand.lock().unwrap().contains(&key));
+
+        state.sync_status.lock().unwrap().in_flight.clear();
+        // The sync fails at once since o/n isn't configured. Its PrChanged
+        // and InboxesChanged don't both fit in the test state's channel.
+        let next = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            next,
+            Ok(ServerEvent::InboxesChanged) | Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert!(!state.on_demand.lock().unwrap().contains(&key));
+    }
+
+    #[tokio::test]
+    async fn waiting_to_claim_gives_up() {
+        let state = test_state();
+        let key = key();
+        state.on_demand.lock().unwrap().insert(key.clone());
+        assert!(!state.wait_to_claim(&key, Duration::from_millis(50)).await);
+
+        // On shutdown it stops waiting at once.
+        let waiting = {
+            let (state, key) = (state.clone(), key.clone());
+            tokio::spawn(async move { state.wait_to_claim(&key, Duration::from_secs(60)).await })
+        };
+        state.shutdown.cancel();
+        let claimed = tokio::time::timeout(Duration::from_secs(1), waiting).await;
+        assert!(!claimed.unwrap().unwrap());
+
+        // A free PR is claimed right away.
+        state.on_demand.lock().unwrap().clear();
+        assert!(state.wait_to_claim(&key, Duration::ZERO).await);
+        assert!(!state.claim(&key));
+    }
+
     #[tokio::test]
     async fn cancelled_token_stops_the_loop() {
         let state = test_state();
@@ -768,6 +874,7 @@ mod tests {
             resolved: false,
             resolved_by: None,
             thread_id: None,
+            can_resolve: false,
         };
         let mut comments = vec![comment(1), comment(2), comment(3)];
         comments[2].in_reply_to = Some(1);
@@ -778,6 +885,7 @@ mod tests {
                     id: "T1".into(),
                     resolved: false,
                     resolved_by: None,
+                    can_resolve: true,
                 },
             ),
             (
@@ -789,6 +897,7 @@ mod tests {
                         login: Some("o".into()),
                         ..Person::default()
                     }),
+                    can_resolve: false,
                 },
             ),
         ]);
@@ -800,15 +909,16 @@ mod tests {
                     c.thread_id.as_deref(),
                     c.resolved,
                     c.resolved_by.as_ref().and_then(|p| p.login.as_deref()),
+                    c.can_resolve,
                 )
             })
             .collect();
         assert_eq!(
             marks,
             [
-                (Some("T1"), false, None),
-                (Some("T2"), true, Some("o")),
-                (None, false, None),
+                (Some("T1"), false, None, true),
+                (Some("T2"), true, Some("o"), false),
+                (None, false, None, false),
             ]
         );
     }
