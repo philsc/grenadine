@@ -1567,6 +1567,9 @@ textarea {
 .terminal-bar .error {
   margin-left: 8px;
 }
+.terminal-bar .terminal-full-screen {
+  margin-left: auto;
+}
 .terminal-body {
   position: relative;
   background: var(--bg);

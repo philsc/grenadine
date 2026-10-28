@@ -57,6 +57,76 @@ extern "C" {
     fn new() -> Fit;
     #[wasm_bindgen(method)]
     fn fit(this: &Fit);
+
+    /// The Keyboard Lock API's `navigator.keyboard`, in Chromium only.
+    type Keyboard;
+    #[wasm_bindgen(method)]
+    fn lock(this: &Keyboard, codes: &js_sys::Array) -> js_sys::Promise;
+    #[wasm_bindgen(method)]
+    fn unlock(this: &Keyboard);
+}
+
+/// The keys the browser keeps for itself (closing the tab, a new window, ...)
+/// that a terminal wants: ^W, ^N, ^T, ^Q and the like.
+const LOCKED_KEYS: &[&str] = &[
+    "KeyW",
+    "KeyN",
+    "KeyT",
+    "KeyQ",
+    "Tab",
+    "PageUp",
+    "PageDown",
+    "BracketLeft",
+    "BracketRight",
+];
+
+/// The browser's keyboard lock, which hands the keys it keeps for itself to
+/// the page, but only while the page is full screen. Firefox has none;
+/// there the site's "Override keyboard shortcuts" permission does the same.
+fn keyboard() -> Option<Keyboard> {
+    let keyboard = js_sys::Reflect::get(&window(), &"navigator".into())
+        .and_then(|n| js_sys::Reflect::get(&n, &"keyboard".into()))
+        .ok()?;
+    js_sys::Reflect::get(&keyboard, &"lock".into())
+        .ok()?
+        .is_function()
+        .then(|| keyboard.unchecked_into())
+}
+
+/// Locks the keys while a terminal has focus, so that elsewhere on the page,
+/// such as in the prompt, they keep doing what the browser does.
+fn lock_keys(locked: bool) {
+    let Some(keyboard) = keyboard() else { return };
+    if locked {
+        let codes: js_sys::Array = LOCKED_KEYS.iter().map(|&k| JsValue::from(k)).collect();
+        let promise = keyboard.lock(&codes);
+        // It's refused outside a top-level, active page; nothing to do then.
+        spawn_local(async move {
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        });
+    } else {
+        keyboard.unlock();
+    }
+}
+
+/// Puts the page full screen, where the keyboard lock holds, or takes it
+/// out again.
+fn toggle_full_screen() {
+    let document = document();
+    if document.fullscreen_element().is_some() {
+        document.exit_fullscreen();
+        return;
+    }
+    if let Some(root) = document.document_element() {
+        let _ = root.request_fullscreen();
+    }
+    // The click moved the focus to the button; give it back to the shell.
+    if let Ok(Some(input)) =
+        document.query_selector(".terminal-host:not([hidden]) .xterm-helper-textarea")
+        && let Ok(input) = input.dyn_into::<web_sys::HtmlElement>()
+    {
+        let _ = input.focus();
+    }
 }
 
 /// Where whether session `id`'s panel is open is kept. Each session has its
@@ -388,6 +458,8 @@ fn TerminalView(session: String, terminal: u64, active: Signal<bool>) -> impl In
             node_ref=host
             hidden=move || !active.get()
             data-terminal=terminal
+            on:focusin=move |_| lock_keys(true)
+            on:focusout=move |_| lock_keys(false)
         ></div>
     }
 }
@@ -514,6 +586,12 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
         drag.set_value(Some((on_move, on_up)));
     };
 
+    let full_screen = RwSignal::new(document().fullscreen_element().is_some());
+    let on_full_screen = window_event_listener_untyped("fullscreenchange", move |_| {
+        full_screen.set(document().fullscreen_element().is_some());
+    });
+    on_cleanup(move || on_full_screen.remove());
+
     let session = id;
     view! {
         <section class="terminal-panel" class:open=open>
@@ -568,6 +646,18 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
                     on:click=move |_| create()
                 >"+"</button>
                 {move || error.get().map(|e| view! { <span class="error">{e}</span> })}
+                {keyboard().is_some().then(|| view! {
+                    <button
+                        class="terminal-full-screen"
+                        aria-pressed=move || full_screen.get().to_string()
+                        title=move || if full_screen.get() {
+                            "Leave full screen"
+                        } else {
+                            "Full screen, where Ctrl+W, Ctrl+N, Ctrl+T and the like reach the terminal (hold Esc to leave)"
+                        }
+                        on:click=move |_| toggle_full_screen()
+                    >{move || if full_screen.get() { "Exit full screen" } else { "Full screen" }}</button>
+                })}
             </div>
             <div
                 class="terminal-body"
