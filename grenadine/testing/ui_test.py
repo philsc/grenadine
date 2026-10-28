@@ -24,7 +24,7 @@ from typing import Any, ClassVar
 from playwright.sync_api import Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
-from grenadine.testing.fake_github import TEAM, TOKEN, FakeGitHub
+from grenadine.testing.fake_github import COMMENTED, TEAM, TOKEN, FakeGitHub
 
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
@@ -658,6 +658,242 @@ class ReviewTest(ServerTestCase):
             .first
         )
 
+    def file(self) -> Locator:
+        return self.page.locator("section.file").filter(
+            has=self.page.locator(
+                ".file-header .path", has_text=exactly(scenarios.REVIEW_PATH)
+            )
+        )
+
+    def comment_on_line(self, line: int, body: str) -> None:
+        file = self.file()
+        file.locator("td.ln.commentable", has_text=exactly(str(line))).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        expect(box).to_be_focused()
+        box.fill(body)
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+
+    def review_panel(self) -> Locator:
+        panel = self.page.locator(".review-panel")
+        panel.locator(".review-button").click()
+        return panel
+
+    def test_review_lines_then_request_changes(self) -> None:
+        pr = self.prs[scenarios.LINE_REVIEW]
+        self.open(scenarios.LINE_REVIEW)
+        self.comment_on_line(4, "Typo here.")
+        thread = self.file().locator(
+            "table .thread", has=self.page.locator(".pending-badge")
+        )
+        expect(thread).to_contain_text("Typo here.")
+        expect(self.page.locator(".review-panel .pending-count")).to_have_text("1")
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.line, c.side, c.body), (4, "RIGHT", "Typo here."))
+        # Pending comments aren't on GitHub's PR yet.
+        self.assertEqual(len(pr.comments), 1)
+
+        # A pending comment can be edited.
+        thread.get_by_role("button", name="Edit").click()
+        box = thread.get_by_role("textbox", name="Save")
+        expect(box).to_have_value("Typo here.")
+        box.fill("Typo: teh.")
+        box.press("Control+Enter")
+        expect(self.file().locator(".thread", has_text="Typo: teh.")).to_have_count(1)
+
+        # And the whole file can be commented on.
+        self.file().get_by_role("button", name="Comment on file").click()
+        box = self.file().get_by_role("textbox", name="Add to review")
+        box.fill("Split this file?")
+        box.press("Control+Enter")
+        expect(
+            self.file().locator(".file-comments .thread", has_text="Split this file?")
+        ).to_have_count(1)
+        expect(self.page.locator(".review-panel .pending-count")).to_have_text("2")
+
+        panel = self.review_panel()
+        panel.get_by_label("Request changes").check()
+        submit = panel.get_by_role("button", name="Submit review")
+        # Requesting changes needs a summary.
+        expect(submit).to_be_disabled()
+        panel.get_by_role("textbox", name="Review summary").fill("A few things.")
+        submit.click()
+
+        header = self.page.locator(".pr-header .review-summary")
+        expect(header.locator(".review-decision")).to_have_text("Changes requested")
+        expect(self.page.locator(".pending-badge")).to_have_count(0)
+        expect(self.page.locator(".review-panel .pending-count")).to_have_count(0)
+        self.assertIsNone(pr.pending)
+        self.assertEqual(
+            [c.body for c in pr.comments],
+            ["Is this right?", "Typo: teh.", "Split this file?"],
+        )
+        self.assertEqual(pr.reviews[-1].body, "A few things.")
+
+    def test_approve_without_comments(self) -> None:
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        # A comment review needs a summary or comments.
+        expect(panel.get_by_role("button", name="Submit review")).to_be_disabled()
+        panel.get_by_label("Approve").check()
+        panel.get_by_role("button", name="Submit review").click()
+        expect(
+            self.page.locator(".pr-header .review-summary .review-decision")
+        ).to_have_text("Approved")
+        expect(self.page.locator("details.conversation .comment-meta")).to_contain_text(
+            "approved"
+        )
+
+    def test_discard_a_review(self) -> None:
+        pr = self.prs[scenarios.DISCARD]
+        self.open(scenarios.DISCARD)
+        self.comment_on_line(5, "Hmm.")
+        expect(self.page.locator(".pending-badge")).to_have_count(1)
+        self.page.once("dialog", lambda d: d.accept())
+        self.review_panel().get_by_role("button", name="Discard review").click()
+        expect(self.page.locator(".pending-badge")).to_have_count(0)
+        self.assertIsNone(pr.pending)
+
+    def test_reply_in_a_review_and_delete_it(self) -> None:
+        pr = self.prs[scenarios.REPLY_IN_REVIEW]
+        self.open(scenarios.REPLY_IN_REVIEW)
+        thread = self.thread()
+        thread.get_by_role("button", name="Reply").click()
+        thread.get_by_role("textbox", name="Reply").fill("Will check.")
+        thread.get_by_role("button", name="Add to review").click()
+        reply = thread.locator(".comment").nth(1)
+        expect(reply.locator(".pending-badge")).to_have_text("Pending")
+        assert pr.pending
+        self.assertEqual(pr.pending.comments[0].in_reply_to, pr.comments[0].id)
+
+        self.page.once("dialog", lambda d: d.accept())
+        reply.get_by_role("button", name="Delete").click()
+        expect(thread.locator(".comment")).to_have_count(1)
+        self.assertEqual(pr.pending.comments, [])
+
+    def test_own_pr_can_only_be_commented_on(self) -> None:
+        self.open(scenarios.OWN)
+        panel = self.review_panel()
+        expect(panel.get_by_label("Approve")).to_be_disabled()
+        expect(panel.get_by_label("Request changes")).to_be_disabled()
+        expect(panel.get_by_label("Comment")).to_be_enabled()
+
+    def test_comment_on_a_removed_line(self) -> None:
+        pr = self.prs[scenarios.LEFT_LINE]
+        self.open(scenarios.LEFT_LINE)
+        file = self.page.locator("section.file").filter(
+            has=self.page.locator(
+                ".file-header .path", has_text=exactly(scenarios.OLD_PATH)
+            )
+        )
+        row = file.locator("tr.line", has_text="Old line 3")
+        # The left line number: the line is only on the left.
+        row.locator("td.ln.commentable").first.click()
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Why remove this?")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.path, c.line, c.side), (scenarios.OLD_PATH, 3, "LEFT"))
+        # GitHub only says which side a pending comment is on in its thread;
+        # had the page lost that, it would show the comment under the new
+        # line 3, which is "Old line 4".
+        after = row.locator("xpath=following-sibling::tr[1]")
+        expect(after).to_have_class(re.compile(r"\bcomment-row\b"))
+        expect(after.locator(".pending-badge")).to_have_count(1)
+        expect(after).to_contain_text("Why remove this?")
+
+    def test_boxes_survive_a_refetch(self) -> None:
+        pr = self.prs[scenarios.KEEP]
+        self.open(scenarios.KEEP)
+        own = {"Origin": self.url.rstrip("/")}
+
+        def refetch(body: str) -> None:
+            """Comments on the PR from outside the page, which refetches it."""
+            resp = self.page.request.post(
+                f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
+                headers=own,
+                data={"body": body},
+            )
+            self.assertEqual(resp.status, 204, resp.text())
+
+        file = self.file()
+        file.locator("td.ln.commentable", has_text=exactly("4")).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Keep **this**.")
+        composer = file.locator(".comment-composer")
+        composer.get_by_role("tab", name="Preview").click()
+        panel = self.review_panel()
+        panel.get_by_label("Approve").check()
+
+        refetch("Ping")
+        conversation = self.page.locator("details.conversation summary")
+        expect(conversation).to_have_text("1 comment")
+        expect(composer.get_by_role("tab", name="Preview")).to_have_attribute(
+            "aria-selected", "true"
+        )
+        expect(composer.locator(".composer-preview strong")).to_have_text("this")
+        expect(panel.locator(".review-popup")).to_be_visible()
+        expect(panel.get_by_label("Approve")).to_be_checked()
+        panel.locator(".review-button").click()
+
+        # A send that a refetch interrupts: the rebuilt box knows it's being
+        # sent, and still closes once it's done.
+        composer.get_by_role("tab", name="Write").click()
+        held, release = self.gh.hold_next_mutation()
+        self.addCleanup(release.set)
+        box.press("Control+Enter")
+        self.assertTrue(held.wait(timeout=10))
+        refetch("Pong")
+        expect(conversation).to_have_text("2 comments")
+        sending = composer.get_by_role("button", name="Sending…")
+        expect(sending).to_be_disabled()
+        box.press("Control+Enter")
+        release.set()
+        expect(box).to_have_count(0)
+        expect(self.file().locator(".pending-badge")).to_have_count(1)
+        assert pr.pending
+        self.assertEqual([c.body for c in pr.pending.comments], ["Keep **this**."])
+        # The draft is gone with it.
+        self.page.reload()
+        expect(self.file().locator(".pending-badge")).to_have_count(1)
+        expect(self.file().get_by_role("textbox")).to_have_count(0)
+
+    def test_reply_now_during_a_review(self) -> None:
+        pr = self.prs[scenarios.REPLY_NOW]
+        self.open(scenarios.REPLY_NOW)
+        self.comment_on_line(4, "Start a review.")
+        expect(self.page.locator(".review-panel .pending-count")).to_have_text("1")
+        thread = self.thread()
+        thread.get_by_role("button", name="Reply").click()
+        # While a review is pending, replies go into it unless asked not to.
+        thread.get_by_role("textbox", name="Add to review").fill("Right away.")
+        thread.get_by_role("button", name="Reply now").click()
+        reply = thread.locator(".comment").nth(1)
+        expect(reply).to_contain_text("Right away.")
+        expect(reply.locator(".pending-badge")).to_have_count(0)
+        self.assertEqual(pr.comments[-1].body, "Right away.")
+        assert pr.pending
+        self.assertEqual([c.body for c in pr.pending.comments], ["Start a review."])
+
+    def test_submit_comments_without_a_summary(self) -> None:
+        pr = self.prs[scenarios.COMMENT_REVIEW]
+        self.open(scenarios.COMMENT_REVIEW)
+        self.comment_on_line(3, "One thing.")
+        panel = self.review_panel()
+        expect(panel.get_by_label("Comment")).to_be_checked()
+        # Comments are enough for a comment review.
+        submit = panel.get_by_role("button", name="Submit review")
+        expect(submit).to_be_enabled()
+        submit.click()
+        expect(self.page.locator(".pending-badge")).to_have_count(0)
+        expect(self.file().locator(".thread", has_text="One thing.")).to_have_count(1)
+        self.assertIsNone(pr.pending)
+        self.assertEqual((pr.reviews[-1].state, pr.reviews[-1].body), (COMMENTED, ""))
+        self.assertEqual(pr.comments[-1].body, "One thing.")
+
     def test_reply_to_a_thread(self) -> None:
         self.open(scenarios.REPLY)
         thread = self.thread()
@@ -752,7 +988,12 @@ class ReviewTest(ServerTestCase):
         request = self.page.request
 
         def refused(status: int, text: str, url: str, **kwargs: Any) -> None:
-            resp = request.post(url, headers=kwargs.pop("headers", own), **kwargs)
+            resp = request.fetch(
+                url,
+                method=kwargs.pop("method", "POST"),
+                headers=kwargs.pop("headers", own),
+                **kwargs,
+            )
             self.assertEqual(resp.status, status, resp.text())
             self.assertIn(text, resp.text())
 
@@ -776,8 +1017,43 @@ class ReviewTest(ServerTestCase):
             f"{api}/threads/{thread}/resolve",
             headers={"Origin": "http://evil.example"},
         )
+        # Threads GitHub would refuse with an opaque error.
+        line = {"path": scenarios.REVIEW_PATH, "side": "Right", "body": "Hi"}
+        refused(
+            400,
+            "the path is empty",
+            f"{api}/review/comments",
+            data={**line, "path": "", "line": 1},
+        )
+        refused(
+            400,
+            "numbered from 1",
+            f"{api}/review/comments",
+            data={**line, "line": 0},
+        )
+        refused(
+            400,
+            "Say what needs to change",
+            f"{api}/review",
+            data={"event": "RequestChanges", "body": " "},
+        )
+        refused(
+            404,
+            "is not a pending comment",
+            f"{api}/review/comments/PRRC_nope",
+            method="PATCH",
+            data={"body": "Hi"},
+        )
+        refused(
+            404,
+            "is not a pending comment",
+            f"{api}/review/comments/PRRC_nope",
+            method="DELETE",
+        )
         self.assertFalse(pr.comments[0].resolved)
         self.assertEqual(len(pr.issue_comments), 0)
+        self.assertIsNone(pr.pending)
+        self.assertEqual(pr.reviews, [])
 
     def test_comment_on_the_pr(self) -> None:
         self.open(scenarios.CONVERSE)
@@ -845,6 +1121,17 @@ class VersionsTest(ServerTestCase):
         # Base can't be the latest version, and Head can't be the base.
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
+
+    def test_lines_are_commentable_only_against_the_base(self) -> None:
+        self.open(scenarios.GROW)
+        lines = self.file(scenarios.STEPS_PY).locator("td.ln.commentable")
+        expect(lines.first).to_be_visible()
+        # GitHub anchors comments to the diff from the base, which can
+        # differ from one between versions.
+        self.choose(5, 6)
+        expect(self.file(scenarios.STEPS_PY).locator("table")).to_be_visible()
+        expect(lines).to_have_count(0)
+        expect(self.page.get_by_role("button", name="Comment on file")).to_have_count(0)
 
     def test_threads_fold(self) -> None:
         self.open(scenarios.GROW)

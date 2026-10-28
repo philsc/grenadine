@@ -68,6 +68,9 @@ pub struct State {
     pub on_demand: std::sync::Mutex<BTreeSet<PrKey>>,
     /// PRs that `follow_up` will sync again.
     pub following_up: std::sync::Mutex<BTreeSet<PrKey>>,
+    /// A lock per PR that changes to the viewer's pending review on it
+    /// take, see `lock_review`.
+    pub review_locks: std::sync::Mutex<BTreeMap<PrKey, Arc<tokio::sync::Mutex<()>>>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
     /// The Claude Code sessions started from the UI.
@@ -84,6 +87,20 @@ impl State {
     /// The clone for `owner/name`, for callers that only read from it.
     pub fn repo(&self, slug: &str) -> Option<Repo> {
         Some(self.repos.get(slug)?.repo.clone())
+    }
+
+    /// Waits until no other change to the viewer's pending review on `key`
+    /// is under way, and holds off others until the guard is dropped.
+    /// Starting a review looks for a pending one first, and two changes at
+    /// once would both find none and both start one.
+    pub async fn lock_review(&self, key: &PrKey) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.review_locks.lock().unwrap();
+            // Drop the locks that nobody holds or waits for.
+            locks.retain(|_, l| Arc::strong_count(l) > 1);
+            locks.entry(key.clone()).or_default().clone()
+        };
+        lock.lock_owned().await
     }
 
     /// Mutates the sync status and broadcasts the new snapshot. Pages get
@@ -389,8 +406,24 @@ fn settling(review: &ReviewInfo) -> bool {
     review.merge.state == MergeState::Unknown || review.ci == Some(CiStatus::Running)
 }
 
+/// Adds the viewer's pending review comments to the REST API's review
+/// comments. The REST API may or may not list pending comments; this
+/// marks the ones it lists and adds the others.
+fn merge_pending(comments: &mut Vec<ReviewComment>, pending: &[ReviewComment]) {
+    for p in pending {
+        match comments.iter_mut().find(|c| c.id == p.id) {
+            Some(c) => {
+                c.pending = true;
+                c.node_id = p.node_id.clone();
+            }
+            None => comments.push(p.clone()),
+        }
+    }
+}
+
 /// Marks each review comment that starts a thread with the thread's ID
-/// and whether it's resolved.
+/// and whether it's resolved. GitHub keeps the side of a pending comment
+/// only on its thread, so pending comments also get the thread's side.
 fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadState>) {
     for c in comments {
         if let Some(t) = threads.get(&c.id) {
@@ -398,6 +431,9 @@ fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadS
             c.resolved_by = t.resolved_by.clone();
             c.thread_id = Some(t.id.clone());
             c.can_resolve = t.can_resolve;
+            if c.pending {
+                c.side = t.side;
+            }
         }
     }
 }
@@ -417,6 +453,13 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
     };
     let mut comments = state.github.review_comments(key).await?;
     let threads = state.github.review_threads(key).await?;
+    // Without the review, the pending comments are unknown too; the
+    // stored ones are kept until the next sync can read them.
+    let pending = match &data.review {
+        Some(_) => data.pending.clone(),
+        None => state.db.pending_comments(key)?,
+    };
+    merge_pending(&mut comments, &pending);
     apply_threads(&mut comments, &threads);
 
     let created_at = github::unix(&data.created_at)?;
@@ -722,12 +765,15 @@ pub fn test_state_with_agents(
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
+        review_locks: std::sync::Mutex::default(),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use grenadine_core::api::Side;
+
     use super::*;
 
     fn key() -> PrKey {
@@ -837,6 +883,7 @@ mod tests {
             comments: vec![],
             checks: vec![],
             ci: Some(CiStatus::Passing),
+            pending_review: None,
             merge: MergeInfo {
                 conflicting: Some(false),
                 state: MergeState::Clean,
@@ -867,7 +914,7 @@ mod tests {
             original_start_line: None,
             line: Some(1),
             start_line: None,
-            side: grenadine_core::api::Side::Right,
+            side: Side::Right,
             on_file: false,
             created_at: String::new(),
             url: String::new(),
@@ -875,6 +922,8 @@ mod tests {
             resolved_by: None,
             thread_id: None,
             can_resolve: false,
+            pending: false,
+            node_id: None,
         };
         let mut comments = vec![comment(1), comment(2), comment(3)];
         comments[2].in_reply_to = Some(1);
@@ -886,6 +935,7 @@ mod tests {
                     resolved: false,
                     resolved_by: None,
                     can_resolve: true,
+                    side: Side::Left,
                 },
             ),
             (
@@ -898,6 +948,7 @@ mod tests {
                         ..Person::default()
                     }),
                     can_resolve: false,
+                    side: Side::Left,
                 },
             ),
         ]);
@@ -919,6 +970,81 @@ mod tests {
                 (Some("T1"), false, None, true),
                 (Some("T2"), true, Some("o"), false),
                 (None, false, None, false),
+            ]
+        );
+        // Submitted comments know their side themselves.
+        assert!(comments.iter().all(|c| c.side == Side::Right));
+    }
+
+    #[test]
+    fn pending_comments_join_the_others() {
+        let comment = |id, pending| ReviewComment {
+            id,
+            in_reply_to: None,
+            author: "me".into(),
+            body: format!("c{id}"),
+            path: "p".into(),
+            original_commit: "c".into(),
+            original_line: Some(1),
+            original_start_line: None,
+            line: Some(1),
+            start_line: None,
+            side: Side::Right,
+            on_file: false,
+            created_at: String::new(),
+            url: String::new(),
+            resolved: false,
+            resolved_by: None,
+            thread_id: None,
+            can_resolve: false,
+            pending,
+            node_id: pending.then(|| format!("C{id}")),
+        };
+        // The REST API lists 2, which is pending, but doesn't know that.
+        let mut comments = vec![comment(1, false), comment(2, false)];
+        let pending = [comment(2, true), comment(3, true)];
+        merge_pending(&mut comments, &pending);
+        let threads = BTreeMap::from([
+            (
+                1,
+                ThreadState {
+                    id: "T1".into(),
+                    resolved: false,
+                    resolved_by: None,
+                    can_resolve: true,
+                    side: Side::Left,
+                },
+            ),
+            (
+                3,
+                ThreadState {
+                    id: "T3".into(),
+                    resolved: false,
+                    resolved_by: None,
+                    can_resolve: false,
+                    side: Side::Left,
+                },
+            ),
+        ]);
+        apply_threads(&mut comments, &threads);
+        let merged: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                (
+                    c.id,
+                    c.pending,
+                    c.node_id.as_deref(),
+                    c.thread_id.as_deref(),
+                    c.side,
+                )
+            })
+            .collect();
+        assert_eq!(
+            merged,
+            [
+                (1, false, None, Some("T1"), Side::Right),
+                (2, true, Some("C2"), None, Side::Right),
+                (3, true, Some("C3"), Some("T3"), Side::Left),
             ]
         );
     }

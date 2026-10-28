@@ -1,14 +1,17 @@
 //! A PR's reviews, its conversation and whether it can be merged.
 
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeState, Review, ReviewDecision, ReviewInfo, ReviewState,
+    Check, CiStatus, IssueComment, MergeState, PrKey, Review, ReviewDecision, ReviewEvent,
+    ReviewInfo, ReviewState, SubmitReview, submit_blocker,
 };
 use leptos::prelude::*;
 
 use crate::api;
-use crate::composer::{ComposerToggle, sender};
+use crate::composer::{
+    ComposerToggle, MarkdownEditor, OpenBoxes, comment_draft_key, draft_signal, sender,
+};
 use crate::inboxes::CiIcon;
-use crate::pr::{CommentFrame, PersonChip, ReviewTarget};
+use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget};
 
 /// Each reviewer's verdict: their latest approval, change request or
 /// dismissal, or their latest comment when they gave no verdict. The PR's
@@ -201,7 +204,7 @@ pub fn conversation(info: &ReviewInfo) -> impl IntoView + use<> {
 /// A comment on the PR itself, behind a button until it's started.
 #[component]
 fn NewComment() -> impl IntoView {
-    let ReviewTarget(key) = expect_context::<ReviewTarget>();
+    let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
     let draft = format!("comment.{}#{}", key.repo, key.number);
     let send = sender(move |body| {
         let key = key.clone();
@@ -210,6 +213,139 @@ fn NewComment() -> impl IntoView {
     view! {
         <div class="new-comment">
             <ComposerToggle draft=draft label="Comment" placeholder="Comment on this PR…" send=send />
+        </div>
+    }
+}
+
+/// What the review panel shows, kept above the parts of the page that a
+/// refetch rebuilds. Its summary's draft and preview are in `OpenBoxes`.
+#[derive(Clone, Copy)]
+pub struct ReviewChoice {
+    event: RwSignal<ReviewEvent>,
+    open: RwSignal<bool>,
+}
+
+impl ReviewChoice {
+    pub fn new() -> ReviewChoice {
+        ReviewChoice {
+            event: RwSignal::new(ReviewEvent::Comment),
+            open: RwSignal::new(false),
+        }
+    }
+}
+
+/// The name of the draft of the summary of the viewer's review of `key`,
+/// which also names submitting and discarding it in `OpenBoxes`.
+fn summary_draft(key: &PrKey) -> String {
+    format!("review.{}#{}", key.repo, key.number)
+}
+
+/// Submitting the viewer's review, or discarding it. `pending` counts the
+/// comments in their pending review; `own` says the PR is the viewer's,
+/// which they can't approve or request changes on.
+#[component]
+pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
+    let ReviewTarget { key, reviewing } = expect_context::<ReviewTarget>();
+    let links = expect_context::<PrLinks>();
+    let boxes = expect_context::<OpenBoxes>();
+    let draft = summary_draft(&key);
+    let body = draft_signal(comment_draft_key(&draft));
+    let ReviewChoice { event, open } = expect_context::<ReviewChoice>();
+    let busy = {
+        let draft = draft.clone();
+        Signal::derive(move || boxes.sending(&draft))
+    };
+    let error = {
+        let draft = draft.clone();
+        Signal::derive(move || boxes.error(&draft))
+    };
+    let blocker = move || body.with(|b| submit_blocker(event.get(), b, pending));
+    let (key, name) = (StoredValue::new(key), StoredValue::new(draft.clone()));
+    let submit = move |_| {
+        if blocker().is_some() {
+            return;
+        }
+        let review = SubmitReview {
+            event: event.get_untracked(),
+            body: body.get_untracked(),
+        };
+        let key = key.get_value();
+        let name = name.get_value();
+        boxes.send(
+            &name.clone(),
+            async move { api::submit_review(&key, &review).await },
+            // The panel may have been rebuilt meanwhile; the summary's
+            // draft goes either way.
+            move || {
+                body.try_set(String::new());
+                boxes.close(&name);
+                event.try_set(ReviewEvent::Comment);
+                open.try_set(false);
+            },
+        );
+    };
+    let discard = move |_| {
+        if !window()
+            .confirm_with_message("Discard your pending review and its comments?")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let key = key.get_value();
+        name.with_value(|name| {
+            boxes.send(name, async move { api::discard_review(&key).await }, || {})
+        });
+    };
+    let choice = move |value: ReviewEvent, label: &'static str, hint: &'static str| {
+        let disabled = own && value != ReviewEvent::Comment;
+        view! {
+            <label class="review-choice" class:disabled=disabled title=if disabled { "You can't approve or request changes on your own PR" } else { hint }>
+                <input type="radio" name="review-event" disabled=disabled
+                    prop:checked=move || event.get() == value
+                    on:change=move |_| event.set(value) />
+                " " {label}
+            </label>
+        }
+    };
+    view! {
+        // Not a <details>: its toggle events race with the page being
+        // rebuilt when the PR is refetched.
+        <div class="review-panel" class:open=move || open.get()>
+            <button type="button" class="review-button" aria-expanded=move || open.get().to_string()
+                on:click=move |_| open.update(|o| *o = !*o)>
+                "Review"
+                {(pending > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending}</span> })}
+            </button>
+            <div class="review-popup" class:hidden=move || !open.get()
+                on:keydown=move |ev| {
+                    if ev.key() == "Escape" {
+                        open.set(false);
+                    }
+                }>
+                <MarkdownEditor
+                    text=body
+                    draft=draft
+                    repo=links.repo.clone()
+                    label="Review summary"
+                    placeholder="Leave a summary (optional for approvals)…"
+                    rows=5
+                />
+                <div class="review-choices">
+                    {choice(ReviewEvent::Comment, "Comment", "Feedback without approving")}
+                    {choice(ReviewEvent::Approve, "Approve", "Approve merging these changes")}
+                    {choice(ReviewEvent::RequestChanges, "Request changes", "Feedback that must be addressed before merging")}
+                </div>
+                {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+                <div class="form-buttons">
+                    <button type="button" class="primary" title=move || blocker().unwrap_or_default()
+                        disabled=move || busy.get() || blocker().is_some() on:click=submit>
+                        {move || if busy.get() { "Submitting…" } else { "Submit review" }}
+                    </button>
+                    {reviewing.then(|| view! {
+                        <button type="button" class="danger" disabled=move || busy.get() on:click=discard>"Discard review"</button>
+                    })}
+                </div>
+            </div>
         </div>
     }
 }
@@ -280,6 +416,7 @@ mod tests {
             comments: vec![],
             checks: vec![],
             ci: None,
+            pending_review: None,
             merge: MergeInfo {
                 conflicting: Some(false),
                 state: MergeState::Clean,

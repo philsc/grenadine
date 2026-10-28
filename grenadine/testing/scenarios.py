@@ -365,25 +365,60 @@ RESOLVE = "Resolve a thread"
 CONVERSE = "Comment on the PR"
 FAIL = "Fail to send a reply"
 LOCKED = "Have a thread I can't resolve"
-REVIEW_CASES = [REPLY, RESOLVE, CONVERSE, FAIL, LOCKED]
+LINE_REVIEW = "Review some lines"
+APPROVE = "Approve without comments"
+DISCARD = "Discard a review"
+REPLY_IN_REVIEW = "Reply in a review"
+OWN = "Review my own PR"
+LEFT_LINE = "Comment on a removed line"
+KEEP = "Keep boxes through refetches"
+REPLY_NOW = "Reply now during a review"
+COMMENT_REVIEW = "Submit comments without a summary"
+REVIEW_CASES = [
+    REPLY,
+    RESOLVE,
+    CONVERSE,
+    FAIL,
+    LOCKED,
+    LINE_REVIEW,
+    APPROVE,
+    DISCARD,
+    REPLY_IN_REVIEW,
+    OWN,
+    LEFT_LINE,
+    KEEP,
+    REPLY_NOW,
+    COMMENT_REVIEW,
+]
+# A file on main, which LEFT_LINE removes the third line of.
+OLD_PATH = "review/old.md"
+OLD_LINES = [f"Old line {i}" for i in range(1, 6)]
 
 
 def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
-    """One PR by the other account per review action, each with an
-    unresolved thread on line 2, so that the tests don't see each other's
-    changes."""
+    """One PR per review action, each with an unresolved thread on line 2,
+    so that the tests don't see each other's changes. All are by the other
+    account but OWN, which is the viewer's."""
     repo = gh.repo(REPO)
     repo.checkout("main")
-    repo.commit("Seed the repo", {"README.md": "# test\n"})
+    repo.commit(
+        "Seed the repo",
+        {"README.md": "# test\n", OLD_PATH: "\n".join(OLD_LINES) + "\n"},
+    )
     repo.push("main")
     prs = {}
     for i, title in enumerate(REVIEW_CASES):
         branch = f"review/{i}"
         repo.checkout(branch, "main")
         lines = [f"{line} of {title}" for line in REVIEW_LINES]
-        repo.commit(title, {REVIEW_PATH: "\n".join(lines) + "\n"}, author=OTHER)
-        repo.push(branch, actor=OTHER)
-        pr = repo.open_pr(title, head=branch, author=OTHER)
+        author = VIEWER if title == OWN else OTHER
+        files = {REVIEW_PATH: "\n".join(lines) + "\n"}
+        if title == LEFT_LINE:
+            kept = OLD_LINES[:2] + OLD_LINES[3:]
+            files[OLD_PATH] = "\n".join(kept) + "\n"
+        repo.commit(title, files, author=author)
+        repo.push(branch, actor=author)
+        pr = repo.open_pr(title, head=branch, author=author)
         root = repo.comment(
             pr, author=OTHER, body="Is this right?", path=REVIEW_PATH, line=2
         )

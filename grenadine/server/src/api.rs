@@ -16,13 +16,15 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
     Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession,
-    NewComment, PrDetail, PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
+    NewComment, NewReply, NewThread, PrDetail, PrKey, PrMissing, ServerEvent, SubmitReview,
+    WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{self, Decision};
+use crate::github::ReviewItem;
 use crate::sync::State;
 use crate::{assets, cleanup, mcp, terminal};
 
@@ -81,6 +83,18 @@ fn api_routes() -> Router<Arc<State>> {
         .route(
             "/api/pr/{owner}/{name}/{number}/threads/{thread}/resolve",
             post(resolve_thread).delete(unresolve_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review",
+            post(submit_review).delete(discard_review),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review/comments",
+            post(add_review_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review/comments/{comment}",
+            axum::routing::patch(edit_review_comment).delete(delete_review_comment),
         )
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
@@ -232,8 +246,8 @@ fn writable(owner: String, name: String, number: u64, state: &State) -> ApiResul
     Ok(key)
 }
 
-fn require_body(c: &NewComment) -> ApiResult<()> {
-    if c.body.trim().is_empty() {
+fn require_body(body: &str) -> ApiResult<()> {
+    if body.trim().is_empty() {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
             "the comment is empty".into(),
@@ -264,7 +278,7 @@ async fn add_comment(
     Json(c): Json<NewComment>,
 ) -> ApiResult<Response> {
     let key = writable(owner, name, number, &state)?;
-    require_body(&c)?;
+    require_body(&c.body)?;
     let id = state.github.pr_id(&key).await?;
     state.github.add_comment(&id, &c.body).await?;
     state.resync(key);
@@ -274,12 +288,21 @@ async fn add_comment(
 async fn reply_to_thread(
     AxState(state): St,
     Path((owner, name, number, thread)): Path<(String, String, u64, String)>,
-    Json(c): Json<NewComment>,
+    Json(r): Json<NewReply>,
 ) -> ApiResult<Response> {
     let key = writable(owner, name, number, &state)?;
     require_thread(&state, &key, &thread)?;
-    require_body(&c)?;
-    state.github.reply_to_thread(&thread, &c.body).await?;
+    require_body(&r.body)?;
+    if r.review {
+        let _lock = state.lock_review(&key).await;
+        let item = ReviewItem::Reply {
+            thread: &thread,
+            body: &r.body,
+        };
+        state.github.add_to_review(&key, item).await?;
+    } else {
+        state.github.reply_to_thread(&thread, &r.body, None).await?;
+    }
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -292,6 +315,117 @@ async fn set_resolved(
     let key = writable(owner, name, number, &state)?;
     require_thread(&state, &key, &thread)?;
     state.github.set_thread_resolved(&thread, resolved).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Refuses a thread that GitHub would refuse with an opaque error.
+fn require_thread_place(t: &NewThread) -> ApiResult<()> {
+    require_body(&t.body)?;
+    if t.path.is_empty() {
+        return Err(refuse(StatusCode::BAD_REQUEST, "the path is empty".into()));
+    }
+    if t.line == Some(0) {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "lines are numbered from 1".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses `comment` unless it's the GraphQL ID of one of the viewer's
+/// pending comments on the PR, so that a request can only change the PR
+/// it names.
+fn require_pending_comment(state: &State, key: &PrKey, comment: &str) -> ApiResult<()> {
+    if !state.db.has_pending_comment(key, comment)? {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{comment} is not a pending comment on {}#{}",
+                key.repo, key.number
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Adds a thread to the viewer's pending review, starting one if needed.
+async fn add_review_thread(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(t): Json<NewThread>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_thread_place(&t)?;
+    {
+        let _lock = state.lock_review(&key).await;
+        state
+            .github
+            .add_to_review(&key, ReviewItem::Thread(&t))
+            .await?;
+    }
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn edit_review_comment(
+    AxState(state): St,
+    Path((owner, name, number, comment)): Path<(String, String, u64, String)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_pending_comment(&state, &key, &comment)?;
+    require_body(&c.body)?;
+    {
+        let _lock = state.lock_review(&key).await;
+        state.github.edit_review_comment(&comment, &c.body).await?;
+    }
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn delete_review_comment(
+    AxState(state): St,
+    Path((owner, name, number, comment)): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_pending_comment(&state, &key, &comment)?;
+    {
+        let _lock = state.lock_review(&key).await;
+        state.github.delete_review_comment(&comment).await?;
+    }
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn submit_review(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(s): Json<SubmitReview>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    {
+        let _lock = state.lock_review(&key).await;
+        let pending = state.github.pending_review(&key).await?;
+        if let Some(why) = submit_blocker(s.event, &s.body, pending.comments) {
+            return Err(refuse(StatusCode::BAD_REQUEST, why.into()));
+        }
+        state.github.submit_review(&pending, &s).await?;
+    }
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn discard_review(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    {
+        let _lock = state.lock_review(&key).await;
+        state.github.discard_review(&key).await?;
+    }
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
 }

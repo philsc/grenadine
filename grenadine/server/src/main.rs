@@ -220,6 +220,7 @@ async fn main() -> Result<()> {
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
+        review_locks: std::sync::Mutex::default(),
         shutdown: shutdown.clone(),
     });
     let sync_task = tokio::spawn(sync::run(
