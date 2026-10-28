@@ -609,6 +609,12 @@ The reason for BLOCKED must be "it needs an approving review" when a
 review is required, "changes were requested" when changes were requested,
 and "required checks or rules aren't satisfied" otherwise.
 
+**REVIEW-MERGE-4.** Reviews, the conversation, checks and the merge state
+must be fetched with each sync of the PR, in the same GraphQL request as
+its other metadata.
+_Why:_ they change whenever the PR's `updatedAt` does, which is what
+triggers a sync.
+
 **REVIEW-MERGE-5.** The merge box must offer the merge methods the
 repository allows, labelled "Create a merge commit", "Squash and merge"
 and "Rebase and merge". The first one picked must be the one last used in
@@ -642,9 +648,3 @@ _Why:_ deleting a branch that other PRs target closes them.
 **REVIEW-MERGE-11.** When the PR targets another open PR's branch, the
 merge box must warn that merging puts its changes there, not into the
 stack's base branch.
-
-**REVIEW-MERGE-4.** Reviews, the conversation, checks and the merge state
-must be fetched with each sync of the PR, in the same GraphQL request as
-its other metadata.
-_Why:_ they change whenever the PR's `updatedAt` does, which is what
-triggers a sync.
