@@ -736,8 +736,9 @@ class AgentTest(ServerTestCase):
     def test_sidebar_has_a_section_per_repo(self) -> None:
         # The open form's draft is listed in its repository's section.
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        # Sessions in no repository come last.
         expect(self.page.locator(".agent-repo-name span")).to_have_text(
-            sorted([scenarios.REPO, self.OTHER_REPO])
+            [*sorted([scenarios.REPO, self.OTHER_REPO]), "General"]
         )
 
         # A repository without sessions says so and links to the form.
@@ -748,6 +749,41 @@ class AgentTest(ServerTestCase):
         other.get_by_role("link", name="Start one").click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
+
+    def test_general_session(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(self.url + "#/agents")
+        repo = self.page.get_by_label("Repository")
+        expect(repo.locator("option")).to_have_text(
+            [*sorted([scenarios.REPO, self.OTHER_REPO]), "General"]
+        )
+        repo.select_option(label="General")
+        # There are no PRs to start from.
+        expect(self.page.get_by_label("Start from PR")).to_be_disabled()
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        expect(self.page.locator(".agent-header")).to_contain_text("in no repository")
+
+        # It works in a plain directory of its own, with nothing to land.
+        directory = Path(self.page.locator(".agent-worktree").inner_text())
+        self.assertTrue((directory / "notes.txt").exists())
+        self.assertFalse((directory / ".git").exists())
+        expect(self.page.get_by_role("button", name="Open PR")).to_have_count(0)
+        expect(
+            self.page.get_by_role("button", name="Merge into checkout")
+        ).to_have_count(0)
+        expect(self.page.locator(".changes-pane")).to_have_count(0)
+        sessions = self.section("General").locator(".agent-entry")
+        expect(sessions).to_have_count(1)
+
+        # Deleting it takes the directory with it.
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        expect(sessions).to_have_count(0)
+        self.assertFalse(directory.exists())
 
     def test_agent_session(self) -> None:
         self.page.goto(self.url)

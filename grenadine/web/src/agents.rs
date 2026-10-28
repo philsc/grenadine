@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs, AgentSession, AgentStatus, Approval,
-    CleanupState, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
+    CleanupState, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
     WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
@@ -107,18 +107,31 @@ fn LandedBadge(landed: Landed) -> impl IntoView {
     }
 }
 
-/// Asks before deleting the session with `id`, then deletes it and calls
-/// `deleted`, or `failed` with what went wrong.
+/// What a repository picker or the sidebar calls `repo`.
+fn repo_label(repo: &str) -> &str {
+    if repo == GENERAL { "General" } else { repo }
+}
+
+/// The configured repositories, then `GENERAL` for a session in none.
+fn with_general(mut repos: Vec<String>) -> Vec<String> {
+    repos.push(GENERAL.to_owned());
+    repos
+}
+
+/// Asks before deleting `session`, then deletes it and calls `deleted`, or
+/// `failed` with what went wrong.
 fn delete_session(
-    id: String,
+    session: &AgentSession,
     deleted: impl FnOnce() + 'static,
     failed: impl FnOnce(String) + 'static,
 ) {
-    let confirmed = window()
-        .confirm_with_message(
-            "Delete this session? Its worktree and branch are deleted too, with any changes that weren't pushed.",
-        )
-        .unwrap_or(false);
+    let message = if session.repo == GENERAL {
+        "Delete this session? Its directory is deleted too, with everything in it."
+    } else {
+        "Delete this session? Its worktree and branch are deleted too, with any changes that weren't pushed."
+    };
+    let confirmed = window().confirm_with_message(message).unwrap_or(false);
+    let id = session.id.clone();
     if !confirmed {
         return;
     }
@@ -286,8 +299,8 @@ fn group<'a>(groups: &'a mut Vec<RepoGroup>, repo: &str) -> &'a mut RepoGroup {
 }
 
 /// The sessions, and the drafts given as `(repo, id)`, grouped by
-/// repository: every configured repository in order, even without either,
-/// then any other repository a session or draft is in.
+/// repository: every one of `repos` in order, even without either, then any
+/// other repository a session or draft is in.
 fn by_repo(
     repos: Vec<String>,
     sessions: Vec<AgentSession>,
@@ -342,7 +355,7 @@ pub fn Sidebar(
                 (Some(Err(e)), _) | (_, Some(Err(e))) => {
                     view! { <p class="error pad">{e}</p> }.into_any()
                 }
-                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(repos, sessions, listed.get())
+                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(with_general(repos), sessions, listed.get())
                     .into_iter()
                     .map(|g| view! { <RepoSessions group=g route=route error=error /> })
                     .collect_view()
@@ -449,7 +462,7 @@ pub fn CleanupView() -> impl IntoView {
             })
         });
         let configured = repos.with(|r| match r {
-            Some(Ok(list)) => list.clone(),
+            Some(Ok(list)) => with_general(list.clone()),
             _ => Vec::new(),
         });
         let next = first_picked
@@ -566,10 +579,10 @@ pub fn CleanupView() -> impl IntoView {
                             repo.set(event_target_value(&ev));
                         }
                     >
-                        {move || repos.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|r| {
+                        {move || repos.get().and_then(Result::ok).map(with_general).unwrap_or_default().into_iter().map(|r| {
                             let value = r.clone();
                             let selected = move || repo.with(|v| *v == value);
-                            view! { <option value=r.clone() selected=selected>{r.clone()}</option> }
+                            view! { <option value=r.clone() selected=selected>{repo_label(&r).to_owned()}</option> }
                         }).collect_view()}
                     </select>
                 </label>
@@ -603,17 +616,26 @@ fn RepoSessions(
         sessions: list,
     } = group;
     let new = format!("#/agents/new/{repo}");
+    let (title, none) = if repo == GENERAL {
+        (
+            "New session in no repository".to_owned(),
+            "No general sessions yet. ",
+        )
+    } else {
+        (
+            format!("New session in {repo}"),
+            "No agents in this repository yet. ",
+        )
+    };
     view! {
         <section class="agent-repo">
             <h2 class="agent-repo-name">
-                <span>{repo.clone()}</span>
-                <a href=new.clone() title=format!("New session in {repo}")>"+"</a>
+                <span>{repo_label(&repo).to_owned()}</span>
+                <a href=new.clone() title=title>"+"</a>
             </h2>
             {if list.is_empty() && drafts.is_empty() {
                 view! {
-                    <p class="agent-none muted">
-                        "No agents in this repository yet. " <a href=new>"Start one"</a>
-                    </p>
+                    <p class="agent-none muted">{none} <a href=new>"Start one"</a></p>
                 }.into_any()
             } else {
                 view! {
@@ -628,19 +650,25 @@ fn RepoSessions(
                                 let id = id.clone();
                                 move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
                             };
-                            let delete = move |_| {
-                                let id = id.clone();
-                                error.set(None);
-                                // Its page can't show it any more.
-                                let leave = is_open(&id);
-                                delete_session(
-                                    id,
-                                    move || if leave { go("#/agents") },
-                                    move |e| error.set(Some(e)),
-                                );
+                            let delete = {
+                                let session = a.clone();
+                                move |_| {
+                                    error.set(None);
+                                    // Its page can't show it any more.
+                                    let leave = is_open(&id);
+                                    delete_session(
+                                        &session,
+                                        move || if leave { go("#/agents") },
+                                        move |e| error.set(Some(e)),
+                                    );
+                                }
                             };
                             let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
-                            let mut meta = vec![a.branch.clone(), cost(a.cost_usd)];
+                            // A general session has no branch.
+                            let mut meta: Vec<String> = [a.branch.clone(), cost(a.cost_usd)]
+                                .into_iter()
+                                .filter(|m| !m.is_empty())
+                                .collect();
                             if let Some(n) = a.pr {
                                 meta.insert(0, format!("#{n}"));
                             }
@@ -956,17 +984,19 @@ pub fn NewSession(draft: String) -> impl IntoView {
     Effect::new(move |_| {
         if let Some(Ok(list)) = repos.get()
             && repo.with_untracked(String::is_empty)
-            && let Some(first) = list.first()
+            && let Some(first) = with_general(list).first()
         {
             repo.set(first.clone());
         }
     });
+    let general = Memo::new(move |_| repo.with(|r| r == GENERAL));
 
     let start = move || {
         if busy.get_untracked() || prompt.with_untracked(|p| p.trim().is_empty()) {
             return;
         }
         let pr = match number.get_untracked().trim() {
+            _ if general.get_untracked() => None,
             "" => None,
             n => match n.trim_start_matches('#').parse() {
                 Ok(n) => Some(n),
@@ -1015,9 +1045,9 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             prop:value=move || repo.get()
                             on:change=move |ev| repo.set(event_target_value(&ev))
                         >
-                            {move || repos.get().and_then(Result::ok).unwrap_or_default().into_iter().map(|r| {
+                            {move || repos.get().and_then(Result::ok).map(with_general).unwrap_or_default().into_iter().map(|r| {
                                 let selected = repo.get_untracked() == r;
-                                view! { <option value=r.clone() selected=selected>{r.clone()}</option> }
+                                view! { <option value=r.clone() selected=selected>{repo_label(&r).to_owned()}</option> }
                             }).collect_view()}
                         </select>
                     </label>
@@ -1025,7 +1055,8 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         <input
                             type="text"
                             class="agent-pr"
-                            placeholder="trunk"
+                            placeholder=move || if general.get() { "" } else { "trunk" }
+                            disabled=general
                             prop:value=move || number.get()
                             on:input=move |ev| number.set(event_target_value(&ev))
                         />
@@ -1047,7 +1078,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         }
                     }
                 ></textarea>
-                <p class="hint muted">"The session gets its own git worktree on a new branch. Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions and a different model."</p>
+                <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} " Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions and a different model."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -1055,7 +1086,11 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         class="primary"
                         disabled=move || busy.get() || prompt.with(|p| p.trim().is_empty())
                     >
-                        {move || if busy.get() { "Creating worktree…" } else { "Start" }}
+                        {move || match (busy.get(), general.get()) {
+                            (false, _) => "Start",
+                            (true, false) => "Creating worktree…",
+                            (true, true) => "Starting…",
+                        }}
                     </button>
                 </div>
             </form>
@@ -1242,7 +1277,11 @@ pub fn AgentView(id: String) -> impl IntoView {
                         }}
                     </div>
                 </main>
-                {move || (load.get() == Load::Ready).then(|| view! { <ChangesPane id=id.clone() events=events /> })}
+                // A general session's directory isn't a git worktree.
+                {move || {
+                    let general = current.with(|s| s.as_ref().is_some_and(|s| s.repo == GENERAL));
+                    (load.get() == Load::Ready && !general).then(|| view! { <ChangesPane id=id.clone() events=events /> })
+                }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
                 <crate::terminal::TerminalPanel id=terminal_id.clone() />
@@ -1353,6 +1392,18 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
         <header class="agent-header">
             {move || {
                 let s = session.get();
+                if s.repo == GENERAL {
+                    return view! {
+                        <h1>{s.title.clone()}</h1>
+                        <p class="muted">
+                            <StatusBadge status=s.status />
+                            " in no repository"
+                            {format!(" · {}", cost(s.cost_usd))}
+                        </p>
+                        <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
+                    }
+                    .into_any();
+                }
                 let from = match s.pr {
                     Some(n) => {
                         let key = PrKey {
@@ -1374,6 +1425,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                     </p>
                     <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
                 }
+                .into_any()
             }}
         </header>
     }
@@ -1410,24 +1462,27 @@ fn AgentActions(
         });
     };
     let delete = move |_| {
-        let id = session.with_untracked(|s| s.id.clone());
-        delete_session(id, || go("#/agents"), move |e| error.set(Some(e)));
+        session
+            .with_untracked(|s| delete_session(s, || go("#/agents"), move |e| error.set(Some(e))));
     };
     view! {
         {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
         <div class="agent-actions">
-            <button
-                class="link"
-                title="Rebase the session's commits onto the server's checkout and fast-forward it"
-                disabled=wrapping
-                on:click=move |_| wrap_up(WrapUpTarget::Checkout)
-            >"Merge into checkout"</button>
-            <button
-                class="link"
-                title="Push each of the session's commits to GitHub and open a stack of pull requests, one per commit"
-                disabled=wrapping
-                on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
-            >"Open PR"</button>
+            // A general session has nothing to land.
+            <Show when=move || session.with(|s| s.repo != GENERAL)>
+                <button
+                    class="link"
+                    title="Rebase the session's commits onto the server's checkout and fast-forward it"
+                    disabled=wrapping
+                    on:click=move |_| wrap_up(WrapUpTarget::Checkout)
+                >"Merge into checkout"</button>
+                <button
+                    class="link"
+                    title="Push each of the session's commits to GitHub and open a stack of pull requests, one per commit"
+                    disabled=wrapping
+                    on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
+                >"Open PR"</button>
+            </Show>
             <button class="link danger" on:click=delete>"Delete"</button>
         </div>
     }
