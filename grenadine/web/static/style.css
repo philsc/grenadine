@@ -380,6 +380,7 @@ input[type="text"] {
   color: var(--fg-muted);
 }
 .pr-status .threads,
+.pr-status .review,
 .pr-status .ci {
   display: inline-flex;
   align-items: center;
@@ -1732,14 +1733,17 @@ textarea {
   font-weight: 600;
 }
 .review-decision.approved,
-.review-state.approved {
+.review-state.approved,
+.pr-status .review.approved {
   color: var(--add-fg);
 }
 .review-decision.changes,
-.review-state.changes {
+.review-state.changes,
+.pr-status .review.changes {
   color: var(--del-fg);
 }
-.review-decision.required {
+.review-decision.required,
+.pr-status .review.required {
   color: var(--warn-fg);
 }
 .review-state.commented {

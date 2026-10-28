@@ -8,8 +8,8 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result};
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus, CleanupItem, Inbox,
-    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, ReviewInfo, Stack,
-    ThreadCounts, Version, VersionKind,
+    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, ReviewDecision,
+    ReviewInfo, Stack, ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -281,6 +281,14 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE prs ADD COLUMN synced_ci TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The search's review decision, an api::ReviewDecision as its JSON
+    -- string (Approved, ChangesRequested, ...) like in prs.review; NULL
+    -- when there's none.
+    ALTER TABLE inbox_prs ADD COLUMN review_decision TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -404,6 +412,21 @@ fn parse_ci(s: &str) -> Option<CiStatus> {
         "running" => Some(CiStatus::Running),
         _ => None,
     }
+}
+
+/// A review decision as its JSON string, the form `prs.review` stores it
+/// in, so that queries can compare the two.
+fn decision_str(d: ReviewDecision) -> String {
+    match serde_json::to_value(d) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => unreachable!("a ReviewDecision serializes as a string"),
+    }
+}
+
+fn parse_decision(s: &str) -> ReviewDecision {
+    // Unknown strings become ReviewDecision::Unknown.
+    serde_json::from_value(serde_json::Value::String(s.to_owned()))
+        .unwrap_or(ReviewDecision::Unknown)
 }
 
 fn parse_kind(s: &str) -> VersionKind {
@@ -540,14 +563,15 @@ impl Db {
                     tx.execute(
                         "INSERT INTO inbox_prs
                             (inbox_id, repo, number, rank, title, author, state, is_draft, url, updated_at,
-                             threads_resolved, threads_total, ci)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             threads_resolved, threads_total, ci, review_decision)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (inbox_id, repo, number) DO UPDATE SET
                             rank = excluded.rank, title = excluded.title, author = excluded.author,
                             state = excluded.state, is_draft = excluded.is_draft, url = excluded.url,
                             updated_at = excluded.updated_at,
                             threads_resolved = excluded.threads_resolved,
-                            threads_total = excluded.threads_total, ci = excluded.ci",
+                            threads_total = excluded.threads_total, ci = excluded.ci,
+                            review_decision = excluded.review_decision",
                         params![
                             id,
                             h.key.repo,
@@ -561,7 +585,8 @@ impl Db {
                             h.updated_at,
                             h.threads.resolved,
                             h.threads.total,
-                            h.ci.map(ci_str)
+                            h.ci.map(ci_str),
+                            h.review_decision.map(decision_str),
                         ],
                     )?;
                 }
@@ -593,7 +618,10 @@ impl Db {
     pub fn inbox_prs(&self, id: i64) -> Result<Vec<PrSummary>> {
         let conn = self.conn();
         // Rows that still have the migration's empty defaults take their
-        // fields from prs until the next poll rewrites them.
+        // fields from prs until the next poll rewrites them. The review
+        // decision comes from the PR's last sync once one read the
+        // reviews: it's what the PR's page shows, and a resync after the
+        // viewer reviewed it updates it before the next search does.
         let mut stmt = conn.prepare(
             "SELECT i.repo, i.number,
                     CASE WHEN i.title = '' THEN COALESCE(p.title, '') ELSE i.title END,
@@ -605,7 +633,9 @@ impl Db {
                     (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
                     p.repo IS NOT NULL,
                     CASE WHEN p.repo IS NULL THEN i.sync_error END,
-                    p.stack, i.threads_resolved, i.threads_total, i.ci
+                    p.stack, i.threads_resolved, i.threads_total, i.ci,
+                    CASE WHEN p.review IS NULL THEN i.review_decision
+                         ELSE json_extract(p.review, '$.decision') END
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
@@ -620,6 +650,7 @@ impl Db {
                 .get::<_, Option<String>>(14)?
                 .as_deref()
                 .and_then(parse_ci);
+            summary.review_decision = r.get::<_, Option<String>>(15)?.map(|s| parse_decision(&s));
             Ok(summary)
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1385,6 +1416,7 @@ fn summary_from_row(
         stack: stack.and_then(|s| s.summary(number)),
         threads: None,
         ci: None,
+        review_decision: None,
     })
 }
 
@@ -1393,10 +1425,27 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use grenadine_core::api::{
-        Check, MergeInfo, MergeMethod, MergeState, Review, ReviewDecision, ReviewState, Side,
+        Check, MergeInfo, MergeMethod, MergeState, Review, ReviewState, Side,
     };
 
     use super::*;
+
+    #[test]
+    fn review_decisions_are_stored_like_in_prs_review() {
+        for d in [
+            ReviewDecision::Approved,
+            ReviewDecision::ChangesRequested,
+            ReviewDecision::ReviewRequired,
+            ReviewDecision::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&d).unwrap(),
+                format!("\"{}\"", decision_str(d))
+            );
+            assert_eq!(parse_decision(&decision_str(d)), d);
+        }
+        assert_eq!(parse_decision("Later"), ReviewDecision::Unknown);
+    }
 
     #[test]
     fn a_second_open_fails_until_the_first_closes() {
@@ -1430,6 +1479,7 @@ mod tests {
                 total: 3,
             },
             ci: Some(CiStatus::Failing),
+            review_decision: Some(ReviewDecision::ChangesRequested),
         }
     }
 
@@ -1520,6 +1570,10 @@ mod tests {
             })
         );
         assert_eq!(prs[0].ci, Some(CiStatus::Failing));
+        assert_eq!(
+            prs[0].review_decision,
+            Some(ReviewDecision::ChangesRequested)
+        );
 
         let versions = vec![
             Version {
@@ -1627,6 +1681,11 @@ mod tests {
         assert_eq!(pr.summary.version_count, 2);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));
         assert!(db.inbox_prs(1).unwrap()[0].synced);
+        // The sync's decision is fresher than the search's.
+        assert_eq!(
+            db.inbox_prs(1).unwrap()[0].review_decision,
+            Some(ReviewDecision::Approved)
+        );
         assert_eq!(
             db.sync_mark(&key).unwrap(),
             Some(SyncMark {

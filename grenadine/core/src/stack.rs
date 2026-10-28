@@ -409,6 +409,7 @@ mod tests {
             stack: stack.and_then(|s| s.summary(number)),
             threads: None,
             ci: None,
+            review_decision: None,
         }
     }
 
