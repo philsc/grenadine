@@ -237,7 +237,7 @@ class ServerTestCase(unittest.TestCase):
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
-        cls.server = subprocess.Popen(
+        cls.server_args = (
             [
                 os.environ["GRENADINE_SERVER"],
                 *repo_flags,
@@ -248,10 +248,10 @@ class ServerTestCase(unittest.TestCase):
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
             ],
-            env=env,
+            env,
         )
+        cls.start_server()
         cls.addClassCleanup(cls.stop_server)
-        cls.wait_for_server()
 
         cls.playwright = sync_playwright().start()
         cls.addClassCleanup(cls.playwright.stop)
@@ -259,6 +259,12 @@ class ServerTestCase(unittest.TestCase):
             executable_path=os.environ["CHROME"]
         )
         cls.addClassCleanup(cls.browser.close)
+
+    @classmethod
+    def start_server(cls) -> None:
+        args, env = cls.server_args
+        cls.server = subprocess.Popen(args, env=env)
+        cls.wait_for_server()
 
     @classmethod
     def stop_server(cls) -> None:
@@ -1442,6 +1448,34 @@ class AgentTest(ServerTestCase):
         expect(permissions).to_have_value("acceptEdits")
         self.page.reload()
         expect(permissions).to_have_value("acceptEdits")
+
+    def test_plan_stranded_by_a_restart(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("make a plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        question = transcript.locator(".approval.questions")
+        question.get_by_label("todo.txt").check()
+        question.get_by_role("button", name="Answer").click()
+        plan = transcript.locator(".approval.plan")
+        expect(plan).to_contain_text("Claude's plan is waiting for your approval")
+
+        # The restart ends the turn that asked, but the plan can still be
+        # answered, with a new turn.
+        self.stop_server()
+        self.start_server()
+        self.page.reload()
+        expect(plan).to_contain_text("The turn ended before the plan was answered")
+        plan.get_by_label("After the plan").select_option(label="Accept edits")
+        plan.get_by_role("button", name="Approve plan").click()
+        expect(transcript.locator(".turn-prompt").last).to_have_text(
+            "I approve the plan. Carry it out."
+        )
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
+        # Once answered, the old plan offers nothing more.
+        expect(plan).to_contain_text("Unanswered plan")
+        expect(plan.get_by_role("button", name="Approve plan")).to_have_count(0)
 
 
 class CleanupTest(ServerTestCase):
