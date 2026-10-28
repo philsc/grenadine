@@ -15,7 +15,8 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
     Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession,
-    NewComment, PrDetail, PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
+    NewComment, NewThread, PrDetail, PrKey, PrMissing, ServerEvent, SubmitReview, WorktreeChanges,
+    WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -70,6 +71,18 @@ pub fn router(state: Arc<State>) -> Router {
         .route(
             "/api/pr/{owner}/{name}/{number}/threads/{thread}/resolve",
             post(resolve_thread).delete(unresolve_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review",
+            post(submit_review).delete(discard_review),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review/comments",
+            post(add_review_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/review/comments/{comment}",
+            axum::routing::patch(edit_review_comment).delete(delete_review_comment),
         )
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
@@ -255,7 +268,14 @@ async fn reply_to_thread(
 ) -> ApiResult<Response> {
     let key = writable(owner, name, number, &state)?;
     require_body(&c)?;
-    state.github.reply_to_thread(&thread, &c.body).await?;
+    let review = match c.review {
+        true => Some(state.github.ensure_pending_review(&key).await?),
+        false => None,
+    };
+    state
+        .github
+        .reply_to_thread(&thread, &c.body, review.as_deref())
+        .await?;
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -267,6 +287,68 @@ async fn set_resolved(
 ) -> ApiResult<Response> {
     let key = writable(owner, name, number, &state)?;
     state.github.set_thread_resolved(&thread, resolved).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Adds a thread to the viewer's pending review, starting one if needed.
+async fn add_review_thread(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(t): Json<NewThread>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    if t.body.trim().is_empty() {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "the comment is empty".into(),
+        ));
+    }
+    let review = state.github.ensure_pending_review(&key).await?;
+    state.github.add_review_thread(&review, &t).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn edit_review_comment(
+    AxState(state): St,
+    Path((owner, name, number, comment)): Path<(String, String, u64, String)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_body(&c)?;
+    state.github.edit_review_comment(&comment, &c.body).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn delete_review_comment(
+    AxState(state): St,
+    Path((owner, name, number, comment)): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    state.github.delete_review_comment(&comment).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn submit_review(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(s): Json<SubmitReview>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    state.github.submit_review(&key, &s).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn discard_review(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    state.github.discard_review(&key).await?;
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
 }

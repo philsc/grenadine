@@ -1861,3 +1861,76 @@ textarea {
 .composer-hint {
   font-size: 12px;
 }
+
+/* The pending review. */
+
+.comment.pending {
+  background: var(--warn-bg);
+}
+.pending-badge {
+  color: var(--warn-fg);
+  border-color: var(--warn-border);
+}
+.comment-actions {
+  margin-left: 8px;
+}
+.comment-actions button.link {
+  font-size: 12px;
+  margin-right: 6px;
+}
+td.ln.commentable {
+  cursor: pointer;
+}
+td.ln.commentable:hover {
+  color: var(--accent);
+  background: var(--accent-bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.file-comment-button {
+  margin-left: 8px;
+  font-size: 12px;
+}
+.review-panel {
+  position: relative;
+}
+.review-panel.open > .review-button {
+  background: var(--bg-subtle);
+}
+.pending-count {
+  margin: 0 0 0 6px;
+  color: var(--warn-fg);
+  border-color: var(--warn-border);
+}
+.review-popup {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 480px;
+  max-width: 90vw;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+.review-popup textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  resize: vertical;
+}
+.review-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 8px 0;
+}
+.review-choice.disabled {
+  color: var(--fg-muted);
+}

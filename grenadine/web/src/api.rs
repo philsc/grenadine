@@ -9,8 +9,8 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
     Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, NewComment,
-    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, SyncStatus, TerminalInfo,
-    WorktreeChanges, WrapUp,
+    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, SubmitReview, SyncStatus,
+    TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -340,14 +340,19 @@ fn pr_url(key: &PrKey) -> String {
 /// Comments on the PR itself.
 pub async fn add_comment(key: &PrKey, body: String) -> Result<()> {
     let req = Request::post(&format!("{}/comments", pr_url(key)))
-        .json(&NewComment { body })
+        .json(&NewComment {
+            body,
+            review: false,
+        })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
 }
 
-pub async fn reply_to_thread(key: &PrKey, thread: &str, body: String) -> Result<()> {
+/// Replies to a thread: right away, or in the viewer's pending review if
+/// `review`.
+pub async fn reply_to_thread(key: &PrKey, thread: &str, body: String, review: bool) -> Result<()> {
     let req = Request::post(&format!("{}/threads/{thread}/replies", pr_url(key)))
-        .json(&NewComment { body })
+        .json(&NewComment { body, review })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
 }
@@ -360,4 +365,47 @@ pub async fn set_thread_resolved(key: &PrKey, thread: &str, resolved: bool) -> R
         Request::delete(&url)
     };
     check(req.send().await).await.map(|_| ())
+}
+
+/// Adds a thread to the viewer's pending review, starting one if needed.
+pub async fn add_review_thread(key: &PrKey, thread: &NewThread) -> Result<()> {
+    let req = Request::post(&format!("{}/review/comments", pr_url(key)))
+        .json(thread)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Edits a pending comment by its GraphQL ID.
+pub async fn edit_review_comment(key: &PrKey, comment: &str, body: String) -> Result<()> {
+    let req = Request::patch(&format!("{}/review/comments/{comment}", pr_url(key)))
+        .json(&NewComment { body, review: true })
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn delete_review_comment(key: &PrKey, comment: &str) -> Result<()> {
+    check(
+        Request::delete(&format!("{}/review/comments/{comment}", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn submit_review(key: &PrKey, review: &SubmitReview) -> Result<()> {
+    let req = Request::post(&format!("{}/review", pr_url(key)))
+        .json(review)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn discard_review(key: &PrKey) -> Result<()> {
+    check(
+        Request::delete(&format!("{}/review", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
 }

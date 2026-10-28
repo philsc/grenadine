@@ -111,6 +111,17 @@ class Comment:
     side: str = "RIGHT"
     resolved: bool = False
     resolved_by: str | None = None
+    # On the whole file rather than on `line`.
+    on_file: bool = False
+
+
+@dataclasses.dataclass
+class PendingReview:
+    """The viewer's review before it's submitted. Its comments aren't in
+    the PR's comments until then."""
+
+    id: str
+    comments: list[Comment] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -144,6 +155,7 @@ class PullRequest:
     issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
     # GitHub's MergeStateStatus; None works it out from the PR.
     merge_state: str | None = None
+    pending: PendingReview | None = None
 
     @property
     def url(self) -> str:
@@ -605,12 +617,12 @@ class FakeGitHub:
                 "path": c.path,
                 "commit_id": c.commit,
                 "original_commit_id": c.commit,
-                "original_line": c.line,
+                "original_line": None if c.on_file else c.line,
                 "original_start_line": None,
-                "line": c.line,
+                "line": None if c.on_file else c.line,
                 "start_line": None,
                 "side": c.side,
-                "subject_type": "line",
+                "subject_type": "file" if c.on_file else "line",
                 "created_at": iso(c.created_at),
                 "html_url": f"{pr.url}#discussion_r{c.id}",
             }
@@ -663,16 +675,94 @@ class FakeGitHub:
 
         def add_reply(info: Any, input: dict[str, Any]) -> Any:
             pr, root = self._thread(input["pullRequestReviewThreadId"])
-            pr.repo.comment(
-                pr,
+            reply = Comment(
+                id=self.next_comment_id(),
                 author=VIEWER,
                 body=input["body"],
                 path=root.path,
-                line=root.line,
                 commit=root.commit,
-                reply_to=root,
+                line=root.line,
+                created_at=self.tick(),
+                in_reply_to=root.id,
+                side=root.side,
+                on_file=root.on_file,
             )
+            if input.get("pullRequestReviewId"):
+                self._pending(input["pullRequestReviewId"])[1].comments.append(reply)
+            else:
+                pr.comments.append(reply)
+            pr.touch()
             return {"clientMutationId": input.get("clientMutationId")}
+
+        def add_review(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            if input.get("event"):
+                self._submit(pr, input["event"], input.get("body") or "")
+                return {"clientMutationId": None, "pullRequestReview": None}
+            if pr.pending:
+                raise ValueError(
+                    "User can only have one pending review per pull request"
+                )
+            pr.pending = PendingReview(id=f"PRR_{self.next_comment_id()}")
+            pr.touch()
+            return {
+                "clientMutationId": None,
+                "pullRequestReview": self._pending_node(pr),
+            }
+
+        def add_thread(info: Any, input: dict[str, Any]) -> Any:
+            pr, review = self._pending(input["pullRequestReviewId"])
+            on_file = input.get("subjectType") == "FILE"
+            review.comments.append(
+                Comment(
+                    id=self.next_comment_id(),
+                    author=VIEWER,
+                    body=input["body"],
+                    path=input["path"],
+                    commit=pr.head_oid,
+                    line=0 if on_file else input["line"],
+                    created_at=self.tick(),
+                    side=input.get("side") or "RIGHT",
+                    on_file=on_file,
+                )
+            )
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def pending_comment(
+            node_id: str,
+        ) -> tuple[PullRequest, PendingReview, Comment]:
+            for pr in self.prs():
+                for c in pr.pending.comments if pr.pending else []:
+                    if f"PRRC_{c.id}" == node_id:
+                        assert pr.pending
+                        return pr, pr.pending, c
+            raise LookupError(
+                f"Could not resolve to a node with the global id of '{node_id}'"
+            )
+
+        def update_comment(info: Any, input: dict[str, Any]) -> Any:
+            pr, _, c = pending_comment(input["pullRequestReviewCommentId"])
+            c.body = input["body"]
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def delete_comment(info: Any, input: dict[str, Any]) -> Any:
+            pr, review, c = pending_comment(input["id"])
+            review.comments.remove(c)
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def submit_review(info: Any, input: dict[str, Any]) -> Any:
+            pr, _ = self._pending(input["pullRequestReviewId"])
+            self._submit(pr, input["event"], input.get("body") or "")
+            return {"clientMutationId": None}
+
+        def delete_review(info: Any, input: dict[str, Any]) -> Any:
+            pr, _ = self._pending(input["pullRequestReviewId"])
+            pr.pending = None
+            pr.touch()
+            return {"clientMutationId": None}
 
         def resolve(resolved: bool) -> Callable[..., Any]:
             def mutation(info: Any, input: dict[str, Any]) -> Any:
@@ -693,6 +783,73 @@ class FakeGitHub:
             "addPullRequestReviewThreadReply": add_reply,
             "resolveReviewThread": resolve(True),
             "unresolveReviewThread": resolve(False),
+            "addPullRequestReview": add_review,
+            "addPullRequestReviewThread": add_thread,
+            "updatePullRequestReviewComment": update_comment,
+            "deletePullRequestReviewComment": delete_comment,
+            "submitPullRequestReview": submit_review,
+            "deletePullRequestReview": delete_review,
+        }
+
+    def _pending(self, node_id: str) -> tuple[PullRequest, PendingReview]:
+        for pr in self.prs():
+            if pr.pending and pr.pending.id == node_id:
+                return pr, pr.pending
+        raise LookupError(
+            f"Could not resolve to a node with the global id of '{node_id}'"
+        )
+
+    def _submit(self, pr: PullRequest, event: str, body: str) -> None:
+        """Submits the viewer's review of `pr`, with its pending comments."""
+        state = {
+            "COMMENT": COMMENTED,
+            "APPROVE": APPROVED,
+            "REQUEST_CHANGES": CHANGES_REQUESTED,
+        }[event]
+        comments = pr.pending.comments if pr.pending else []
+        if state != APPROVED and not body and not comments:
+            raise ValueError("Review body is required")
+        if state != COMMENTED and pr.author == VIEWER:
+            raise ValueError(
+                "Can not approve or request changes on your own pull request"
+            )
+        pr.comments.extend(comments)
+        pr.pending = None
+        pr.repo.review(pr, author=VIEWER, state=state, body=body)
+
+    def _pending_node(self, pr: PullRequest) -> dict[str, Any]:
+        """The viewer's pending review of `pr`, as GraphQL shows it."""
+        assert pr.pending
+        review = pr.pending
+
+        def comment_node(c: Comment) -> dict[str, Any]:
+            return {
+                "id": f"PRRC_{c.id}",
+                "databaseId": c.id,
+                "body": c.body,
+                "path": c.path,
+                "line": None if c.on_file else c.line,
+                "startLine": None,
+                "originalLine": None if c.on_file else c.line,
+                "originalStartLine": None,
+                "subjectType": "FILE" if c.on_file else "LINE",
+                "createdAt": iso(c.created_at),
+                "url": f"{pr.url}#discussion_r{c.id}",
+                "replyTo": {"databaseId": c.in_reply_to} if c.in_reply_to else None,
+                "originalCommit": {"oid": c.commit},
+            }
+
+        return {
+            "id": review.id,
+            "viewerDidAuthor": True,
+            "state": "PENDING",
+            "body": "",
+            "submittedAt": None,
+            "url": f"{pr.url}#pullrequestreview-pending",
+            "author": self._user_node(VIEWER),
+            "comments": lambda info, **_: {
+                "nodes": [comment_node(c) for c in review.comments]
+            },
         }
 
     def _pr_by_id(self, node_id: str) -> PullRequest:
@@ -858,18 +1015,22 @@ class FakeGitHub:
             **_: Any,
         ) -> Any:
             found = [r for r in pr.reviews if states is None or r.state in states]
-            return {
-                "nodes": [
-                    {
-                        "state": r.state,
-                        "body": r.body,
-                        "submittedAt": iso(r.submitted_at or EPOCH),
-                        "url": f"{pr.url}#pullrequestreview-{i}",
-                        "author": self._user_node(r.author),
-                    }
-                    for i, r in enumerate(found[:first])
-                ]
-            }
+            nodes = [
+                {
+                    "id": f"PRR_{pr.number}_{i}",
+                    "viewerDidAuthor": r.author == VIEWER,
+                    "comments": lambda info, **_: {"nodes": []},
+                    "state": r.state,
+                    "body": r.body,
+                    "submittedAt": iso(r.submitted_at or EPOCH),
+                    "url": f"{pr.url}#pullrequestreview-{i}",
+                    "author": self._user_node(r.author),
+                }
+                for i, r in enumerate(found)
+            ]
+            if pr.pending and (states is None or "PENDING" in states):
+                nodes.append(self._pending_node(pr))
+            return {"nodes": nodes[:first]}
 
         def comments(
             info: Any, first: int | None = None, last: int | None = None, **_: Any
@@ -897,6 +1058,7 @@ class FakeGitHub:
                 "nodes": [
                     {
                         "id": f"PRRT_{c.id}",
+                        "diffSide": c.side,
                         "isResolved": c.resolved,
                         "viewerCanResolve": True,
                         "viewerCanUnresolve": True,

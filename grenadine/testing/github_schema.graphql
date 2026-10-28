@@ -23,6 +23,80 @@ type Mutation {
   ): MutationPayload
   resolveReviewThread(input: ResolveReviewThreadInput!): MutationPayload
   unresolveReviewThread(input: UnresolveReviewThreadInput!): MutationPayload
+  addPullRequestReview(input: AddPullRequestReviewInput!): AddPullRequestReviewPayload
+  addPullRequestReviewThread(
+    input: AddPullRequestReviewThreadInput!
+  ): MutationPayload
+  updatePullRequestReviewComment(
+    input: UpdatePullRequestReviewCommentInput!
+  ): MutationPayload
+  deletePullRequestReviewComment(
+    input: DeletePullRequestReviewCommentInput!
+  ): MutationPayload
+  submitPullRequestReview(input: SubmitPullRequestReviewInput!): MutationPayload
+  deletePullRequestReview(input: DeletePullRequestReviewInput!): MutationPayload
+}
+
+type AddPullRequestReviewPayload {
+  clientMutationId: String
+  pullRequestReview: PullRequestReview
+}
+
+enum PullRequestReviewEvent {
+  COMMENT
+  APPROVE
+  REQUEST_CHANGES
+  DISMISS
+}
+
+enum DiffSide {
+  LEFT
+  RIGHT
+}
+
+enum PullRequestReviewThreadSubjectType {
+  LINE
+  FILE
+}
+
+input AddPullRequestReviewInput {
+  pullRequestId: ID!
+  event: PullRequestReviewEvent
+  body: String
+  clientMutationId: String
+}
+
+input AddPullRequestReviewThreadInput {
+  pullRequestReviewId: ID
+  path: String!
+  body: String!
+  line: Int
+  side: DiffSide
+  subjectType: PullRequestReviewThreadSubjectType
+  clientMutationId: String
+}
+
+input UpdatePullRequestReviewCommentInput {
+  pullRequestReviewCommentId: ID!
+  body: String!
+  clientMutationId: String
+}
+
+input DeletePullRequestReviewCommentInput {
+  id: ID!
+  clientMutationId: String
+}
+
+input SubmitPullRequestReviewInput {
+  pullRequestReviewId: ID
+  event: PullRequestReviewEvent!
+  body: String
+  clientMutationId: String
+}
+
+input DeletePullRequestReviewInput {
+  pullRequestReviewId: ID!
+  clientMutationId: String
 }
 
 type MutationPayload {
@@ -179,6 +253,9 @@ type PullRequestReviewConnection {
 }
 
 type PullRequestReview {
+  id: ID!
+  viewerDidAuthor: Boolean!
+  comments(first: Int, after: String): PullRequestReviewCommentConnection!
   state: PullRequestReviewState!
   body: String!
   submittedAt: DateTime
@@ -344,6 +421,7 @@ type PageInfo {
 
 type PullRequestReviewThread {
   id: ID!
+  diffSide: DiffSide!
   isResolved: Boolean!
   viewerCanResolve: Boolean!
   viewerCanUnresolve: Boolean!
@@ -356,5 +434,17 @@ type PullRequestReviewCommentConnection {
 }
 
 type PullRequestReviewComment {
+  id: ID!
   databaseId: Int
+  body: String!
+  path: String!
+  line: Int
+  startLine: Int
+  originalLine: Int
+  originalStartLine: Int
+  subjectType: PullRequestReviewThreadSubjectType!
+  createdAt: DateTime!
+  url: URI!
+  replyTo: PullRequestReviewComment
+  originalCommit: Commit
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
-use grenadine_core::api::{Blob, ChangeStatus, FileChange, Side, WorktreeFile};
+use grenadine_core::api::{Blob, ChangeStatus, FileChange, NewThread, PrKey, Side, WorktreeFile};
 use grenadine_core::diff::{self, Hunk, Line};
 use grenadine_core::edit::Fragment;
 use grenadine_core::inline::{self, Aligned};
@@ -13,11 +13,130 @@ use grenadine_core::rebase;
 use leptos::prelude::*;
 
 use crate::api;
+use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{highlight_lines, mark};
 use crate::inboxes::load_flag;
 use crate::pr::{Anchor, Placed, ThreadView};
 
 const CONTEXT: usize = 3;
+
+/// Whether and where lines of a PR's diff can be commented on: the new
+/// side always, the old side only when `left`.
+#[derive(Clone)]
+pub struct Commenting {
+    pub key: PrKey,
+    pub left: bool,
+}
+
+impl Commenting {
+    /// The name of the draft of a comment on `line` (1-based) of `side`,
+    /// or on the whole file.
+    fn draft(&self, path: &str, at: Option<(Side, u32)>) -> String {
+        let at = match at {
+            Some((Side::Left, l)) => format!("L{l}"),
+            Some((Side::Right, l)) => format!("R{l}"),
+            None => "file".to_owned(),
+        };
+        format!("line.{}#{}:{path}:{at}", self.key.repo, self.key.number)
+    }
+
+    fn allows(&self, side: Side) -> bool {
+        side == Side::Right || self.left
+    }
+}
+
+/// A file's comment hooks: where its comments go, and the boxes they're
+/// written in.
+#[derive(Clone)]
+struct FileCommenting {
+    commenting: Commenting,
+    path: String,
+    boxes: OpenBoxes,
+}
+
+impl FileCommenting {
+    /// The line number cell for 0-based `line` of `side`, which opens a
+    /// comment box on the line when clicked.
+    fn ln(
+        this: Option<&Self>,
+        class: String,
+        side: Side,
+        line: Option<usize>,
+        shown: String,
+    ) -> AnyView {
+        match (this, line) {
+            (Some(fc), Some(l)) if fc.commenting.allows(side) => {
+                let draft = fc.commenting.draft(&fc.path, Some((side, l as u32 + 1)));
+                let boxes = fc.boxes;
+                view! {
+                    <td class=format!("{class} commentable") title="Comment on this line"
+                        on:click=move |_| boxes.set(&draft, true)>{shown}</td>
+                }
+                .into_any()
+            }
+            _ => view! { <td class=class>{shown}</td> }.into_any(),
+        }
+    }
+
+    /// The comment boxes for 0-based lines of a row, shown while open.
+    fn boxes_row(
+        this: Option<&Self>,
+        at: &[(Side, Option<usize>)],
+        colspan: u32,
+    ) -> Option<AnyView> {
+        let fc = this?;
+        let rows: Vec<AnyView> = at
+            .iter()
+            .filter_map(|&(side, line)| Some((side, line? as u32 + 1)))
+            .filter(|(side, _)| fc.commenting.allows(*side))
+            .map(|(side, line)| fc.box_row(Some((side, line)), colspan))
+            .collect();
+        (!rows.is_empty()).then(|| rows.into_any())
+    }
+
+    /// A row with the comment box for `at`, shown while it's open.
+    fn box_row(&self, at: Option<(Side, u32)>, colspan: u32) -> AnyView {
+        let draft = self.commenting.draft(&self.path, at);
+        let boxes = self.boxes;
+        let this = self.clone();
+        (move || {
+            boxes.is_open(&draft).then(|| {
+                view! {
+                    <tr class="comment-row composer-row">
+                        <td colspan=colspan>{this.composer(at)}</td>
+                    </tr>
+                }
+            })
+        })
+        .into_any()
+    }
+
+    /// The box for a comment on `at`, or on the whole file.
+    fn composer(&self, at: Option<(Side, u32)>) -> impl IntoView + use<> {
+        let draft = self.commenting.draft(&self.path, at);
+        let (key, path) = (self.commenting.key.clone(), self.path.clone());
+        let send = sender(move |body| {
+            let key = key.clone();
+            let thread = NewThread {
+                path: path.clone(),
+                side: at.map_or(Side::Right, |(s, _)| s),
+                line: at.map(|(_, l)| l),
+                body,
+            };
+            async move { api::add_review_thread(&key, &thread).await }
+        });
+        view! {
+            <Composer
+                draft=draft
+                repo=self.commenting.key.repo.clone()
+                label="Add to review"
+                placeholder=if at.is_some() { "Comment on this line…" } else { "Comment on this file…" }
+                send=send
+                autofocus=true
+            />
+        }
+    }
+}
 
 /// Files with more changed lines than this start collapsed.
 const BIG_FILE: usize = 3000;
@@ -105,6 +224,7 @@ pub fn DiffView(
     comments: Arc<HashMap<String, Vec<Placed>>>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
+    #[prop(optional_no_strip)] commenting: Option<Commenting>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
     let files = LocalResource::new(move || {
@@ -143,7 +263,7 @@ pub fn DiffView(
                 </ul>
                 {files.iter().map(|f| {
                     let placed = comments.get(f.change.path()).cloned().unwrap_or_default();
-                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes /> }
+                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes commenting=commenting.clone() /> }
                 }).collect_view()}
             }
             .into_any()
@@ -291,8 +411,14 @@ fn FileView(
     comments: Vec<Placed>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
+    #[prop(optional_no_strip)] commenting: Option<Commenting>,
 ) -> impl IntoView {
     let c = &file.change;
+    let fc = commenting.map(|commenting| FileCommenting {
+        commenting,
+        path: c.path().to_owned(),
+        boxes: expect_context::<OpenBoxes>(),
+    });
     let binary = [&file.old, &file.new]
         .iter()
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
@@ -311,6 +437,7 @@ fn FileView(
     let body = {
         let file = file.clone();
         let comments = comments.clone();
+        let fc = fc.clone();
         // Computed once, on first expansion.
         let cache = StoredValue::new_local(None::<Arc<Layout>>);
         move || {
@@ -331,9 +458,9 @@ fn FileView(
                 l
             });
             if side_by_side.get() {
-                split_view(&l, &comments, inline_changes).into_any()
+                split_view(&l, &comments, inline_changes, fc.as_ref()).into_any()
             } else {
-                unified_view(&l, &comments, inline_changes).into_any()
+                unified_view(&l, &comments, inline_changes, fc.as_ref()).into_any()
             }
         }
     };
@@ -345,9 +472,23 @@ fn FileView(
                 <span class="path">{title}</span>
                 {all_upstream.then(|| view! { <span class="badge upstream-badge">"only rebase changes"</span> })}
                 <span class="stats"><span class="plus">{format!("+{added}")}</span>" "<span class="minus">{format!("−{removed}")}</span></span>
+                {fc.clone().map(|fc| {
+                    let draft = fc.commenting.draft(&fc.path, None);
+                    view! {
+                        <button type="button" class="link file-comment-button" on:click=move |ev| {
+                            // The header's own click folds the file.
+                            ev.stop_propagation();
+                            fc.boxes.set(&draft, true);
+                        }>"Comment on file"</button>
+                    }
+                })}
             </header>
             {(!file_comments.is_empty()).then(|| view! {
                 <div class="file-comments">{file_comments.into_iter().map(|p| view! { <ThreadView thread=p.thread /> }).collect_view()}</div>
+            })}
+            {fc.map(|fc| {
+                let draft = fc.commenting.draft(&fc.path, None);
+                move || fc.boxes.is_open(&draft).then(|| view! { <div class="file-comments">{fc.composer(None)}</div> })
             })}
             {body}
         </section>
@@ -394,7 +535,7 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
                     new_start: f.new_start,
                     ..layout_texts(&path, &path, &f.old, &f.new, None)
                 };
-                unified_view(&l, &[], inline_changes)
+                unified_view(&l, &[], inline_changes, None)
             }).collect_view()}
         </div>
     }
@@ -482,6 +623,7 @@ fn unified_view(
     l: &Layout,
     comments: &[Placed],
     inline_changes: Signal<bool>,
+    fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
@@ -520,8 +662,8 @@ fn unified_view(
             rows.push(
                 view! {
                     <tr class=format!("line {kind}") class:upstream=upstream>
-                        <td class="ln">{num(old.map(|o| o + l.old_start))}</td>
-                        <td class="ln">{num(new.map(|n| n + l.new_start))}</td>
+                        {FileCommenting::ln(fc, "ln".into(), Side::Left, old, num(old.map(|o| o + l.old_start)))}
+                        {FileCommenting::ln(fc, "ln".into(), Side::Right, new, num(new.map(|n| n + l.new_start)))}
                         <td class="marker">{marker}</td>
                         <td class="code" inner_html=code></td>
                     </tr>
@@ -531,6 +673,11 @@ fn unified_view(
             let mut threads = lc.take(Side::Left, old);
             threads.extend(lc.take(Side::Right, new));
             rows.extend(threads_row(threads, 4));
+            rows.extend(FileCommenting::boxes_row(
+                fc,
+                &[(Side::Left, old), (Side::Right, new)],
+                4,
+            ));
         }
     }
     rows.extend(skip_row(l.skipped_after, 4));
@@ -545,6 +692,7 @@ fn split_view(
     l: &Layout,
     comments: &[Placed],
     inline_changes: Signal<bool>,
+    fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
@@ -562,9 +710,9 @@ fn split_view(
             rows.push(
                 view! {
                     <tr class="line" class:upstream=upstream>
-                        <td class=format!("ln {lk}")>{num(r.old)}</td>
+                        {FileCommenting::ln(fc, format!("ln {lk}"), Side::Left, r.old, num(r.old))}
                         <td class=format!("code {lk}") inner_html=html(&l.old_html, r.old)></td>
-                        <td class=format!("ln {rk}")>{num(r.new)}</td>
+                        {FileCommenting::ln(fc, format!("ln {rk}"), Side::Right, r.new, num(r.new))}
                         <td class=format!("code {rk}") inner_html=html(&l.new_html, r.new)></td>
                     </tr>
                 }
@@ -573,6 +721,11 @@ fn split_view(
             let mut threads = lc.take(Side::Left, r.old);
             threads.extend(lc.take(Side::Right, r.new));
             rows.extend(threads_row(threads, 4));
+            rows.extend(FileCommenting::boxes_row(
+                fc,
+                &[(Side::Left, r.old), (Side::Right, r.new)],
+                4,
+            ));
         }
     }
     rows.extend(skip_row(l.skipped_after, 4));

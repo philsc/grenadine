@@ -10,10 +10,11 @@ use grenadine_core::api::{
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::composer::{Composer, OpenBoxes, sender};
+use crate::composer::{Composer, OpenBoxes, SendComment, sender};
+use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
-use crate::review::{Conversation, MergeBox, ReviewSummary};
+use crate::review::{Conversation, MergeBox, ReviewChoice, ReviewPanel, ReviewSummary};
 use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.
@@ -135,7 +136,8 @@ fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u3
         .map(|v| (v.sha.as_str(), v.number))
         .collect();
     let mut counts: HashMap<u32, (u32, u32)> = HashMap::new();
-    for t in threads(comments) {
+    // Pending threads aren't threads until the review is submitted.
+    for t in threads(comments).into_iter().filter(|t| !t.root.pending) {
         if let Some(&n) = numbers.get(t.root.original_commit.as_str()) {
             let (resolved, total) = counts.entry(n).or_default();
             *resolved += u32::from(t.root.resolved);
@@ -182,6 +184,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(OpenBoxes::new());
+    provide_context(ReviewChoice::new());
 
     move || {
         match pr.get() {
@@ -219,7 +222,11 @@ pub(crate) struct PrLinks {
 /// The PR whose page this is, for the comments and actions that change it
 /// on GitHub. Missing on pages that only show diffs, e.g. an agent's.
 #[derive(Clone)]
-pub(crate) struct ReviewTarget(pub(crate) PrKey);
+pub(crate) struct ReviewTarget {
+    pub(crate) key: PrKey,
+    /// The viewer has a pending review on the PR.
+    pub(crate) reviewing: bool,
+}
 
 /// Routes clicks on the `data-grenadine` links that markdown rendering put
 /// on PR references and that the stack list has. Shift+click — or a plain
@@ -289,7 +296,13 @@ fn PrBody(
         repo: pr.summary.key.repo.clone(),
         invert: pr_links,
     });
-    provide_context(ReviewTarget(pr.summary.key.clone()));
+    provide_context(ReviewTarget {
+        key: pr.summary.key.clone(),
+        reviewing: pr
+            .review
+            .as_ref()
+            .is_some_and(|r| r.pending_review.is_some()),
+    });
     let latest = pr.versions.len() as u32;
     let selection = {
         let pr = pr.clone();
@@ -348,6 +361,14 @@ fn PrBody(
                 .and_then(|(a, b)| Some((a?, b?)))
                 .filter(|(a, b)| a != b);
             let (inline, panel) = place(&pr.comments, &pr.versions, sel);
+            // GitHub anchors new comments to the PR's current diff.
+            let commenting = (pr.review.is_some()
+                && pr.summary.state == "OPEN"
+                && sel.head == latest)
+                .then(|| Commenting {
+                    key: pr.summary.key.clone(),
+                    left: sel.base == 0,
+                });
             view! {
                 <CommentPanel threads=panel chosen=chosen selection=selection />
                 <DiffView
@@ -356,6 +377,7 @@ fn PrBody(
                     right=head.sha.clone()
                     upstream=upstream
                     comments=Arc::new(inline)
+                    commenting=commenting
                     side_by_side=side_by_side.into()
                     inline_changes=inline_changes.into()
                 />
@@ -390,6 +412,12 @@ fn PrBody(
             {pr.review.clone().filter(|_| s.state == "OPEN").map(|info| view! { <MergeBox info=info /> })}
             <div class="toolbar">
                 <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
+                {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
+                    <ReviewPanel
+                        pending=pr.comments.iter().filter(|c| c.pending).count()
+                        own=info.viewer == s.author
+                    />
+                })}
                 <label class="toggle">
                     <input
                         type="checkbox"
@@ -680,15 +708,86 @@ fn VersionPicker(
 #[component]
 pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
     let links = expect_context::<PrLinks>();
+    let pending = comment
+        .node_id
+        .clone()
+        .filter(|_| comment.pending)
+        .zip(use_context::<ReviewTarget>());
+    // Open while the comment is being edited, in the same set as the boxes
+    // for new comments so that a refetch doesn't close it.
+    let boxes = expect_context::<OpenBoxes>();
+    let edit_draft = format!("edit.{}", comment.id);
+    let editing = {
+        let draft = edit_draft.clone();
+        Signal::derive(move || boxes.is_open(&draft))
+    };
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let body = {
+        let (comment, pending, repo) = (comment.clone(), pending.clone(), links.repo.clone());
+        move || match pending.clone().filter(|_| editing.get()) {
+            Some((node, target)) => {
+                let send = sender(move |body| {
+                    let (key, node) = (target.key.clone(), node.clone());
+                    async move { api::edit_review_comment(&key, &node, body).await }
+                });
+                view! {
+                    <Composer
+                        draft=edit_draft.clone()
+                        repo=repo.clone()
+                        label="Save"
+                        placeholder="Edit the comment…"
+                        send=send
+                        initial=comment.body.clone()
+                        autofocus=true
+                    />
+                }
+                .into_any()
+            }
+            None => view! {
+                <div class="markdown" inner_html=markdown::to_html(&comment.body, &repo)
+                    on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
+            }
+            .into_any(),
+        }
+    };
+    let start_editing = move |_| boxes.set(&format!("edit.{}", comment.id), true);
+    let actions = pending.map(|(node, target)| {
+        let delete = move |_| {
+            if !window()
+                .confirm_with_message("Delete this pending comment?")
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let (key, node) = (target.key.clone(), node.clone());
+            busy.set(true);
+            error.set(None);
+            leptos::task::spawn_local(async move {
+                if let Err(e) = api::delete_review_comment(&key, &node).await {
+                    let _ = error.try_set(Some(e));
+                }
+                let _ = busy.try_set(false);
+            });
+        };
+        view! {
+            <span class="comment-actions">
+                <button type="button" class="link" on:click=start_editing>"Edit"</button>
+                <button type="button" class="link" disabled=move || busy.get() on:click=delete>"Delete"</button>
+            </span>
+        }
+    });
     view! {
-        <div class="comment">
+        <div class="comment" class:pending=comment.pending>
             <div class="comment-meta">
                 <strong>{comment.author.clone()}</strong>
+                {comment.pending.then(|| view! { " " <span class="badge pending-badge">"Pending"</span> })}
                 " "
                 <a class="muted" href=comment.url.clone() target="_blank" rel="noopener">{comment.created_at.replace('T', " ").trim_end_matches('Z').to_owned()}</a>
+                {actions}
             </div>
-            <div class="markdown" inner_html=markdown::to_html(&comment.body, &links.repo)
-                on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
+            {body}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
         </div>
     }
 }
@@ -755,10 +854,10 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
 /// Replying to a thread and resolving it, under its comments.
 #[component]
 fn ThreadActions(root: ReviewComment) -> impl IntoView {
-    let (Some(ReviewTarget(key)), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id)
-    else {
+    let (Some(target), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id) else {
         return ().into_any();
     };
+    let key = target.key;
     let links = expect_context::<PrLinks>();
     let draft = format!("reply.{thread}");
     let boxes = expect_context::<OpenBoxes>();
@@ -778,22 +877,32 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
             leptos::task::spawn_local(async move {
                 // On success the page refreshes once the PR has synced.
                 if let Err(e) = api::set_thread_resolved(&key, &thread, !resolved).await {
-                    error.set(Some(e));
+                    let _ = error.try_set(Some(e));
                 }
-                busy.set(false);
+                let _ = busy.try_set(false);
             });
         }
     };
-    let send = {
+    let reply = |review: bool| -> SendComment {
         let (key, thread) = (key.clone(), thread.clone());
         sender(move |body| {
             let (key, thread) = (key.clone(), thread.clone());
-            async move { api::reply_to_thread(&key, &thread, body).await }
+            async move { api::reply_to_thread(&key, &thread, body, review).await }
         })
     };
-    let close = {
-        let draft = draft.clone();
-        Callback::new(move |()| boxes.set(&draft, false))
+    // While a review is pending, replies go into it unless asked otherwise.
+    let (label, send, alt) = if target.reviewing {
+        (
+            "Add to review",
+            reply(true),
+            ("Reply now".to_owned(), reply(false)),
+        )
+    } else {
+        (
+            "Reply",
+            reply(false),
+            ("Add to review".to_owned(), reply(true)),
+        )
     };
     let open = {
         let draft = draft.clone();
@@ -806,11 +915,10 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
                     <Composer
                         draft=draft.clone()
                         repo=links.repo.clone()
-                        label="Reply"
+                        label=label
                         placeholder="Reply…"
                         send=send.clone()
-                        on_cancel=close
-                        on_sent=close
+                        alt=alt.clone()
                         autofocus=true
                     />
                 }
@@ -925,6 +1033,8 @@ mod tests {
             resolved_by: None,
             thread_id: None,
             can_resolve: false,
+            pending: false,
+            node_id: None,
         }
     }
 

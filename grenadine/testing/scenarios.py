@@ -360,13 +360,27 @@ REVIEW_LINES = [f"Line {i}" for i in range(1, 11)]
 REPLY = "Reply to a thread"
 RESOLVE = "Resolve a thread"
 CONVERSE = "Comment on the PR"
-REVIEW_CASES = [REPLY, RESOLVE, CONVERSE]
+LINE_REVIEW = "Review some lines"
+APPROVE = "Approve without comments"
+DISCARD = "Discard a review"
+REPLY_IN_REVIEW = "Reply in a review"
+OWN = "Review my own PR"
+REVIEW_CASES = [
+    REPLY,
+    RESOLVE,
+    CONVERSE,
+    LINE_REVIEW,
+    APPROVE,
+    DISCARD,
+    REPLY_IN_REVIEW,
+    OWN,
+]
 
 
 def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
-    """One PR by the other account per review action, each with an
-    unresolved thread on line 2, so that the tests don't see each other's
-    changes."""
+    """One PR per review action, each with an unresolved thread on line 2,
+    so that the tests don't see each other's changes. All are by the other
+    account but OWN, which is the viewer's."""
     repo = gh.repo(REPO)
     repo.checkout("main")
     repo.commit("Seed the repo", {"README.md": "# test\n"})
@@ -376,9 +390,10 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
         branch = f"review/{i}"
         repo.checkout(branch, "main")
         lines = [f"{line} of {title}" for line in REVIEW_LINES]
-        repo.commit(title, {REVIEW_PATH: "\n".join(lines) + "\n"}, author=OTHER)
-        repo.push(branch, actor=OTHER)
-        pr = repo.open_pr(title, head=branch, author=OTHER)
+        author = VIEWER if title == OWN else OTHER
+        repo.commit(title, {REVIEW_PATH: "\n".join(lines) + "\n"}, author=author)
+        repo.push(branch, actor=author)
+        pr = repo.open_pr(title, head=branch, author=author)
         repo.comment(pr, author=OTHER, body="Is this right?", path=REVIEW_PATH, line=2)
         prs[title] = pr
     return prs
