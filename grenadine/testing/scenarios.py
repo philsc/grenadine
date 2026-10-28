@@ -353,3 +353,32 @@ def versions_cases(gh: FakeGitHub) -> Versions:
     shas[FILE_KINDS] = v
 
     return Versions(prs, shas)
+
+
+REVIEW_PATH = "review/notes.md"
+REVIEW_LINES = [f"Line {i}" for i in range(1, 11)]
+REPLY = "Reply to a thread"
+RESOLVE = "Resolve a thread"
+CONVERSE = "Comment on the PR"
+REVIEW_CASES = [REPLY, RESOLVE, CONVERSE]
+
+
+def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
+    """One PR by the other account per review action, each with an
+    unresolved thread on line 2, so that the tests don't see each other's
+    changes."""
+    repo = gh.repo(REPO)
+    repo.checkout("main")
+    repo.commit("Seed the repo", {"README.md": "# test\n"})
+    repo.push("main")
+    prs = {}
+    for i, title in enumerate(REVIEW_CASES):
+        branch = f"review/{i}"
+        repo.checkout(branch, "main")
+        lines = [f"{line} of {title}" for line in REVIEW_LINES]
+        repo.commit(title, {REVIEW_PATH: "\n".join(lines) + "\n"}, author=OTHER)
+        repo.push(branch, actor=OTHER)
+        pr = repo.open_pr(title, head=branch, author=OTHER)
+        repo.comment(pr, author=OTHER, body="Is this right?", path=REVIEW_PATH, line=2)
+        prs[title] = pr
+    return prs

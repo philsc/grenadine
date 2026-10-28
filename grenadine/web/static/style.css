@@ -1812,3 +1812,52 @@ textarea {
 .merge-status.bad {
   color: var(--del-fg);
 }
+
+/* Writing comments. */
+
+.thread-actions,
+.new-comment {
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+}
+.thread-actions .form-buttons,
+.new-comment.form-buttons {
+  margin: 0;
+}
+.comment-composer textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  resize: vertical;
+}
+.composer-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.composer-tabs button {
+  font-size: 12px;
+  border-color: transparent;
+  background: none;
+}
+.composer-tabs button.active {
+  border-color: var(--border);
+  background: var(--bg-subtle);
+}
+.composer-preview {
+  min-height: 4em;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.comment-composer .form-buttons {
+  align-items: center;
+}
+.composer-hint {
+  font-size: 12px;
+}

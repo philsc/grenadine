@@ -492,8 +492,7 @@ _Why:_ only their author can see them, and they may never be submitted.
 
 **REVIEW-CONV-1.** Below the description, the page must list the
 comments on the PR and the reviews, oldest first, in a section titled
-"N comments" that starts out unfolded. The section must be hidden when
-the list is empty.
+"N comments" that starts out unfolded.
 
 **REVIEW-CONV-2.** Each review must show its author, its verdict
 ("approved", "requested changes", "reviewed") and its summary. Comment
@@ -502,6 +501,38 @@ _Why:_ their comments are already shown in the diff.
 
 **REVIEW-CONV-3.** Each entry must link its time to the entry on GitHub
 and render its body like the description.
+
+## Writing comments
+
+**REVIEW-WRITE-1.** Comments are written in a comment box with Write and
+Preview tabs. The preview must render the text like the description.
+Ctrl+Enter, or Cmd+Enter, must send it; plain Enter adds a line.
+_Why:_ comments usually span several lines, unlike agent prompts.
+
+**REVIEW-WRITE-2.** What's written in a comment box must be kept as a
+draft in the browser until it's sent, so that reloading the page or
+switching PRs doesn't lose it. A box with a draft must start out open.
+Cancel must close the box and drop its draft.
+
+**REVIEW-WRITE-3.** A box must stay open with its text and show the error
+when sending fails. Once sent, it must close and drop its draft.
+
+**REVIEW-WRITE-4.** Every unfolded review thread must offer Reply, which
+opens a comment box under the thread. A reply must be posted to GitHub
+right away.
+
+**REVIEW-WRITE-5.** An unfolded thread must offer Resolve, or Unresolve
+when it's resolved, when GitHub says the viewer may. Resolving folds the
+thread like any other resolved thread (VPICK-CMT-7).
+
+**REVIEW-WRITE-6.** The conversation must end with a Comment button that
+opens a comment box for a comment on the PR itself. The conversation must
+be shown even when it's empty, titled "No comments".
+
+**REVIEW-WRITE-7.** After grenadine changes a PR on GitHub, it must sync
+the PR again so that the page shows the change. A sync that was already
+running when the change was made must not count, since it may have read
+the PR before the change.
 
 ## Merge box
 

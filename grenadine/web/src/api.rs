@@ -8,8 +8,9 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PermissionMode,
-    PrDetail, PrKey, PrMissing, PromptImage, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
+    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, NewComment,
+    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, SyncStatus, TerminalInfo,
+    WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -329,5 +330,34 @@ pub async fn wrap_up_agent(id: &str, wrap_up: &WrapUp) -> Result<()> {
     let req = Request::post(&format!("/api/agents/{id}/wrap-up"))
         .json(wrap_up)
         .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+fn pr_url(key: &PrKey) -> String {
+    format!("/api/pr/{}/{}", key.repo, key.number)
+}
+
+/// Comments on the PR itself.
+pub async fn add_comment(key: &PrKey, body: String) -> Result<()> {
+    let req = Request::post(&format!("{}/comments", pr_url(key)))
+        .json(&NewComment { body })
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn reply_to_thread(key: &PrKey, thread: &str, body: String) -> Result<()> {
+    let req = Request::post(&format!("{}/threads/{thread}/replies", pr_url(key)))
+        .json(&NewComment { body })
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+pub async fn set_thread_resolved(key: &PrKey, thread: &str, resolved: bool) -> Result<()> {
+    let url = format!("{}/threads/{thread}/resolve", pr_url(key));
+    let req = if resolved {
+        Request::post(&url)
+    } else {
+        Request::delete(&url)
+    };
     check(req.send().await).await.map(|_| ())
 }

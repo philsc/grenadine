@@ -134,6 +134,34 @@ impl State {
         });
     }
 
+    /// Syncs a PR after grenadine changed it on GitHub, so the page shows
+    /// the change. Unlike `sync_once`, a sync that's already running
+    /// doesn't make this one redundant, since it may have read the PR
+    /// before the change: this one waits for it and then runs.
+    pub fn resync(self: &Arc<State>, key: PrKey) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let polling = {
+                    let status = state.sync_status.lock().unwrap();
+                    status.in_flight.iter().any(|p| p.key == key)
+                };
+                if !polling && state.on_demand.lock().unwrap().insert(key.clone()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let result = sync_pr(&state, &key).await;
+            state.on_demand.lock().unwrap().remove(&key);
+            if let Err(e) = result {
+                tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
+                let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
+            }
+            state.send(ServerEvent::PrChanged(key.clone()));
+            state.send(ServerEvent::InboxesChanged);
+        });
+    }
+
     /// Ends the poll and records its outcome.
     fn status_idle(&self, result: &Result<()>) {
         self.update_status(|s| {
@@ -293,6 +321,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
             c.resolved = t.resolved;
             c.resolved_by = t.resolved_by.clone();
             c.thread_id = Some(t.id.clone());
+            c.can_resolve = t.can_resolve;
         }
     }
 

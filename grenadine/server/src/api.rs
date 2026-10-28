@@ -14,8 +14,8 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail,
-    PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
+    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession,
+    NewComment, PrDetail, PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -31,19 +31,25 @@ type St = AxState<Arc<State>>;
 /// makes a third bigger, and its text.
 const PROMPT_BODY_LIMIT: usize = agent::MAX_IMAGES * agent::MAX_IMAGE_BYTES / 3 * 4 + (1 << 20);
 
-/// An error that becomes a 500 response.
-struct ApiError(anyhow::Error);
+/// An error that becomes a response with its status, 500 unless the
+/// request was at fault.
+struct ApiError(StatusCode, anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        ApiError(e.into())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", self.0)).into_response()
+        (self.0, format!("{:#}", self.1)).into_response()
     }
+}
+
+/// An error the request is at fault for.
+fn refuse(status: StatusCode, msg: String) -> ApiError {
+    ApiError(status, anyhow::anyhow!(msg))
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -53,6 +59,18 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/inboxes", get(inboxes).post(create_inbox))
         .route("/api/inboxes/{id}", put(update_inbox).delete(delete_inbox))
         .route("/api/pr/{owner}/{name}/{number}", get(pr))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/comments",
+            post(add_comment),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/threads/{thread}/replies",
+            post(reply_to_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/threads/{thread}/resolve",
+            post(resolve_thread).delete(unresolve_thread),
+        )
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
         .route("/api/sync", get(sync_status))
@@ -189,6 +207,82 @@ async fn pr(
         None => PrMissing::NotSynced,
     };
     Ok(missing(what))
+}
+
+/// The PR a write goes to, if its repository is configured.
+fn writable(owner: String, name: String, number: u64, state: &State) -> ApiResult<PrKey> {
+    let key = PrKey {
+        repo: format!("{owner}/{name}"),
+        number,
+    };
+    if !state.repos.contains_key(&key.repo) {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("{} is not a configured repository", key.repo),
+        ));
+    }
+    Ok(key)
+}
+
+fn require_body(c: &NewComment) -> ApiResult<()> {
+    if c.body.trim().is_empty() {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "the comment is empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Comments on the PR itself.
+async fn add_comment(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_body(&c)?;
+    let id = state.github.pr_id(&key).await?;
+    state.github.add_comment(&id, &c.body).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn reply_to_thread(
+    AxState(state): St,
+    Path((owner, name, number, thread)): Path<(String, String, u64, String)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_body(&c)?;
+    state.github.reply_to_thread(&thread, &c.body).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn set_resolved(
+    state: Arc<State>,
+    (owner, name, number, thread): (String, String, u64, String),
+    resolved: bool,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    state.github.set_thread_resolved(&thread, resolved).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn resolve_thread(
+    AxState(state): St,
+    Path(path): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    set_resolved(state, path, true).await
+}
+
+async fn unresolve_thread(
+    AxState(state): St,
+    Path(path): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    set_resolved(state, path, false).await
 }
 
 /// Syncs the PR's stack-mates that changed since their last sync, going by

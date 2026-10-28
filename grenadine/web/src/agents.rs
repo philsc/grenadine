@@ -16,6 +16,7 @@ use leptos::task::spawn_local;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
+use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
 use crate::images::{self, AttachButton, Attachments};
@@ -858,28 +859,6 @@ fn model_signal() -> RwSignal<String> {
 /// switching to another session and back.
 fn draft_key(id: &str) -> String {
     format!("grenadine.agent-draft.{id}")
-}
-
-/// The follow-up being written in session `id`: the draft left there last,
-/// kept as it changes and dropped once empty.
-fn draft_signal(id: &str) -> RwSignal<String> {
-    let key = draft_key(id);
-    let draft = RwSignal::new(
-        storage()
-            .and_then(|s| s.get_item(&key).ok().flatten())
-            .unwrap_or_default(),
-    );
-    Effect::new(move |_| {
-        let Some(s) = storage() else { return };
-        draft.with(|d| {
-            let _ = if d.trim().is_empty() {
-                s.remove_item(&key)
-            } else {
-                s.set_item(&key, d)
-            };
-        });
-    });
-    draft
 }
 
 /// The model a request asks for; `None` leaves it to Claude Code.
@@ -2164,7 +2143,8 @@ fn Composer(
     model: RwSignal<String>,
 ) -> impl IntoView {
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
-    let prompt = id.with_value(|id| draft_signal(id));
+    // The follow-up being written in this session.
+    let prompt = id.with_value(|id| draft_signal(draft_key(id)));
     let images = RwSignal::new(Vec::<PromptImage>::new());
     let error = RwSignal::new(None::<String>);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && images.with(Vec::is_empty);
