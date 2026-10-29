@@ -22,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{OnceCell, broadcast, oneshot};
 
 use crate::git::Repo;
+use crate::reflow::reflow;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
@@ -1322,10 +1323,11 @@ const TERMINAL_TOOLS: [&str; 3] = [
     "mcp__grenadine__wait_for_terminal",
 ];
 
-/// A PR's title and body for a commit with `message`.
+/// A PR's title and body for a commit with `message`. The body is
+/// rewrapped at 72 columns so GitHub's squash merge doesn't wrap it again.
 fn pr_text(message: &str) -> (String, String) {
     let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
-    (subject.trim().to_owned(), body.trim().to_owned())
+    (subject.trim().to_owned(), reflow(body.trim(), 72))
 }
 
 /// Runs one prompt and returns the status the session ends up in.
@@ -2812,6 +2814,14 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             ("Fix it".into(), "Because.".into())
         );
         assert_eq!(pr_text("Two"), ("Two".into(), "".into()));
+        let long = "word ".repeat(15);
+        assert_eq!(
+            pr_text(&format!("Three\n\n{}", long.trim_end())),
+            (
+                "Three".into(),
+                format!("{}\nword", "word ".repeat(14).trim_end())
+            )
+        );
     }
 
     #[test]
