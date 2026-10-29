@@ -1,17 +1,20 @@
 //! Login shells in agent sessions' worktrees, which a session's page shows
 //! as terminal tabs. A shell keeps running while no page shows it, and a
-//! page that connects gets its recent output first.
+//! page that connects gets its recent output first. Claude reads them as
+//! text through the session's MCP server.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::{CStr, OsStr};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
+use fancy_regex::Regex;
 use grenadine_core::api::{AgentSession, ServerEvent, TerminalInfo, TerminalSize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -29,6 +32,9 @@ const BACKLOG: usize = 1024;
 /// How long a closed terminal's shell gets to exit after SIGHUP before it
 /// is killed.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often a wait for a terminal checks whether it is done.
+const WAIT_POLL: Duration = Duration::from_millis(200);
 
 pub struct Terminals {
     /// The shell they run.
@@ -52,6 +58,11 @@ struct Session {
 
 pub struct Terminal {
     writer: tokio::sync::Mutex<pty_process::OwnedWritePty>,
+    /// The pty's controlling side, to see which process group is in the
+    /// foreground.
+    pty: OwnedFd,
+    /// The shell's PID, which is also its process group's ID.
+    pid: u32,
     output: Mutex<Output>,
     /// Cancelled to close the terminal.
     hangup: CancellationToken,
@@ -62,6 +73,10 @@ pub struct Terminal {
 struct Output {
     /// The last `SCROLLBACK` bytes of output.
     recent: VecDeque<u8>,
+    /// How many bytes of output there have been in all.
+    total: u64,
+    /// The size the shell was last told it has.
+    size: TerminalSize,
     /// Sends the output to the connected pages; `None` once the shell
     /// exited.
     tx: Option<broadcast::Sender<Bytes>>,
@@ -143,7 +158,49 @@ impl Terminals {
     }
 }
 
+/// Why a wait for a terminal ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitEnd {
+    /// The output since the wait began matched.
+    Matched,
+    /// A command finished and the shell is back at its prompt.
+    Finished,
+    /// The shell is at its prompt and its output has stopped.
+    Idle,
+    /// The shell exited.
+    Exited,
+    TimedOut,
+}
+
+impl WaitEnd {
+    pub fn describe(self) -> &'static str {
+        match self {
+            WaitEnd::Matched => "The output matched.",
+            WaitEnd::Finished => "A command finished and the shell is back at its prompt.",
+            WaitEnd::Idle => "The shell is at its prompt and its output stopped.",
+            WaitEnd::Exited => "The shell exited.",
+            WaitEnd::TimedOut => "The wait timed out.",
+        }
+    }
+}
+
 impl Terminal {
+    fn new(writer: pty_process::OwnedWritePty, pty: OwnedFd, pid: u32) -> Terminal {
+        Terminal {
+            writer: tokio::sync::Mutex::new(writer),
+            pty,
+            pid,
+            output: Mutex::new(Output {
+                recent: VecDeque::new(),
+                total: 0,
+                size: TerminalSize { cols: 80, rows: 24 },
+                tx: Some(broadcast::channel(BACKLOG).0),
+            }),
+            hangup: CancellationToken::new(),
+            exited: CancellationToken::new(),
+        }
+    }
+
     /// The recent output and a receiver for what comes after it, or `None`
     /// once the shell exited.
     fn subscribe(&self) -> Option<(Vec<u8>, broadcast::Receiver<Bytes>)> {
@@ -152,9 +209,116 @@ impl Terminal {
         Some((output.recent.iter().copied().collect(), rx))
     }
 
+    /// The last `lines` lines of the recent output as the terminal shows
+    /// them, without colors.
+    pub fn text(&self, lines: usize) -> String {
+        let (recent, size) = {
+            let output = self.output.lock().unwrap();
+            (
+                output.recent.iter().copied().collect::<Vec<_>>(),
+                output.size,
+            )
+        };
+        render(&recent, size, lines)
+    }
+
+    /// The output after the first `start` bytes of it, as far as it is
+    /// still recent, as a terminal shows it on its own.
+    fn text_since(&self, start: u64) -> String {
+        let (since, size) = {
+            let output = self.output.lock().unwrap();
+            let new = usize::try_from(output.total - start).unwrap_or(usize::MAX);
+            let skip = output.recent.len().saturating_sub(new);
+            let since: Vec<u8> = output.recent.range(skip..).copied().collect();
+            (since, output.size)
+        };
+        render(&since, size, usize::MAX)
+    }
+
+    /// Whether the shell, rather than a command that it started, has the
+    /// terminal.
+    fn at_prompt(&self) -> bool {
+        // SAFETY: tcgetpgrp has no memory-safety preconditions.
+        let group = unsafe { libc::tcgetpgrp(self.pty.as_raw_fd()) };
+        group == self.pid as libc::pid_t
+    }
+
+    /// Waits for the first of these, and returns which it was:
+    /// - the output since the wait began matches `until`;
+    /// - a command that ran during the wait finished, and the shell is back
+    ///   at its prompt;
+    /// - the shell is at its prompt and has been quiet for `idle` since a
+    ///   line of output came, which catches commands too quick to see run
+    ///   but not a pause while typing one;
+    /// - the shell exits;
+    /// - `timeout` passes.
+    pub async fn wait(
+        &self,
+        until: Option<&Regex>,
+        idle: Option<Duration>,
+        timeout: Duration,
+    ) -> WaitEnd {
+        let (start, mut rx) = {
+            let output = self.output.lock().unwrap();
+            match &output.tx {
+                Some(tx) => (output.total, tx.subscribe()),
+                None => return WaitEnd::Exited,
+            }
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut poll = tokio::time::interval(WAIT_POLL);
+        // Output since the last poll.
+        let mut fresh = false;
+        let mut last_output: Option<Instant> = None;
+        let mut new_line = false;
+        let mut ran = false;
+        loop {
+            tokio::select! {
+                out = rx.recv() => match out {
+                    Ok(data) => {
+                        fresh = true;
+                        last_output = Some(Instant::now());
+                        new_line |= data.contains(&b'\n');
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        fresh = true;
+                        last_output = Some(Instant::now());
+                        new_line = true;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return WaitEnd::Exited,
+                },
+                _ = poll.tick() => {
+                    if fresh
+                        && let Some(until) = until
+                        && until.is_match(&self.text_since(start)).unwrap_or(false)
+                    {
+                        return WaitEnd::Matched;
+                    }
+                    let quiet = !std::mem::take(&mut fresh);
+                    if !self.at_prompt() {
+                        ran = true;
+                    } else if ran {
+                        // The prompt has been printed once the output
+                        // stopped.
+                        if quiet {
+                            return WaitEnd::Finished;
+                        }
+                    } else if let (Some(idle), Some(last)) = (idle, last_output)
+                        && new_line
+                        && last.elapsed() >= idle
+                    {
+                        return WaitEnd::Idle;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => return WaitEnd::TimedOut,
+            }
+        }
+    }
+
     fn push(&self, data: &[u8]) {
         let mut output = self.output.lock().unwrap();
         output.recent.extend(data);
+        output.total += data.len() as u64;
         let excess = output.recent.len().saturating_sub(SCROLLBACK);
         output.recent.drain(..excess);
         if let Some(tx) = &output.tx {
@@ -163,14 +327,41 @@ impl Terminal {
         }
     }
 
-    async fn write(&self, input: &[u8]) -> std::io::Result<()> {
+    pub(crate) async fn write(&self, input: &[u8]) -> std::io::Result<()> {
         self.writer.lock().await.write_all(input).await
     }
 
     async fn resize(&self, size: TerminalSize) {
-        let size = pty_process::Size::new(size.rows.max(1), size.cols.max(1));
-        let _ = self.writer.lock().await.resize(size);
+        let size = TerminalSize {
+            cols: size.cols.max(1),
+            rows: size.rows.max(1),
+        };
+        let writer = self.writer.lock().await;
+        if writer
+            .resize(pty_process::Size::new(size.rows, size.cols))
+            .is_ok()
+        {
+            self.output.lock().unwrap().size = size;
+        }
     }
+}
+
+/// The last `lines` lines of `output` as a terminal of `size` shows it,
+/// scrollback included, without colors. Wrapped lines are joined.
+fn render(output: &[u8], size: TerminalSize, lines: usize) -> String {
+    let dim = |n: u16| std::num::NonZeroU16::new(n).unwrap_or(std::num::NonZeroU16::MIN);
+    let mut parser = vt100::Parser::new(dim(size.rows), dim(size.cols), usize::MAX);
+    parser.process(output);
+    let mut formatted = String::new();
+    // Writing to a String can't fail.
+    let _ = parser.screen().write_contents_formatted_basic(
+        &mut formatted,
+        vt100::capture::BasicFormattedCaptureRange::Full(&mut Default::default()),
+    );
+    let plain: String = vt100::capture::basic_formatted_to_plain(&formatted).collect();
+    let all: Vec<&str> = plain.lines().map(str::trim_end).collect();
+    let end = all.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1);
+    all[end.saturating_sub(lines)..end].join("\n")
 }
 
 /// The user's login shell from the password database, else `$SHELL`.
@@ -252,16 +443,9 @@ pub fn open(state: &Arc<State>, session: &AgentSession) -> Result<TerminalInfo> 
         state.agents.slice_of(&session.id),
     )?;
     let pid = child.id().context("the shell exited right away")?;
+    let fd = pty.as_fd().try_clone_to_owned()?;
     let (mut reader, writer) = pty.into_split();
-    let terminal = Arc::new(Terminal {
-        writer: tokio::sync::Mutex::new(writer),
-        output: Mutex::new(Output {
-            recent: VecDeque::new(),
-            tx: Some(broadcast::channel(BACKLOG).0),
-        }),
-        hangup: CancellationToken::new(),
-        exited: CancellationToken::new(),
-    });
+    let terminal = Arc::new(Terminal::new(writer, fd, pid));
     let id = {
         let mut sessions = state.agents.terminals.sessions.lock().unwrap();
         let s = sessions.entry(session.id.clone()).or_default();
@@ -385,16 +569,9 @@ mod tests {
     #[tokio::test]
     async fn scrollback_keeps_the_end() {
         let (pty, _) = pty_process::open().unwrap();
+        let fd = pty.as_fd().try_clone_to_owned().unwrap();
         let (_, writer) = pty.into_split();
-        let t = Terminal {
-            writer: tokio::sync::Mutex::new(writer),
-            output: Mutex::new(Output {
-                recent: VecDeque::new(),
-                tx: Some(broadcast::channel(BACKLOG).0),
-            }),
-            hangup: CancellationToken::new(),
-            exited: CancellationToken::new(),
-        };
+        let t = Terminal::new(writer, fd, 0);
         t.push(&vec![b'a'; SCROLLBACK]);
         t.push(b"bc");
         let (recent, mut rx) = t.subscribe().unwrap();
@@ -404,5 +581,18 @@ mod tests {
         assert_eq!(&rx.try_recv().unwrap()[..], b"d");
         t.output.lock().unwrap().tx = None;
         assert!(t.subscribe().is_none());
+    }
+
+    #[test]
+    fn renders_what_the_terminal_shows() {
+        let size = TerminalSize { cols: 10, rows: 3 };
+        // Progress redrawn over itself, colors, and a line that wraps.
+        let output = b"one\r\n\x1b[32mtwo\x1b[0m\r\n50%\r100%\r\n0123456789abc\r\n$ \r\n\r\n";
+        assert_eq!(
+            render(output, size, usize::MAX),
+            "one\ntwo\n100%\n0123456789abc\n$"
+        );
+        assert_eq!(render(output, size, 2), "0123456789abc\n$");
+        assert_eq!(render(b"", size, 5), "");
     }
 }

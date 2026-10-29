@@ -59,6 +59,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vt100 = "0.18"
 # Must match the wasm-bindgen CLI that rules_rust_wasm_bindgen 0.74.0 ships
 # (rrwbd__wasm-bindgen-cli-0.2.121); the CLI rejects any other version.
 wasm-bindgen = "=0.2.121"

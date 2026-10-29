@@ -1299,6 +1299,29 @@ fn landed_note(session: &AgentSession) -> Option<String> {
     Some(note)
 }
 
+/// What Claude is told about the session's terminal tabs, when it has any.
+fn terminals_note(state: &State, id: &str) -> Option<String> {
+    let open = state.agents.terminals.list(id);
+    if open.is_empty() {
+        return None;
+    }
+    let names: Vec<_> = open.iter().map(|t| format!("Terminal {}", t.id)).collect();
+    Some(format!(
+        "The user has terminal tabs open in this session's page: {}. They are login shells in \
+         this session's working directory. When you ask the user to run a command in one, call \
+         the grenadine MCP server's wait_for_terminal tool to wait for it and read its output, \
+         instead of asking them to paste it. read_terminal reads a terminal at any time.",
+        names.join(", ")
+    ))
+}
+
+/// The grenadine MCP server's tools that Claude may use without asking.
+const TERMINAL_TOOLS: [&str; 3] = [
+    "mcp__grenadine__list_terminals",
+    "mcp__grenadine__read_terminal",
+    "mcp__grenadine__wait_for_terminal",
+];
+
 /// A PR's title and body for a commit with `message`.
 fn pr_text(message: &str) -> (String, String) {
     let (subject, body) = message.split_once('\n').unwrap_or((message, ""));
@@ -1333,6 +1356,10 @@ async fn turn(
             }
         }
     });
+    let notes: Vec<_> = [landed_note(&session), terminals_note(state, id)]
+        .into_iter()
+        .flatten()
+        .collect();
     // `systemd-run --scope` execs claude, so the PID stays claude's.
     let mut cmd = if state.agents.slices {
         let mut cmd = tokio::process::Command::new("systemd-run");
@@ -1360,10 +1387,13 @@ async fn turn(
         "--permission-prompt-tool",
         "mcp__grenadine__approve",
     ])
+    .arg("--allowedTools")
+    .args(TERMINAL_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
     .args(
-        landed_note(&session)
+        (!notes.is_empty())
+            .then(|| notes.join("\n\n"))
             .into_iter()
             .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
     )
@@ -2090,6 +2120,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(lines[1].contains(" --permission-mode manual "), "{log}");
         assert!(!lines[1].contains("--model"), "{log}");
         assert!(lines[1].contains("--permission-prompt-tool mcp__grenadine__approve"));
+        assert!(
+            lines[1].contains(
+                " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
+                 mcp__grenadine__wait_for_terminal --mcp-config "
+            ),
+            "{log}"
+        );
         assert!(lines[1].ends_with(" | second | 1"), "{log}");
 
         // Pages get the stored events and the streamed text.
@@ -3158,6 +3195,24 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             note.contains("#5 https://github.com/o/n/pull/5 from branch `grenadine/agent/abc-2`\n"),
             "{note}"
         );
+    }
+
+    #[tokio::test]
+    async fn tells_claude_about_open_terminals() {
+        let mut state = crate::sync::test_state();
+        Arc::get_mut(&mut state).unwrap().agents.terminals =
+            crate::terminal::Terminals::new("/bin/sh".into());
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_row(&uuid(), "o/n", dir.path());
+        assert_eq!(terminals_note(&state, &session.id), None);
+        crate::terminal::open(&state, &session).unwrap();
+        crate::terminal::open(&state, &session).unwrap();
+        let note = terminals_note(&state, &session.id).unwrap();
+        assert!(
+            note.contains("this session's page: Terminal 1, Terminal 2."),
+            "{note}"
+        );
+        state.agents.terminals.close_all(&session.id).await;
     }
 
     #[tokio::test]
