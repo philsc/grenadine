@@ -434,9 +434,9 @@ pub fn CleanupView() -> impl IntoView {
     let cleanup = cleanup_resource();
     let repos = LocalResource::new(api::repos);
     let picked = RwSignal::new(Vec::<i64>::new());
-    let repo = RwSignal::new(String::new());
-    // Until a repository is picked, it follows the first picked item's.
-    let repo_picked = RwSignal::new(false);
+    // What items describe is outside any worktree, so the session needs
+    // none unless a repository is picked.
+    let repo = RwSignal::new(GENERAL.to_owned());
     let model = model_signal();
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -449,27 +449,6 @@ pub fn CleanupView() -> impl IntoView {
     Effect::new(move |_| {
         if let Some(Ok(c)) = cleanup.get() {
             picked.update(|p| p.retain(|id| c.items.iter().any(|i| i.id == *id)));
-        }
-    });
-    Effect::new(move |_| {
-        if repo_picked.get() {
-            return;
-        }
-        let first_picked = picked.with(|p| p.first().copied()).and_then(|id| {
-            cleanup.with(|c| match c {
-                Some(Ok(c)) => c.items.iter().find(|i| i.id == id).map(|i| i.repo.clone()),
-                _ => None,
-            })
-        });
-        let configured = repos.with(|r| match r {
-            Some(Ok(list)) => with_general(list.clone()),
-            _ => Vec::new(),
-        });
-        let next = first_picked
-            .filter(|r| configured.contains(r))
-            .or_else(|| configured.first().cloned());
-        if let Some(next) = next {
-            repo.set(next);
         }
     });
 
@@ -574,10 +553,7 @@ pub fn CleanupView() -> impl IntoView {
                 <label>"Repository"
                     <select
                         prop:value=move || repo.get()
-                        on:change=move |ev| {
-                            repo_picked.set(true);
-                            repo.set(event_target_value(&ev));
-                        }
+                        on:change=move |ev| repo.set(event_target_value(&ev))
                     >
                         {move || repos.get().and_then(Result::ok).map(with_general).unwrap_or_default().into_iter().map(|r| {
                             let value = r.clone();
@@ -593,6 +569,7 @@ pub fn CleanupView() -> impl IntoView {
                     on:click=hand_off
                 >
                     {move || match (busy.get(), picked.with(Vec::len)) {
+                        (true, _) if repo.with(|r| r == GENERAL) => "Starting…".to_owned(),
                         (true, _) => "Creating worktree…".to_owned(),
                         (false, 0) => "Pick items to clean up".to_owned(),
                         (false, n) => format!("Clean up {} in a new session", count(n, "item")),

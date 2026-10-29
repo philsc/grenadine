@@ -1551,8 +1551,11 @@ class CleanupTest(ServerTestCase):
         hand_off = self.page.get_by_role("button", name="Pick items to clean up")
         expect(hand_off).to_be_disabled()
         self.page.get_by_label("Container e2e").check()
+        # The session runs in no repository, whichever one the item is from.
+        expect(self.page.get_by_label("Repository")).to_have_value("general")
         self.page.get_by_role("button", name="Clean up 1 item in a new session").click()
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".agent-header")).to_contain_text("in no repository")
         prompt = self.page.locator(".transcript .turn-prompt")
         expect(prompt).to_contain_text(
             "Clean up what deleted agent sessions left behind"

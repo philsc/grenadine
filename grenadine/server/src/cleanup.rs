@@ -633,8 +633,8 @@ fn hand_off_prompt(items: &[CleanupItem]) -> String {
         "Clean up what deleted agent sessions left behind\n\n\
          A scan of the sessions' transcripts found the items below. Check that each one \
          still exists and is safe to remove, e.g. that nothing else uses it, before you \
-         remove it, and leave out anything that isn't. This worktree is only a place to \
-         work from; the items are elsewhere on this machine or on remotes.\n",
+         remove it, and leave out anything that isn't. Where this session runs is only a \
+         place to work from; the items are elsewhere on this machine or on remotes.\n",
     );
     for item in items {
         prompt += &format!(
