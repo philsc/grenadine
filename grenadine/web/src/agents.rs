@@ -8,7 +8,7 @@ use std::time::Duration;
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs, AgentSession, AgentStatus, Approval,
     CleanupState, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    WorktreeFile, WrapUp, WrapUpTarget,
+    PromptImage, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -18,6 +18,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
+use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
 use crate::{Route, Updates, api, hash_for, markdown};
 
@@ -952,6 +953,8 @@ pub fn NewSession(draft: String) -> impl IntoView {
     let prompt = RwSignal::new(saved.prompt);
     let mode = RwSignal::new(saved.mode);
     let model = RwSignal::new(saved.model);
+    // Drafts keep only the text; images last as long as the form.
+    let images = RwSignal::new(Vec::<PromptImage>::new());
     let error = RwSignal::new(None::<String>);
     let id = StoredValue::new(draft.clone());
 
@@ -1012,6 +1015,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
             prompt: prompt.get_untracked(),
             permission_mode: mode.get_untracked(),
             model: model_arg(model),
+            images: images.get_untracked(),
         };
         let id = id.get_value();
         busy.set(true);
@@ -1034,10 +1038,15 @@ pub fn NewSession(draft: String) -> impl IntoView {
 
     view! {
         <div class="agents">
-            <form class="agent-form" on:submit=move |ev| {
-                ev.prevent_default();
-                start();
-            }>
+            <form
+                class="agent-form"
+                on:submit=move |ev| {
+                    ev.prevent_default();
+                    start();
+                }
+                on:dragover=images::drag_over
+                on:drop=move |ev| images::drop(ev, images, error)
+            >
                 <h2>"New session"</h2>
                 <div class="agent-form-row">
                     <label>"Repository"
@@ -1071,6 +1080,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                     aria-label="Prompt"
                     prop:value=move || prompt.get()
                     on:input=move |ev| prompt.set(event_target_value(&ev))
+                    on:paste=move |ev| images::paste(ev, images, error)
                     on:keydown=move |ev| {
                         if submits(&ev) {
                             ev.prevent_default();
@@ -1078,6 +1088,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         }
                     }
                 ></textarea>
+                <Attachments images=images />
                 <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} " Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions and a different model."</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
@@ -1092,6 +1103,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             (true, true) => "Starting…",
                         }}
                     </button>
+                    <AttachButton images=images error=error />
                 </div>
             </form>
         </div>
@@ -1609,9 +1621,23 @@ fn Transcript(
                     let repo = repo.clone();
                     let id = id.clone();
                     match e.kind {
+                        // A prompt can be only images.
+                        AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
                         AgentEventKind::Prompt(p)
                         | AgentEventKind::ApprovalResolved { message: Some(p), .. } => view! {
                             <div class="turn-prompt">{p}</div>
+                        }.into_any(),
+                        AgentEventKind::Images(names) => view! {
+                            <div class="turn-images">
+                                {names.into_iter().map(|name| {
+                                    let url = format!("/api/agents/{id}/images/{name}");
+                                    view! {
+                                        <a href=url.clone() target="_blank" rel="noopener">
+                                            <img src=url.clone() alt="Image sent with the prompt" />
+                                        </a>
+                                    }
+                                }).collect_view()}
+                            </div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
                             <div class="turn-text markdown" inner_html=markdown::to_html(&t, &repo)></div>
@@ -1826,7 +1852,7 @@ fn PlanCard(
         busy.set(true);
         error.set(None);
         spawn_local(async move {
-            if let Err(e) = api::send_agent_message(&agent, prompt, next, model).await {
+            if let Err(e) = api::send_agent_message(&agent, prompt, Vec::new(), next, model).await {
                 error.set(Some(e));
             }
             busy.set(false);
@@ -2112,7 +2138,9 @@ fn Composer(
 ) -> impl IntoView {
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
     let prompt = id.with_value(|id| draft_signal(id));
+    let images = RwSignal::new(Vec::<PromptImage>::new());
     let error = RwSignal::new(None::<String>);
+    let blank = move || prompt.with(|p| p.trim().is_empty()) && images.with(Vec::is_empty);
     let working = move || {
         session.with(|s| {
             matches!(
@@ -2123,15 +2151,20 @@ fn Composer(
     };
 
     let send = move || {
-        let text = prompt.get_untracked();
-        if text.trim().is_empty() {
+        if blank() {
             return;
         }
+        let text = prompt.get_untracked();
+        let attached = images.get_untracked();
         let mode = mode.get_untracked();
         let model = model_arg(model);
         spawn_local(async move {
-            match api::send_agent_message(&id.get_value(), text, mode, model).await {
-                Ok(()) => prompt.set(String::new()),
+            match api::send_agent_message(&id.get_value(), text, attached, mode, model).await {
+                Ok(()) => {
+                    prompt.set(String::new());
+                    images.set(Vec::new());
+                    error.set(None);
+                }
                 Err(e) => error.set(Some(e)),
             }
         });
@@ -2145,16 +2178,22 @@ fn Composer(
     };
 
     view! {
-        <form class="composer" on:submit=move |ev| {
-            ev.prevent_default();
-            send();
-        }>
+        <form
+            class="composer"
+            on:submit=move |ev| {
+                ev.prevent_default();
+                send();
+            }
+            on:dragover=images::drag_over
+            on:drop=move |ev| images::drop(ev, images, error)
+        >
             <textarea
                 rows="3"
                 aria-label="Follow-up"
                 placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)" } else { "Reply to Claude… (Enter sends, Shift+Enter for a new line)" }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
+                on:paste=move |ev| images::paste(ev, images, error)
                 on:keydown=move |ev| {
                     if submits(&ev) {
                         ev.prevent_default();
@@ -2162,11 +2201,13 @@ fn Composer(
                     }
                 }
             ></textarea>
+            <Attachments images=images />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode />
                 <ModelSelect model=model />
-                <button type="submit" class="primary" disabled=move || prompt.with(|p| p.trim().is_empty())>"Send"</button>
+                <button type="submit" class="primary" disabled=blank>"Send"</button>
+                <AttachButton images=images error=error />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
                 <div class="composer-status">
                     {move || active_model.get().map(|m| view! { <span class="agent-model" title="Model">{m}</span> })}

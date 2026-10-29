@@ -1,5 +1,5 @@
 {
-  "checksum": "1d557ffd6a6a1d4d461caa9be8a6cf8d0e5baf4f8177ca7ed016c3f82be2a28d",
+  "checksum": "6359e329fb3cb1f591d4e56df23d43d12f2e8e59e39f9c94d1d11ac7338d36b3",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16528,6 +16528,7 @@
             "BeforeUnloadEvent",
             "BinaryType",
             "Blob",
+            "CanvasRenderingContext2d",
             "CharacterData",
             "ClipboardEvent",
             "CloseEvent",
@@ -16536,6 +16537,7 @@
             "CompositionEvent",
             "CssStyleDeclaration",
             "CustomEvent",
+            "DataTransfer",
             "DeviceMotionEvent",
             "DeviceOrientationEvent",
             "Document",
@@ -16549,6 +16551,8 @@
             "EventSource",
             "EventSourceInit",
             "EventTarget",
+            "File",
+            "FileList",
             "FileReader",
             "FocusEvent",
             "FormData",
@@ -16622,6 +16626,7 @@
             "HtmlTrackElement",
             "HtmlUListElement",
             "HtmlVideoElement",
+            "ImageBitmap",
             "InputEvent",
             "IntersectionObserver",
             "IntersectionObserverEntry",
@@ -16693,7 +16698,6 @@
           "selects": {
             "wasm32-unknown-unknown": [
               "BlobPropertyBag",
-              "File",
               "ServiceWorkerGlobalScope",
               "WorkerGlobalScope"
             ]

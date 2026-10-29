@@ -8,6 +8,7 @@ mod diffview;
 mod drafts;
 mod events;
 mod highlight;
+mod images;
 mod inboxes;
 mod markdown;
 mod pr;

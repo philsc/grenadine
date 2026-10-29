@@ -36,7 +36,8 @@ STARTUP_TIMEOUT = 30
 # lists its models when asked like the Agent SDK does, summarizes a new
 # session's request as "Task: " and its first line, answers the scans of
 # deleted sessions with a container they left behind, and finds no stale
-# cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME".
+# cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME". It
+# says how many images came with the prompt.
 FAKE_CLAUDE = r"""
 import json
 import subprocess
@@ -46,7 +47,8 @@ import urllib.request
 import uuid
 
 args = sys.argv[1:]
-if "--input-format" in args:
+# Listing models is the only call without an MCP server.
+if "--input-format" in args and "--mcp-config" not in args:
     request = json.loads(sys.stdin.readline())
     models = [
         {"value": "default", "displayName": "Default (recommended)", "description": "claude-test"},
@@ -69,7 +71,9 @@ if "--json-schema" in args:
         output = {"items": [item]}
     print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
-prompt = sys.stdin.read()
+content = json.loads(sys.stdin.read())["message"]["content"]
+images = sum(block["type"] == "image" for block in content)
+prompt = "".join(block["text"] for block in content if block["type"] == "text")
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
 mode = args[args.index("--permission-mode") + 1]
 model = args[args.index("--model") + 1] if "--model" in args else "claude-test"
@@ -115,6 +119,8 @@ for word in ["Working ", "on ", "it"]:
     time.sleep(0.05)
 usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 40000, "output_tokens": 500}
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
+if images:
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"I see {images} images."}]}})
 # Grenadine asks it to commit before landing its work.
 if prompt.startswith("Wrap up: commit"):
     subprocess.run(["git", "add", "-A"], check=True)
@@ -996,6 +1002,50 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(transcript.locator(".turn-prompt")).to_have_count(2)
         expect(follow_up).to_have_value("")
+
+    def test_pasted_images_go_with_the_prompt(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # A screenshot pasted into the text box shows as a thumbnail.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("look at this")
+        paste = """async (box) => {
+            const canvas = document.createElement("canvas");
+            canvas.width = 2000;
+            canvas.height = 1000;
+            canvas.getContext("2d").fillRect(0, 0, 10, 10);
+            const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+            const data = new DataTransfer();
+            data.items.add(new File([blob], "screenshot.png", {type: "image/png"}));
+            box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+        }"""
+        follow_up.evaluate(paste)
+        thumbnails = self.page.locator(".prompt-image img")
+        expect(thumbnails).to_have_count(1)
+        follow_up.evaluate(paste)
+        expect(thumbnails).to_have_count(2)
+        self.page.get_by_role("button", name="Remove the image").first.click()
+        expect(thumbnails).to_have_count(1)
+        # The pasted text stays as it was.
+        expect(follow_up).to_have_value("look at this")
+
+        # Claude gets the image with the prompt, scaled down, and the
+        # transcript shows it.
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(transcript).to_contain_text("I see 1 images.")
+        expect(thumbnails).to_have_count(0)
+        sent = transcript.locator(".turn-images img")
+        expect(sent).to_have_count(1)
+        expect(sent).to_have_js_property("naturalWidth", 1568)
+        self.page.reload()
+        expect(sent).to_have_js_property("naturalWidth", 1568)
 
     def test_new_session_drafts_survive_switching(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

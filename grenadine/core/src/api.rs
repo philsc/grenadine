@@ -570,6 +570,9 @@ pub struct NewAgent {
     /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Images that go with the prompt, e.g. pasted screenshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<PromptImage>,
 }
 
 /// A follow-up prompt for an agent session.
@@ -581,6 +584,18 @@ pub struct AgentMessage {
     /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Images that go with the prompt, e.g. pasted screenshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<PromptImage>,
+}
+
+/// An image sent with a prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// The image's bytes, base64-encoded.
+    pub data: String,
 }
 
 /// Where wrapping up a session puts its commits.
@@ -680,6 +695,9 @@ pub struct Approval {
 pub enum AgentEventKind {
     /// A prompt the user sent.
     Prompt(String),
+    /// The images sent with the prompt before it, by their names under
+    /// `/api/agents/{id}/images/`.
+    Images(Vec<String>),
     /// A piece of assistant text while it streams in. Never stored; the
     /// complete `Text` follows.
     TextDelta(String),
