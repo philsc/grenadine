@@ -1397,6 +1397,10 @@ textarea {
   background: var(--bg);
 }
 .approval .plan-feedback {
+  /* A block, so the gap to the buttons doesn't hang on the browser's
+     baseline, and wide enough for the focus ring. */
+  display: block;
+  margin: 6px 0;
   width: 100%;
   box-sizing: border-box;
   font: inherit;
