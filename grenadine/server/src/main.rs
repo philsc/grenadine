@@ -9,6 +9,7 @@ mod git;
 mod github;
 mod inboxes;
 mod mcp;
+mod reflow;
 mod stack;
 mod summary;
 mod sync;
