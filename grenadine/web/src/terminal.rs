@@ -226,6 +226,9 @@ struct Live {
     xterm: XTerm,
     fit: Fit,
     connection: RefCell<Option<Connection>>,
+    /// What was typed while the connection was still opening, sent once
+    /// it opens.
+    pending: RefCell<Vec<u8>>,
     stopped: Cell<bool>,
     observer: RefCell<Option<web_sys::ResizeObserver>>,
     _on_data: Closure<dyn FnMut(String)>,
@@ -284,6 +287,7 @@ impl Live {
                 xterm,
                 fit,
                 connection: RefCell::new(None),
+                pending: RefCell::new(Vec::new()),
                 stopped: Cell::new(false),
                 observer: RefCell::new(None),
                 _on_data: on_data,
@@ -335,6 +339,10 @@ impl Live {
                 // The server starts over with the recent output.
                 live.xterm.reset();
                 live.send_size();
+                let pending = std::mem::take(&mut *live.pending.borrow_mut());
+                if !pending.is_empty() {
+                    live.send(&pending);
+                }
             }
         });
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
@@ -386,10 +394,16 @@ impl Live {
     }
 
     fn send(&self, data: &[u8]) {
-        if let Some(c) = &*self.connection.borrow()
-            && c.socket.ready_state() == WebSocket::OPEN
-        {
-            let _ = c.socket.send_with_u8_array(data);
+        let Some(c) = &*self.connection.borrow() else {
+            return;
+        };
+        match c.socket.ready_state() {
+            WebSocket::OPEN => {
+                let _ = c.socket.send_with_u8_array(data);
+            }
+            // Keys typed right after a tab opens would otherwise be lost.
+            WebSocket::CONNECTING => self.pending.borrow_mut().extend_from_slice(data),
+            _ => {}
         }
     }
 
