@@ -23,4 +23,23 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
-      - run: bazel test //...
+      - run: bazel test --build_event_json_file=bep.json //...
+      # Collect the logs and outputs of the tests that didn't pass.
+      - if: failure()
+        run: |
+          testlogs=$(bazel info bazel-testlogs)
+          jq -r 'select(.id.testResult and .testResult.status != "PASSED")
+              | .testResult.testActionOutput[] | select(.name == "test.log") | .uri' bep.json \
+            | sed 's|^file://||' \
+            | while read -r log; do
+                dir=$(dirname "$log")
+                dest="failed-testlogs/${dir#"$testlogs"/}"
+                mkdir -p "$dest"
+                cp -rL "$dir"/. "$dest"
+              done
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failed-testlogs
+          path: failed-testlogs
+          if-no-files-found: ignore
