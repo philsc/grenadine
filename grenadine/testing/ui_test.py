@@ -144,7 +144,8 @@ if prompt.startswith("commit "):
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
     result(tool_use, prompt.removeprefix("open pr ") + "\n")
-# `screenshot` has it read a screenshot, whose result carries the image.
+# `screenshot` has it read a screenshot, whose result carries the image,
+# and then show it to the user.
 if prompt == "screenshot":
     png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
            "hKmMIQAAAABJRU5ErkJggg==")
@@ -153,6 +154,11 @@ if prompt == "screenshot":
     tool_use = use("Read", {"file_path": "shot.png"})
     image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}}
     result(tool_use, [image])
+    arguments = {"path": "shot.png", "caption": "The page"}
+    tool_use = use("mcp__grenadine__show_image", arguments)
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    shown = rpc("tools/call", {"name": "show_image", "arguments": arguments})
+    result(tool_use, shown["result"]["content"][0]["text"])
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -950,17 +956,20 @@ class AgentTest(ServerTestCase):
         transcript = self.page.locator(".transcript")
         expect(transcript.locator(".turn-end")).to_have_count(1)
 
-        # The screenshot Read returned shows below its collapsed tool call.
+        # The screenshot Read returned shows below its collapsed tool call,
+        # and the one Claude showed has its caption.
         images = transcript.locator(".turn-image")
-        expect(images).to_have_count(1)
+        expect(images).to_have_count(2)
+        expect(images.locator("figcaption")).to_have_text(["The page"])
+        expect(images.last.locator("img")).to_have_attribute("alt", "The page")
         for img in images.locator("img").all():
             img.scroll_into_view_if_needed()
             expect(img).to_have_js_property("naturalWidth", 1)
         expect(transcript.locator(".tool[open]")).to_have_count(0)
 
-        # It's stored, so a reload shows it again.
+        # They're stored, so a reload shows them again.
         self.page.reload()
-        expect(images).to_have_count(1)
+        expect(images).to_have_count(2)
         expect(images.first.locator("img")).to_have_js_property("naturalWidth", 1)
 
     def test_sidebar_delete(self) -> None:

@@ -703,6 +703,13 @@ pub enum AgentEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
     },
+    /// An image Claude showed the user with the `show_image` tool.
+    Image {
+        /// The id that `/api/images/{id}` serves the image under.
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
     /// Claude wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
         id: String,

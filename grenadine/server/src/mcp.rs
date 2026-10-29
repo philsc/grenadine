@@ -5,8 +5,9 @@
 //! to `AskUserQuestion` and the mode an approved plan goes on in come back
 //! with the approval.
 //!
-//! The other tools let Claude read the session's terminal tabs, e.g. to see
-//! what a command it asked the user to run printed.
+//! The terminal tools let Claude read the session's terminal tabs, e.g. to
+//! see what a command it asked the user to run printed. `show_image` puts
+//! an image, such as a screenshot, into the transcript.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use axum::Json;
 use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use grenadine_core::api::PermissionMode;
+use grenadine_core::api::{AgentEventKind, PermissionMode};
 use serde_json::{Value, json};
 
 use crate::agent::{self, Decision};
@@ -35,6 +36,9 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// How long a terminal at its prompt has to be quiet for a wait without
 /// `until` to end, unless Claude says otherwise.
 const IDLE: Duration = Duration::from_secs(3);
+
+/// The largest image `show_image` shows.
+const MAX_IMAGE: u64 = 20 << 20;
 
 /// Forgets the permission request when Claude Code hangs up without an
 /// answer, e.g. because the turn was interrupted.
@@ -193,6 +197,27 @@ pub async fn handle(
                     },
                 },
                 "annotations": {"readOnlyHint": true},
+            }, {
+                "name": "show_image",
+                "description": "Shows the user an image file, such as a screenshot, in \
+                    the session's transcript. Use it whenever the user asks how something \
+                    looks, or to show what a screenshot you took shows. PNG, JPEG, GIF and \
+                    WebP are supported.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The image's path, absolute or relative to the \
+                                session's working directory.",
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "A short caption shown below the image.",
+                        },
+                    },
+                    "required": ["path"],
+                },
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -244,8 +269,12 @@ pub async fn handle(
         }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or_default();
-            let (text, failed) = match terminal_tool(&state, &id, name, &params["arguments"]).await
-            {
+            let args = &params["arguments"];
+            let result = match name {
+                "show_image" => show_image(&state, &id, args).await,
+                _ => terminal_tool(&state, &id, name, args).await,
+            };
+            let (text, failed) = match result {
                 Ok(text) => (text, false),
                 Err(e) => (format!("{e:#}"), true),
             };
@@ -263,6 +292,49 @@ fn seconds(value: &Value) -> Option<Duration> {
     value
         .as_f64()
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
+}
+
+/// The MIME type of an image in a format browsers show, from its first
+/// bytes.
+fn image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Puts the image at `args.path` into the session's transcript.
+async fn show_image(state: &State, id: &str, args: &Value) -> anyhow::Result<String> {
+    let path = args["path"].as_str().context("`path` is required")?;
+    let session = state.db.agent(id)?.context("The session is gone.")?;
+    let path = std::path::Path::new(&session.worktree).join(path);
+    let size = tokio::fs::metadata(&path)
+        .await
+        .with_context(|| format!("Can't read {}", path.display()))?
+        .len();
+    if size > MAX_IMAGE {
+        bail!("{} is larger than {} MB.", path.display(), MAX_IMAGE >> 20);
+    }
+    let data = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("Can't read {}", path.display()))?;
+    let mime = image_mime(&data)
+        .with_context(|| format!("{} isn't a PNG, JPEG, GIF or WebP image.", path.display()))?;
+    let image = agent::store_image(state, id, mime, &data)?;
+    let caption = args["caption"]
+        .as_str()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
+    agent::emit(state, id, AgentEventKind::Image { id: image, caption })?;
+    Ok("The user sees the image in the transcript.".into())
 }
 
 /// Runs one of the tools that read the session's terminals.
@@ -330,7 +402,7 @@ async fn terminal_tool(
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{AgentEventKind, AgentSession, AgentStatus};
+    use grenadine_core::api::{AgentSession, AgentStatus};
 
     use super::*;
 
@@ -427,7 +499,8 @@ mod tests {
                 "approve",
                 "list_terminals",
                 "read_terminal",
-                "wait_for_terminal"
+                "wait_for_terminal",
+                "show_image"
             ]
         );
         let (_, body) = call(
@@ -694,6 +767,41 @@ mod tests {
                     "answers": {"Tea?": "Yes"},
                 },
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn shows_images() {
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let text = dir.path().join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+
+        let (message, failed) = tool(&state, "show_image", json!({"path": text})).await;
+        assert!(failed && message.ends_with("isn't a PNG, JPEG, GIF or WebP image."));
+        let (message, failed) = tool(&state, "show_image", json!({})).await;
+        assert!(failed, "{message}");
+
+        let (_, failed) = tool(
+            &state,
+            "show_image",
+            json!({"path": png, "caption": " The page "}),
+        )
+        .await;
+        assert!(!failed);
+        let events = state.db.agent_events(ID).unwrap();
+        let [event] = &events[..] else {
+            panic!("{events:?}")
+        };
+        let AgentEventKind::Image { id, caption } = &event.kind else {
+            panic!("{event:?}")
+        };
+        assert_eq!(caption.as_deref(), Some("The page"));
+        assert_eq!(
+            state.db.agent_image(id).unwrap(),
+            Some(("image/png".into(), b"\x89PNG\r\n\x1a\nrest".to_vec()))
         );
     }
 }
