@@ -1485,7 +1485,11 @@ fn Transcript(
                         content,
                         is_error,
                         patch,
-                    } => Some((id.clone(), (content.clone(), *is_error, patch.clone()))),
+                        images,
+                    } => Some((
+                        id.clone(),
+                        (content.clone(), *is_error, patch.clone(), images.clone()),
+                    )),
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>()
@@ -1601,7 +1605,7 @@ fn Transcript(
                             let body = {
                                 let name = name.clone();
                                 move || {
-                                    let patch = result.with(|r| r.as_ref().map(|(_, _, p)| p.clone()));
+                                    let patch = result.with(|r| r.as_ref().map(|(_, _, p, _)| p.clone()));
                                     match edit_fragments(&name, &value, &patch.unwrap_or_default()) {
                                         Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
                                         None => view! { <pre class="tool-input">{pretty(&input)}</pre> }.into_any(),
@@ -1615,18 +1619,26 @@ fn Transcript(
                                         " " <code>{summary}</code>
                                         {move || match result.get() {
                                             None => view! { <span class="muted">" …"</span> }.into_any(),
-                                            Some((_, true, _)) => view! { <span class="error">" failed"</span> }.into_any(),
+                                            Some((_, true, _, _)) => view! { <span class="error">" failed"</span> }.into_any(),
                                             Some(_) => ().into_any(),
                                         }}
                                     </summary>
                                     {body}
                                     // A successful edit's result only repeats the diff.
                                     {move || result.get()
-                                        .filter(|(_, is_error, _)| *is_error || !is_edit)
-                                        .map(|(content, is_error, _)| view! {
+                                        .filter(|(_, is_error, _, _)| *is_error || !is_edit)
+                                        .map(|(content, is_error, _, _)| view! {
                                             <pre class="tool-result" class:error=is_error>{content}</pre>
                                         })}
                                 </details>
+                                // Outside the details, so that screenshots show without
+                                // opening the tool call.
+                                {move || {
+                                    let images = result.with(|r| r.as_ref().map(|(_, _, _, i)| i.clone()));
+                                    images.unwrap_or_default().into_iter().map(|image| view! {
+                                        <TranscriptImage id=image />
+                                    }).collect_view()
+                                }}
                             }.into_any()
                         }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "ExitPlanMode" => {
@@ -1726,6 +1738,19 @@ fn Transcript(
             }}
             <div node_ref=end></div>
         </div>
+    }
+}
+
+/// An image in the transcript, which opens at full size in a new tab.
+#[component]
+fn TranscriptImage(id: String) -> impl IntoView {
+    let src = format!("/api/images/{id}");
+    view! {
+        <figure class="turn-image">
+            <a href=src.clone() target="_blank">
+                <img src=src.clone() alt="" loading="lazy" />
+            </a>
+        </figure>
     }
 }
 

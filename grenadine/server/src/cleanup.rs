@@ -696,6 +696,7 @@ mod tests {
             content: content.into(),
             is_error,
             patch: Vec::new(),
+            images: Vec::new(),
         })
     }
 

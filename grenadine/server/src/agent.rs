@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, GENERAL, Landed,
     LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
@@ -1485,7 +1486,8 @@ async fn turn(
                 }
             }
             Parsed::Events(events) => {
-                for kind in events {
+                for mut kind in events {
+                    store_images(state, id, &mut kind)?;
                     if let AgentEventKind::Usage { tokens, window } = kind {
                         record_usage(state, id, tokens, window)?;
                         continue;
@@ -1637,6 +1639,56 @@ fn result_text(content: &Value) -> String {
     }
 }
 
+/// The images in a tool result as `data:` URLs, which `store_images`
+/// replaces with ids before the result is stored.
+fn result_images(content: &Value) -> Vec<String> {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "image" && b["source"]["type"] == "base64")
+        .filter_map(|b| {
+            let source = &b["source"];
+            Some(format!(
+                "data:{};base64,{}",
+                source["media_type"].as_str()?,
+                source["data"].as_str()?
+            ))
+        })
+        .collect()
+}
+
+/// Stores an image of session `id`'s transcript and returns its new id.
+pub fn store_image(state: &State, id: &str, mime: &str, data: &[u8]) -> Result<String> {
+    let image = uuid();
+    state.db.add_agent_image(id, &image, mime, data)?;
+    Ok(image)
+}
+
+/// Moves the images of a tool result from its `data:` URLs into the
+/// database, so that the transcript only carries their ids. Images that
+/// don't decode are dropped.
+fn store_images(state: &State, id: &str, kind: &mut AgentEventKind) -> Result<()> {
+    let AgentEventKind::ToolResult { images, .. } = kind else {
+        return Ok(());
+    };
+    let mut stored = Vec::new();
+    for url in images.drain(..) {
+        let Some((mime, data)) = url
+            .strip_prefix("data:")
+            .and_then(|u| u.split_once(";base64,"))
+        else {
+            continue;
+        };
+        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+            continue;
+        };
+        stored.push(store_image(state, id, mime, &data)?);
+    }
+    *images = stored;
+    Ok(())
+}
+
 /// The hunks of a file tool's `structuredPatch`, or none when the result
 /// has no patch.
 fn patch(result: &Value) -> Vec<PatchHunk> {
@@ -1727,6 +1779,7 @@ fn parse_line(line: &str) -> Parsed {
                 // A message carries one tool result, and its patch is
                 // beside it.
                 patch: patch(&v["tool_use_result"]),
+                images: result_images(&b["content"]),
             })
             .collect(),
         Some("result") => {
@@ -1864,17 +1917,19 @@ mod tests {
                 content: "No shell for you".into(),
                 is_error: true,
                 patch: vec![],
+                images: vec![],
             }]
         );
         assert_eq!(
             events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"a"},{"type":"image"}]}]},"parent_tool_use_id":null}"#
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"a"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]}]},"parent_tool_use_id":null}"#
             ),
             [AgentEventKind::ToolResult {
                 id: "toolu_2".into(),
                 content: "a\n[image]".into(),
                 is_error: false,
                 patch: vec![],
+                images: vec!["data:image/png;base64,iVBO".into()],
             }]
         );
         assert_eq!(
@@ -1890,6 +1945,7 @@ mod tests {
                     new_start: 4,
                     lines: vec![" a".into(), "-b".into(), "+c".into()],
                 }],
+                images: vec![],
             }]
         );
         assert_eq!(
@@ -2848,6 +2904,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             content: content.into(),
             is_error,
             patch: Vec::new(),
+            images: Vec::new(),
         };
         let events = [
             bash(

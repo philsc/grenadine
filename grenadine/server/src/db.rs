@@ -260,6 +260,17 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE inbox_prs ADD COLUMN ci TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Images in sessions' transcripts, which events refer to by id.
+    CREATE TABLE agent_images (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+        mime TEXT NOT NULL,
+        data BLOB NOT NULL
+    );
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1117,6 +1128,27 @@ impl Db {
         Ok(seq)
     }
 
+    /// Stores an image of a session's transcript under `image`, a new id.
+    pub fn add_agent_image(&self, id: &str, image: &str, mime: &str, data: &[u8]) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO agent_images (id, agent_id, mime, data) VALUES (?, ?, ?, ?)",
+            params![image, id, mime, data],
+        )?;
+        Ok(())
+    }
+
+    /// An image's MIME type and bytes.
+    pub fn agent_image(&self, image: &str) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT mime, data FROM agent_images WHERE id = ?",
+                [image],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// A session's transcript in order.
     pub fn agent_events(&self, id: &str) -> Result<Vec<AgentEvent>> {
         let conn = self.conn();
@@ -1838,9 +1870,17 @@ mod tests {
         // Events need their session.
         assert!(db.append_agent_event("x", &text).is_err());
 
+        db.add_agent_image("a", "i", "image/png", b"png").unwrap();
+        assert_eq!(
+            db.agent_image("i").unwrap(),
+            Some(("image/png".into(), b"png".to_vec()))
+        );
+        assert_eq!(db.agent_image("j").unwrap(), None);
+
         assert!(db.delete_agent("a").unwrap());
         assert!(!db.delete_agent("a").unwrap());
         assert_eq!(db.agent_events("a").unwrap(), []);
+        assert_eq!(db.agent_image("i").unwrap(), None);
     }
 
     #[test]
@@ -1923,6 +1963,7 @@ mod tests {
                 content: "https://github.com/o/n/pull/4".into(),
                 is_error: false,
                 patch: Vec::new(),
+                images: Vec::new(),
             },
         ];
         for e in &events {

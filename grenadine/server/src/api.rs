@@ -63,6 +63,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
+        .route("/api/images/{id}", get(image))
         .route(
             "/api/agents/{id}/terminals",
             get(terminals).post(open_terminal),
@@ -210,7 +211,8 @@ fn is_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Commits and blobs never change, so their responses can be cached forever.
+/// Commits, blobs and images never change, so their responses can be cached
+/// forever.
 fn immutable<T: IntoResponse>(body: T) -> Response {
     (
         [(header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
@@ -560,6 +562,14 @@ async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<R
     Ok(Sse::new(agent_event_stream(&state, &id)?)
         .keep_alive(keep_alive())
         .into_response())
+}
+
+/// An image of a session's transcript. Images never change once stored.
+async fn image(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    Ok(match state.db.agent_image(&id)? {
+        Some((mime, data)) => immutable(([(header::CONTENT_TYPE, mime)], data)),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
 }
 
 #[cfg(test)]
