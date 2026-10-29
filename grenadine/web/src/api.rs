@@ -9,7 +9,7 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
     Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PermissionMode,
-    PrDetail, PrKey, PrMissing, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
+    PrDetail, PrKey, PrMissing, PromptImage, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -261,6 +261,7 @@ pub async fn create_agent(req: &NewAgent) -> Result<AgentSession> {
 pub async fn send_agent_message(
     id: &str,
     prompt: String,
+    images: Vec<PromptImage>,
     permission_mode: PermissionMode,
     model: Option<String>,
 ) -> Result<()> {
@@ -269,6 +270,7 @@ pub async fn send_agent_message(
             prompt,
             permission_mode,
             model,
+            images,
         })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())

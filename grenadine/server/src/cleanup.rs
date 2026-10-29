@@ -665,6 +665,7 @@ pub async fn hand_off(state: &Arc<State>, req: NewCleanupSession) -> Result<Opti
             prompt: hand_off_prompt(&items),
             permission_mode: PermissionMode::Plan,
             model: req.model,
+            images: Vec::new(),
         },
     )
     .await?;

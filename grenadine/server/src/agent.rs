@@ -1,7 +1,7 @@
 //! Claude Code sessions driven from the UI. Each session works in its own
 //! git worktree; every prompt runs one `claude -p` process that resumes
-//! the session, and its stream-json output becomes the session's
-//! transcript. Each prompt comes with a permission mode; Claude asks about
+//! the session and reads the prompt as a stream-json message, and its
+//! stream-json output becomes the session's transcript. Each prompt comes with a permission mode; Claude asks about
 //! the tool uses that the mode doesn't decide on its own through the MCP
 //! tool in `mcp.rs`, which waits for the user's answer from the page.
 
@@ -16,7 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, GENERAL, Landed,
-    LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, ServerEvent, WrapUp, WrapUpTarget,
+    LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, PromptImage, ServerEvent, WrapUp,
+    WrapUpTarget,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -42,6 +43,21 @@ const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
 /// How much of claude's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
+
+/// The most images one prompt may come with.
+pub const MAX_IMAGES: usize = 20;
+
+/// The largest image a prompt may come with, in bytes. The Claude API
+/// takes images up to 5 MB.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// The image types Claude takes, with the extensions they're stored with.
+const IMAGE_TYPES: [(&str, &str); 4] = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpg"),
+    ("image/gif", "gif"),
+    ("image/webp", "webp"),
+];
 
 /// How long a deleted session's processes get to exit before they're
 /// killed.
@@ -102,6 +118,9 @@ pub struct Agents {
     claude: PathBuf,
     /// Worktrees go to `<dir>/<owner>/<name>/<id>`.
     worktrees: PathBuf,
+    /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
+    /// is `images` next to `worktrees`.
+    images: PathBuf,
     /// Where Claude Code reaches this server, e.g. `http://127.0.0.1:8765`.
     base_url: String,
     /// Whether each session's processes go into their own systemd user
@@ -124,8 +143,8 @@ struct Live {
     events: broadcast::Sender<AgentEvent>,
     /// Authenticates the session's MCP endpoint.
     secret: String,
-    /// Prompts with their mode and model.
-    queue: VecDeque<(String, PermissionMode, Option<String>)>,
+    /// Prompts waiting for their turn.
+    queue: VecDeque<Queued>,
     /// Whether a task is running the queued prompts.
     running: bool,
     /// The current claude process.
@@ -136,6 +155,15 @@ struct Live {
     pending: HashMap<String, oneshot::Sender<Decision>>,
     /// The wrap-up in progress, if any.
     wrap_up: Option<Pending>,
+}
+
+/// A prompt with the names of its images, and the mode and model its turn
+/// goes with.
+struct Queued {
+    prompt: String,
+    images: Vec<String>,
+    mode: PermissionMode,
+    model: Option<String>,
 }
 
 impl Live {
@@ -501,11 +529,13 @@ impl Agents {
         summaries: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
+        // Claude Code runs in the worktrees, so a relative path would
+        // resolve differently there.
+        let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
             claude,
-            // Claude Code runs in the worktrees, so a relative path would
-            // resolve differently there.
-            worktrees: std::path::absolute(&worktrees)?,
+            images: worktrees.with_file_name("images"),
+            worktrees,
             base_url,
             slices,
             live: std::sync::Mutex::default(),
@@ -525,6 +555,11 @@ impl Agents {
     /// The `claude` executable.
     pub fn claude(&self) -> &Path {
         &self.claude
+    }
+
+    /// Where the images sent with prompts go.
+    pub fn images(&self) -> &Path {
+        &self.images
     }
 
     /// Runs `f` on the session's live state, creating it if needed.
@@ -698,8 +733,16 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
+    let images = save_images(state, &id, &req.images).await?;
     crate::summary::start(state, &id, &req.prompt);
-    send(state, &id, req.prompt, req.permission_mode, req.model);
+    send_with_images(
+        state,
+        &id,
+        req.prompt,
+        images,
+        req.permission_mode,
+        req.model,
+    );
     Ok(session)
 }
 
@@ -764,13 +807,142 @@ pub fn send(
     mode: PermissionMode,
     model: Option<String>,
 ) {
+    send_with_images(state, id, prompt, Vec::new(), mode, model);
+}
+
+/// Queues a prompt with the images `save_images` saved for it.
+pub fn send_with_images(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    images: Vec<String>,
+    mode: PermissionMode,
+    model: Option<String>,
+) {
     let start = state.agents.with_live(id, |l| {
-        l.queue.push_back((prompt, mode, model));
+        l.queue.push_back(Queued {
+            prompt,
+            images,
+            mode,
+            model,
+        });
         !std::mem::replace(&mut l.running, true)
     });
     if start {
         tokio::spawn(run(state.clone(), id.to_owned()));
     }
+}
+
+/// Why Claude can't take `images`, if it can't.
+pub fn check_images(images: &[PromptImage]) -> Option<String> {
+    if images.len() > MAX_IMAGES {
+        return Some(format!("a prompt can have at most {MAX_IMAGES} images"));
+    }
+    for image in images {
+        if extension(&image.media_type).is_none() {
+            return Some(format!("{} images aren't supported", image.media_type));
+        }
+        // Base64 takes 4 characters for every 3 bytes.
+        if image.data.len() / 4 * 3 > MAX_IMAGE_BYTES {
+            return Some(format!(
+                "images can be at most {} MB",
+                MAX_IMAGE_BYTES / 1024 / 1024
+            ));
+        }
+    }
+    None
+}
+
+/// The extension images of `media_type` are stored with.
+fn extension(media_type: &str) -> Option<&'static str> {
+    IMAGE_TYPES
+        .iter()
+        .find(|(t, _)| *t == media_type)
+        .map(|(_, ext)| *ext)
+}
+
+/// The media type of the image stored as `name`.
+fn media_type(name: &str) -> Option<&'static str> {
+    let (_, ext) = name.rsplit_once('.')?;
+    IMAGE_TYPES.iter().find(|(_, e)| *e == ext).map(|(t, _)| *t)
+}
+
+/// Stores the images sent with one of the session's prompts, which
+/// `check_images` took, and returns their names.
+pub async fn save_images(state: &State, id: &str, images: &[PromptImage]) -> Result<Vec<String>> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = state.agents.images.join(id);
+    tokio::fs::create_dir_all(&dir).await?;
+    let mut names = Vec::new();
+    for image in images {
+        let ext = extension(&image.media_type)
+            .ok_or_else(|| anyhow!("{} images aren't supported", image.media_type))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .context("the image isn't valid base64")?;
+        let name = format!("{}.{ext}", random_hex(16));
+        tokio::fs::write(dir.join(&name), bytes).await?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// The file of the session's image `name` and its media type, if `name`
+/// could be one of its images.
+pub fn image_file(state: &State, id: &str, name: &str) -> Option<(PathBuf, &'static str)> {
+    let (stem, _) = name.rsplit_once('.')?;
+    if !valid_id(id) || stem.len() != 32 || !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((state.agents.images.join(id).join(name), media_type(name)?))
+}
+
+/// Removes the images of sessions that are gone, e.g. those of sessions
+/// deleted while the server was down.
+pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
+    let Ok(dirs) = std::fs::read_dir(images) else {
+        return Ok(());
+    };
+    let owned: std::collections::BTreeSet<String> =
+        db.agents()?.into_iter().map(|s| s.id).collect();
+    for dir in dirs.flatten() {
+        let name = dir.file_name().to_string_lossy().into_owned();
+        if valid_id(&name) && !owned.contains(&name) {
+            remove_tree(&dir.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// The stream-json user message that gives Claude `prompt` with the images
+/// in `dir` named `images`. The text goes last: Claude Code only takes a
+/// prompt for a slash command when its last block is the command.
+async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<String> {
+    let mut content = Vec::new();
+    for name in images {
+        let bytes = tokio::fs::read(dir.join(name))
+            .await
+            .with_context(|| format!("can't read the image {name}"))?;
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type(name).unwrap_or("image/png"),
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        }));
+    }
+    if !prompt.trim().is_empty() {
+        content.push(json!({"type": "text", "text": prompt}));
+    }
+    let message = json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": null,
+    });
+    Ok(format!("{message}\n"))
 }
 
 /// Stops the current turn and drops the queued prompts.
@@ -938,6 +1110,12 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             workspace.starts_with(&worktree)
         }))
     });
+    match tokio::fs::remove_dir_all(state.agents.images.join(id)).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("can't remove the images of agent {id}: {e}");
+        }
+        _ => {}
+    }
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
     state.agents.terminals.forget(id);
@@ -959,7 +1137,7 @@ async fn run(state: Arc<State>, id: String) {
             l.interrupted = false;
             (prompt, l.wrap_up.is_some())
         });
-        let Some((prompt, mode, model)) = prompt else {
+        let Some(queued) = prompt else {
             if !waiting {
                 return;
             }
@@ -974,7 +1152,7 @@ async fn run(state: Arc<State>, id: String) {
             }
             return;
         };
-        let status = match turn(&state, &id, prompt, mode, model).await {
+        let status = match turn(&state, &id, queued).await {
             Ok(status) => status,
             Err(e) => {
                 tracing::warn!("agent {id}: {e:#}");
@@ -1333,18 +1511,21 @@ fn pr_text(message: &str) -> (String, String) {
 }
 
 /// Runs one prompt and returns the status the session ends up in.
-async fn turn(
-    state: &Arc<State>,
-    id: &str,
-    prompt: String,
-    mode: PermissionMode,
-    model: Option<String>,
-) -> Result<AgentStatus> {
+async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatus> {
+    let Queued {
+        prompt,
+        images,
+        mode,
+        model,
+    } = queued;
     let session = state
         .db
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
+    if !images.is_empty() {
+        emit(state, id, AgentEventKind::Images(images.clone()))?;
+    }
     set_status(state, id, AgentStatus::Running);
     // Nothing of a general session's is lost with its directory, so one
     // that went away comes back.
@@ -1382,6 +1563,8 @@ async fn turn(
         cmd.args(["--session-id", id]);
     }
     cmd.args([
+        "--input-format",
+        "stream-json",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -1414,6 +1597,7 @@ async fn turn(
     if let Some(model) = model.filter(|m| m != "default") {
         cmd.arg("--model").arg(model);
     }
+    let input = user_message(&prompt, &state.agents.images.join(id), &images).await?;
     // Keep claude out of the terminal's process group, like git in
     // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
     // SAFETY: setsid is async-signal-safe and the closure touches no
@@ -1442,7 +1626,7 @@ async fn turn(
     // taken for a flag. If claude exits without reading it, its exit status
     // and stderr below say why.
     let mut stdin = child.stdin.take().unwrap();
-    if let Err(e) = stdin.write_all(prompt.as_bytes()).await
+    if let Err(e) = stdin.write_all(input.as_bytes()).await
         && e.kind() != std::io::ErrorKind::BrokenPipe
     {
         return Err(e.into());
@@ -2039,6 +2223,75 @@ mod tests {
         panic!("the session didn't finish {turns} turns");
     }
 
+    /// A prompt's images go to claude as content blocks of a stream-json
+    /// message, stay for the transcript and go with the session.
+    #[tokio::test]
+    async fn sends_images() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {log}
+cat >> {log}
+echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+"#,
+            log = log.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let session = start(&state, "plain text").await;
+        let id = &session.id;
+        std::fs::remove_file(&log).unwrap();
+
+        let png = PromptImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0K".into(),
+        };
+        assert_eq!(check_images(std::slice::from_ref(&png)), None);
+        let bmp = PromptImage {
+            media_type: "image/bmp".into(),
+            ..png.clone()
+        };
+        assert!(check_images(&[bmp]).is_some());
+        let names = save_images(&state, id, &[png]).await.unwrap();
+        send_with_images(
+            &state,
+            id,
+            "what's this?".into(),
+            names.clone(),
+            PermissionMode::Auto,
+            None,
+        );
+        let events = wait_for_turns(&state, id, 2).await;
+        assert!(
+            events.contains(&AgentEventKind::Images(names.clone())),
+            "{events:?}"
+        );
+
+        let log = std::fs::read_to_string(&log).unwrap();
+        let (args, input) = log.split_once('\n').unwrap();
+        assert!(args.contains("--input-format stream-json"), "{args}");
+        let message: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(
+            message["message"]["content"],
+            json!([
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0K"}},
+                {"type": "text", "text": "what's this?"},
+            ])
+        );
+
+        let (file, media_type) = image_file(&state, id, &names[0]).unwrap();
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            [0x89, b'P', b'N', b'G', b'\r', b'\n']
+        );
+        assert!(image_file(&state, id, "../../etc/passwd").is_none());
+        assert!(delete(&state, id).await.unwrap());
+        assert!(!file.exists());
+    }
+
     /// Claude Code lists its models in its answer to `initialize`, as
     /// 2.1 writes it, shortened.
     #[tokio::test]
@@ -2098,6 +2351,11 @@ echo '{{"type":"control_response","response":{{"subtype":"success","request_id":
         assert!(!state.agents.offers(Some("sonnet")).await);
     }
 
+    /// Reads the prompt's text from the stream-json message on stdin into
+    /// `$prompt`, for fake claudes in shell. Only for text without quotes,
+    /// backslashes or newlines, which JSON would escape.
+    const READ_PROMPT: &str = r#"prompt=$(sed -n 's/.*"text":"\([^"]*\)".*/\1/p')"#;
+
     #[tokio::test]
     async fn runs_turns_in_a_worktree_and_resumes() {
         let fx = crate::git::tests::fixture();
@@ -2105,7 +2363,7 @@ echo '{{"type":"control_response","response":{{"subtype":"success","request_id":
         let log = dir.path().join("log");
         let script = format!(
             r#"#!/bin/sh
-prompt=$(cat)
+{READ_PROMPT}
 echo "$* | $prompt | $(cat a)" >> {log}
 echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
 echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"Hi"}}}},"parent_tool_use_id":null}}'
@@ -2124,6 +2382,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 prompt: "-first".into(),
                 permission_mode: PermissionMode::Auto,
                 model: Some("sonnet".into()),
+                images: Vec::new(),
             },
         )
         .await
@@ -2239,6 +2498,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
             prompt: "what's a monad?".into(),
             permission_mode: PermissionMode::Auto,
             model: None,
+            images: Vec::new(),
         };
         let err = create(&state, new(Some(1))).await.unwrap_err().to_string();
         assert!(err.contains("can't start from a PR"), "{err}");
@@ -2304,6 +2564,7 @@ esac
                 prompt: "please write a note\nin notes.txt".into(),
                 permission_mode: PermissionMode::Auto,
                 model: None,
+                images: Vec::new(),
             },
         )
         .await
@@ -2370,6 +2631,7 @@ esac
                 prompt: "Run the e2e tests".into(),
                 permission_mode: PermissionMode::Auto,
                 model: None,
+                images: Vec::new(),
             },
         )
         .await
@@ -2620,6 +2882,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 prompt: "build".into(),
                 permission_mode: PermissionMode::Auto,
                 model: None,
+                images: Vec::new(),
             },
         )
         .await
@@ -2800,6 +3063,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 prompt: "go".into(),
                 permission_mode: PermissionMode::default(),
                 model: None,
+                images: Vec::new(),
             },
         )
         .await
@@ -2833,6 +3097,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 prompt: "go".into(),
                 permission_mode: PermissionMode::default(),
                 model: None,
+                images: Vec::new(),
             },
         )
         .await
@@ -2951,7 +3216,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         format!(
             r#"#!/bin/sh
 echo "$@" >> {log}.args
-prompt=$(cat)
+{READ_PROMPT}
 echo "$prompt" >> {log}
 set -- $prompt
 case "$1" in
@@ -2987,6 +3252,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 prompt: prompt.into(),
                 permission_mode: PermissionMode::Auto,
                 model: None,
+                images: Vec::new(),
             },
         )
         .await

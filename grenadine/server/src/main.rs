@@ -203,6 +203,9 @@ async fn main() -> Result<()> {
     if let Some(shell) = args.shell {
         agents.terminals = terminal::Terminals::new(shell);
     }
+    if let Err(e) = agent::remove_orphaned_images(&db, agents.images()) {
+        tracing::warn!("can't remove orphaned images: {e:#}");
+    }
 
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();

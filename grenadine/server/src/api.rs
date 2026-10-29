@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Query, State as AxState};
+use axum::extract::{DefaultBodyLimit, Path, Query, State as AxState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,10 @@ use crate::sync::State;
 use crate::{assets, cleanup, mcp, terminal};
 
 type St = AxState<Arc<State>>;
+
+/// How big a prompt's request may be: room for its images, which base64
+/// makes a third bigger, and its text.
+const PROMPT_BODY_LIMIT: usize = agent::MAX_IMAGES * agent::MAX_IMAGE_BYTES / 3 * 4 + (1 << 20);
 
 /// An error that becomes a 500 response.
 struct ApiError(anyhow::Error);
@@ -54,10 +58,19 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/api/sync", get(sync_status))
         .route("/api/events", get(events))
         .route("/api/repos", get(repos))
-        .route("/api/agents", get(agents).post(create_agent))
+        .route(
+            "/api/agents",
+            get(agents)
+                .post(create_agent)
+                .layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
+        )
         .route("/api/agents/models", get(agent_models))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
-        .route("/api/agents/{id}/messages", post(agent_message))
+        .route(
+            "/api/agents/{id}/messages",
+            post(agent_message).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
+        )
+        .route("/api/agents/{id}/images/{name}", get(agent_image))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
         .route("/api/agents/{id}/approvals", post(approve))
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
@@ -333,6 +346,9 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
     if req.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
+    if let Some(e) = agent::check_images(&req.images) {
+        return Ok((StatusCode::BAD_REQUEST, e).into_response());
+    }
     if !state.agents.offers(req.model.as_deref()).await {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
@@ -472,14 +488,43 @@ async fn agent_message(
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    if msg.prompt.trim().is_empty() {
+    // An image can say it all.
+    if msg.prompt.trim().is_empty() && msg.images.is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
+    }
+    if let Some(e) = agent::check_images(&msg.images) {
+        return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
     if !state.agents.offers(msg.model.as_deref()).await {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
     }
-    agent::send(&state, &id, msg.prompt, msg.permission_mode, msg.model);
+    let images = agent::save_images(&state, &id, &msg.images).await?;
+    agent::send_with_images(
+        &state,
+        &id,
+        msg.prompt,
+        images,
+        msg.permission_mode,
+        msg.model,
+    );
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// An image sent with one of the session's prompts. Images never change.
+async fn agent_image(
+    AxState(state): St,
+    Path((id, name)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let Some((path, media_type)) = agent::image_file(&state, &id, &name) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(immutable(([(header::CONTENT_TYPE, media_type)], bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(StatusCode::NOT_FOUND.into_response())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn interrupt_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
