@@ -1526,6 +1526,11 @@ class AgentTest(ServerTestCase):
         # A plan sent back comes again with the feedback in it.
         plans = transcript.locator(".approval.plan")
         expect(plans.locator(".plan-text strong")).to_have_text("todo.txt")
+        # The feedback box leaves its focus ring room above the buttons.
+        box = plans.get_by_label("Feedback").bounding_box()
+        buttons = plans.locator(".form-buttons").bounding_box()
+        assert box is not None and buttons is not None
+        self.assertGreaterEqual(buttons["y"] - (box["y"] + box["height"]), 6)
         plans.get_by_label("Feedback").fill("Add a title")
         plans.get_by_role("button", name="Keep planning").click()
         expect(plans).to_have_count(2)
