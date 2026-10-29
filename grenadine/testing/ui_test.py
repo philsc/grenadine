@@ -1617,12 +1617,9 @@ class CleanupTest(ServerTestCase):
         repo.commit("Seed", {"README": "hello\n"})
         repo.push("main")
 
-    def test_deleted_sessions_leave_cleanup_items(self) -> None:
-        # The section is there before anything is left behind.
+    def leave_behind(self) -> None:
+        """Starts a session and deletes it, which leaves one item behind."""
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
-        section = self.page.locator(".agent-cleanup .agent-item")
-        expect(section).to_contain_text("Nothing to clean up")
-
         self.page.get_by_label("Permissions").select_option(label="Auto")
         self.page.get_by_label("Prompt").fill("run the e2e tests")
         self.page.get_by_role("button", name="Start").click()
@@ -1630,6 +1627,14 @@ class CleanupTest(ServerTestCase):
         self.page.once("dialog", lambda dialog: dialog.accept())
         self.page.locator(".agent-actions").get_by_role("button", name="Delete").click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
+    def test_deleted_sessions_leave_cleanup_items(self) -> None:
+        # The section is there before anything is left behind.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        section = self.page.locator(".agent-cleanup .agent-item")
+        expect(section).to_contain_text("Nothing to clean up")
+
+        self.leave_behind()
 
         # Scanning the deleted session finds what it left behind.
         expect(section).to_contain_text("1 item to clean up")
@@ -1668,6 +1673,50 @@ class CleanupTest(ServerTestCase):
         expect(item).to_have_count(0)
         expect(self.page.locator(".cleanup")).to_contain_text("Nothing to clean up.")
         expect(section).to_contain_text("Nothing to clean up")
+
+    def test_select_all_picks_every_item(self) -> None:
+        self.leave_behind()
+        self.leave_behind()
+        section = self.page.locator(".agent-cleanup .agent-item")
+        expect(section).to_contain_text("2 items to clean up")
+        section.click()
+        items = self.page.locator(".cleanup-item input[type=checkbox]")
+        expect(items).to_have_count(2)
+
+        select_all = self.page.get_by_label("Select all")
+        select_all.check()
+        expect(items.nth(0)).to_be_checked()
+        expect(items.nth(1)).to_be_checked()
+        expect(
+            self.page.get_by_role("button", name="Clean up 2 items in a new session")
+        ).to_be_enabled()
+
+        # Picking only some leaves it indeterminate, and checking it then
+        # picks the rest.
+        items.nth(0).uncheck()
+        expect(select_all).not_to_be_checked()
+        expect(select_all).to_have_js_property("indeterminate", True)
+        expect(
+            self.page.get_by_role("button", name="Clean up 1 item in a new session")
+        ).to_be_enabled()
+        select_all.check()
+        expect(items.nth(0)).to_be_checked()
+        expect(select_all).to_have_js_property("indeterminate", False)
+
+        select_all.uncheck()
+        expect(items.nth(0)).not_to_be_checked()
+        expect(items.nth(1)).not_to_be_checked()
+        expect(
+            self.page.get_by_role("button", name="Pick items to clean up")
+        ).to_be_disabled()
+
+        # It goes away with the last item.
+        for n in (1, 0):
+            self.page.locator(".cleanup-item").first.get_by_role(
+                "button", name="Delete"
+            ).click()
+            expect(items).to_have_count(n)
+        expect(select_all).to_have_count(0)
 
 
 if __name__ == "__main__":
