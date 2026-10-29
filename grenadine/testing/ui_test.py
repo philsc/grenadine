@@ -38,6 +38,7 @@ STARTUP_TIMEOUT = 30
 # deleted sessions with a container they left behind, and finds no stale
 # cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME".
 FAKE_CLAUDE = r"""
+import base64
 import json
 import subprocess
 import sys
@@ -143,6 +144,15 @@ if prompt.startswith("commit "):
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
     result(tool_use, prompt.removeprefix("open pr ") + "\n")
+# `screenshot` has it read a screenshot, whose result carries the image.
+if prompt == "screenshot":
+    png = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+           "hKmMIQAAAABJRU5ErkJggg==")
+    with open("shot.png", "wb") as f:
+        f.write(base64.b64decode(png))
+    tool_use = use("Read", {"file_path": "shot.png"})
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}}
+    result(tool_use, [image])
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -930,6 +940,28 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_images(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("screenshot")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The screenshot Read returned shows below its collapsed tool call.
+        images = transcript.locator(".turn-image")
+        expect(images).to_have_count(1)
+        for img in images.locator("img").all():
+            img.scroll_into_view_if_needed()
+            expect(img).to_have_js_property("naturalWidth", 1)
+        expect(transcript.locator(".tool[open]")).to_have_count(0)
+
+        # It's stored, so a reload shows it again.
+        self.page.reload()
+        expect(images).to_have_count(1)
+        expect(images.first.locator("img")).to_have_js_property("naturalWidth", 1)
 
     def test_sidebar_delete(self) -> None:
         sessions = self.section(scenarios.REPO).locator(".agent-entry")

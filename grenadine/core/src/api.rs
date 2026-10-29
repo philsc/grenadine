@@ -698,6 +698,10 @@ pub enum AgentEventKind {
         /// The change a file tool made, when Claude Code reports one.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         patch: Vec<PatchHunk>,
+        /// The ids of the images in the result, such as screenshots, which
+        /// `/api/images/{id}` serves.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     /// Claude wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
