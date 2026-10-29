@@ -446,6 +446,10 @@ pub fn CleanupView() -> impl IntoView {
         Some(Ok(c)) => c.items,
         _ => Vec::new(),
     };
+    let all = move || {
+        let items = items();
+        !items.is_empty() && picked.with(|p| items.iter().all(|i| p.contains(&i.id)))
+    };
     // Items that are gone can't stay picked.
     Effect::new(move |_| {
         if let Some(Ok(c)) = cleanup.get() {
@@ -500,6 +504,23 @@ pub fn CleanupView() -> impl IntoView {
                     }).collect_view()}
                     {c.items.is_empty().then(|| view! { <p class="muted">"Nothing to clean up."</p> })}
                 }.into_any(),
+            })}
+            {move || (!items().is_empty()).then(|| view! {
+                <label class="cleanup-pick cleanup-all">
+                    <input
+                        type="checkbox"
+                        prop:checked=all
+                        prop:indeterminate=move || !all() && picked.with(|p| !p.is_empty())
+                        on:change=move |ev| {
+                            if event_target_checked(&ev) {
+                                picked.set(items().iter().map(|i| i.id).collect());
+                            } else {
+                                picked.set(Vec::new());
+                            }
+                        }
+                    />
+                    "Select all"
+                </label>
             })}
             <ul class="cleanup-items">
                 <For each=items key=|i| (i.id, i.handed_off_to.clone()) let:item>

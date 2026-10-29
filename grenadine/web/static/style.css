@@ -1239,6 +1239,10 @@ textarea {
   font-weight: 600;
   cursor: pointer;
 }
+.cleanup-all {
+  margin: 0 0 8px 13px;
+  font-weight: normal;
+}
 .cleanup-meta {
   margin: 2px 0 0 24px;
   font-size: 12px;
