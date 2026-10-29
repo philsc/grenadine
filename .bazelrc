@@ -31,6 +31,11 @@ build --compilation_mode=opt
 build --linkopt=-Wno-unused-command-line-argument
 build --host_linkopt=-Wno-unused-command-line-argument
 
+# Print the logs of failing tests so that CI shows why they failed, and the
+# full command line of failing build actions.
+test --test_output=errors
+build --verbose_failures
+
 # Lint with clippy and ruff: bazel build --config=lint //...
 # Warnings are errors so that a cached run can't hide them.
 build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
