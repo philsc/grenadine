@@ -1378,6 +1378,11 @@ textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
 }
+.turn-image figcaption {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
 .edit-diff {
   border-top: 1px solid var(--border);
   max-height: 400px;

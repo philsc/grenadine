@@ -1636,11 +1636,14 @@ fn Transcript(
                                 {move || {
                                     let images = result.with(|r| r.as_ref().map(|(_, _, _, i)| i.clone()));
                                     images.unwrap_or_default().into_iter().map(|image| view! {
-                                        <TranscriptImage id=image />
+                                        <TranscriptImage id=image caption=None />
                                     }).collect_view()
                                 }}
                             }.into_any()
                         }
+                        AgentEventKind::Image { id: image, caption } => view! {
+                            <TranscriptImage id=image caption=caption />
+                        }.into_any(),
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "ExitPlanMode" => {
                             let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
                             let plan = value["plan"].as_str().unwrap_or_default();
@@ -1743,13 +1746,14 @@ fn Transcript(
 
 /// An image in the transcript, which opens at full size in a new tab.
 #[component]
-fn TranscriptImage(id: String) -> impl IntoView {
+fn TranscriptImage(id: String, caption: Option<String>) -> impl IntoView {
     let src = format!("/api/images/{id}");
     view! {
         <figure class="turn-image">
             <a href=src.clone() target="_blank">
-                <img src=src.clone() alt="" loading="lazy" />
+                <img src=src.clone() alt=caption.clone().unwrap_or_default() loading="lazy" />
             </a>
+            {caption.map(|c| view! { <figcaption>{c}</figcaption> })}
         </figure>
     }
 }

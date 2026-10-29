@@ -1317,10 +1317,11 @@ fn terminals_note(state: &State, id: &str) -> Option<String> {
 }
 
 /// The grenadine MCP server's tools that Claude may use without asking.
-const TERMINAL_TOOLS: [&str; 3] = [
+const ALLOWED_TOOLS: [&str; 4] = [
     "mcp__grenadine__list_terminals",
     "mcp__grenadine__read_terminal",
     "mcp__grenadine__wait_for_terminal",
+    "mcp__grenadine__show_image",
 ];
 
 /// A PR's title and body for a commit with `message`.
@@ -1389,7 +1390,7 @@ async fn turn(
         "mcp__grenadine__approve",
     ])
     .arg("--allowedTools")
-    .args(TERMINAL_TOOLS)
+    .args(ALLOWED_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
     .args(
@@ -2179,7 +2180,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(
             lines[1].contains(
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
-                 mcp__grenadine__wait_for_terminal --mcp-config "
+                 mcp__grenadine__wait_for_terminal mcp__grenadine__show_image --mcp-config "
             ),
             "{log}"
         );
