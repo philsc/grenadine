@@ -1498,6 +1498,23 @@ fn AgentActions(
     }
 }
 
+/// The events to show, without the repeated ends of a turn that older
+/// servers stored: one for each background task that finished after the
+/// answer.
+fn shown(events: &[AgentEvent]) -> Vec<AgentEvent> {
+    let ended = |e: &AgentEvent| matches!(e.kind, AgentEventKind::TurnEnded { .. });
+    events
+        .iter()
+        .enumerate()
+        .filter(|&(i, e)| {
+            !(matches!(e.kind, AgentEventKind::TurnEnded { error: None, .. })
+                && i > 0
+                && ended(&events[i - 1]))
+        })
+        .map(|(_, e)| e.clone())
+        .collect()
+}
+
 #[component]
 fn Transcript(
     session: Signal<AgentSession>,
@@ -1617,7 +1634,7 @@ fn Transcript(
     view! {
         <div class="transcript">
             <For
-                each=move || events.get()
+                each=move || events.with(|events| shown(events))
                 key=|e| e.seq
                 children=move |e| {
                     let repo = repo.clone();
@@ -2290,6 +2307,29 @@ fn ContextMeter(usage: Signal<(Option<u64>, Option<u64>)>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shows_a_turn_end_once() {
+        let event = |seq, kind| AgentEvent {
+            seq: Some(seq),
+            kind,
+        };
+        let ended = |error: Option<&str>| AgentEventKind::TurnEnded {
+            error: error.map(Into::into),
+            cost_usd: Some(1.0),
+        };
+        let events = [
+            event(1, AgentEventKind::Text("a".into())),
+            event(2, ended(None)),
+            event(3, ended(None)),
+            event(4, ended(Some("failed"))),
+            event(5, ended(None)),
+            event(6, AgentEventKind::Text("b".into())),
+            event(7, ended(None)),
+        ];
+        let seqs: Vec<_> = shown(&events).iter().filter_map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 2, 4, 6, 7]);
+    }
 
     #[test]
     fn edit_fragments_by_tool() {
