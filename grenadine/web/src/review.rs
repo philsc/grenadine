@@ -1,8 +1,8 @@
 //! A PR's reviews, its conversation and whether it can be merged.
 
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, Person, PrKey, Review, ReviewEvent, ReviewInfo, ReviewState,
-    SubmitReview,
+    Check, CiStatus, IssueComment, MergeMethod, MergeRequest, Person, PrKey, Review, ReviewEvent,
+    ReviewInfo, ReviewState, SubmitReview,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -432,10 +432,220 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
     }
 }
 
-/// The checks on the PR's head and whether it can be merged. Only for open
-/// PRs.
+/// Whether the PR may be merged now: `Ok(true)` when only by bypassing the
+/// branch's rules, which the viewer may do, or why it may not.
+pub fn can_merge(info: &ReviewInfo, is_draft: bool) -> Result<bool, &'static str> {
+    let m = &info.merge;
+    if is_draft {
+        return Err("Drafts can't be merged.");
+    }
+    if m.methods.is_empty() {
+        return Err("The repository allows no merge method.");
+    }
+    if m.conflicting == Some(true) || m.state == "DIRTY" {
+        return Err("Resolve the conflicts first.");
+    }
+    match m.state.as_str() {
+        "CLEAN" | "HAS_HOOKS" | "UNSTABLE" => Ok(false),
+        "BLOCKED" | "BEHIND" if m.can_merge_as_admin => Ok(true),
+        "BLOCKED" => Err("The branch's rules block merging."),
+        "BEHIND" => Err("Bring the branch up to date first."),
+        _ => Err("GitHub hasn't worked out yet whether this can be merged."),
+    }
+}
+
+/// The merge method to offer first: the one last used in the repository,
+/// else GitHub's default for the viewer, else the first allowed.
+pub fn pick_method(info: &ReviewInfo, last: Option<MergeMethod>) -> Option<MergeMethod> {
+    let allowed = |m: &MergeMethod| info.merge.methods.contains(m);
+    last.filter(allowed)
+        .or(info.merge.default_method.filter(allowed))
+        .or(info.merge.methods.first().copied())
+}
+
+fn method_label(m: MergeMethod) -> &'static str {
+    match m {
+        MergeMethod::Merge => "Create a merge commit",
+        MergeMethod::Squash => "Squash and merge",
+        MergeMethod::Rebase => "Rebase and merge",
+    }
+}
+
+fn method_key(repo: &str) -> String {
+    format!("grenadine.merge-method.{repo}")
+}
+
+fn last_method(repo: &str) -> Option<MergeMethod> {
+    let saved = storage()?.get_item(&method_key(repo)).ok().flatten()?;
+    serde_json::from_str(&saved).ok()
+}
+
+/// What the merge box shows, kept above the parts of the page that a
+/// refetch rebuilds. `None` means the default.
+#[derive(Clone, Copy)]
+pub struct MergeChoice {
+    method: RwSignal<Option<MergeMethod>>,
+    /// The squash commit's message, once the viewer edits it.
+    message: RwSignal<Option<(String, String)>>,
+    delete_branch: RwSignal<Option<bool>>,
+    busy: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+}
+
+impl MergeChoice {
+    pub fn new() -> MergeChoice {
+        MergeChoice {
+            method: RwSignal::new(None),
+            message: RwSignal::new(None),
+            delete_branch: RwSignal::new(None),
+            busy: RwSignal::new(false),
+            error: RwSignal::new(None),
+        }
+    }
+}
+
+/// The PR being merged, as the merge box needs it.
+#[derive(Clone)]
+pub struct MergeTarget {
+    pub title: String,
+    pub body: String,
+    pub is_draft: bool,
+    /// The latest version, which is what gets merged.
+    pub head_oid: Option<String>,
+    pub base_ref: String,
+    /// The open PR whose branch this one targets, if it's stacked on one.
+    pub open_parent: Option<u64>,
+    /// Other open PRs target this one's branch.
+    pub has_children: bool,
+}
+
+/// Merging the PR: the method, the squash message, deleting the branch.
 #[component]
-pub fn MergeBox(info: ReviewInfo) -> impl IntoView {
+fn MergeControls(info: ReviewInfo, target: MergeTarget) -> impl IntoView {
+    let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
+    let MergeChoice {
+        method,
+        message,
+        delete_branch,
+        busy,
+        error,
+    } = expect_context::<MergeChoice>();
+    let allowed = can_merge(&info, target.is_draft);
+    let fallback = pick_method(&info, last_method(&key.repo));
+    let chosen = move || method.get().or(fallback);
+    let deletes = !info.merge.delete_branch_on_merge;
+    // Deleting a branch that other PRs target would close them.
+    let delete = move || delete_branch.get().unwrap_or(!target.has_children);
+    let default_message = (
+        format!("{} (#{})", target.title, key.number),
+        target.body.clone(),
+    );
+    // Only whether it's being edited: the fields must not be rebuilt as
+    // the message changes.
+    let editing = Memo::new(move |_| message.with(Option::is_some));
+    let editing = move || editing.get();
+    let methods = info.merge.methods.clone();
+    let admin = allowed == Ok(true);
+    let blocked = allowed.err();
+    let key = StoredValue::new(key);
+    let head = target.head_oid.clone();
+    let base_ref = target.base_ref.clone();
+    let merge = move |_| {
+        let (Some(m), Some(head)) = (chosen(), head.clone()) else {
+            return;
+        };
+        let (repo, number) = key.with_value(|k| (k.repo.clone(), k.number));
+        let what = format!("{} #{number} into {base_ref}?", method_label(m));
+        if !window().confirm_with_message(&what).unwrap_or(false) {
+            return;
+        }
+        if let Some(s) = storage() {
+            let _ = s.set_item(
+                &method_key(&repo),
+                &serde_json::to_string(&m).unwrap_or_default(),
+            );
+        }
+        let (title, body) = message
+            .get_untracked()
+            .filter(|_| m == MergeMethod::Squash)
+            .unzip();
+        let request = MergeRequest {
+            method: m,
+            head_oid: head,
+            title,
+            body,
+            delete_branch: deletes && delete(),
+        };
+        busy.set(true);
+        error.set(None);
+        let key = key.get_value();
+        spawn_local(async move {
+            match api::merge(&key, &request).await {
+                Ok(merged) => error.set(merged.warning),
+                Err(e) => error.set(Some(e)),
+            }
+            busy.set(false);
+        });
+    };
+    view! {
+        <div class="merge-controls">
+            {target.open_parent.map(|p| view! {
+                <p class="banner warn">{format!(
+                    "This PR targets the branch of #{p}, so merging it puts its changes there, not into {}.",
+                    target.base_ref
+                )}</p>
+            })}
+            {blocked.map(|why| view! { <p class="muted merge-blocked">{why}</p> })}
+            <div class="form-buttons">
+                <select aria-label="Merge method" prop:value=move || chosen().map(|m| format!("{m:?}")).unwrap_or_default()
+                    on:change=move |ev| method.set(serde_json::from_str(&format!("\"{}\"", event_target_value(&ev))).ok())>
+                    {methods.into_iter().map(|m| view! {
+                        <option value=format!("{m:?}") selected=move || chosen() == Some(m)>{method_label(m)}</option>
+                    }).collect_view()}
+                </select>
+                <button type="button" class=if admin { "danger" } else { "primary" }
+                    disabled=move || busy.get() || blocked.is_some() || target.head_oid.is_none()
+                    title=if admin { "Merges without waiting for the branch's rules, which you may bypass" } else { "" }
+                    on:click=merge>
+                    {move || match (busy.get(), admin) {
+                        (true, _) => "Merging…".to_owned(),
+                        (false, true) => "Merge, bypassing rules".to_owned(),
+                        (false, false) => "Merge".to_owned(),
+                    }}
+                </button>
+                {deletes.then(|| view! {
+                    <label class="toggle">
+                        <input type="checkbox" prop:checked=delete
+                            on:change=move |ev| delete_branch.set(Some(event_target_checked(&ev))) />
+                        " Delete the branch"
+                    </label>
+                })}
+                {move || (chosen() == Some(MergeMethod::Squash) && !editing()).then(|| {
+                    let default_message = default_message.clone();
+                    view! {
+                        <button type="button" class="link" on:click=move |_| message.set(Some(default_message.clone()))>"Edit the commit message"</button>
+                    }
+                })}
+            </div>
+            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| view! {
+                <div class="merge-message">
+                    <input type="text" aria-label="Commit title"
+                        prop:value=move || message.with(|m| m.as_ref().map(|m| m.0.clone()).unwrap_or_default())
+                        on:input=move |ev| message.update(|m| if let Some(m) = m { m.0 = event_target_value(&ev) }) />
+                    <textarea rows="6" aria-label="Commit message"
+                        prop:value=move || message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
+                        on:input=move |ev| message.update(|m| if let Some(m) = m { m.1 = event_target_value(&ev) })></textarea>
+                </div>
+            })}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+}
+
+/// The checks on the PR's head, whether it can be merged and merging it.
+/// Only for open PRs.
+#[component]
+pub fn MergeBox(info: ReviewInfo, target: MergeTarget) -> impl IntoView {
     let (class, text) = merge_status(&info);
     let checks = (!info.checks.is_empty()).then(|| {
         let rows = info
@@ -466,6 +676,7 @@ pub fn MergeBox(info: ReviewInfo) -> impl IntoView {
         <section class="merge-box">
             {checks}
             <p class=format!("merge-status {class}")>{text}</p>
+            <MergeControls info=info target=target />
         </section>
     }
 }
@@ -563,6 +774,44 @@ mod tests {
         i.merge.conflicting = None;
         i.merge.state = "UNKNOWN".into();
         assert_eq!(merge_status(&i).0, "warn");
+    }
+
+    #[test]
+    fn when_a_pr_can_be_merged() {
+        let mut i = info();
+        i.merge.methods = vec![MergeMethod::Squash];
+        assert_eq!(can_merge(&i, false), Ok(false));
+        assert!(can_merge(&i, true).is_err());
+        i.merge.state = "UNSTABLE".into();
+        assert_eq!(can_merge(&i, false), Ok(false));
+        i.merge.state = "BLOCKED".into();
+        assert!(can_merge(&i, false).is_err());
+        i.merge.can_merge_as_admin = true;
+        assert_eq!(can_merge(&i, false), Ok(true));
+        // Conflicts can't be bypassed.
+        i.merge.conflicting = Some(true);
+        assert!(can_merge(&i, false).is_err());
+        i.merge.conflicting = None;
+        i.merge.state = "UNKNOWN".into();
+        assert!(can_merge(&i, false).is_err());
+        i.merge.state = "CLEAN".into();
+        i.merge.methods.clear();
+        assert!(can_merge(&i, false).is_err());
+    }
+
+    #[test]
+    fn picks_a_merge_method() {
+        use MergeMethod::*;
+        let mut i = info();
+        i.merge.methods = vec![Merge, Squash];
+        assert_eq!(pick_method(&i, None), Some(Merge));
+        i.merge.default_method = Some(Squash);
+        assert_eq!(pick_method(&i, None), Some(Squash));
+        assert_eq!(pick_method(&i, Some(Merge)), Some(Merge));
+        // A method the repository no longer allows isn't offered.
+        assert_eq!(pick_method(&i, Some(Rebase)), Some(Squash));
+        i.merge.default_method = Some(Rebase);
+        assert_eq!(pick_method(&i, None), Some(Merge));
     }
 
     #[test]

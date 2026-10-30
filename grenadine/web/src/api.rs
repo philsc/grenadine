@@ -8,9 +8,9 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentMessage, AgentModelInfo, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, NewComment,
-    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, SubmitReview, SyncStatus,
-    TerminalInfo, WorktreeChanges, WrapUp,
+    Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
+    NewCleanupSession, NewComment, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
+    PromptImage, SubmitReview, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -408,4 +408,15 @@ pub async fn discard_review(key: &PrKey) -> Result<()> {
     )
     .await
     .map(|_| ())
+}
+
+pub async fn merge(key: &PrKey, merge: &MergeRequest) -> Result<Merged> {
+    let req = Request::post(&format!("{}/merge", pr_url(key)))
+        .json(merge)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }

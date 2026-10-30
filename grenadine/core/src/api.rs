@@ -250,6 +250,27 @@ pub struct NewThread {
     pub body: String,
 }
 
+/// The body of a request that merges a PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeRequest {
+    pub method: MergeMethod,
+    /// The head the viewer reviewed. GitHub refuses the merge when the PR's
+    /// head has moved on since.
+    pub head_oid: String,
+    /// The merge commit's title and body; `None` leaves them to GitHub.
+    pub title: Option<String>,
+    pub body: Option<String>,
+    /// Delete the head branch once merged.
+    pub delete_branch: bool,
+}
+
+/// The response to a merge that went through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Merged {
+    /// What went wrong after merging, e.g. deleting the branch.
+    pub warning: Option<String>,
+}
+
 /// What submitting a review says about the PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewEvent {

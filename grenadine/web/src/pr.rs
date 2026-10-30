@@ -14,7 +14,9 @@ use crate::composer::{Composer, OpenBoxes, SendComment, sender};
 use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
-use crate::review::{Conversation, MergeBox, ReviewChoice, ReviewPanel, ReviewSummary};
+use crate::review::{
+    Conversation, MergeBox, MergeChoice, MergeTarget, ReviewChoice, ReviewPanel, ReviewSummary,
+};
 use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.
@@ -185,6 +187,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(OpenBoxes::new());
     provide_context(ReviewChoice::new());
+    provide_context(MergeChoice::new());
 
     move || {
         match pr.get() {
@@ -409,7 +412,7 @@ fn PrBody(
             <section class="description markdown" inner_html=body_html
                 on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
             {pr.review.clone().map(|info| view! { <Conversation info=info /> })}
-            {pr.review.clone().filter(|_| s.state == "OPEN").map(|info| view! { <MergeBox info=info /> })}
+            {pr.review.clone().filter(|_| s.state == "OPEN").map(|info| view! { <MergeBox info=info target=merge_target(&pr) /> })}
             <div class="toolbar">
                 <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
                 {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
@@ -457,6 +460,35 @@ fn PrBody(
             </div>
             {diff}
         </article>
+    }
+}
+
+fn merge_target(pr: &PrDetail) -> MergeTarget {
+    let n = pr.summary.key.number;
+    let stack = pr
+        .stack
+        .as_ref()
+        .map(|s| s.prs.as_slice())
+        .unwrap_or_default();
+    let open = |number: u64| {
+        stack
+            .iter()
+            .any(|p| p.number == number && p.state == "OPEN")
+    };
+    MergeTarget {
+        title: pr.summary.title.clone(),
+        body: pr.body.clone(),
+        is_draft: pr.summary.is_draft,
+        head_oid: pr.versions.last().map(|v| v.sha.clone()),
+        base_ref: pr.base_ref.clone(),
+        open_parent: stack
+            .iter()
+            .find(|p| p.number == n)
+            .and_then(|p| p.parent)
+            .filter(|&p| open(p)),
+        has_children: stack
+            .iter()
+            .any(|p| p.parent == Some(n) && p.state == "OPEN"),
     }
 }
 

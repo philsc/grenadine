@@ -365,6 +365,9 @@ APPROVE = "Approve without comments"
 DISCARD = "Discard a review"
 REPLY_IN_REVIEW = "Reply in a review"
 OWN = "Review my own PR"
+SQUASH = "Squash and merge me"
+STALE_HEAD = "Move on before merging"
+BLOCKED = "Wait for the rules"
 REVIEW_CASES = [
     REPLY,
     RESOLVE,
@@ -374,6 +377,9 @@ REVIEW_CASES = [
     DISCARD,
     REPLY_IN_REVIEW,
     OWN,
+    SQUASH,
+    STALE_HEAD,
+    BLOCKED,
 ]
 
 
@@ -395,5 +401,7 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
         repo.push(branch, actor=author)
         pr = repo.open_pr(title, head=branch, author=author)
         repo.comment(pr, author=OTHER, body="Is this right?", path=REVIEW_PATH, line=2)
+        if title == BLOCKED:
+            pr.merge_state = "BLOCKED"
         prs[title] = pr
     return prs

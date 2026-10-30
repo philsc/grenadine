@@ -392,6 +392,33 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(pr.review_decision(), APPROVED)
         self.assertEqual(pr.reviews[-1].body, "LGTM")
 
+    def test_merging(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id headRef {{ id }} }} }} }}"
+        )["data"]["repository"]["pullRequest"]
+        merge = (
+            "mutation($p: ID!, $h: GitObjectID!) { mergePullRequest(input: {"
+            " pullRequestId: $p, mergeMethod: SQUASH, expectedHeadOid: $h,"
+            ' commitHeadline: "Title"}) { clientMutationId } }'
+        )
+        out = self.query(merge, p=pr_id["id"], h="0" * 40)
+        self.assertIn("Head branch was modified", out["errors"][0]["message"])
+        self.assertEqual(pr.state, "OPEN")
+
+        out = self.query(merge, p=pr_id["id"], h=pr.head_oid)
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.state, "MERGED")
+        self.assertEqual(pr.merged_with, ("SQUASH", "Title", None))
+
+        out = self.query(
+            "mutation($r: ID!) { deleteRef(input: {refId: $r}) { clientMutationId } }",
+            r=pr_id["headRef"]["id"],
+        )
+        self.assertNotIn("errors", out)
+        self.assertIn(pr.head, self.repo.deleted_branches)
+
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')
         self.assertIn("Cannot query field 'nope'", out["errors"][0]["message"])
