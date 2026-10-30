@@ -380,6 +380,7 @@ input[type="text"] {
   color: var(--fg-muted);
 }
 .pr-status .threads,
+.pr-status .review,
 .pr-status .ci {
   display: inline-flex;
   align-items: center;
@@ -394,6 +395,15 @@ input[type="text"] {
 }
 .pr-status .ci.running {
   color: var(--warn-fg);
+}
+.pr-status .review.approved {
+  color: var(--add-fg);
+}
+.pr-status .review.changes {
+  color: var(--del-fg);
+}
+.pr-status .review.required {
+  color: var(--fg-muted);
 }
 
 /* Stack-mates in an inbox are joined by a line left of their titles. */

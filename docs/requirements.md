@@ -648,3 +648,16 @@ _Why:_ deleting a branch that other PRs target closes them.
 **REVIEW-MERGE-11.** When the PR targets another open PR's branch, the
 merge box must warn that merging puts its changes there, not into the
 stack's base branch.
+
+## Inboxes
+
+**REVIEW-INBOX-1.** Each PR in an inbox must show GitHub's review decision
+as an icon before its CI icon: a green check for approved, red for
+changes requested and muted for review required, titled "Approved",
+"Changes requested" and "Review required". A PR without a decision shows
+no icon.
+_Why:_ it tells at a glance which of one's PRs can be merged and which
+need work, without opening them.
+
+**REVIEW-INBOX-2.** The decision must come from the inbox search, like the
+thread count and the CI status, so that it costs no extra requests.

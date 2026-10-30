@@ -195,6 +195,7 @@ fn InboxSection(
                                     </span>
                                     <span class="pr-status">
                                         {pr.threads.filter(|t| t.total > 0).map(|t| view! { <ThreadCount threads=t /> })}
+                                        {pr.review_decision.clone().map(|d| view! { <ReviewIcon decision=d /> })}
                                         {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
                                     </span>
                                 </a>
@@ -232,6 +233,42 @@ fn ThreadCount(threads: ThreadCounts) -> impl IntoView {
                 <path d="M2.5 3.5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7l-3 2.5V11h-.5a1 1 0 0 1-1-1z" />
             </svg>
             {format!("{resolved}/{total}")}
+        </span>
+    }
+}
+
+/// GitHub's review decision on the PR: approved, changes requested, or a
+/// review still required.
+#[component]
+fn ReviewIcon(decision: String) -> impl IntoView {
+    let (class, title, path) = match decision.as_str() {
+        "APPROVED" => ("review approved", "Approved", "M3.5 8.5l3 3 6-7"),
+        "CHANGES_REQUESTED" => (
+            "review changes",
+            "Changes requested",
+            "M3 3.5h10v7H8l-3 2.5v-2.5H3zM6 7h4",
+        ),
+        _ => (
+            "review required",
+            "Review required",
+            "M1.5 8s2.5-4.5 6.5-4.5 6.5 4.5 6.5 4.5-2.5 4.5-6.5 4.5S1.5 8 1.5 8zM8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z",
+        ),
+    };
+    view! {
+        <span class=class title=title>
+            <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                <path d=path />
+            </svg>
         </span>
     }
 }

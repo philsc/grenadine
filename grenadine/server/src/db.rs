@@ -278,6 +278,13 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE prs ADD COLUMN review TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The search's review decision: APPROVED, CHANGES_REQUESTED or
+    -- REVIEW_REQUIRED; NULL when there's none.
+    ALTER TABLE inbox_prs ADD COLUMN review_decision TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -530,14 +537,15 @@ impl Db {
                     tx.execute(
                         "INSERT INTO inbox_prs
                             (inbox_id, repo, number, rank, title, author, state, is_draft, url, updated_at,
-                             threads_resolved, threads_total, ci)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             threads_resolved, threads_total, ci, review_decision)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT (inbox_id, repo, number) DO UPDATE SET
                             rank = excluded.rank, title = excluded.title, author = excluded.author,
                             state = excluded.state, is_draft = excluded.is_draft, url = excluded.url,
                             updated_at = excluded.updated_at,
                             threads_resolved = excluded.threads_resolved,
-                            threads_total = excluded.threads_total, ci = excluded.ci",
+                            threads_total = excluded.threads_total, ci = excluded.ci,
+                            review_decision = excluded.review_decision",
                         params![
                             id,
                             h.key.repo,
@@ -551,7 +559,8 @@ impl Db {
                             h.updated_at,
                             h.threads.resolved,
                             h.threads.total,
-                            h.ci.map(ci_str)
+                            h.ci.map(ci_str),
+                            h.review_decision,
                         ],
                     )?;
                 }
@@ -595,7 +604,7 @@ impl Db {
                     (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
                     p.repo IS NOT NULL,
                     CASE WHEN p.repo IS NULL THEN i.sync_error END,
-                    p.stack, i.threads_resolved, i.threads_total, i.ci
+                    p.stack, i.threads_resolved, i.threads_total, i.ci, i.review_decision
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
@@ -610,6 +619,7 @@ impl Db {
                 .get::<_, Option<String>>(14)?
                 .as_deref()
                 .and_then(parse_ci);
+            summary.review_decision = r.get(15)?;
             Ok(summary)
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1345,6 +1355,7 @@ fn summary_from_row(
         stack: stack.and_then(|s| s.summary(number)),
         threads: None,
         ci: None,
+        review_decision: None,
     })
 }
 
@@ -1388,6 +1399,7 @@ mod tests {
                 total: 3,
             },
             ci: Some(CiStatus::Failing),
+            review_decision: Some("CHANGES_REQUESTED".into()),
         }
     }
 
@@ -1476,6 +1488,7 @@ mod tests {
             })
         );
         assert_eq!(prs[0].ci, Some(CiStatus::Failing));
+        assert_eq!(prs[0].review_decision.as_deref(), Some("CHANGES_REQUESTED"));
 
         let versions = vec![
             Version {
