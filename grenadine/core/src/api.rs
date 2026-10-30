@@ -214,6 +214,16 @@ pub struct ReviewComment {
     /// it needs. Only set on a thread's root comment.
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// The viewer may resolve the thread this comment starts, or unresolve
+    /// it if it's resolved. Only meaningful on a thread's root comment.
+    #[serde(default)]
+    pub can_resolve: bool,
+}
+
+/// The body of a request that comments on a PR or replies to a thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewComment {
+    pub body: String,
 }
 
 /// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.

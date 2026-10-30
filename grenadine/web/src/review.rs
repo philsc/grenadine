@@ -3,9 +3,10 @@
 use grenadine_core::api::{Check, CiStatus, IssueComment, Person, Review, ReviewInfo, ReviewState};
 use leptos::prelude::*;
 
+use crate::composer::{Composer, OpenBoxes, sender};
 use crate::inboxes::CiIcon;
-use crate::markdown;
-use crate::pr::{PersonChip, PrLinks, markdown_click};
+use crate::pr::{PersonChip, PrLinks, ReviewTarget, markdown_click};
+use crate::{api, markdown};
 
 /// Each reviewer's verdict: their latest approval, change request or
 /// dismissal, or their latest comment when they gave no verdict. The PR's
@@ -202,17 +203,69 @@ pub fn Conversation(info: ReviewInfo) -> impl IntoView {
             },
         })
         .collect::<Vec<_>>();
-    if items.is_empty() {
-        return ().into_any();
-    }
     let count = items.len();
     view! {
         <details class="conversation" open>
-            <summary>{if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") }}</summary>
+            <summary>{match count {
+                0 => "No comments".to_owned(),
+                1 => "1 comment".to_owned(),
+                n => format!("{n} comments"),
+            }}</summary>
             {items}
+            <NewComment />
         </details>
     }
-    .into_any()
+}
+
+/// A comment on the PR itself, behind a button until it's started.
+#[component]
+fn NewComment() -> impl IntoView {
+    let ReviewTarget(key) = expect_context::<ReviewTarget>();
+    let links = expect_context::<PrLinks>();
+    let draft = format!("comment.{}#{}", key.repo, key.number);
+    let boxes = expect_context::<OpenBoxes>();
+    let writing = {
+        let draft = draft.clone();
+        Signal::derive(move || boxes.is_open(&draft))
+    };
+    let send = sender(move |body| {
+        let key = key.clone();
+        async move { api::add_comment(&key, body).await }
+    });
+    let close = {
+        let draft = draft.clone();
+        Callback::new(move |()| boxes.set(&draft, false))
+    };
+    let open = {
+        let draft = draft.clone();
+        move |_| boxes.set(&draft, true)
+    };
+    move || {
+        if writing.get() {
+            view! {
+                <div class="new-comment">
+                    <Composer
+                        draft=draft.clone()
+                        repo=links.repo.clone()
+                        label="Comment"
+                        placeholder="Comment on this PR…"
+                        send=send.clone()
+                        on_cancel=close
+                        on_sent=close
+                        autofocus=true
+                    />
+                </div>
+            }
+            .into_any()
+        } else {
+            view! {
+                <div class="new-comment form-buttons">
+                    <button type="button" on:click=open.clone()>"Comment"</button>
+                </div>
+            }
+            .into_any()
+        }
+    }
 }
 
 /// The checks on the PR's head and whether it can be merged. Only for open

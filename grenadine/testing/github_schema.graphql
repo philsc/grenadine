@@ -14,6 +14,44 @@ type Query {
   viewer: User!
 }
 
+# Each mutation's payload only offers clientMutationId: grenadine resyncs the
+# PR after a change rather than reading the payload.
+type Mutation {
+  addComment(input: AddCommentInput!): MutationPayload
+  addPullRequestReviewThreadReply(
+    input: AddPullRequestReviewThreadReplyInput!
+  ): MutationPayload
+  resolveReviewThread(input: ResolveReviewThreadInput!): MutationPayload
+  unresolveReviewThread(input: UnresolveReviewThreadInput!): MutationPayload
+}
+
+type MutationPayload {
+  clientMutationId: String
+}
+
+input AddCommentInput {
+  subjectId: ID!
+  body: String!
+  clientMutationId: String
+}
+
+input AddPullRequestReviewThreadReplyInput {
+  pullRequestReviewThreadId: ID!
+  body: String!
+  pullRequestReviewId: ID
+  clientMutationId: String
+}
+
+input ResolveReviewThreadInput {
+  threadId: ID!
+  clientMutationId: String
+}
+
+input UnresolveReviewThreadInput {
+  threadId: ID!
+  clientMutationId: String
+}
+
 enum SearchType {
   ISSUE
   ISSUE_ADVANCED
@@ -91,6 +129,7 @@ type PullRequestConnection {
 }
 
 type PullRequest {
+  id: ID!
   number: Int!
   title: String!
   body: String!
@@ -306,6 +345,8 @@ type PageInfo {
 type PullRequestReviewThread {
   id: ID!
   isResolved: Boolean!
+  viewerCanResolve: Boolean!
+  viewerCanUnresolve: Boolean!
   resolvedBy: User
   comments(first: Int, after: String): PullRequestReviewCommentConnection!
 }

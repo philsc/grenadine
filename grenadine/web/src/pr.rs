@@ -10,6 +10,7 @@ use grenadine_core::api::{
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::composer::{Composer, OpenBoxes, sender};
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
 use crate::review::{Conversation, MergeBox, ReviewSummary};
@@ -180,6 +181,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
+    provide_context(OpenBoxes::new());
 
     move || {
         match pr.get() {
@@ -213,6 +215,11 @@ pub(crate) struct PrLinks {
     pub(crate) repo: String,
     pub(crate) invert: RwSignal<bool>,
 }
+
+/// The PR whose page this is, for the comments and actions that change it
+/// on GitHub. Missing on pages that only show diffs, e.g. an agent's.
+#[derive(Clone)]
+pub(crate) struct ReviewTarget(pub(crate) PrKey);
 
 /// Routes clicks on the `data-grenadine` links that markdown rendering put
 /// on PR references and that the stack list has. Shift+click — or a plain
@@ -282,6 +289,7 @@ fn PrBody(
         repo: pr.summary.key.repo.clone(),
         invert: pr_links,
     });
+    provide_context(ReviewTarget(pr.summary.key.clone()));
     let latest = pr.versions.len() as u32;
     let selection = {
         let pr = pr.clone();
@@ -715,6 +723,7 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
                 view! {
                     <CommentBody comment=thread.root.clone() />
                     {thread.replies.iter().map(|r| view! { <CommentBody comment=r.clone() /> }).collect_view()}
+                    <ThreadActions root=thread.root.clone() />
                 }
             })
         }
@@ -741,6 +750,88 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
             {comments}
         </div>
     }
+}
+
+/// Replying to a thread and resolving it, under its comments.
+#[component]
+fn ThreadActions(root: ReviewComment) -> impl IntoView {
+    let (Some(ReviewTarget(key)), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id)
+    else {
+        return ().into_any();
+    };
+    let links = expect_context::<PrLinks>();
+    let draft = format!("reply.{thread}");
+    let boxes = expect_context::<OpenBoxes>();
+    let replying = {
+        let draft = draft.clone();
+        Signal::derive(move || boxes.is_open(&draft))
+    };
+    let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let resolved = root.resolved;
+    let toggle = {
+        let (key, thread) = (key.clone(), thread.clone());
+        move |_| {
+            let (key, thread) = (key.clone(), thread.clone());
+            busy.set(true);
+            error.set(None);
+            leptos::task::spawn_local(async move {
+                // On success the page refreshes once the PR has synced.
+                if let Err(e) = api::set_thread_resolved(&key, &thread, !resolved).await {
+                    error.set(Some(e));
+                }
+                busy.set(false);
+            });
+        }
+    };
+    let send = {
+        let (key, thread) = (key.clone(), thread.clone());
+        sender(move |body| {
+            let (key, thread) = (key.clone(), thread.clone());
+            async move { api::reply_to_thread(&key, &thread, body).await }
+        })
+    };
+    let close = {
+        let draft = draft.clone();
+        Callback::new(move |()| boxes.set(&draft, false))
+    };
+    let open = {
+        let draft = draft.clone();
+        move |_| boxes.set(&draft, true)
+    };
+    view! {
+        <div class="thread-actions">
+            {move || if replying.get() {
+                view! {
+                    <Composer
+                        draft=draft.clone()
+                        repo=links.repo.clone()
+                        label="Reply"
+                        placeholder="Reply…"
+                        send=send.clone()
+                        on_cancel=close
+                        on_sent=close
+                        autofocus=true
+                    />
+                }
+                .into_any()
+            } else {
+                view! {
+                    <div class="form-buttons">
+                        <button type="button" class="reply-button" on:click=open.clone()>"Reply"</button>
+                        {root.can_resolve.then(|| view! {
+                            <button type="button" disabled=move || busy.get() on:click=toggle.clone()>
+                                {if resolved { "Unresolve" } else { "Resolve" }}
+                            </button>
+                        })}
+                    </div>
+                }
+                .into_any()
+            }}
+            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
@@ -833,6 +924,7 @@ mod tests {
             resolved: false,
             resolved_by: None,
             thread_id: None,
+            can_resolve: false,
         }
     }
 

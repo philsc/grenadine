@@ -1525,6 +1525,7 @@ mod tests {
                 avatar_url: None,
             }),
             thread_id: Some("T3".into()),
+            can_resolve: true,
         }];
         let review = ReviewInfo {
             viewer: "me".into(),
