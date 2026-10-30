@@ -1647,6 +1647,10 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
 
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut ended = None;
+    // The cost already added to the session's, and whether the last event
+    // shown ended the turn.
+    let mut billed = 0.0;
+    let mut last_was_end = false;
     let mut stopping = false;
     let mut prs = OpenedPrs::default();
     loop {
@@ -1680,11 +1684,21 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
                         continue;
                     }
                     if let AgentEventKind::TurnEnded { error, cost_usd } = &kind {
+                        // The cost is the process's total so far, and a
+                        // process can report several results: one more for
+                        // each background task that finishes after the
+                        // answer.
                         if let Some(cost) = cost_usd {
-                            state.db.add_agent_cost(id, *cost)?;
+                            state.db.add_agent_cost(id, cost - billed)?;
+                            billed = *cost;
                         }
+                        let repeat = ended == Some(true) && last_was_end && error.is_none();
                         ended = Some(error.is_none());
+                        if repeat {
+                            continue;
+                        }
                     }
+                    last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
                     let opened = prs.see(&session.repo, &kind);
                     emit(state, id, kind)?;
                     record_prs(state, id, &opened)?;
@@ -2474,6 +2488,59 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(!std::path::Path::new(&session.worktree).exists());
         assert_eq!(state.db.agent(id).unwrap(), None);
         assert!(!delete(&state, id).await.unwrap());
+    }
+
+    /// Background tasks finishing after the answer make claude report more
+    /// results, each with the process's cost so far. The session shows one
+    /// end per answer and is charged the total once.
+    #[tokio::test]
+    async fn shows_repeated_results_once() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"First"}]},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Second"}]},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}'
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let session = create(
+            &state,
+            NewAgent {
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::Auto,
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let transcript = wait_for_turns(&state, &session.id, 2).await;
+
+        let ended = |cost| AgentEventKind::TurnEnded {
+            error: None,
+            cost_usd: Some(cost),
+        };
+        assert_eq!(
+            transcript,
+            [
+                AgentEventKind::Prompt("go".into()),
+                AgentEventKind::Text("First".into()),
+                ended(0.25),
+                AgentEventKind::Text("Second".into()),
+                ended(0.5),
+            ]
+        );
+        let session = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(session.status, AgentStatus::Idle);
+        assert_eq!(session.cost_usd, 0.5);
     }
 
     /// A general session runs in an empty directory of its own, outside any
