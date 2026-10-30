@@ -632,6 +632,127 @@ class ReviewTest(ServerTestCase):
             .first
         )
 
+    def file(self) -> Locator:
+        return self.page.locator("section.file").filter(
+            has=self.page.locator(
+                ".file-header .path", has_text=exactly(scenarios.REVIEW_PATH)
+            )
+        )
+
+    def comment_on_line(self, line: int, body: str) -> None:
+        file = self.file()
+        file.locator("td.ln.commentable", has_text=exactly(str(line))).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        expect(box).to_be_focused()
+        box.fill(body)
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+
+    def review_panel(self) -> Locator:
+        panel = self.page.locator(".review-panel")
+        panel.locator(".review-button").click()
+        return panel
+
+    def test_review_lines_then_request_changes(self) -> None:
+        pr = self.prs[scenarios.LINE_REVIEW]
+        self.open(scenarios.LINE_REVIEW)
+        self.comment_on_line(4, "Typo here.")
+        thread = self.file().locator(
+            "table .thread", has=self.page.locator(".pending-badge")
+        )
+        expect(thread).to_contain_text("Typo here.")
+        expect(self.page.locator(".review-panel .pending-count")).to_have_text("1")
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.line, c.side, c.body), (4, "RIGHT", "Typo here."))
+        # Pending comments aren't on GitHub's PR yet.
+        self.assertEqual(len(pr.comments), 1)
+
+        # A pending comment can be edited.
+        thread.get_by_role("button", name="Edit").click()
+        box = thread.get_by_role("textbox", name="Save")
+        expect(box).to_have_value("Typo here.")
+        box.fill("Typo: teh.")
+        box.press("Control+Enter")
+        expect(self.file().locator(".thread", has_text="Typo: teh.")).to_have_count(1)
+
+        # And the whole file can be commented on.
+        self.file().get_by_role("button", name="Comment on file").click()
+        box = self.file().get_by_role("textbox", name="Add to review")
+        box.fill("Split this file?")
+        box.press("Control+Enter")
+        expect(
+            self.file().locator(".file-comments .thread", has_text="Split this file?")
+        ).to_have_count(1)
+        expect(self.page.locator(".review-panel .pending-count")).to_have_text("2")
+
+        panel = self.review_panel()
+        panel.get_by_label("Request changes").check()
+        submit = panel.get_by_role("button", name="Submit review")
+        # Requesting changes needs a summary.
+        expect(submit).to_be_disabled()
+        panel.get_by_role("textbox", name="Review summary").fill("A few things.")
+        submit.click()
+
+        header = self.page.locator(".pr-header .review-summary")
+        expect(header.locator(".review-decision")).to_have_text("Changes requested")
+        expect(self.page.locator(".pending-badge")).to_have_count(0)
+        expect(self.page.locator(".review-panel .pending-count")).to_have_count(0)
+        self.assertIsNone(pr.pending)
+        self.assertEqual(
+            [c.body for c in pr.comments],
+            ["Is this right?", "Typo: teh.", "Split this file?"],
+        )
+        self.assertEqual(pr.reviews[-1].body, "A few things.")
+
+    def test_approve_without_comments(self) -> None:
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        # A comment review needs a summary or comments.
+        expect(panel.get_by_role("button", name="Submit review")).to_be_disabled()
+        panel.get_by_label("Approve").check()
+        panel.get_by_role("button", name="Submit review").click()
+        expect(
+            self.page.locator(".pr-header .review-summary .review-decision")
+        ).to_have_text("Approved")
+        expect(self.page.locator("details.conversation .comment-meta")).to_contain_text(
+            "approved"
+        )
+
+    def test_discard_a_review(self) -> None:
+        pr = self.prs[scenarios.DISCARD]
+        self.open(scenarios.DISCARD)
+        self.comment_on_line(5, "Hmm.")
+        expect(self.page.locator(".pending-badge")).to_have_count(1)
+        self.page.once("dialog", lambda d: d.accept())
+        self.review_panel().get_by_role("button", name="Discard review").click()
+        expect(self.page.locator(".pending-badge")).to_have_count(0)
+        self.assertIsNone(pr.pending)
+
+    def test_reply_in_a_review_and_delete_it(self) -> None:
+        pr = self.prs[scenarios.REPLY_IN_REVIEW]
+        self.open(scenarios.REPLY_IN_REVIEW)
+        thread = self.thread()
+        thread.get_by_role("button", name="Reply").click()
+        thread.get_by_role("textbox", name="Reply").fill("Will check.")
+        thread.get_by_role("button", name="Add to review").click()
+        reply = thread.locator(".comment").nth(1)
+        expect(reply.locator(".pending-badge")).to_have_text("Pending")
+        assert pr.pending
+        self.assertEqual(pr.pending.comments[0].in_reply_to, pr.comments[0].id)
+
+        self.page.once("dialog", lambda d: d.accept())
+        reply.get_by_role("button", name="Delete").click()
+        expect(thread.locator(".comment")).to_have_count(1)
+        self.assertEqual(pr.pending.comments, [])
+
+    def test_own_pr_can_only_be_commented_on(self) -> None:
+        self.open(scenarios.OWN)
+        panel = self.review_panel()
+        expect(panel.get_by_label("Approve")).to_be_disabled()
+        expect(panel.get_by_label("Request changes")).to_be_disabled()
+        expect(panel.get_by_label("Comment")).to_be_enabled()
+
     def test_reply_to_a_thread(self) -> None:
         self.open(scenarios.REPLY)
         thread = self.thread()

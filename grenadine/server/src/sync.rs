@@ -316,12 +316,26 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
     };
     let mut comments = state.github.review_comments(key).await?;
     let threads = state.github.review_threads(key).await?;
+    // GitHub's REST API may or may not list pending comments; mark the
+    // ones it lists and add the others.
+    for p in &data.pending {
+        match comments.iter_mut().find(|c| c.id == p.id) {
+            Some(c) => {
+                c.pending = true;
+                c.node_id = p.node_id.clone();
+            }
+            None => comments.push(p.clone()),
+        }
+    }
     for c in &mut comments {
         if let Some(t) = threads.get(&c.id) {
             c.resolved = t.resolved;
             c.resolved_by = t.resolved_by.clone();
             c.thread_id = Some(t.id.clone());
             c.can_resolve = t.can_resolve;
+            if c.pending {
+                c.side = t.side;
+            }
         }
     }
 

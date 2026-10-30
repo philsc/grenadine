@@ -47,6 +47,19 @@ query($owner: String!, $name: String!, $number: Int!) {
       reviews(first: 100) {
         nodes { state body submittedAt url author { ...Who } }
       }
+      pending: reviews(states: [PENDING], first: 1) {
+        nodes {
+          id viewerDidAuthor
+          comments(first: 100) {
+            nodes {
+              id databaseId body path line startLine originalLine originalStartLine
+              subjectType createdAt url
+              replyTo { databaseId }
+              originalCommit { oid }
+            }
+          }
+        }
+      }
       reviewRequests(first: 20) {
         nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
       }
@@ -85,7 +98,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id
+          id diffSide
           isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -313,6 +326,72 @@ class FakeGitHubTest(unittest.TestCase):
         )
         self.assertIn("Could not resolve", out["errors"][0]["message"])
 
+    def test_pending_reviews(self) -> None:
+        pr = self.inboxes.prs["Ask me for a review"]
+        root = self.repo.comment(
+            pr, author="other", body="Hmm", path="inbox/x.md", line=1
+        )
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id }} }} }}"
+        )["data"]["repository"]["pullRequest"]["id"]
+
+        out = self.query(
+            "mutation($p: ID!) { addPullRequestReview(input: {pullRequestId: $p})"
+            " { pullRequestReview { id } } }",
+            p=pr_id,
+        )
+        review = out["data"]["addPullRequestReview"]["pullRequestReview"]["id"]
+        out = self.query(
+            "mutation($p: ID!) { addPullRequestReview(input: {pullRequestId: $p})"
+            " { clientMutationId } }",
+            p=pr_id,
+        )
+        self.assertIn("one pending review", out["errors"][0]["message"])
+
+        self.query(
+            "mutation($r: ID!) { addPullRequestReviewThread(input: {pullRequestReviewId: $r,"
+            ' path: "inbox/x.md", body: "Nit", line: 1, side: RIGHT}) { clientMutationId } }',
+            r=review,
+        )
+        self.query(
+            "mutation($r: ID!, $t: ID!) { addPullRequestReviewThreadReply(input: {"
+            ' pullRequestReviewThreadId: $t, pullRequestReviewId: $r, body: "Agreed"})'
+            " { clientMutationId } }",
+            r=review,
+            t=f"PRRT_{root.id}",
+        )
+        # Pending comments stay out of the PR's comments.
+        self.assertEqual(len(pr.comments), 1)
+        out = self.query(PR_QUERY, owner="test", name="test", number=pr.number)
+        self.assertNotIn("errors", out)
+        [pending] = out["data"]["repository"]["pullRequest"]["pending"]["nodes"]
+        self.assertEqual(pending["id"], review)
+        nit, agreed = pending["comments"]["nodes"]
+        self.assertEqual((nit["body"], nit["line"]), ("Nit", 1))
+        self.assertEqual(agreed["replyTo"], {"databaseId": root.id})
+
+        self.query(
+            "mutation($c: ID!) { updatePullRequestReviewComment(input: {"
+            ' pullRequestReviewCommentId: $c, body: "Nit: typo"}) { clientMutationId } }',
+            c=nit["id"],
+        )
+        self.query(
+            "mutation($c: ID!) { deletePullRequestReviewComment(input: {id: $c})"
+            " { clientMutationId } }",
+            c=agreed["id"],
+        )
+        out = self.query(
+            "mutation($r: ID!) { submitPullRequestReview(input: {pullRequestReviewId: $r,"
+            ' event: APPROVE, body: "LGTM"}) { clientMutationId } }',
+            r=review,
+        )
+        self.assertNotIn("errors", out)
+        self.assertIsNone(pr.pending)
+        self.assertEqual([c.body for c in pr.comments], ["Hmm", "Nit: typo"])
+        self.assertEqual(pr.review_decision(), APPROVED)
+        self.assertEqual(pr.reviews[-1].body, "LGTM")
+
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')
         self.assertIn("Cannot query field 'nope'", out["errors"][0]["message"])
@@ -334,6 +413,7 @@ class FakeGitHubTest(unittest.TestCase):
             [
                 {
                     "id": f"PRRT_{root.id}",
+                    "diffSide": "RIGHT",
                     "isResolved": True,
                     "viewerCanResolve": True,
                     "viewerCanUnresolve": True,

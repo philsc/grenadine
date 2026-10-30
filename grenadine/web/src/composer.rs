@@ -38,13 +38,6 @@ pub fn comment_draft_key(id: &str) -> String {
     format!("grenadine.comment-draft.{id}")
 }
 
-/// Whether a comment draft is waiting under `id`.
-pub fn has_draft(id: &str) -> bool {
-    storage()
-        .and_then(|s| s.get_item(&comment_draft_key(id)).ok().flatten())
-        .is_some_and(|d| !d.trim().is_empty())
-}
-
 /// The comment boxes open on the page, by draft name. Provided above the
 /// parts of the page that are rebuilt when the PR is refetched, so that an
 /// open box survives that even before anything was typed into it.
@@ -52,14 +45,29 @@ pub fn has_draft(id: &str) -> bool {
 pub struct OpenBoxes(RwSignal<std::collections::HashSet<String>>);
 
 impl OpenBoxes {
+    /// Starts out with the boxes that hold drafts open.
     pub fn new() -> OpenBoxes {
-        OpenBoxes(RwSignal::new(Default::default()))
+        let prefix = comment_draft_key("");
+        let mut open = std::collections::HashSet::new();
+        if let Some(s) = storage() {
+            for i in 0..s.length().unwrap_or(0) {
+                if let Some(name) = s
+                    .key(i)
+                    .ok()
+                    .flatten()
+                    .and_then(|k| k.strip_prefix(&prefix).map(str::to_owned))
+                {
+                    open.insert(name);
+                }
+            }
+        }
+        OpenBoxes(RwSignal::new(open))
     }
 
     /// Whether the box for `draft` is open: opened and not closed since,
-    /// or holding a draft.
+    /// or holding a draft when the page loaded.
     pub fn is_open(self, draft: &str) -> bool {
-        self.0.with(|open| open.contains(draft)) || has_draft(draft)
+        self.0.with(|open| open.contains(draft))
     }
 
     pub fn set(self, draft: &str, open: bool) {
@@ -86,6 +94,23 @@ where
     Arc::new(move |body| Box::pin(f(body)))
 }
 
+/// Closes the box for `draft` and drops its draft. This goes through
+/// storage and `boxes`, which outlive the box itself: a refetch of the PR
+/// may replace the box while its comment is being sent.
+fn close_box(boxes: OpenBoxes, draft: &str) {
+    if let Some(s) = storage() {
+        let _ = s.remove_item(&comment_draft_key(draft));
+    }
+    boxes.set(draft, false);
+    boxes.set(&preview_name(draft), false);
+}
+
+/// The name under which `OpenBoxes` notes that the box for `draft` shows
+/// its preview, so that a refetch doesn't switch it back.
+fn preview_name(draft: &str) -> String {
+    format!("preview:{draft}")
+}
+
 /// Whether a key sends the comment: Ctrl+Enter, or Cmd+Enter on a Mac.
 /// Plain Enter adds a line, as comments are usually several lines long.
 fn submits(ev: &web_sys::KeyboardEvent) -> bool {
@@ -93,8 +118,10 @@ fn submits(ev: &web_sys::KeyboardEvent) -> bool {
 }
 
 /// A comment box. `draft` names its draft (see `comment_draft_key`) and
-/// `repo` is where markdown references in the preview point. `on_cancel`
-/// adds a Cancel button; `on_sent` runs once the comment was sent.
+/// `repo` is where markdown references in the preview point. `alt` adds a
+/// second button that sends the comment another way. `initial` is the text
+/// to start with when there's no draft. The box is one of `OpenBoxes`, by
+/// its draft's name: Cancel, and sending, close it and drop the draft.
 #[component]
 pub fn Composer(
     draft: String,
@@ -102,12 +129,25 @@ pub fn Composer(
     #[prop(into)] label: String,
     #[prop(into)] placeholder: String,
     send: SendComment,
-    #[prop(optional)] on_cancel: Option<Callback<()>>,
-    #[prop(optional)] on_sent: Option<Callback<()>>,
+    #[prop(optional)] alt: Option<(String, SendComment)>,
+    #[prop(optional)] initial: Option<String>,
     #[prop(optional)] autofocus: bool,
 ) -> impl IntoView {
+    let boxes = expect_context::<OpenBoxes>();
     let text = draft_signal(comment_draft_key(&draft));
-    let preview = RwSignal::new(false);
+    let draft = StoredValue::new(draft);
+    if let Some(initial) = initial.filter(|_| text.with_untracked(|t| t.trim().is_empty())) {
+        text.set(initial);
+    }
+    let (alt_label, alt_send) = alt.unzip();
+    let alt_send = StoredValue::new(alt_send);
+    let shown = preview_name(&draft.get_value());
+    let preview = {
+        let shown = shown.clone();
+        Signal::derive(move || boxes.is_open(&shown))
+    };
+    let shown = StoredValue::new(shown);
+    let set_preview = move |on: bool| shown.with_value(|s| boxes.set(s, on));
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let textarea = NodeRef::<leptos::html::Textarea>::new();
@@ -120,27 +160,33 @@ pub fn Composer(
     }
     let send = StoredValue::new(send);
     let empty = move || text.with(|t| t.trim().is_empty());
-    let submit = move || {
+    // Sends with the main button's action, or with `alt`'s.
+    let submit_with = move |use_alt: bool| {
         if empty() || busy.get_untracked() {
             return;
         }
         busy.set(true);
         error.set(None);
-        let fut = send.with_value(|send| send(text.get_untracked()));
+        let body = text.get_untracked();
+        let fut = match alt_send.with_value(|a| a.clone()).filter(|_| use_alt) {
+            Some(alt) => alt(body),
+            None => send.with_value(|send| send(body)),
+        };
+        let draft = draft.get_value();
         spawn_local(async move {
             match fut.await {
                 Ok(()) => {
-                    text.set(String::new());
-                    preview.set(false);
-                    if let Some(cb) = on_sent {
-                        cb.run(());
-                    }
+                    let _ = text.try_set(String::new());
+                    close_box(boxes, &draft);
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => {
+                    let _ = error.try_set(Some(e));
+                }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
+    let submit = move || submit_with(false);
     view! {
         <form class="comment-composer" on:submit=move |ev| {
             ev.prevent_default();
@@ -149,10 +195,10 @@ pub fn Composer(
             <div class="composer-tabs" role="tablist">
                 <button type="button" role="tab" class:active=move || !preview.get()
                     aria-selected=move || (!preview.get()).to_string()
-                    on:click=move |_| preview.set(false)>"Write"</button>
+                    on:click=move |_| set_preview(false)>"Write"</button>
                 <button type="button" role="tab" class:active=move || preview.get()
                     aria-selected=move || preview.get().to_string()
-                    on:click=move |_| preview.set(true)>"Preview"</button>
+                    on:click=move |_| set_preview(true)>"Preview"</button>
             </div>
             <textarea
                 node_ref=textarea
@@ -184,12 +230,13 @@ pub fn Composer(
                 <button type="submit" class="primary" disabled=move || empty() || busy.get()>
                     {move || if busy.get() { "Sending…".to_owned() } else { label.clone() }}
                 </button>
-                {on_cancel.map(|cb| view! {
-                    <button type="button" on:click=move |_| {
-                        text.set(String::new());
-                        cb.run(());
-                    }>"Cancel"</button>
+                {alt_label.map(|l| view! {
+                    <button type="button" disabled=move || empty() || busy.get() on:click=move |_| submit_with(true)>{l}</button>
                 })}
+                <button type="button" on:click=move |_| {
+                    text.set(String::new());
+                    draft.with_value(|d| close_box(boxes, d));
+                }>"Cancel"</button>
                 <span class="muted composer-hint">"Ctrl+Enter sends"</span>
             </div>
         </form>

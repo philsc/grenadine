@@ -1526,6 +1526,8 @@ mod tests {
             }),
             thread_id: Some("T3".into()),
             can_resolve: true,
+            pending: false,
+            node_id: None,
         }];
         let review = ReviewInfo {
             viewer: "me".into(),
@@ -1549,6 +1551,7 @@ mod tests {
                 url: None,
             }],
             ci: Some(CiStatus::Passing),
+            pending_review: None,
             merge: MergeInfo {
                 conflicting: Some(false),
                 state: "CLEAN".into(),

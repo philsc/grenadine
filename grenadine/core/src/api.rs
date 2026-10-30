@@ -218,11 +218,51 @@ pub struct ReviewComment {
     /// it if it's resolved. Only meaningful on a thread's root comment.
     #[serde(default)]
     pub can_resolve: bool,
+    /// The comment is part of the viewer's pending review: only the viewer
+    /// sees it until the review is submitted.
+    #[serde(default)]
+    pub pending: bool,
+    /// The comment's GraphQL ID, which editing and deleting a pending
+    /// comment need. Only set on pending comments.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
-/// The body of a request that comments on a PR or replies to a thread.
+/// The body of a request that comments on a PR, replies to a thread or
+/// edits a pending comment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewComment {
+    pub body: String,
+    /// For a reply: add it to the viewer's pending review, starting one if
+    /// needed, rather than posting it right away.
+    #[serde(default)]
+    pub review: bool,
+}
+
+/// The body of a request that adds a thread to the viewer's pending
+/// review, starting one if needed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewThread {
+    pub path: String,
+    pub side: Side,
+    /// The 1-based line on `side`; `None` comments on the whole file.
+    pub line: Option<u32>,
+    pub body: String,
+}
+
+/// What submitting a review says about the PR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+/// The body of a request that submits the viewer's review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitReview {
+    pub event: ReviewEvent,
+    /// The review's summary; may be empty.
     pub body: String,
 }
 
@@ -344,6 +384,10 @@ pub struct ReviewInfo {
     pub checks: Vec<Check>,
     pub ci: Option<CiStatus>,
     pub merge: MergeInfo,
+    /// The GraphQL ID of the viewer's pending review, if they started one.
+    /// Its comments are among the PR's comments, marked `pending`.
+    #[serde(default)]
+    pub pending_review: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

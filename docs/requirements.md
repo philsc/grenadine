@@ -534,6 +534,52 @@ the PR again so that the page shows the change. A sync that was already
 running when the change was made must not count, since it may have read
 the PR before the change.
 
+## Pending review
+
+A review is written as GitHub's pending review, so it's also there on
+github.com and can be continued or submitted in either place.
+
+**REVIEW-PEND-1.** Clicking a line number in the diff must open a comment
+box under that line, and "Comment on file" in a file's header must open
+one for the whole file. Sending must add the comment to the viewer's
+pending review, starting one if there's none.
+
+**REVIEW-PEND-2.** Lines and files can only be commented on when the PR
+is open and Head is the latest version. Lines on the left side can only
+be commented on when Base is the merge-base row.
+_Why:_ GitHub anchors new comments to the PR's current diff, and left
+lines are lines of the merge-base (VPICK-CMT-3).
+
+**REVIEW-PEND-3.** Comments of the pending review must be shown like
+other comments, placed by the same rules, with a "Pending" badge, Edit and
+Delete. Delete must ask first. Pending threads must not be counted in the
+version picker.
+
+**REVIEW-PEND-4.** A reply box must offer both posting the reply right
+away and adding it to the pending review. While a review is pending,
+adding it to the review must be the main button; otherwise posting it
+right away must be.
+
+**REVIEW-PEND-5.** The toolbar must have a Review button showing the
+number of pending comments. It must open a panel with a summary box,
+Comment, Approve and Request changes, "Submit review" and, while a review
+is pending, "Discard review", which must ask first.
+
+**REVIEW-PEND-6.** Submitting must submit the pending review with the
+summary and the chosen verdict, or review the PR without comments when
+nothing is pending. Request changes needs a summary. Comment needs a
+summary or pending comments. Submit must be disabled until these hold.
+
+**REVIEW-PEND-7.** On the viewer's own PR, Approve and Request changes
+must be disabled.
+_Why:_ GitHub refuses them.
+
+**REVIEW-PEND-8.** Comment boxes, which ones are open and show their
+preview, the panel's choice and whether it is open must survive the page
+refetching the PR. A comment sent while the page refetches must still
+close its box and drop its draft.
+_Why:_ every change, the viewer's own included, refetches the PR.
+
 ## Merge box
 
 **REVIEW-MERGE-1.** Below the conversation, open PRs must show a merge
