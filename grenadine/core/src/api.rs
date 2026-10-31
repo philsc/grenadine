@@ -210,6 +210,10 @@ pub struct ReviewComment {
     /// meaningful on a thread's root comment.
     #[serde(default)]
     pub resolved_by: Option<Person>,
+    /// The GraphQL ID of the thread this comment starts, which resolving
+    /// it needs. Only set on a thread's root comment.
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 /// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.
@@ -243,6 +247,93 @@ pub struct PrDetail {
     pub drift: Option<String>,
     /// Set when the last sync of this PR failed.
     pub sync_error: Option<String>,
+    /// Reviews, the conversation, checks and whether the PR can be merged.
+    /// `None` until a sync fetched them.
+    #[serde(default)]
+    pub review: Option<ReviewInfo>,
+}
+
+/// The verdict of a submitted review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+}
+
+/// A submitted review of a PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Review {
+    pub author: Person,
+    pub state: ReviewState,
+    /// The review's summary; empty when it has none.
+    pub body: String,
+    pub submitted_at: String,
+    pub url: String,
+}
+
+/// A comment on the PR itself rather than on its code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueComment {
+    pub author: Person,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+}
+
+/// One check run or commit status on the PR's head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    /// `None` for a check that finished without passing or failing, e.g.
+    /// one that was skipped.
+    pub status: Option<CiStatus>,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+/// Whether and how the PR can be merged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeInfo {
+    /// Whether the PR conflicts with its base; `None` while GitHub is
+    /// still working that out.
+    pub conflicting: Option<bool>,
+    /// GitHub's `MergeStateStatus`, e.g. CLEAN, BLOCKED, BEHIND or DIRTY.
+    pub state: String,
+    /// The merge methods the repository allows, in GitHub's order.
+    pub methods: Vec<MergeMethod>,
+    /// The method GitHub preselects for the viewer.
+    pub default_method: Option<MergeMethod>,
+    /// The repository deletes head branches once their PRs are merged.
+    pub delete_branch_on_merge: bool,
+    /// The viewer may merge despite failing requirements.
+    pub can_merge_as_admin: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewInfo {
+    /// The login of the user grenadine acts as.
+    pub viewer: String,
+    /// GitHub's REVIEW_REQUIRED, APPROVED or CHANGES_REQUESTED; `None`
+    /// when the repository doesn't require reviews and nobody reviewed.
+    pub decision: Option<String>,
+    /// Submitted reviews, oldest first.
+    pub reviews: Vec<Review>,
+    /// Users and teams asked to review who haven't yet.
+    pub requested: Vec<String>,
+    /// Comments on the PR itself, oldest first.
+    pub comments: Vec<IssueComment>,
+    /// The checks on the PR's head and their combined state.
+    pub checks: Vec<Check>,
+    pub ci: Option<CiStatus>,
+    pub merge: MergeInfo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

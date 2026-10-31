@@ -1715,3 +1715,100 @@ textarea {
     columns: 1;
   }
 }
+
+/* Reviews, the conversation and the merge box on the PR page. */
+
+.review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.review-decision {
+  font-weight: 600;
+}
+.review-decision.approved,
+.review-state.approved {
+  color: var(--add-fg);
+}
+.review-decision.changes,
+.review-state.changes {
+  color: var(--del-fg);
+}
+.review-decision.required {
+  color: var(--warn-fg);
+}
+.review-state.commented {
+  color: var(--fg-muted);
+}
+.review-summary .review-state.approved .avatar,
+.review-summary .review-state.approved .avatar-generic {
+  box-shadow: 0 0 0 2px var(--add-fg);
+}
+.review-summary .review-state.changes .avatar,
+.review-summary .review-state.changes .avatar-generic {
+  box-shadow: 0 0 0 2px var(--del-fg);
+}
+.conversation,
+.merge-box {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 16px 0;
+}
+.conversation > summary {
+  padding: 6px 12px;
+  background: var(--bg-subtle);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.conversation[open] > summary {
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+}
+.conversation .comment-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.merge-box {
+  padding: 8px 12px;
+}
+.merge-box .checks summary {
+  cursor: pointer;
+}
+.merge-box .checks ul {
+  list-style: none;
+  margin: 4px 0;
+  padding-left: 16px;
+}
+.merge-box .check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.merge-box .ci {
+  display: inline-flex;
+  align-items: center;
+}
+.merge-box .ci.passing {
+  color: var(--add-fg);
+}
+.merge-box .ci.failing {
+  color: var(--del-fg);
+}
+.merge-box .ci.running {
+  color: var(--warn-fg);
+}
+.merge-status {
+  margin: 4px 0;
+  font-weight: 600;
+}
+.merge-status.ok {
+  color: var(--add-fg);
+}
+.merge-status.warn {
+  color: var(--warn-fg);
+}
+.merge-status.bad {
+  color: var(--del-fg);
+}

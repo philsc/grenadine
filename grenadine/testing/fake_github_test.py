@@ -11,7 +11,9 @@ from pathlib import Path
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import (
+    APPROVED,
     TOKEN,
+    CheckRun,
     FakeGitHub,
     SearchError,
     matches,
@@ -41,9 +43,39 @@ query($owner: String!, $name: String!, $number: Int!) {
       commits(first: 100) {
         nodes { commit { oid checkSuites(first: 10) { nodes { createdAt } } } }
       }
+      reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
+      reviews(first: 100) {
+        nodes { state body submittedAt url author { ...Who } }
+      }
+      reviewRequests(first: 20) {
+        nodes { requestedReviewer { ... on User { login } ... on Team { name } } }
+      }
+      comments(last: 100) {
+        nodes { body createdAt url author { ...Who } }
+      }
+      head: commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              state
+              contexts(first: 100) {
+                nodes {
+                  ... on CheckRun { name status conclusion detailsUrl }
+                  ... on StatusContext { context state targetUrl }
+                }
+              }
+            }
+          }
+        }
+      }
     }
+    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
+    viewerDefaultMergeMethod deleteBranchOnMerge
   }
+  viewer { login }
 }
+
+fragment Who on Actor { login avatarUrl ... on User { name } }
 """
 
 THREADS_QUERY = """
@@ -53,6 +85,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
+          id
           isResolved
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -179,6 +212,60 @@ class FakeGitHubTest(unittest.TestCase):
             [n["commit"]["oid"] for n in data["commits"]["nodes"]], [second]
         )
 
+    def test_pr_query_reports_reviews_and_merge_state(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.review(pr, author="other", state=APPROVED, body="LGTM")
+        self.repo.issue_comment(pr, author="other", body="Thanks!")
+        pr.review_requests.add("third")
+        pr.checks = "FAILURE"
+        pr.check_runs = [
+            CheckRun("lint"),
+            CheckRun("test", conclusion="FAILURE"),
+            CheckRun("deploy", status="IN_PROGRESS", conclusion=None),
+        ]
+        self.repo.merge_methods = ["SQUASH", "MERGE"]
+
+        out = self.query(PR_QUERY, owner="test", name="test", number=pr.number)
+        self.assertNotIn("errors", out)
+        self.assertEqual(out["data"]["viewer"], {"login": "me"})
+        repo = out["data"]["repository"]
+        self.assertEqual(
+            {k: v for k, v in repo.items() if k != "pullRequest"},
+            {
+                "mergeCommitAllowed": True,
+                "squashMergeAllowed": True,
+                "rebaseMergeAllowed": False,
+                "viewerDefaultMergeMethod": "SQUASH",
+                "deleteBranchOnMerge": False,
+            },
+        )
+        data = repo["pullRequest"]
+        self.assertEqual(data["reviewDecision"], "APPROVED")
+        self.assertEqual(data["mergeable"], "MERGEABLE")
+        self.assertEqual(data["mergeStateStatus"], "UNSTABLE")
+        [review] = data["reviews"]["nodes"]
+        self.assertEqual(review["state"], "APPROVED")
+        self.assertEqual(review["body"], "LGTM")
+        self.assertEqual(review["author"]["name"], "Other Person")
+        self.assertEqual(
+            data["reviewRequests"]["nodes"], [{"requestedReviewer": {"login": "third"}}]
+        )
+        [comment] = data["comments"]["nodes"]
+        self.assertEqual(comment["body"], "Thanks!")
+        rollup = data["head"]["nodes"][0]["commit"]["statusCheckRollup"]
+        self.assertEqual(rollup["state"], "FAILURE")
+        self.assertEqual(
+            [
+                (c["name"], c["status"], c["conclusion"])
+                for c in rollup["contexts"]["nodes"]
+            ],
+            [
+                ("lint", "COMPLETED", "SUCCESS"),
+                ("test", "COMPLETED", "FAILURE"),
+                ("deploy", "IN_PROGRESS", None),
+            ],
+        )
+
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')
         self.assertIn("Cannot query field 'nope'", out["errors"][0]["message"])
@@ -199,6 +286,7 @@ class FakeGitHubTest(unittest.TestCase):
             threads["nodes"],
             [
                 {
+                    "id": f"PRRT_{root.id}",
                     "isResolved": True,
                     "resolvedBy": {
                         "login": "other",

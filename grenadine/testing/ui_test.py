@@ -527,6 +527,60 @@ class InboxTest(ServerTestCase):
         expect(description.locator("li code")).to_have_text("inline code")
         expect(description.locator("pre")).to_contain_text("fn main() {}")
 
+    def test_pr_page_shows_reviews_and_the_conversation(self) -> None:
+        pr = self.cases.prs["Get changes requested"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        summary = self.page.locator(".pr-header .review-summary")
+        expect(summary.locator(".review-decision")).to_have_text("Changes requested")
+        expect(summary.locator(".review-state.changes")).to_have_text("Other Person")
+        expect(summary.locator(".muted")).to_have_text("Waiting on third")
+
+        conversation = self.page.locator("details.conversation")
+        expect(conversation.locator("summary")).to_have_text("2 comments")
+        comments = conversation.locator(".comment")
+        expect(comments.nth(0).locator(".comment-meta")).to_contain_text(
+            "Other Person requested changes"
+        )
+        expect(comments.nth(0).locator(".markdown")).to_have_text(
+            "Please split this up."
+        )
+        expect(comments.nth(1).locator(".comment-meta")).to_contain_text("Me Myself")
+        expect(comments.nth(1).locator(".markdown")).to_have_text("Will do, thanks!")
+
+        merge = self.page.locator(".merge-box")
+        expect(merge.locator(".checks")).to_have_count(0)
+        expect(merge.locator(".merge-status")).to_have_text("Ready to merge.")
+
+    def test_pr_page_shows_checks(self) -> None:
+        pr = self.cases.prs["Ask my team for a review"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        checks = self.page.locator(".merge-box details.checks")
+        expect(checks.locator("summary")).to_have_text(
+            "Checks: 1 failing, 1 passing, 1 skipped"
+        )
+        # Failing checks show unfolded.
+        expect(checks).to_have_attribute("open", "")
+        expect(checks.locator(".check")).to_have_text(["lint", "test", "docs"])
+        expect(checks.locator(".check").nth(1).locator(".ci")).to_have_class(
+            re.compile(r"\bfailing\b")
+        )
+        expect(checks.locator(".check a").nth(0)).to_have_attribute(
+            "href", f"{pr.url}/checks?name=lint"
+        )
+        expect(self.page.locator(".merge-status")).to_have_text(
+            "Can be merged, but not every check passed."
+        )
+        # Without reviews or comments there's no conversation.
+        expect(self.page.locator("details.conversation")).to_have_count(0)
+
+    def test_pr_page_of_a_merged_pr_has_no_merge_box(self) -> None:
+        pr = self.cases.prs["Get merged"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        expect(self.page.locator(".merge-box")).to_have_count(0)
+
     def test_pr_page_of_a_draft(self) -> None:
         pr = self.cases.prs["Stay a draft"]
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
