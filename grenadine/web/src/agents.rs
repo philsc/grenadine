@@ -916,7 +916,8 @@ fn model_arg(model: RwSignal<String>) -> Option<String> {
 }
 
 /// Picks one of `backend`'s models. Until they're listed, or when they
-/// can't be, only its configured default is offered.
+/// can't be, its configured default is offered, and the model picked
+/// last stays, marked as not listed.
 #[component]
 fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl IntoView {
     let models = listed_models(backend);
@@ -925,9 +926,9 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
         backends().refetch();
     }
     let options = Memo::new(move |_| {
-        let mut models = models.get().unwrap_or_default();
-        if !models.iter().any(|m| m.value == DEFAULT_MODEL) {
-            models.insert(
+        let mut options = models.get().unwrap_or_default();
+        if !options.iter().any(|m| m.value == DEFAULT_MODEL) {
+            options.insert(
                 0,
                 AgentModelInfo {
                     value: DEFAULT_MODEL.into(),
@@ -936,14 +937,27 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
                 },
             );
         }
-        models
+        let picked = model.get();
+        if !options.iter().any(|m| m.value == picked) {
+            options.push(AgentModelInfo {
+                display_name: format!("{picked} (not listed)"),
+                description: format!("{} didn't list this model", backend.get().label()),
+                value: picked,
+            });
+        }
+        options
     });
     // A pick that's no longer offered goes back to the default. Without
     // a list there's no telling, and the pick stays.
     Effect::new(move |_| {
-        if models.with(|m| m.as_ref().is_some_and(|m| !m.is_empty()))
-            && !options.with(|ms| model.with_untracked(|m| ms.iter().any(|i| &i.value == m)))
-        {
+        let stale = models.with(|ms| {
+            ms.as_ref().is_some_and(|ms| {
+                !ms.is_empty()
+                    && model
+                        .with_untracked(|m| m != DEFAULT_MODEL && !ms.iter().any(|i| &i.value == m))
+            })
+        });
+        if stale {
             model.set(DEFAULT_MODEL.into());
         }
     });
@@ -964,6 +978,20 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
             }).collect_view()}
         </select>
     }
+}
+
+/// How the permissions work for `backend`, for the new session form.
+fn permissions_hint(backend: AgentBackend) -> String {
+    let agent = backend.agent_name();
+    let plan = backend
+        .mode_label(PermissionMode::plan().as_str())
+        .unwrap_or("Plan");
+    format!(
+        " {agent} asks here before it uses a tool, unless the permissions let it go ahead. \
+         {plan} has {agent} look around without changing anything, then asks you to approve its \
+         plan before it goes ahead. Every prompt can pick different permissions and a different \
+         model."
+    )
 }
 
 /// Whether a key in a prompt sends it: Enter does, Shift+Enter adds a line,
@@ -1137,7 +1165,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 <textarea
                     class="agent-prompt"
                     rows="5"
-                    placeholder="What should Claude do? (Enter starts, Shift+Enter for a new line)"
+                    placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
                     aria-label="Prompt"
                     prop:value=move || prompt.get()
                     on:input=move |ev| prompt.set(event_target_value(&ev))
@@ -1150,7 +1178,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                     }
                 ></textarea>
                 <Attachments images=images />
-                <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} " Claude asks here before it uses a tool, unless the permissions let it go ahead: Accept edits allows file edits, and Auto allows whatever Claude Code's classifier deems safe. Plan first has Claude look around without changing anything, then asks you to approve its plan before it goes ahead. Every prompt can pick different permissions and a different model."</p>
+                <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -1802,6 +1830,7 @@ fn Transcript(
                                 <QuestionCard
                                     agent=id
                                     tool=tool
+                                    backend=backend
                                     questions=questions
                                     resolved=resolved
                                     waiting=waiting
@@ -1816,6 +1845,7 @@ fn Transcript(
                                 <ApprovalCard
                                     agent=id
                                     tool=tool
+                                    backend=backend
                                     tool_name=tool_name
                                     summary=summary
                                     input=pretty(&input)
@@ -1983,11 +2013,11 @@ fn PlanCard(
         <div class="approval plan" class:pending=pending>
             <p>
                 {move || match state.get() {
-                    Some(true) => "Plan approved",
-                    Some(false) => "Plan sent back",
-                    None if !open.get() => "Unanswered plan",
-                    None if waiting.get() => "Claude's plan is waiting for your approval",
-                    None => "The turn ended before the plan was answered. Answering it continues the session.",
+                    Some(true) => "Plan approved".to_owned(),
+                    Some(false) => "Plan sent back".to_owned(),
+                    None if !open.get() => "Unanswered plan".to_owned(),
+                    None if waiting.get() => format!("{}'s plan is waiting for your approval", backend.agent_name()),
+                    None => "The turn ended before the plan was answered. Answering it continues the session.".to_owned(),
                 }}
             </p>
             <div class="plan-text markdown" inner_html=plan></div>
@@ -1996,7 +2026,7 @@ fn PlanCard(
                     class="plan-feedback"
                     rows="2"
                     aria-label="Feedback"
-                    placeholder="What should change? Claude gets this when it keeps planning."
+                    placeholder=format!("What should change? {} gets this when it keeps planning.", backend.agent_name())
                     prop:value=move || feedback.get()
                     on:input=move |ev| feedback.set(event_target_value(&ev))
                 ></textarea>
@@ -2054,6 +2084,8 @@ fn answer_text(q: &Question, picked: &[String], other: &str) -> String {
 fn QuestionCard(
     agent: String,
     tool: String,
+    /// The session's backend, for what the card calls the agent.
+    backend: AgentBackend,
     questions: Vec<Question>,
     resolved: Memo<HashMap<String, bool>>,
     waiting: Signal<bool>,
@@ -2102,10 +2134,10 @@ fn QuestionCard(
         <div class="approval questions" class:pending=pending>
             <p>
                 {move || match state.get() {
-                    Some(true) => "Answered",
-                    Some(false) => "Not answered",
-                    None if waiting.get() => "Claude asks",
-                    None => "Unanswered",
+                    Some(true) => "Answered".to_owned(),
+                    Some(false) => "Not answered".to_owned(),
+                    None if waiting.get() => format!("{} asks", backend.agent_name()),
+                    None => "Unanswered".to_owned(),
                 }}
             </p>
             {move || if pending() {
@@ -2191,13 +2223,15 @@ fn QuestionCard(
 fn ApprovalCard(
     agent: String,
     tool: String,
+    /// The session's backend, for what the card calls the agent.
+    backend: AgentBackend,
     tool_name: String,
     summary: String,
     input: String,
     /// What a file tool would change, shown instead of `input`.
     diff: Option<(String, Vec<Fragment>)>,
     resolved: Memo<HashMap<String, bool>>,
-    /// Whether Claude Code is running and so may wait for an answer;
+    /// Whether the backend is running and so may wait for an answer;
     /// requests from before a restart stay unanswered.
     waiting: Signal<bool>,
 ) -> impl IntoView {
@@ -2222,10 +2256,10 @@ fn ApprovalCard(
         <div class="approval" class:pending=move || state.get().is_none() && waiting.get()>
             <p>
                 {move || match state.get() {
-                    Some(true) => "Allowed ",
-                    Some(false) => "Denied ",
-                    None if waiting.get() => "Claude wants to use ",
-                    None => "Unanswered: ",
+                    Some(true) => "Allowed ".to_owned(),
+                    Some(false) => "Denied ".to_owned(),
+                    None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
+                    None => "Unanswered: ".to_owned(),
                 }}
                 <span class="tool-name">{tool_name}</span> " " <code>{summary}</code>
             </p>
@@ -2311,7 +2345,7 @@ fn Composer(
             <textarea
                 rows="3"
                 aria-label="Follow-up"
-                placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)" } else { "Reply to Claude… (Enter sends, Shift+Enter for a new line)" }
+                placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:paste=move |ev| images::paste(ev, images, error)

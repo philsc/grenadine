@@ -595,8 +595,12 @@ pub fn remove_orphaned_worktrees(
     // Git keeps the path the worktree was added at, which needn't be the
     // canonical one.
     let added = std::path::absolute(worktrees)?;
-    let owned: std::collections::BTreeSet<String> =
-        db.agents()?.into_iter().map(|s| s.branch).collect();
+    // Even sessions this build can't run own what they own.
+    let owned: std::collections::BTreeSet<String> = db
+        .agents_unchecked()?
+        .into_iter()
+        .map(|(s, _)| s.branch)
+        .collect();
     for (slug, cloned) in repos {
         let repo = &cloned.repo;
         let dirs = [root.join(slug), added.join(slug)];
@@ -609,7 +613,7 @@ pub fn remove_orphaned_worktrees(
             }) else {
                 continue;
             };
-            if db.agent(id)?.is_some() {
+            if db.agent_unchecked(id)?.is_some() {
                 continue;
             }
             if let Err(e) = repo.worktree_remove_only(&path) {
@@ -646,7 +650,7 @@ pub fn remove_orphaned_worktrees(
         else {
             continue;
         };
-        if db.agent(id)?.is_some() {
+        if db.agent_unchecked(id)?.is_some() {
             continue;
         }
         match remove_tree(&path) {
@@ -766,17 +770,16 @@ impl Agents {
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
-    /// one it lists.
+    /// one it lists. While it can't list them, there's no telling, so any
+    /// that can't pass for a flag goes and the backend itself rejects one
+    /// it doesn't have.
     pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
-        match model {
-            None => true,
-            Some(m) => self
-                .backend(backend)
-                .models()
-                .await
-                .iter()
-                .any(|i| i.value == m),
+        let Some(m) = model else { return true };
+        let models = self.backend(backend).models().await;
+        if models.is_empty() {
+            return !m.is_empty() && !m.starts_with('-');
         }
+        models.iter().any(|i| i.value == m)
     }
 }
 
@@ -1022,8 +1025,11 @@ pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
     let Ok(dirs) = std::fs::read_dir(images) else {
         return Ok(());
     };
-    let owned: std::collections::BTreeSet<String> =
-        db.agents()?.into_iter().map(|s| s.id).collect();
+    let owned: std::collections::BTreeSet<String> = db
+        .agents_unchecked()?
+        .into_iter()
+        .map(|(s, _)| s.id)
+        .collect();
     for dir in dirs.flatten() {
         let name = dir.file_name().to_string_lossy().into_owned();
         if valid_id(&name) && !owned.contains(&name) {
@@ -1127,9 +1133,10 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
 
 /// Stops the session and removes it along with its worktree and branch, or
 /// a general session's directory. Returns false when there is no such
-/// session.
+/// session. A session whose backend this build doesn't know goes too, but
+/// isn't scanned.
 pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
-    let Some(session) = state.db.agent(id)? else {
+    let Some((session, known)) = state.db.agent_unchecked(id)? else {
         return Ok(false);
     };
     // Without its clone the worktree and branch would stay behind with
@@ -1208,7 +1215,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     state.agents.live.lock().unwrap().remove(id);
     state.agents.terminals.forget(id);
     state.send(ServerEvent::AgentsChanged);
-    crate::cleanup::scan(state, scanned, events);
+    if known {
+        crate::cleanup::scan(state, scanned, events);
+    }
     Ok(true)
 }
 
@@ -2638,6 +2647,16 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             .unwrap();
         assert!(delete(&state, &gone).await.unwrap());
         assert!(state.db.agent(&gone).unwrap().is_none());
+
+        // One of a backend this build doesn't know can be deleted too.
+        let unknown = uuid();
+        state
+            .db
+            .create_agent(&session_row(&unknown, GENERAL, &dir.path().join("u")))
+            .unwrap();
+        state.db.set_agent_backend_raw(&unknown, "devin", "acu");
+        assert!(delete(&state, &unknown).await.unwrap());
+        assert!(state.db.agent_unchecked(&unknown).unwrap().is_none());
     }
 
     /// Worktrees no session owns go at startup with their branches, even
@@ -2674,6 +2693,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(&repo_dir.join(&detached), &["checkout", "-q", "--detach"]);
         db.create_agent(&session_row(&owned, "owner/name", &repo_dir.join(&owned)))
             .unwrap();
+        // A session of a backend this build doesn't know still owns its
+        // worktree.
+        db.set_agent_backend_raw(&owned, "devin", "acu");
         let elsewhere = dir.path().join("elsewhere");
         fx.clone
             .worktree_add(&elsewhere, "grenadine/agent/other", "HEAD")

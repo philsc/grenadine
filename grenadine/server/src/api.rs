@@ -787,7 +787,9 @@ async fn terminal_socket(
 }
 
 async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    if find_agent(&state, &id)?.is_none() || !agent::delete(&state, &id).await? {
+    // Not `find_agent`: a session whose backend this build doesn't know
+    // can still be deleted.
+    if !agent::valid_id(&id) || !agent::delete(&state, &id).await? {
         return Ok(StatusCode::NOT_FOUND);
     }
     Ok(StatusCode::NO_CONTENT)

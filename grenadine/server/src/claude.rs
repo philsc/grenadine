@@ -743,23 +743,22 @@ echo '{{"type":"control_response","response":{{"subtype":"success","request_id":
         );
     }
 
-    /// Without a list, prompts can only go with Claude Code's default,
-    /// and the models are empty.
+    /// Without a list, the models are empty and prompts can ask for any
+    /// model that can't pass for a flag; Claude Code rejects one it
+    /// doesn't have.
     #[tokio::test]
-    async fn offers_only_the_default_without_models() {
+    async fn offers_any_model_without_a_list() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
         let backends = state.agents.backends().await;
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].models, []);
-        assert!(state.agents.offers(AgentBackend::Claude, None).await);
-        assert!(
-            !state
-                .agents
-                .offers(AgentBackend::Claude, Some("sonnet"))
-                .await
-        );
+        let offers = async |model| state.agents.offers(AgentBackend::Claude, model).await;
+        assert!(offers(None).await);
+        assert!(offers(Some("opus")).await);
+        assert!(!offers(Some("--help")).await);
+        assert!(!offers(Some("")).await);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus,
     CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary,
@@ -1063,23 +1063,69 @@ impl Db {
         Ok(())
     }
 
-    /// Every agent session, newest first.
+    /// Every agent session, newest first. Sessions whose backend or cost
+    /// unit this build doesn't know are left out with a warning.
     pub fn agents(&self) -> Result<Vec<AgentSession>> {
+        Ok(self
+            .agents_unchecked()?
+            .into_iter()
+            .filter_map(|(session, known)| {
+                if !known {
+                    tracing::warn!(
+                        "agent {}: its backend or cost unit is unknown to this build",
+                        session.id
+                    );
+                }
+                known.then_some(session)
+            })
+            .collect())
+    }
+
+    /// Every agent session, newest first, with whether this build knows
+    /// its backend and cost unit; unknown ones read as the defaults. Only
+    /// for what doesn't run the session, like removing what it owns.
+    pub fn agents_unchecked(&self) -> Result<Vec<(AgentSession, bool)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC, id"
         ))?;
-        let rows = stmt.query_map([], agent_from_row)?;
+        let rows = stmt.query_map([], agent_from_row_unchecked)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The session; an error when its backend or cost unit is one this
+    /// build doesn't know, e.g. one a newer grenadine wrote, rather than
+    /// passing for another.
     pub fn agent(&self, id: &str) -> Result<Option<AgentSession>> {
+        Ok(match self.agent_unchecked(id)? {
+            Some((session, true)) => Some(session),
+            Some((_, false)) => {
+                bail!("agent {id}: its backend or cost unit is unknown to this build")
+            }
+            None => None,
+        })
+    }
+
+    /// Stores a backend and cost unit that may be unknown to this build,
+    /// like a newer grenadine would.
+    #[cfg(test)]
+    pub fn set_agent_backend_raw(&self, id: &str, backend: &str, cost_unit: &str) {
+        self.conn()
+            .execute(
+                "UPDATE agents SET backend = ?, cost_unit = ? WHERE id = ?",
+                params![backend, cost_unit, id],
+            )
+            .unwrap();
+    }
+
+    /// The session like `agents_unchecked` has it.
+    pub fn agent_unchecked(&self, id: &str) -> Result<Option<(AgentSession, bool)>> {
         Ok(self
             .conn()
             .query_row(
                 &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?"),
                 [id],
-                agent_from_row,
+                agent_from_row_unchecked,
             )
             .optional()?)
     }
@@ -1358,24 +1404,15 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p \
       WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting)";
 
-/// Column `i` of `r` as `parse` reads it. A value it doesn't know, e.g.
-/// one a newer grenadine wrote, fails the row rather than passing for
-/// another.
-fn parsed<T>(r: &rusqlite::Row, i: usize, parse: fn(&str) -> Option<T>) -> rusqlite::Result<T> {
-    let s: String = r.get(i)?;
-    parse(&s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            i,
-            rusqlite::types::Type::Text,
-            format!("unknown value {s:?}").into(),
-        )
-    })
-}
-
-fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
-    Ok(AgentSession {
+/// The session in `r`, and whether this build knows its backend and cost
+/// unit; unknown ones read as the defaults.
+fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession, bool)> {
+    let backend = AgentBackend::parse(&r.get::<_, String>(1)?);
+    let cost_unit = CostUnit::parse(&r.get::<_, String>(11)?);
+    let known = backend.is_some() && cost_unit.is_some();
+    let session = AgentSession {
         id: r.get(0)?,
-        backend: parsed(r, 1, AgentBackend::parse)?,
+        backend: backend.unwrap_or_default(),
         repo: r.get(2)?,
         pr: r.get(3)?,
         title: r.get(4)?,
@@ -1385,7 +1422,7 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         status: parse_status(&r.get::<_, String>(8)?),
         created_at: r.get(9)?,
         cost: r.get(10)?,
-        cost_unit: parsed(r, 11, CostUnit::parse)?,
+        cost_unit: cost_unit.unwrap_or_default(),
         context_tokens: r.get(12)?,
         context_window: r.get(13)?,
         landed: r
@@ -1400,7 +1437,8 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         }),
         // The listing looks at the worktree for these.
         unstaged: 0,
-    })
+    };
+    Ok((session, known))
 }
 
 fn status_str(s: AgentStatus) -> &'static str {
@@ -2029,22 +2067,25 @@ mod tests {
     }
 
     /// A row whose backend or cost unit this build doesn't know fails to
-    /// load instead of passing for Claude's or USD.
+    /// load instead of passing for Claude's or USD, and the listing leaves
+    /// it out.
     #[test]
     fn unknown_backends_fail_to_load() {
         let db = Db::in_memory();
         db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
         db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
-        db.conn()
-            .execute("UPDATE agents SET backend = 'devin' WHERE id = 'a'", [])
-            .unwrap();
-        db.conn()
-            .execute("UPDATE agents SET cost_unit = 'acu' WHERE id = 'b'", [])
-            .unwrap();
+        db.set_agent_backend_raw("a", "devin", "usd");
+        db.set_agent_backend_raw("b", "claude", "acu");
+        db.create_agent(&agent("c", AgentStatus::Idle)).unwrap();
         for id in ["a", "b"] {
             let e = db.agent(id).unwrap_err();
-            assert!(format!("{e:#}").contains("unknown value"), "{e:#}");
+            assert!(format!("{e:#}").contains("unknown to this build"), "{e:#}");
+            let (session, known) = db.agent_unchecked(id).unwrap().unwrap();
+            assert_eq!((session.id.as_str(), known), (id, false));
         }
+        let listed: Vec<_> = db.agents().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(listed, ["c"]);
+        assert_eq!(db.agents_unchecked().unwrap().len(), 3);
     }
 
     #[test]
