@@ -130,9 +130,13 @@ pub trait Backend: Send + Sync {
         sink: TurnSink<'a>,
     ) -> BoxFuture<'a, Result<AgentStatus>>;
 
-    /// Runs `job` on a model of its own for the job's kind and returns
-    /// the answer, in the shape of the job's schema.
-    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>>;
+    /// Runs `job` in `cwd`, on a model of its own for the job's kind, and
+    /// returns the answer, in the shape of the job's schema.
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>>;
 }
 
 /// One prompt's turn: what it says and how it runs.
@@ -200,9 +204,15 @@ pub struct JobSpec<'a> {
     pub input: &'a str,
     pub tools: JobTools,
     pub budget: Budget,
-    /// A directory it may read besides `cwd`, on a backend that can.
+    /// A directory it may read besides where it runs, on a backend that
+    /// can.
     pub add_dir: Option<&'a Path>,
-    pub cwd: &'a Path,
+    /// The clone it runs in, so that it can ask git about the repo; Devin,
+    /// which has no `--setting-sources user`, loads the clone's own rules
+    /// and hooks there. Without one, it runs in a private directory of its
+    /// own: the backends load instructions, settings and even hooks from
+    /// where they run, and a shared directory like /tmp could hold anyone's.
+    pub clone: Option<&'a Path>,
     /// How long it may take before it's killed.
     pub timeout: Duration,
 }
@@ -903,7 +913,13 @@ impl Agents {
         if !self.offered(backend).await {
             bail!("{} isn't offered", backend.label());
         }
-        self.backend(backend).structured(job).await
+        // It goes away with the job, however that ends.
+        let dir = tempfile::Builder::new()
+            .prefix("grenadine-")
+            .tempdir()
+            .with_context(|| format!("can't create a directory for the {}", job.kind.name()))?;
+        let cwd = job.clone.unwrap_or(dir.path());
+        self.backend(backend).structured(job, cwd).await
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
@@ -2507,6 +2523,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
 case " $* " in
 *" --json-schema "*)
   echo "$*" > {dir}/summary_args
+  pwd > {dir}/summary_cwd
   cat > {dir}/summary_input
   echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
   ;;
@@ -2552,6 +2569,19 @@ esac
         let args = std::fs::read_to_string(dir.path().join("summary_args")).unwrap();
         assert!(args.contains("--model haiku"), "{args}");
         assert!(args.contains("--tools  --permission-mode"), "{args}");
+        // In a private directory of its own, which is gone again.
+        let cwd = std::fs::read_to_string(dir.path().join("summary_cwd")).unwrap();
+        let cwd = Path::new(cwd.trim());
+        assert!(
+            cwd.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("grenadine-"),
+            "{}",
+            cwd.display()
+        );
+        assert!(!cwd.exists(), "{} is left", cwd.display());
         let input = std::fs::read_to_string(dir.path().join("summary_input")).unwrap();
         assert!(
             input.ends_with("please write a note\nin notes.txt\n"),

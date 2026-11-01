@@ -69,8 +69,12 @@ impl Backend for Claude {
         turn(&self.exe, state, session, t, sink).boxed()
     }
 
-    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>> {
-        structured(&self.exe, job).boxed()
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.exe, job, cwd).boxed()
     }
 }
 
@@ -452,8 +456,8 @@ fn job_model(kind: JobKind) -> &'static str {
 }
 
 /// Runs `claude -p --output-format json --json-schema` for `job` on its
-/// input and returns its `structured_output`.
-async fn structured(claude: &Path, job: &JobSpec<'_>) -> Result<Value> {
+/// input in `cwd` and returns its `structured_output`.
+async fn structured(claude: &Path, job: &JobSpec<'_>, cwd: &Path) -> Result<Value> {
     let name = job.kind.name();
     let mut cmd = tokio::process::Command::new(claude);
     cmd.args([
@@ -483,7 +487,7 @@ async fn structured(claude: &Path, job: &JobSpec<'_>) -> Result<Value> {
     if !allowed.is_empty() {
         cmd.arg("--allowedTools").args(allowed);
     }
-    cmd.current_dir(job.cwd)
+    cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

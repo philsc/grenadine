@@ -79,7 +79,7 @@ async fn run(state: &State, backend: AgentBackend, input: &str) -> Result<String
                 add_dir: None,
                 // Away from any repository, whose instructions would only
                 // distract.
-                cwd: &std::env::temp_dir(),
+                clone: None,
                 timeout: TIMEOUT,
             },
         )

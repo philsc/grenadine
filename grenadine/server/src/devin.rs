@@ -98,8 +98,12 @@ impl Backend for Devin {
         turn(&self.config.exe, state, session, t, sink).boxed()
     }
 
-    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>> {
-        structured(&self.config.exe, self.job_model(job.kind), job).boxed()
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.config.exe, self.job_model(job.kind), job, cwd).boxed()
     }
 }
 
@@ -1298,15 +1302,15 @@ fn parse_reply(name: &str, reply: &str) -> Result<Value> {
     })
 }
 
-/// Runs `job` on `model` as a `devin acp` session in ask mode and returns
+/// Runs `job` on `model` as a `devin acp` session in `cwd`, in ask mode, and returns
 /// its reply parsed as JSON; the schema is only in the prompt. The job's
 /// session is deleted, on every way out, so it doesn't stay in the user's
 /// Devin history.
-async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>) -> Result<Value> {
+async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) -> Result<Value> {
     let mut cmd = tokio::process::Command::new(devin);
-    cmd.arg("acp").current_dir(job.cwd);
+    cmd.arg("acp").current_dir(cwd);
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
-    let (result, session) = run_job(&mut rpc, model, job).await;
+    let (result, session) = run_job(&mut rpc, model, job, cwd).await;
     if let Some(session) = session {
         // The session only existed for the job; it doesn't belong in the
         // user's history. A hung delete doesn't keep the job.
@@ -1420,7 +1424,12 @@ impl JobRun<'_> {
 }
 
 /// The job's outcome, beside the session id it got to.
-async fn run_job(rpc: &mut Rpc, model: &str, job: &JobSpec<'_>) -> (Result<Value>, Option<String>) {
+async fn run_job(
+    rpc: &mut Rpc,
+    model: &str,
+    job: &JobSpec<'_>,
+    cwd: &Path,
+) -> (Result<Value>, Option<String>) {
     let mut session = None;
     let result = tokio::time::timeout(job.timeout, async {
         rpc.call("initialize", initialize_params(), |_, _| Ok(()))
@@ -1428,7 +1437,7 @@ async fn run_job(rpc: &mut Rpc, model: &str, job: &JobSpec<'_>) -> (Result<Value
         let result = rpc
             .call(
                 "session/new",
-                json!({"cwd": job.cwd, "mcpServers": []}),
+                json!({"cwd": cwd, "mcpServers": []}),
                 |_, _| Ok(()),
             )
             .await?;
@@ -2055,7 +2064,7 @@ mod job_tests {
         )
     }
 
-    fn job(dir: &Path) -> JobSpec<'_> {
+    fn job() -> JobSpec<'static> {
         static SCHEMA: std::sync::LazyLock<Value> =
             std::sync::LazyLock::new(|| json!({"type": "object"}));
         JobSpec {
@@ -2065,7 +2074,7 @@ mod job_tests {
             tools: JobTools::ReadOnly,
             budget: crate::agent::Budget { usd: 1.0, acu: 1.0 },
             add_dir: None,
-            cwd: dir,
+            clone: None,
             timeout: Duration::from_secs(20),
         }
     }
@@ -2087,7 +2096,7 @@ mod job_tests {
             dir.path(),
             vec![chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})],
         );
-        let out = structured(&exe, "swe-2-high", &job(dir.path()))
+        let out = structured(&exe, "swe-2-high", &job(), dir.path())
             .await
             .unwrap();
         assert_eq!(out, json!({"ok": true}));
@@ -2126,7 +2135,7 @@ mod job_tests {
                 json!({"end": "end_turn"}),
             ],
         );
-        let e = structured(&exe, "swe-2-high", &job(dir.path()))
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("budget"), "{e:#}");
@@ -2153,7 +2162,7 @@ mod job_tests {
         steps.push(chunk(r#"{"a": 1}"#));
         steps.push(json!({"end": "end_turn"}));
         let exe = fake_job(dir.path(), steps);
-        let out = structured(&exe, "swe-2-high", &job(dir.path()))
+        let out = structured(&exe, "swe-2-high", &job(), dir.path())
             .await
             .unwrap();
         assert_eq!(out, json!({"a": 1}));
@@ -2169,9 +2178,11 @@ mod job_tests {
     async fn times_out() {
         let dir = tempfile::tempdir().unwrap();
         let exe = fake_job(dir.path(), Vec::new());
-        let mut job = job(dir.path());
+        let mut job = job();
         job.timeout = Duration::from_millis(500);
-        let e = structured(&exe, "swe-2-high", &job).await.unwrap_err();
+        let e = structured(&exe, "swe-2-high", &job, dir.path())
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("took longer"), "{e:#}");
         assert_eq!(methods(dir.path()).last().unwrap(), "session/delete");
     }

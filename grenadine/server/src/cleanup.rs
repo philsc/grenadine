@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL,
     NewAgent, NewCleanupSession, PermissionMode, ServerEvent,
@@ -336,7 +336,6 @@ async fn run(
         state,
         session.backend,
         &SCAN,
-        &session.id,
         &schema,
         &input,
         clone.as_deref(),
@@ -367,22 +366,18 @@ const PRUNE: Job = Job {
 };
 
 /// Runs `job` on `backend` on `input` with only the read-only tools, in
-/// `cwd` or else a directory of its own named after `id`, and returns
-/// its output as `schema` has it. `add_dir` is a directory it may read
-/// too.
-#[allow(clippy::too_many_arguments)]
+/// `clone` if there is one, and returns its output as `schema` has it.
+/// `add_dir` is a directory it may read too.
 async fn ask(
     state: &State,
     backend: AgentBackend,
     job: &Job,
-    id: &str,
     schema: &Value,
     input: &str,
-    cwd: Option<&Path>,
+    clone: Option<&Path>,
     add_dir: Option<&Path>,
 ) -> Result<Value> {
-    let dir = scan_dir(id)?;
-    let result = state
+    state
         .agents
         .structured(
             backend,
@@ -393,19 +388,11 @@ async fn ask(
                 tools: JobTools::ReadOnly,
                 budget: job.budget,
                 add_dir,
-                cwd: cwd.unwrap_or(&dir),
+                clone,
                 timeout: job.timeout,
             },
         )
-        .await;
-    let _ = std::fs::remove_dir_all(&dir);
-    result
-}
-
-fn scan_dir(id: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("grenadine-cleanup-{id}"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
-    Ok(dir)
+        .await
 }
 
 /// The `(title, detail)` pairs in a scan's output.
@@ -526,10 +513,7 @@ async fn prune_in(
         },
         "required": ["stale"],
     });
-    let output = ask(
-        state, backend, &PRUNE, "prune", &schema, &input, clone, None,
-    )
-    .await?;
+    let output = ask(state, backend, &PRUNE, &schema, &input, clone, None).await?;
     let mut deleted = 0;
     for (id, reason) in parse_stale(&output, items) {
         if state.db.delete_cleanup_item(id)? {
