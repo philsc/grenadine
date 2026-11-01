@@ -1722,6 +1722,16 @@ class AgentTest(ServerTestCase):
         )
         # With nothing else to pick, there's no picker.
         expect(self.page.get_by_label("Backend")).to_have_count(0)
+        # The draft keeps its pick, so once Devin is back, so is the draft's
+        # backend.
+        self.page.get_by_label("Prompt").fill("later")
+        self.page.unroute("**/api/agents/backends")
+        self.page.add_init_script(
+            "localStorage.setItem('grenadine.agent-backend', 'claude')"
+        )
+        self.page.reload()
+        expect(self.page.get_by_label("Prompt")).to_have_value("later")
+        expect(self.page.get_by_label("Backend")).to_have_value("devin")
 
     def test_devin_session(self) -> None:
         transcript = self.start_devin_session("Code", "write a note")

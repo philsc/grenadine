@@ -1050,7 +1050,21 @@ pub fn NewSession(draft: String) -> impl IntoView {
     });
     let number = RwSignal::new(saved.pr);
     let prompt = RwSignal::new(saved.prompt);
-    let backend = RwSignal::new(saved.backend);
+    // The backend the draft picked, and the one the form goes with: a
+    // backend the server doesn't offer, e.g. Devin once it can't list its
+    // models, can't start the session, so the form goes with the first
+    // one it does. Only a pick is kept in the draft, so a backend that's
+    // missing for a while gets it back.
+    let picked = RwSignal::new(saved.backend);
+    let backend = Memo::new(move |_| {
+        let picked = picked.get();
+        match backends().get() {
+            Some(Ok(list)) if !list.iter().any(|i| i.backend == picked) => {
+                list.first().map_or(picked, |i| i.backend)
+            }
+            _ => picked,
+        }
+    });
     let mode = RwSignal::new(offered_mode(saved.backend, Some(saved.mode.as_str())));
     // The draft's model goes until the backend changes.
     let model = model_signal(backend.into());
@@ -1073,7 +1087,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
             repo.get(),
             number.get(),
             prompt.get(),
-            backend.get(),
+            picked.get(),
             mode.get(),
             model.get(),
         );
@@ -1088,17 +1102,6 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 ..d.clone()
             }
         });
-    });
-    // A backend the server doesn't offer, e.g. Devin once it can't list
-    // its models, can't start the session, so the draft goes over to
-    // one it does.
-    Effect::new(move |_| {
-        if let Some(Ok(list)) = backends().get()
-            && !list.iter().any(|i| i.backend == backend.get_untracked())
-            && let Some(first) = list.first()
-        {
-            backend.set(first.backend);
-        }
     });
     // A form left without writing anything isn't worth keeping.
     on_cleanup(move || drafts.remove_if_blank(&draft));
@@ -1183,7 +1186,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                                 <select
                                     prop:value=move || backend.get().as_str()
                                     on:change=move |ev| {
-                                        backend.set(AgentBackend::parse(&event_target_value(&ev)).unwrap_or_default());
+                                        picked.set(AgentBackend::parse(&event_target_value(&ev)).unwrap_or_default());
                                     }
                                 >
                                     {list.into_iter().map(|i| {
