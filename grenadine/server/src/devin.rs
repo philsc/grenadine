@@ -598,7 +598,7 @@ fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
 /// How long listing the models may take.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the listing's session gets to be deleted.
+/// How long a throwaway session gets to be deleted.
 const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The models Devin offers, from a throwaway `devin acp` session's model
@@ -1314,6 +1314,13 @@ async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) ->
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
     let (result, session) = run_job(&mut rpc, model, job, cwd).await;
     if let Some(session) = session {
+        // A prompt may still be running, e.g. after a timeout, and Devin
+        // might not delete a session that's busy. It ignores a cancel with
+        // nothing running.
+        if result.is_err() {
+            rpc.acp
+                .notify("session/cancel", json!({"sessionId": session}));
+        }
         // The session only existed for the job; it doesn't belong in the
         // user's history. A hung delete doesn't keep the job.
         let delete = rpc.call("session/delete", json!({"sessionId": session}));
@@ -2193,8 +2200,8 @@ mod job_tests {
         assert!(log.contains("decline"), "{log}");
     }
 
-    /// A devin that never answers the prompt: timeout, and the session's
-    /// delete is still attempted.
+    /// A devin that never answers the prompt: timeout, and the prompt is
+    /// cancelled before the session is deleted.
     #[tokio::test]
     async fn times_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -2205,7 +2212,10 @@ mod job_tests {
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("took longer"), "{e:#}");
-        assert_eq!(methods(dir.path()).last().unwrap(), "session/delete");
+        assert_eq!(
+            methods(dir.path())[4..],
+            ["session/prompt", "session/cancel", "session/delete"]
+        );
     }
 
     /// A subagent's tool call becomes a ToolUse with its parent, and isn't
