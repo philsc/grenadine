@@ -1670,22 +1670,33 @@ async fn run_job(
 /// `dir/devin_log`. Returns the executable to run as devin.
 #[cfg(test)]
 pub fn fake(dir: &Path, mut scenario: Value) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::io::Write as _;
     let fake = std::path::absolute(std::env::var("FAKE_DEVIN").unwrap()).unwrap();
     scenario["log"] = dir.join("devin_log").to_str().unwrap().into();
     let path = dir.join("scenario.json");
     std::fs::write(&path, scenario.to_string()).unwrap();
     let exe = dir.join("devin");
-    std::fs::write(
-        &exe,
-        format!(
-            "#!/bin/sh\nexec {} --scenario={} \"$@\"\n",
-            fake.display(),
-            path.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Another process writes it: a test thread that forks while this one
+    // holds it open for writing would keep it open in the child, and
+    // running it would fail with "Text file busy".
+    let mut writer = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(&exe)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let script = format!(
+        "#!/bin/sh\nexec {} --scenario={} \"$@\"\n",
+        fake.display(),
+        path.display()
+    );
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
     exe
 }
 
