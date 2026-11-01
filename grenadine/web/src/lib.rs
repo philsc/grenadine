@@ -27,7 +27,7 @@ use wasm_bindgen::prelude::*;
 pub struct Updates {
     pub inboxes: RwSignal<u64>,
     /// The PR that changed last, with a counter so that the same PR changing
-    /// twice still notifies.
+    /// twice still notifies. `None` after a reconnect, when any PR may have.
     pub pr: RwSignal<(Option<PrKey>, u64)>,
     /// The poller's status, shown in the top bar.
     pub sync: RwSignal<SyncStatus>,
@@ -152,6 +152,10 @@ fn listen(updates: Updates) {
     // refetch everything.
     let on_open = move || {
         updates.inboxes.update(|n| *n += 1);
+        updates.pr.update(|(k, n)| {
+            *k = None;
+            *n += 1;
+        });
         updates.agents.update(|n| *n += 1);
         updates.cleanup.update(|n| *n += 1);
         updates.terminals.update(|n| *n += 1);

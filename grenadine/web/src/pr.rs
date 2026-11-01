@@ -157,12 +157,12 @@ fn short(sha: &str) -> &str {
 #[component]
 pub fn PrView(key: PrKey) -> impl IntoView {
     let updates = expect_context::<Updates>();
-    // Changes only when this PR changed.
+    // Changes only when this PR, or any after a reconnect, changed.
     let rev = {
         let key = key.clone();
         Memo::new(move |prev: Option<&u64>| {
             updates.pr.with(|(k, n)| {
-                if k.as_ref() == Some(&key) {
+                if k.as_ref().is_none_or(|k| k == &key) {
                     *n
                 } else {
                     prev.copied().unwrap_or(0)

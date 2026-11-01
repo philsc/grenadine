@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use grenadine_core::api::{
-    CiStatus, MergeState, Person, PrKey, ReviewComment, ReviewInfo, ServerEvent, StackPr,
+    CiStatus, MergeState, Person, PrDetail, PrKey, ReviewComment, ReviewInfo, ServerEvent, StackPr,
     SyncPhase, SyncStatus, SyncingPr, Version,
 };
 use grenadine_core::versions::{self, History};
@@ -154,9 +154,24 @@ impl State {
         }
         let state = self.clone();
         tokio::spawn(async move {
+            // A page that gets PrChanged fetches the PR again, which starts
+            // another of these syncs when no inbox covers the PR. Only a
+            // change is worth telling it about, or the two would loop.
+            let before = state.stored(&key);
             let result = sync_pr(&state, &key).await;
             state.finish(&key, result);
+            if state.stored(&key) != before {
+                state.send(ServerEvent::PrChanged(key));
+            }
         });
+    }
+
+    /// What a page shows for `key`: the stored PR and the last sync's error.
+    fn stored(&self, key: &PrKey) -> (Option<PrDetail>, Option<String>) {
+        (
+            self.db.pr(key).ok().flatten(),
+            self.db.pr_sync_error(key).ok().flatten(),
+        )
     }
 
     /// Claims `key` for a sync outside the poll, in `on_demand`, unless
@@ -169,12 +184,11 @@ impl State {
         !polling && self.on_demand.lock().unwrap().insert(key.clone())
     }
 
-    /// Ends a sync that `claim` let run: releases `key`, records the
-    /// outcome and has pages showing the PR fetch it again.
+    /// Ends a sync that `claim` let run: releases `key` and records the
+    /// outcome.
     fn finish(self: &Arc<State>, key: &PrKey, result: Result<bool>) {
         self.on_demand.lock().unwrap().remove(key);
         self.synced(key, result);
-        self.send(ServerEvent::PrChanged(key.clone()));
     }
 
     /// Waits until `claim` gets `key`. False if that took longer than
@@ -229,6 +243,7 @@ impl State {
                 let again = matches!(result, Ok(true));
                 // While this runs, `synced` doesn't start more follow-ups.
                 state.finish(&key, result);
+                state.send(ServerEvent::PrChanged(key.clone()));
                 state.send(ServerEvent::InboxesChanged);
                 if !again {
                     break;
@@ -257,6 +272,7 @@ impl State {
             }
             let result = sync_pr(&state, &key).await;
             state.finish(&key, result);
+            state.send(ServerEvent::PrChanged(key));
             state.send(ServerEvent::InboxesChanged);
         });
     }
@@ -812,6 +828,32 @@ mod tests {
             next,
             Ok(ServerEvent::InboxesChanged) | Err(broadcast::error::RecvError::Lagged(_))
         ));
+        assert!(!state.on_demand.lock().unwrap().contains(&key));
+    }
+
+    /// A page refetches its PR on PrChanged, and fetching a PR no inbox
+    /// covers starts another on-demand sync, so a sync that changed
+    /// nothing mustn't send one.
+    #[tokio::test]
+    async fn on_demand_syncs_send_only_changes() {
+        let state = test_state();
+        let key = key();
+        let mut events = state.events.subscribe();
+        // The sync fails at once since o/n isn't configured, which the
+        // page hasn't seen yet.
+        state.sync_once(key.clone());
+        let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(first, Ok(ServerEvent::PrChanged(k)) if k == key));
+
+        // Failing the same way again changes nothing.
+        state.sync_once(key.clone());
+        let again = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+        assert!(
+            again.is_err(),
+            "sent {again:?} for a sync that changed nothing"
+        );
         assert!(!state.on_demand.lock().unwrap().contains(&key));
     }
 
