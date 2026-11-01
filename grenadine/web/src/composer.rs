@@ -180,22 +180,41 @@ impl OpenBoxes {
                 .cloned()
                 .collect()
         });
-        let drafts = comment_draft_key("");
-        if let Some(s) = storage() {
-            for i in 0..s.length().unwrap_or(0) {
-                if let Some(name) = s.key(i).ok().flatten().and_then(|k| {
-                    k.strip_prefix(&drafts)
-                        .filter(|n| n.starts_with(prefix))
-                        .map(str::to_owned)
-                }) {
-                    names.insert(name);
-                }
-            }
-        }
+        names.extend(stored_drafts(prefix));
         for name in names.iter().filter(|n| !keep(n)) {
             self.close(name);
         }
     }
+
+    /// The names of the open boxes whose drafts' names start with
+    /// `prefix`, like `is_open` says; tracked.
+    pub fn open_with_prefix(self, prefix: &str) -> HashSet<String> {
+        let mut names: HashSet<String> = self.open.with(|o| {
+            o.iter()
+                .filter(|n| n.starts_with(prefix))
+                .cloned()
+                .collect()
+        });
+        names.extend(stored_drafts(prefix).into_iter().filter(|n| has_draft(n)));
+        names
+    }
+}
+
+/// The names of the stored drafts that start with `prefix`, empty or not.
+fn stored_drafts(prefix: &str) -> Vec<String> {
+    let drafts = comment_draft_key("");
+    let Some(s) = storage() else {
+        return Vec::new();
+    };
+    (0..s.length().unwrap_or(0))
+        .filter_map(|i| {
+            s.key(i).ok().flatten().and_then(|k| {
+                k.strip_prefix(&drafts)
+                    .filter(|n| n.starts_with(prefix))
+                    .map(str::to_owned)
+            })
+        })
+        .collect()
 }
 
 /// What sends the comment; it resolves once the server took it.

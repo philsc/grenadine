@@ -2,7 +2,8 @@
 //! server sends, and the diffs of an agent's file edits and worktree.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,12 +14,13 @@ use grenadine_core::edit::Fragment;
 use grenadine_core::inline::{self, Aligned};
 use grenadine_core::rebase;
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, highlight_lines, mark, plain_lines};
 use crate::inboxes::load_flag;
-use crate::pr::{Anchor, Placed, ThreadView};
+use crate::pr::{Anchor, Placed, Thread, ThreadView};
 
 const CONTEXT: usize = 3;
 
@@ -37,7 +39,12 @@ impl Commenting {
             Some((Side::Right, l)) => format!("R{l}"),
             None => "file".to_owned(),
         };
-        format!("line.{}#{}:{path}:{at}", self.key.repo, self.key.number)
+        format!("{}{at}", self.draft_prefix(path))
+    }
+
+    /// What the names of the drafts of comments on `path` start with.
+    fn draft_prefix(&self, path: &str) -> String {
+        format!("line.{}#{}:{path}:", self.key.repo, self.key.number)
     }
 }
 
@@ -51,42 +58,44 @@ struct FileCommenting {
 }
 
 impl FileCommenting {
-    /// The line number cell for 0-based `line` of `side`, which opens a
-    /// comment box on the line when clicked.
-    fn ln(
-        this: Option<&Self>,
-        class: String,
-        side: Side,
-        line: Option<usize>,
-        shown: String,
-    ) -> AnyView {
-        match (this, line) {
-            (Some(fc), Some(l)) => {
-                let draft = fc.commenting.draft(&fc.path, Some((side, l as u32 + 1)));
-                let boxes = fc.boxes;
-                view! {
-                    <td class=format!("{class} commentable") title="Comment on this line"
-                        on:click=move |_| boxes.set(&draft, true)>{shown}</td>
-                }
-                .into_any()
-            }
-            _ => view! { <td class=class>{shown}</td> }.into_any(),
-        }
+    /// The lines (1-based) whose comment boxes are open; tracked.
+    fn open_lines(&self) -> HashSet<(Side, u32)> {
+        let prefix = self.commenting.draft_prefix(&self.path);
+        self.boxes
+            .open_with_prefix(&prefix)
+            .iter()
+            .filter_map(|name| {
+                let at = name.strip_prefix(&prefix)?;
+                let side = match at.get(..1)? {
+                    "L" => Side::Left,
+                    "R" => Side::Right,
+                    _ => return None,
+                };
+                Some((side, at[1..].parse().ok()?))
+            })
+            .collect()
     }
 
-    /// The comment boxes for 0-based lines of a row, shown while open.
-    fn boxes_row(
-        this: Option<&Self>,
-        at: &[(Side, Option<usize>)],
-        colspan: u32,
-    ) -> Option<AnyView> {
-        let fc = this?;
-        let rows: Vec<AnyView> = at
-            .iter()
-            .filter_map(|&(side, line)| Some((side, line? as u32 + 1)))
-            .map(|(side, line)| fc.box_row(Some((side, line)), colspan))
-            .collect();
-        (!rows.is_empty()).then(|| rows.into_any())
+    /// Opens the comment box for the line whose number cell is in or under
+    /// the click's target.
+    fn open_clicked(&self, ev: &leptos::ev::MouseEvent) {
+        let Some(cell) = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|t| t.closest("td.commentable").ok().flatten())
+        else {
+            return;
+        };
+        let side = match cell.get_attribute("data-side").as_deref() {
+            Some("L") => Side::Left,
+            Some("R") => Side::Right,
+            _ => return,
+        };
+        let Some(line) = cell.get_attribute("data-line").and_then(|l| l.parse().ok()) else {
+            return;
+        };
+        self.boxes
+            .set(&self.commenting.draft(&self.path, Some((side, line))), true);
     }
 
     /// A row with the comment box for `at`, shown while it's open.
@@ -785,23 +794,166 @@ impl<'a> LineComments<'a> {
     }
 }
 
-fn threads_row(threads: Vec<&Placed>, colspan: u32) -> Option<AnyView> {
-    (!threads.is_empty()).then(|| {
-        view! {
-            <tr class="comment-row">
-                <td colspan=colspan>
-                    {threads.into_iter().map(|p| view! { <ThreadView thread=p.thread.clone() /> }).collect_view()}
-                </td>
-            </tr>
-        }
-        .into_any()
-    })
+/// One row of a diff table, as HTML, and what goes under it.
+struct Row {
+    class: String,
+    cells: String,
+    threads: Vec<Arc<Thread>>,
+    /// The lines (1-based) whose comment boxes go under the row.
+    lines: Vec<(Side, u32)>,
 }
 
-fn skip_row(n: usize, colspan: u32) -> Option<AnyView> {
-    (n > 0).then(|| {
-        view! { <tr class="skip"><td colspan=colspan>{format!("⋯ {n} unchanged lines")}</td></tr> }.into_any()
-    })
+impl Row {
+    fn skip(n: usize, colspan: u32) -> Option<Row> {
+        (n > 0).then(|| Row {
+            class: "skip".to_owned(),
+            cells: format!("<td colspan=\"{colspan}\">⋯ {n} unchanged lines</td>"),
+            threads: Vec::new(),
+            lines: Vec::new(),
+        })
+    }
+
+    /// A row of lines; the threads are for any of `at`, and so are the
+    /// comment boxes.
+    fn new(
+        class: String,
+        cells: String,
+        threads: Vec<&Placed>,
+        at: &[(Side, Option<usize>)],
+    ) -> Row {
+        Row {
+            class,
+            cells,
+            threads: threads.into_iter().map(|p| p.thread.clone()).collect(),
+            lines: at
+                .iter()
+                .filter_map(|&(side, line)| Some((side, line? as u32 + 1)))
+                .collect(),
+        }
+    }
+}
+
+/// A diff table's row group: a run of plain rows, which goes in as HTML that
+/// the browser parses much faster than it could be built element by
+/// element, or a row with threads or open comment boxes under it, which are
+/// components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Group {
+    Plain(usize, usize),
+    Row(usize),
+}
+
+/// The row groups of `rows`, given the lines with open comment boxes.
+fn groups(rows: &[Row], open: &HashSet<(Side, u32)>) -> Vec<Group> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for (i, r) in rows.iter().enumerate() {
+        if !r.threads.is_empty() || r.lines.iter().any(|l| open.contains(l)) {
+            if start < i {
+                groups.push(Group::Plain(start, i));
+            }
+            groups.push(Group::Row(i));
+            start = i + 1;
+        }
+    }
+    if start < rows.len() {
+        groups.push(Group::Plain(start, rows.len()));
+    }
+    groups
+}
+
+fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyView {
+    match group {
+        Group::Plain(start, end) => {
+            let mut html = String::new();
+            for r in &rows[start..end] {
+                let _ = write!(html, "<tr class=\"{}\">{}</tr>", r.class, r.cells);
+            }
+            view! { <tbody inner_html=html></tbody> }.into_any()
+        }
+        Group::Row(i) => {
+            let r = &rows[i];
+            let threads = (!r.threads.is_empty()).then(|| {
+                view! {
+                    <tr class="comment-row">
+                        <td colspan=4>
+                            {r.threads.iter().map(|t| view! { <ThreadView thread=t.clone() /> }).collect_view()}
+                        </td>
+                    </tr>
+                }
+            });
+            let boxes = fc.map(|fc| {
+                r.lines
+                    .iter()
+                    .map(|&at| fc.box_row(Some(at), 4))
+                    .collect_view()
+            });
+            view! {
+                <tbody>
+                    <tr class=r.class.clone() inner_html=r.cells.clone()></tr>
+                    {threads}
+                    {boxes}
+                </tbody>
+            }
+            .into_any()
+        }
+    }
+}
+
+/// A diff table of `rows`. Clicking a commentable line number opens a
+/// comment box under its row.
+fn diff_table(
+    class: &'static str,
+    rows: Vec<Row>,
+    inline_changes: Signal<bool>,
+    fc: Option<FileCommenting>,
+) -> impl IntoView + use<> {
+    let rows = Arc::new(rows);
+    let each = {
+        let (rows, fc) = (rows.clone(), fc.clone());
+        move || {
+            let open = fc
+                .as_ref()
+                .map(FileCommenting::open_lines)
+                .unwrap_or_default();
+            groups(&rows, &open)
+        }
+    };
+    let on_click = {
+        let fc = fc.clone();
+        move |ev: leptos::ev::MouseEvent| {
+            if let Some(fc) = &fc {
+                fc.open_clicked(&ev);
+            }
+        }
+    };
+    view! {
+        <table class=class class:inline-changes=move || inline_changes.get() on:click=on_click>
+            <For each=each key=|g| *g children=move |g| group_view(&rows, g, fc.as_ref()) />
+        </table>
+    }
+}
+
+/// The line number cell for 0-based `line` of `side`. Clicking a
+/// commentable one opens a comment box on the line.
+fn ln_cell(
+    fc: Option<&FileCommenting>,
+    class: &str,
+    side: Side,
+    line: Option<usize>,
+    shown: String,
+) -> String {
+    match (fc, line) {
+        (Some(_), Some(l)) => {
+            let side = if side == Side::Left { "L" } else { "R" };
+            format!(
+                "<td class=\"{class} commentable\" title=\"Comment on this line\" \
+                 data-side=\"{side}\" data-line=\"{}\">{shown}</td>",
+                l + 1
+            )
+        }
+        _ => format!("<td class=\"{class}\">{shown}</td>"),
+    }
 }
 
 fn outside_comments(rest: Vec<(Side, u32, &Placed)>) -> Option<AnyView> {
@@ -825,8 +977,12 @@ fn num(n: Option<usize>) -> String {
     n.map(|n| (n + 1).to_string()).unwrap_or_default()
 }
 
-fn html(lines: &[String], n: Option<usize>) -> String {
-    n.and_then(|n| lines.get(n)).cloned().unwrap_or_default()
+fn html(lines: &[String], n: Option<usize>) -> &str {
+    n.and_then(|n| lines.get(n)).map_or("", String::as_str)
+}
+
+fn upstream_class(upstream: bool) -> &'static str {
+    if upstream { " upstream" } else { "" }
 }
 
 fn unified_view(
@@ -836,9 +992,9 @@ fn unified_view(
     fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
-    let mut rows: Vec<AnyView> = Vec::new();
+    let mut rows = Vec::new();
     for h in &l.shape.hunks {
-        rows.extend(skip_row(h.skipped_before, 4));
+        rows.extend(Row::skip(h.skipped_before, 4));
         for line in &h.lines {
             let (old, new, kind, block, code) = match *line {
                 Line::Context { old, new } => (
@@ -863,37 +1019,37 @@ fn unified_view(
                     html(&l.new_html, Some(new)),
                 ),
             };
-            let upstream = block.is_some_and(|b| l.shape.upstream[b]);
+            let upstream = upstream_class(block.is_some_and(|b| l.shape.upstream[b]));
             let marker = match kind {
                 "del" => "−",
                 "add" => "+",
                 _ => " ",
             };
-            rows.push(
-                view! {
-                    <tr class=format!("line {kind}") class:upstream=upstream>
-                        {FileCommenting::ln(fc, "ln".into(), Side::Left, old, num(old.map(|o| o + l.old_start)))}
-                        {FileCommenting::ln(fc, "ln".into(), Side::Right, new, num(new.map(|n| n + l.new_start)))}
-                        <td class="marker">{marker}</td>
-                        <td class="code" inner_html=code></td>
-                    </tr>
-                }
-                .into_any(),
+            let cells = format!(
+                "{}{}<td class=\"marker\">{marker}</td><td class=\"code\">{code}</td>",
+                ln_cell(fc, "ln", Side::Left, old, num(old.map(|o| o + l.old_start))),
+                ln_cell(
+                    fc,
+                    "ln",
+                    Side::Right,
+                    new,
+                    num(new.map(|n| n + l.new_start))
+                ),
             );
             let mut threads = lc.take(Side::Left, old);
             threads.extend(lc.take(Side::Right, new));
-            rows.extend(threads_row(threads, 4));
-            rows.extend(FileCommenting::boxes_row(
-                fc,
+            rows.push(Row::new(
+                format!("line {kind}{upstream}"),
+                cells,
+                threads,
                 &[(Side::Left, old), (Side::Right, new)],
-                4,
             ));
         }
     }
-    rows.extend(skip_row(l.shape.skipped_after, 4));
+    rows.extend(Row::skip(l.shape.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
-        <table class="diff unified" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>
+        {diff_table("diff unified", rows, inline_changes, fc.cloned())}
         {outside}
     }
 }
@@ -905,11 +1061,11 @@ fn split_view(
     fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
-    let mut rows: Vec<AnyView> = Vec::new();
+    let mut rows = Vec::new();
     for h in &l.shape.hunks {
-        rows.extend(skip_row(h.skipped_before, 4));
+        rows.extend(Row::skip(h.skipped_before, 4));
         for r in &h.rows {
-            let upstream = r.block.is_some_and(|b| l.shape.upstream[b]);
+            let upstream = upstream_class(r.block.is_some_and(|b| l.shape.upstream[b]));
             let (lk, rk) = match (r.block, r.old, r.new) {
                 (None, _, _) => ("ctx", "ctx"),
                 (Some(_), o, n) => (
@@ -917,31 +1073,94 @@ fn split_view(
                     if n.is_some() { "add" } else { "blank" },
                 ),
             };
-            rows.push(
-                view! {
-                    <tr class="line" class:upstream=upstream>
-                        {FileCommenting::ln(fc, format!("ln {lk}"), Side::Left, r.old, num(r.old))}
-                        <td class=format!("code {lk}") inner_html=html(&l.old_html, r.old)></td>
-                        {FileCommenting::ln(fc, format!("ln {rk}"), Side::Right, r.new, num(r.new))}
-                        <td class=format!("code {rk}") inner_html=html(&l.new_html, r.new)></td>
-                    </tr>
-                }
-                .into_any(),
+            let cells = format!(
+                "{}<td class=\"code {lk}\">{}</td>{}<td class=\"code {rk}\">{}</td>",
+                ln_cell(fc, &format!("ln {lk}"), Side::Left, r.old, num(r.old)),
+                html(&l.old_html, r.old),
+                ln_cell(fc, &format!("ln {rk}"), Side::Right, r.new, num(r.new)),
+                html(&l.new_html, r.new),
             );
             let mut threads = lc.take(Side::Left, r.old);
             threads.extend(lc.take(Side::Right, r.new));
-            rows.extend(threads_row(threads, 4));
-            rows.extend(FileCommenting::boxes_row(
-                fc,
+            rows.push(Row::new(
+                format!("line{upstream}"),
+                cells,
+                threads,
                 &[(Side::Left, r.old), (Side::Right, r.new)],
-                4,
             ));
         }
     }
-    rows.extend(skip_row(l.shape.skipped_after, 4));
+    rows.extend(Row::skip(l.shape.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
-        <table class="diff split" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>
+        {diff_table("diff split", rows, inline_changes, fc.cloned())}
         {outside}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(lines: &[(Side, u32)], threads: usize) -> Row {
+        let thread = |id| {
+            Arc::new(Thread {
+                root: grenadine_core::api::ReviewComment {
+                    id,
+                    in_reply_to: None,
+                    author: "a".into(),
+                    body: "b".into(),
+                    path: "f.rs".into(),
+                    original_commit: "c".into(),
+                    original_line: None,
+                    original_start_line: None,
+                    line: None,
+                    start_line: None,
+                    side: Side::Right,
+                    on_file: false,
+                    created_at: String::new(),
+                    url: String::new(),
+                    resolved: false,
+                    resolved_by: None,
+                    thread_id: None,
+                    can_resolve: false,
+                    pending: false,
+                    node_id: None,
+                },
+                replies: Vec::new(),
+            })
+        };
+        Row {
+            class: "line".into(),
+            cells: String::new(),
+            threads: (0..threads as u64).map(thread).collect(),
+            lines: lines.to_vec(),
+        }
+    }
+
+    #[test]
+    fn rows_with_threads_or_open_boxes_get_groups_of_their_own() {
+        let rows = [
+            row(&[(Side::Left, 1), (Side::Right, 1)], 0),
+            row(&[(Side::Right, 2)], 1),
+            row(&[(Side::Right, 3)], 0),
+            row(&[(Side::Left, 4)], 0),
+            row(&[], 0),
+        ];
+        assert_eq!(
+            groups(&rows, &HashSet::new()),
+            [Group::Plain(0, 1), Group::Row(1), Group::Plain(2, 5)]
+        );
+        let open = HashSet::from([(Side::Left, 4), (Side::Left, 1)]);
+        assert_eq!(
+            groups(&rows, &open),
+            [
+                Group::Row(0),
+                Group::Row(1),
+                Group::Plain(2, 3),
+                Group::Row(3),
+                Group::Plain(4, 5)
+            ]
+        );
     }
 }
