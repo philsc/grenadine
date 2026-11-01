@@ -1382,8 +1382,10 @@ struct JobRun<'a> {
     session: String,
     /// The root's text, reset when it starts a tool call.
     text: String,
-    /// What it has spent, in ACU.
-    acu: f64,
+    /// What the root and each subagent have spent, in ACU, by agent id.
+    /// Each reports its own running total; the root's leaves out the
+    /// subagents'.
+    spent: HashMap<String, f64>,
     /// The commands of the root's exec calls, by tool call id.
     execs: HashMap<String, String>,
 }
@@ -1401,7 +1403,7 @@ impl JobRun<'_> {
             Incoming::Request(r) => self.request(acp, r),
             Incoming::Notification(_) | Incoming::Response(_) => {}
         }
-        if self.acu > self.job.budget.acu {
+        if self.spent.values().sum::<f64>() > self.job.budget.acu {
             acp.notify("session/cancel", json!({"sessionId": self.session}));
             bail!(
                 "the {} went over its budget of {} ACU",
@@ -1413,6 +1415,14 @@ impl JobRun<'_> {
     }
 
     fn update(&mut self, u: SessionUpdate) {
+        if let SessionUpdate::UsageUpdate(usage) = &u {
+            if let Some(total) = extension(&usage.meta, "totalAcuCost").and_then(Value::as_f64) {
+                let agent = u.subagent().unwrap_or("root").to_owned();
+                let spent = self.spent.entry(agent).or_default();
+                *spent = spent.max(total);
+            }
+            return;
+        }
         if u.subagent().is_some() {
             return;
         }
@@ -1429,12 +1439,6 @@ impl JobRun<'_> {
                 {
                     let command = call.raw_input["command"].as_str().unwrap_or_default();
                     self.execs.insert(call.tool_call_id, command.to_owned());
-                }
-            }
-            SessionUpdate::UsageUpdate(usage) => {
-                if let Some(total) = extension(&usage.meta, "totalAcuCost").and_then(Value::as_f64)
-                {
-                    self.acu = total;
                 }
             }
             _ => {}
@@ -1502,7 +1506,7 @@ async fn run_job(
             job,
             session: id.clone(),
             text: String::new(),
-            acu: 0.0,
+            spent: HashMap::new(),
             execs: HashMap::new(),
         };
         let prompt = format!(
@@ -2185,6 +2189,42 @@ mod job_tests {
             .find(|m| m["id"] == "new-1")
             .unwrap();
         assert_eq!(reply["error"]["code"], -32601, "{reply}");
+    }
+
+    /// A usage update step: `agent`'s running ACU total.
+    fn usage(agent: &str, acu: f64) -> Value {
+        json!({"update": {
+            "sessionUpdate": "usage_update",
+            "used": 1,
+            "size": 2,
+            "_meta": {
+                "cognition.ai/totalAcuCost": acu,
+                "cognition.ai/subagent_context": {"parentAgentId": agent},
+            },
+        }})
+    }
+
+    /// The budget counts each agent's latest total once, and the
+    /// subagents' on top of the root's.
+    #[tokio::test]
+    async fn the_budget_counts_subagents() {
+        let steps = |sub: Option<f64>| {
+            let mut steps = vec![usage("root", 0.6), usage("root", 0.9)];
+            steps.extend(sub.map(|acu| usage("sub-1", acu)));
+            steps.extend([chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})]);
+            steps
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(Some(0.05)));
+        let out = structured(&exe, "swe-2-high", &job(), dir.path()).await;
+        assert_eq!(out.unwrap(), json!({"ok": true}));
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(Some(0.2)));
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
+        assert!(methods(dir.path()).contains(&"session/cancel".to_owned()));
     }
 
     /// Over budget: session/cancel goes out and the error says so.
