@@ -217,6 +217,51 @@ pub struct JobSpec<'a> {
     pub timeout: Duration,
 }
 
+/// A fresh directory, gone again once it's dropped, for a background
+/// process to run in. The backends load instructions, settings and hooks
+/// from where they run and from its parents, so it's in a parent only
+/// this user can write to, never in a shared one like /tmp.
+pub fn private_dir() -> Result<tempfile::TempDir> {
+    let parent = private_parent(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )?;
+    Ok(tempfile::Builder::new()
+        .prefix("grenadine-")
+        .tempdir_in(&parent)?)
+}
+
+/// Where `private_dir` makes its directories: the runtime directory if
+/// it's this user's alone, else `grenadine/jobs` in the cache directory,
+/// which only this user may use.
+fn private_parent(
+    runtime: Option<std::ffi::OsString>,
+    cache: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    // SAFETY: getuid can't fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    if let Some(runtime) = set(runtime)
+        && let Ok(m) = std::fs::metadata(&runtime)
+        && m.is_dir()
+        && m.uid() == uid
+        && m.mode() & 0o077 == 0
+    {
+        return Ok(runtime);
+    }
+    let cache = set(cache)
+        .or_else(|| set(home).map(|h| h.join(".cache")))
+        .context("neither XDG_RUNTIME_DIR nor HOME is set")?;
+    let dir = cache.join("grenadine").join("jobs");
+    std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("can't make {} private", dir.display()))?;
+    Ok(dir)
+}
+
 /// A backend's models: listed once and kept, or the listing's failure
 /// kept for `LISTING_RETRY`. A listing without any models counts as a
 /// failure, since there's nothing to keep. Whoever asks while it lists waits for that
@@ -914,9 +959,7 @@ impl Agents {
             bail!("{} isn't offered", backend.label());
         }
         // It goes away with the job, however that ends.
-        let dir = tempfile::Builder::new()
-            .prefix("grenadine-")
-            .tempdir()
+        let dir = private_dir()
             .with_context(|| format!("can't create a directory for the {}", job.kind.name()))?;
         let cwd = job.clone.unwrap_or(dir.path());
         self.backend(backend).structured(job, cwd).await
@@ -2510,6 +2553,35 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         assert!(delete(&state, &session.id).await.unwrap());
         assert!(!worktree.exists());
         assert_eq!(state.db.agent(&session.id).unwrap(), None);
+    }
+
+    /// Jobs' directories go in the runtime directory if it's private,
+    /// else in a private one in the cache directory.
+    #[test]
+    fn private_dirs_have_private_parents() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("run");
+        std::fs::create_dir(&runtime).unwrap();
+        let home = dir.path().join("home");
+        let some = |p: &Path| Some(p.as_os_str().to_owned());
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            private_parent(some(&runtime), None, some(&home)).unwrap(),
+            runtime
+        );
+        // One that others may use doesn't count.
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let jobs = private_parent(some(&runtime), None, some(&home)).unwrap();
+        assert_eq!(jobs, home.join(".cache/grenadine/jobs"));
+        let mode = std::fs::metadata(&jobs).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let cache = dir.path().join("cache");
+        assert_eq!(
+            private_parent(None, some(&cache), some(&home)).unwrap(),
+            cache.join("grenadine/jobs")
+        );
+        assert!(private_parent(None, None, None).is_err());
     }
 
     /// Haiku summarizes a new session's first prompt in the background,

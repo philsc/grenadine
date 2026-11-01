@@ -646,9 +646,7 @@ async fn list_models(exe: &Path) -> Result<Vec<AgentModelInfo>> {
 /// `list_models`, giving up after `timeout`.
 async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentModelInfo>> {
     // It goes away with the listing, however that ends.
-    let dir = tempfile::Builder::new()
-        .prefix("grenadine-models-")
-        .tempdir()
+    let dir = crate::agent::private_dir()
         .context("can't create a directory for listing Devin's models")?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("acp").current_dir(dir.path());
