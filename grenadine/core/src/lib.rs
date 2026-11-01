@@ -6,6 +6,7 @@
 pub mod api;
 pub mod diff;
 pub mod edit;
+pub mod filter;
 pub mod inline;
 pub mod rebase;
 pub mod stack;
