@@ -92,6 +92,8 @@ pub struct ThreadState {
     pub id: String,
     pub resolved: bool,
     pub resolved_by: Option<Person>,
+    /// The viewer may resolve the thread, or unresolve it if it's resolved.
+    pub can_resolve: bool,
 }
 
 /// Which branch of a PR `GitHub::prs_by_ref` matches.
@@ -300,7 +302,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
-          isResolved
+          isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
         }
@@ -592,6 +594,101 @@ impl GitHub {
             .cloned()
             .unwrap_or_default();
         Ok((resp.get("data").cloned().unwrap_or(Value::Null), errors))
+    }
+
+    /// Runs a GraphQL mutation. Unlike a query's, any error fails it: a
+    /// change must not half succeed silently.
+    async fn mutate(&self, query: &str, variables: Value) -> Result<Value> {
+        let (data, errors) = self.graphql(query, variables).await?;
+        if let Some(e) = errors.first() {
+            bail!(
+                "GitHub refused the change: {}",
+                e["message"].as_str().unwrap_or("unknown error")
+            );
+        }
+        Ok(data)
+    }
+
+    /// Looks up the PR's node with a query: its GraphQL `id`, which
+    /// mutations on the PR itself need, and the GraphQL `fields` asked for
+    /// besides, e.g. `viewerCanUpdate`, or none. Unlike `pr`, any error
+    /// fails it.
+    pub async fn pr_node(&self, key: &PrKey, fields: &str) -> Result<Value> {
+        let (owner, name) = split_repo(&key.repo)?;
+        let (data, errors) = self
+            .graphql(
+                &format!(
+                    "query($owner: String!, $name: String!, $number: Int!) {{
+                       repository(owner: $owner, name: $name) {{
+                         pullRequest(number: $number) {{ id {fields} }}
+                       }}
+                     }}"
+                ),
+                json!({ "owner": owner, "name": name, "number": key.number }),
+            )
+            .await?;
+        let pr = data.pointer("/repository/pullRequest").cloned();
+        // GitHub reports a missing repository or PR as an error too.
+        let Some(pr) = pr.filter(|pr| !str_at(pr, "/id").is_empty()) else {
+            bail!("can't find {}#{} on GitHub", key.repo, key.number);
+        };
+        if let Some(e) = errors.first() {
+            bail!(
+                "can't look up {}#{} on GitHub: {}",
+                key.repo,
+                key.number,
+                e["message"].as_str().unwrap_or("unknown error")
+            );
+        }
+        Ok(pr)
+    }
+
+    /// The PR's GraphQL ID, which mutations on the PR itself need.
+    pub async fn pr_id(&self, key: &PrKey) -> Result<String> {
+        Ok(str_at(&self.pr_node(key, "").await?, "/id").to_owned())
+    }
+
+    /// Adds a reply to a review thread.
+    pub async fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<()> {
+        self.mutate(
+            "mutation($thread: ID!, $body: String!) {
+               addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) {
+                 clientMutationId
+               }
+             }",
+            json!({ "thread": thread_id, "body": body }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Resolves a review thread, or unresolves it.
+    pub async fn set_thread_resolved(&self, thread_id: &str, resolved: bool) -> Result<()> {
+        let field = if resolved {
+            "resolveReviewThread"
+        } else {
+            "unresolveReviewThread"
+        };
+        self.mutate(
+            &format!(
+                "mutation($thread: ID!) {{ {field}(input: {{ threadId: $thread }}) {{ clientMutationId }} }}"
+            ),
+            json!({ "thread": thread_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Comments on a PR (or an issue) by its GraphQL ID.
+    pub async fn add_comment(&self, subject_id: &str, body: &str) -> Result<()> {
+        self.mutate(
+            "mutation($subject: ID!, $body: String!) {
+               addComment(input: { subjectId: $subject, body: $body }) { clientMutationId }
+             }",
+            json!({ "subject": subject_id, "body": body }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Runs several searches in one GraphQL request. Each result is either
@@ -955,6 +1052,7 @@ impl GitHub {
                 resolved: false,
                 resolved_by: None,
                 thread_id: None,
+                can_resolve: false,
             })
             .collect())
     }
@@ -988,12 +1086,18 @@ impl GitHub {
             out.extend(nodes(threads, "/nodes").filter_map(|t| {
                 let id = t.pointer("/comments/nodes/0/databaseId")?.as_u64()?;
                 let resolved = t["isResolved"].as_bool() == Some(true);
+                let can = if resolved {
+                    "viewerCanUnresolve"
+                } else {
+                    "viewerCanResolve"
+                };
                 Some((
                     id,
                     ThreadState {
                         id: str_at(t, "/id").to_owned(),
                         resolved,
                         resolved_by: resolved.then(|| person_at(&t["resolvedBy"])).flatten(),
+                        can_resolve: t[can].as_bool() == Some(true),
                     },
                 ))
             }));

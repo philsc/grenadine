@@ -5,8 +5,10 @@ use grenadine_core::api::{
 };
 use leptos::prelude::*;
 
+use crate::api;
+use crate::composer::{ComposerToggle, sender};
 use crate::inboxes::CiIcon;
-use crate::pr::{CommentFrame, PersonChip};
+use crate::pr::{CommentFrame, PersonChip, ReviewTarget};
 
 /// Each reviewer's verdict: their latest approval, change request or
 /// dismissal, or their latest comment when they gave no verdict. The PR's
@@ -157,7 +159,7 @@ fn entries(info: &ReviewInfo) -> Vec<Entry<'_>> {
 }
 
 /// The comments on the PR itself and the reviews' summaries.
-pub fn conversation(info: &ReviewInfo) -> AnyView {
+pub fn conversation(info: &ReviewInfo) -> impl IntoView + use<> {
     let items = entries(info)
         .into_iter()
         .map(|e| match e {
@@ -182,17 +184,34 @@ pub fn conversation(info: &ReviewInfo) -> AnyView {
             }
         })
         .collect::<Vec<_>>();
-    if items.is_empty() {
-        return ().into_any();
-    }
     let count = items.len();
     view! {
         <details class="conversation" open>
-            <summary>{if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") }}</summary>
+            <summary>{match count {
+                0 => "No comments".to_owned(),
+                1 => "1 comment".to_owned(),
+                n => format!("{n} comments"),
+            }}</summary>
             {items}
+            <NewComment />
         </details>
     }
-    .into_any()
+}
+
+/// A comment on the PR itself, behind a button until it's started.
+#[component]
+fn NewComment() -> impl IntoView {
+    let ReviewTarget(key) = expect_context::<ReviewTarget>();
+    let draft = format!("comment.{}#{}", key.repo, key.number);
+    let send = sender(move |body| {
+        let key = key.clone();
+        async move { api::add_comment(&key, body).await }
+    });
+    view! {
+        <div class="new-comment">
+            <ComposerToggle draft=draft label="Comment" placeholder="Comment on this PR…" send=send />
+        </div>
+    }
 }
 
 /// The checks on the PR's head and whether it can be merged. Only for open

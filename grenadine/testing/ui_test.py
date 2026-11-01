@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from playwright.sync_api import Locator, expect, sync_playwright
 
@@ -486,7 +486,12 @@ class InboxTest(ServerTestCase):
                 i["inbox"]["id"] for i in json.load(resp) if i["inbox"]["name"] == name
             ]
         for id in ids:
-            req = urllib.request.Request(f"{self.url}api/inboxes/{id}", method="DELETE")
+            req = urllib.request.Request(
+                f"{self.url}api/inboxes/{id}",
+                method="DELETE",
+                # Writes are only taken from the server's own pages.
+                headers={"Origin": self.url.rstrip("/")},
+            )
             urllib.request.urlopen(req).close()
 
     def test_custom_inbox(self) -> None:
@@ -572,8 +577,10 @@ class InboxTest(ServerTestCase):
         expect(self.page.locator(".merge-status")).to_have_text(
             "Can be merged, but not every check passed."
         )
-        # Without reviews or comments there's no conversation.
-        expect(self.page.locator("details.conversation")).to_have_count(0)
+        # Without reviews or comments, the conversation is empty.
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            "No comments"
+        )
         # The request went to a team.
         expect(self.page.locator(".pr-header .review-summary .muted")).to_have_text(
             f"Waiting on {TEAM}"
@@ -625,6 +632,166 @@ class InboxTest(ServerTestCase):
         # The PR itself is bold; the others link to GitHub.
         expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
         expect(rows.locator("a")).to_have_attribute("href", base.url)
+
+
+class ReviewTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.prs = scenarios.review_cases(gh)
+
+    def open(self, title: str) -> None:
+        pr = self.prs[title]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+
+    def thread(self) -> Locator:
+        return (
+            self.page.locator("section.file")
+            .filter(
+                has=self.page.locator(
+                    ".file-header .path", has_text=exactly(scenarios.REVIEW_PATH)
+                )
+            )
+            .locator(".thread")
+            .first
+        )
+
+    def test_reply_to_a_thread(self) -> None:
+        self.open(scenarios.REPLY)
+        thread = self.thread()
+        thread.get_by_role("button", name="Reply").click()
+        box = thread.get_by_role("textbox", name="Reply")
+        expect(box).to_be_focused()
+        expect(thread.locator(".composer-hint")).to_have_text("Ctrl+Enter sends")
+        box.fill("It is, see **the docs**.")
+
+        # The preview renders the markdown.
+        thread.get_by_role("tab", name="Preview").click()
+        expect(thread.locator(".composer-preview strong")).to_have_text("the docs")
+        thread.get_by_role("tab", name="Write").click()
+
+        box.press("Control+Enter")
+        expect(thread.locator(".comment")).to_have_count(2)
+        expect(thread.locator(".comment").nth(1)).to_contain_text(
+            "It is, see the docs."
+        )
+        expect(
+            thread.locator(".comment").nth(1).locator(".comment-meta")
+        ).to_contain_text("me")
+        reply = self.prs[scenarios.REPLY].comments[-1]
+        self.assertEqual(reply.author, "me")
+        self.assertEqual(reply.in_reply_to, self.prs[scenarios.REPLY].comments[0].id)
+
+    def test_reply_drafts_survive_a_reload(self) -> None:
+        self.open(scenarios.REPLY)
+        self.thread().get_by_role("button", name="Reply").click()
+        self.thread().get_by_role("textbox", name="Reply").fill("Half a thought")
+        self.page.reload()
+        expect(self.thread().get_by_role("textbox", name="Reply")).to_have_value(
+            "Half a thought"
+        )
+        # Cancel drops the draft.
+        self.thread().get_by_role("button", name="Cancel").click()
+        expect(self.thread().get_by_role("button", name="Reply")).to_be_visible()
+        self.page.reload()
+        expect(self.thread().get_by_role("button", name="Reply")).to_be_visible()
+
+    def test_resolve_and_unresolve_a_thread(self) -> None:
+        self.open(scenarios.RESOLVE)
+        thread = self.thread()
+        thread.get_by_role("button", name="Resolve").click()
+        # Resolved threads fold.
+        expect(thread.locator(".thread-header .thread-resolved")).to_have_text(
+            "Resolved by Me Myself"
+        )
+        expect(thread.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "false"
+        )
+        self.assertTrue(self.prs[scenarios.RESOLVE].comments[0].resolved)
+
+        thread.locator(".thread-header").click()
+        thread.get_by_role("button", name="Unresolve").click()
+        expect(thread.locator(".thread-resolved")).to_have_count(0)
+        self.assertFalse(self.prs[scenarios.RESOLVE].comments[0].resolved)
+
+    def test_a_failed_reply_keeps_its_box(self) -> None:
+        self.open(scenarios.FAIL)
+        thread = self.thread()
+        thread.get_by_role("button", name="Reply").click()
+        box = thread.get_by_role("textbox", name="Reply")
+        box.fill("Not lost")
+        self.gh.fail_next_mutation = "Something went wrong"
+        box.press("Control+Enter")
+        expect(thread.locator(".comment-composer .error")).to_contain_text(
+            "Something went wrong"
+        )
+        expect(box).to_have_value("Not lost")
+        expect(thread.locator(".comment")).to_have_count(1)
+
+        # Sending again works, and closes the box.
+        box.press("Control+Enter")
+        expect(thread.locator(".comment")).to_have_count(2)
+        expect(thread.get_by_role("textbox")).to_have_count(0)
+        # The draft is gone with it.
+        self.page.reload()
+        expect(self.thread().get_by_role("button", name="Reply")).to_be_visible()
+
+    def test_a_thread_the_viewer_cannot_resolve(self) -> None:
+        self.open(scenarios.LOCKED)
+        thread = self.thread()
+        expect(thread.get_by_role("button", name="Reply")).to_be_visible()
+        expect(thread.get_by_role("button", name="Resolve")).to_have_count(0)
+
+    def test_the_api_refuses_bad_writes(self) -> None:
+        pr = self.prs[scenarios.FAIL]
+        api = f"{self.url}api/pr/{scenarios.REPO}/{pr.number}"
+        thread = f"PRRT_{pr.comments[0].id}"
+        own = {"Origin": self.url.rstrip("/")}
+        request = self.page.request
+
+        def refused(status: int, text: str, url: str, **kwargs: Any) -> None:
+            resp = request.post(url, headers=kwargs.pop("headers", own), **kwargs)
+            self.assertEqual(resp.status, status, resp.text())
+            self.assertIn(text, resp.text())
+
+        refused(400, "the comment is empty", f"{api}/comments", data={"body": " "})
+        refused(
+            404,
+            "is not a review thread",
+            f"{api}/threads/PRRT_nope/replies",
+            data={"body": "Hi"},
+        )
+        refused(
+            404,
+            "is not a configured repository",
+            f"{self.url}api/pr/elsewhere/repo/1/comments",
+            data={"body": "Hi"},
+        )
+        # Another site's page can't resolve threads (CSRF).
+        refused(
+            403,
+            "cross-origin",
+            f"{api}/threads/{thread}/resolve",
+            headers={"Origin": "http://evil.example"},
+        )
+        self.assertFalse(pr.comments[0].resolved)
+        self.assertEqual(len(pr.issue_comments), 0)
+
+    def test_comment_on_the_pr(self) -> None:
+        self.open(scenarios.CONVERSE)
+        conversation = self.page.locator("details.conversation")
+        expect(conversation.locator("summary")).to_have_text("No comments")
+        conversation.get_by_role("button", name="Comment").click()
+        conversation.get_by_role("textbox", name="Comment").fill("Looks good to me.")
+        conversation.get_by_role("button", name="Comment").click()
+        expect(conversation.locator("summary")).to_have_text("1 comment")
+        expect(conversation.locator(".comment .markdown")).to_have_text(
+            "Looks good to me."
+        )
+        # The box closes once the comment is sent.
+        expect(conversation.get_by_role("textbox")).to_have_count(0)
 
 
 class VersionsTest(ServerTestCase):

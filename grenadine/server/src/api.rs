@@ -7,15 +7,16 @@ use axum::Json;
 use axum::Router;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Path, Query, State as AxState};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession, PrDetail,
-    PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
+    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, NewAgent, NewCleanupSession,
+    NewComment, PrDetail, PrKey, PrMissing, ServerEvent, WorktreeChanges, WrapUp,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -31,28 +32,56 @@ type St = AxState<Arc<State>>;
 /// makes a third bigger, and its text.
 const PROMPT_BODY_LIMIT: usize = agent::MAX_IMAGES * agent::MAX_IMAGE_BYTES / 3 * 4 + (1 << 20);
 
-/// An error that becomes a 500 response.
-struct ApiError(anyhow::Error);
+/// An error that becomes a response with its status, 500 unless the
+/// request was at fault.
+struct ApiError(StatusCode, anyhow::Error);
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        ApiError(e.into())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", self.0)).into_response()
+        (self.0, format!("{:#}", self.1)).into_response()
     }
+}
+
+/// An error the request is at fault for.
+fn refuse(status: StatusCode, msg: String) -> ApiError {
+    ApiError(status, anyhow::anyhow!(msg))
 }
 
 type ApiResult<T> = Result<T, ApiError>;
 
 pub fn router(state: Arc<State>) -> Router {
+    api_routes()
+        .layer(axum::middleware::from_fn(same_origin_writes))
+        .route("/mcp/{id}/{secret}", post(mcp::handle))
+        .fallback(get(assets::serve))
+        .with_state(state)
+}
+
+/// The routes of the UI's API. Their writes are only taken from the
+/// server's own pages, see `same_origin_writes`.
+fn api_routes() -> Router<Arc<State>> {
     Router::new()
         .route("/api/inboxes", get(inboxes).post(create_inbox))
         .route("/api/inboxes/{id}", put(update_inbox).delete(delete_inbox))
         .route("/api/pr/{owner}/{name}/{number}", get(pr))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/comments",
+            post(add_comment),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/threads/{thread}/replies",
+            post(reply_to_thread),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/threads/{thread}/resolve",
+            post(resolve_thread).delete(unresolve_thread),
+        )
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
         .route("/api/sync", get(sync_status))
@@ -95,9 +124,6 @@ pub fn router(state: Arc<State>) -> Router {
             "/api/cleanup/{id}",
             axum::routing::delete(delete_cleanup_item),
         )
-        .route("/mcp/{id}/{secret}", post(mcp::handle))
-        .fallback(get(assets::serve))
-        .with_state(state)
 }
 
 async fn inboxes(AxState(state): St) -> ApiResult<Json<Vec<InboxWithPrs>>> {
@@ -189,6 +215,99 @@ async fn pr(
         None => PrMissing::NotSynced,
     };
     Ok(missing(what))
+}
+
+/// The PR a write goes to, if its repository is configured.
+fn writable(owner: String, name: String, number: u64, state: &State) -> ApiResult<PrKey> {
+    let key = PrKey {
+        repo: format!("{owner}/{name}"),
+        number,
+    };
+    if !state.repos.contains_key(&key.repo) {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("{} is not a configured repository", key.repo),
+        ));
+    }
+    Ok(key)
+}
+
+fn require_body(c: &NewComment) -> ApiResult<()> {
+    if c.body.trim().is_empty() {
+        return Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "the comment is empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses `thread` unless it's one of the PR's review threads, so that a
+/// request can only change the PR it names.
+fn require_thread(state: &State, key: &PrKey, thread: &str) -> ApiResult<()> {
+    if !state.db.has_thread(key, thread)? {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!(
+                "{thread} is not a review thread of {}#{}",
+                key.repo, key.number
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Comments on the PR itself.
+async fn add_comment(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_body(&c)?;
+    let id = state.github.pr_id(&key).await?;
+    state.github.add_comment(&id, &c.body).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn reply_to_thread(
+    AxState(state): St,
+    Path((owner, name, number, thread)): Path<(String, String, u64, String)>,
+    Json(c): Json<NewComment>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_thread(&state, &key, &thread)?;
+    require_body(&c)?;
+    state.github.reply_to_thread(&thread, &c.body).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn set_resolved(
+    state: Arc<State>,
+    (owner, name, number, thread): (String, String, u64, String),
+    resolved: bool,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    require_thread(&state, &key, &thread)?;
+    state.github.set_thread_resolved(&thread, resolved).await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn resolve_thread(
+    AxState(state): St,
+    Path(path): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    set_resolved(state, path, true).await
+}
+
+async fn unresolve_thread(
+    AxState(state): St,
+    Path(path): Path<(String, String, u64, String)>,
+) -> ApiResult<Response> {
+    set_resolved(state, path, false).await
 }
 
 /// Syncs the PR's stack-mates that changed since their last sync, going by
@@ -458,6 +577,18 @@ fn same_origin(headers: &HeaderMap) -> bool {
         .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host))
 }
 
+/// Refuses requests other than reads unless they come from the server's
+/// own pages. Without this, any website open in the browser could post a
+/// form here, e.g. to resolve a thread (cross-site request forgery).
+/// Browsers send `Origin` with every such request, also with their own.
+async fn same_origin_writes(req: axum::extract::Request, next: Next) -> Response {
+    let read = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if !read && !same_origin(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    next.run(req).await
+}
+
 async fn terminal_socket(
     AxState(state): St,
     Path((id, terminal)): Path<(String, u64)>,
@@ -649,6 +780,38 @@ mod tests {
         )));
         assert!(!same_origin(&headers(Some("null"), "127.0.0.1:8765")));
         assert!(!same_origin(&headers(None, "127.0.0.1:8765")));
+    }
+
+    #[tokio::test]
+    async fn writes_only_come_from_the_servers_pages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(crate::sync::test_state())).into_future());
+        let http = reqwest::Client::new();
+        let resolve = format!("http://{addr}/api/pr/o/n/1/threads/T/resolve");
+        let status =
+            |req: reqwest::RequestBuilder| async move { req.send().await.unwrap().status() };
+
+        // A form on another site, or a request that doesn't say where it's
+        // from.
+        let evil = http.post(&resolve).header("Origin", "http://evil.example");
+        assert_eq!(status(evil).await, StatusCode::FORBIDDEN);
+        assert_eq!(status(http.delete(&resolve)).await, StatusCode::FORBIDDEN);
+        let inbox = http
+            .post(format!("http://{addr}/api/inboxes"))
+            .header("Origin", "http://evil.example")
+            .json(&serde_json::json!({ "name": "x", "query": "y" }));
+        assert_eq!(status(inbox).await, StatusCode::FORBIDDEN);
+
+        // The server's own pages get through, to find that o/n isn't
+        // configured.
+        let own = http
+            .post(&resolve)
+            .header("Origin", format!("http://{addr}"));
+        assert_eq!(status(own).await, StatusCode::NOT_FOUND);
+        // Reads need no origin.
+        let inboxes = http.get(format!("http://{addr}/api/inboxes"));
+        assert_eq!(status(inboxes).await, StatusCode::OK);
     }
 
     #[tokio::test]

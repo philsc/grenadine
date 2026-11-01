@@ -95,7 +95,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
-          isResolved
+          isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
         }
@@ -294,6 +294,85 @@ class FakeGitHubTest(unittest.TestCase):
         data = out["data"]["repository"]["pullRequest"]
         self.assertEqual(data["reviewDecision"], APPROVED)
 
+    def test_mutations(self) -> None:
+        pr = self.inboxes.prs["Get changes requested"]
+        root = self.repo.comment(
+            pr, author="other", body="Hmm", path="inbox/x.md", line=1
+        )
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id }} }} }}"
+        )["data"]["repository"]["pullRequest"]["id"]
+
+        out = self.query(
+            'mutation($s: ID!) { addComment(input: {subjectId: $s, body: "Done"})'
+            " { clientMutationId } }",
+            s=pr_id,
+        )
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.issue_comments[-1].body, "Done")
+        self.assertEqual(pr.issue_comments[-1].author, "me")
+
+        thread = f"PRRT_{root.id}"
+        out = self.query(
+            "mutation($t: ID!) { addPullRequestReviewThreadReply("
+            'input: {pullRequestReviewThreadId: $t, body: "Fixed"}) { clientMutationId } }',
+            t=thread,
+        )
+        self.assertNotIn("errors", out)
+        reply = pr.comments[-1]
+        self.assertEqual(
+            (reply.body, reply.in_reply_to, reply.path), ("Fixed", root.id, root.path)
+        )
+
+        self.query(
+            "mutation($t: ID!) { resolveReviewThread(input: {threadId: $t}) { clientMutationId } }",
+            t=thread,
+        )
+        self.assertEqual((root.resolved, root.resolved_by), (True, "me"))
+        self.query(
+            "mutation($t: ID!) { unresolveReviewThread(input: {threadId: $t}) { clientMutationId } }",
+            t=thread,
+        )
+        self.assertEqual((root.resolved, root.resolved_by), (False, None))
+
+        out = self.query(
+            'mutation { resolveReviewThread(input: {threadId: "nope"}) { clientMutationId } }'
+        )
+        self.assertIn("Could not resolve", out["errors"][0]["message"])
+
+        # The next mutation can be made to fail, and only that one.
+        self.gh.fail_next_mutation = "Something went wrong"
+        resolve = (
+            "mutation($t: ID!) { resolveReviewThread(input: {threadId: $t})"
+            " { clientMutationId } }"
+        )
+        out = self.query(resolve, t=thread)
+        self.assertEqual(out["errors"][0]["message"], "Something went wrong")
+        self.assertFalse(root.resolved)
+        self.assertNotIn("errors", self.query(resolve, t=thread))
+        self.assertTrue(root.resolved)
+
+    def test_threads_the_viewer_cannot_resolve(self) -> None:
+        pr = self.inboxes.prs["Get changes requested"]
+        root = self.repo.comment(
+            pr, author="other", body="Hmm", path="inbox/x.md", line=1
+        )
+        root.can_resolve = False
+        threads = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{"
+            " reviewThreads(first: 10) { nodes { id viewerCanResolve } } } } }"
+        )["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        self.assertIn({"id": f"PRRT_{root.id}", "viewerCanResolve": False}, threads)
+        out = self.query(
+            "mutation($t: ID!) { resolveReviewThread(input: {threadId: $t})"
+            " { clientMutationId } }",
+            t=f"PRRT_{root.id}",
+        )
+        self.assertIn("not accessible", out["errors"][0]["message"])
+        self.assertFalse(root.resolved)
+
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')
         self.assertIn("Cannot query field 'nope'", out["errors"][0]["message"])
@@ -316,6 +395,8 @@ class FakeGitHubTest(unittest.TestCase):
                 {
                     "id": f"PRRT_{root.id}",
                     "isResolved": True,
+                    "viewerCanResolve": False,
+                    "viewerCanUnresolve": True,
                     "resolvedBy": {
                         "login": "other",
                         "name": "Other Person",

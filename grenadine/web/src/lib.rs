@@ -4,6 +4,7 @@
 
 mod agents;
 mod api;
+mod composer;
 mod diffview;
 mod drafts;
 mod events;
