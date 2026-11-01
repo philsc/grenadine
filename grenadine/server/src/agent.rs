@@ -217,6 +217,19 @@ pub struct JobSpec<'a> {
     pub timeout: Duration,
 }
 
+/// The error of a job on a backend that isn't offered, e.g. because it
+/// can't list its models right now.
+#[derive(Debug)]
+pub struct NotOffered(pub AgentBackend);
+
+impl std::fmt::Display for NotOffered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} isn't offered", self.0.label())
+    }
+}
+
+impl std::error::Error for NotOffered {}
+
 /// A fresh directory, gone again once it's dropped, for a background
 /// process to run in. The backends load instructions, settings and hooks
 /// from where they run and from its parents, so it's in a parent only
@@ -956,7 +969,7 @@ impl Agents {
     /// schema. A backend that isn't offered doesn't run it.
     pub async fn structured(&self, backend: AgentBackend, job: &JobSpec<'_>) -> Result<Value> {
         if !self.offered(backend).await {
-            bail!("{} isn't offered", backend.label());
+            return Err(NotOffered(backend).into());
         }
         // It goes away with the job, however that ends.
         let dir = private_dir()
@@ -4405,5 +4418,47 @@ cat {dir}/answer
         assert_eq!(left.len(), 1);
         // Only the one listing, which failed.
         assert_eq!(std::fs::read_to_string(&runs).unwrap(), "acp\n");
+    }
+
+    /// A scan of a Devin session tries again while Devin isn't offered,
+    /// and then leaves an item that says what to do.
+    #[tokio::test]
+    async fn a_devin_scan_waits_for_devin() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = dir.path().join("devin");
+        std::fs::write(&devin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
+        state
+            .agents
+            .scans
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = AgentSession {
+            backend: AgentBackend::Devin,
+            title: "Run the e2e tests".into(),
+            ..AgentSession::fixture("devin-s", &fx.clone.slug)
+        };
+        crate::cleanup::scan(&state, session, Vec::new());
+        let mut found = Vec::new();
+        for _ in 0..200 {
+            let c = crate::cleanup::cleanup_state(&state).unwrap();
+            if c.scanning.is_empty() {
+                found = c.items;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].title,
+            "Couldn't scan \u{201c}Run the e2e tests\u{201d}"
+        );
+        assert!(
+            found[0].detail.contains("Devin couldn't be reached"),
+            "{}",
+            found[0].detail
+        );
     }
 }

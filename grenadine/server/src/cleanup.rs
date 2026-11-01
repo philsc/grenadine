@@ -20,7 +20,7 @@ use grenadine_core::api::{
 };
 use serde_json::{Value, json};
 
-use crate::agent::{Budget, JobKind, JobSpec, JobTools};
+use crate::agent::{Budget, JobKind, JobSpec, JobTools, NotOffered};
 use crate::sync::State;
 
 /// How long a scan may take before it's killed.
@@ -28,6 +28,17 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What a scan may spend.
 const SCAN_BUDGET: Budget = Budget { usd: 2.0, acu: 1.0 };
+
+/// How long a scan waits to try again while its backend isn't offered,
+/// as long as a failed listing of the backend's models is kept.
+const SCAN_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(5 * 60)
+};
+
+/// How often a scan tries while its backend isn't offered.
+const SCAN_TRIES: u32 = 7;
 
 /// How often the cleanup items are checked for stale ones.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -463,24 +474,20 @@ pub fn scan(state: &Arc<State>, session: AgentSession, events: Vec<AgentEvent>) 
     state.send(ServerEvent::CleanupChanged);
     let state = state.clone();
     tokio::spawn(async move {
-        let found = match run(&state, &session, &events).await {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::warn!("scanning {} for cleanup: {e:#}", session.id);
-                let mut detail = format!(
-                    "Looking for what the session left behind failed:\n\n```\n{e:#}\n```\n"
-                );
-                // Devin keeps its transcripts where only Devin reads them.
-                if session.backend == AgentBackend::Claude {
-                    detail += &format!(
-                        "\nIts full transcript may still be at `{}`.",
-                        transcript_path(&session).display()
-                    );
+        // A backend that isn't offered may well be again soon, e.g. once
+        // it can list its models.
+        let mut tries = 1;
+        let found = loop {
+            match run(&state, &session, &events).await {
+                Ok(found) => break found,
+                Err(e) if e.is::<NotOffered>() && tries < SCAN_TRIES => {
+                    tries += 1;
+                    tokio::select! {
+                        _ = tokio::time::sleep(SCAN_RETRY) => {}
+                        _ = state.shutdown.cancelled() => break failed_scan(&session, &e),
+                    }
                 }
-                vec![(
-                    format!("Couldn't scan \u{201c}{}\u{201d}", session.title),
-                    detail,
-                )]
+                Err(e) => break failed_scan(&session, &e),
             }
         };
         if let Err(e) = state
@@ -498,6 +505,37 @@ pub fn scan(state: &Arc<State>, session: AgentSession, events: Vec<AgentEvent>) 
             .remove(&session.id);
         state.send(ServerEvent::CleanupChanged);
     });
+}
+
+/// The item that says the scan of `session` failed with `e`.
+fn failed_scan(session: &AgentSession, e: &anyhow::Error) -> Vec<(String, String)> {
+    tracing::warn!("scanning {} for cleanup: {e:#}", session.id);
+    let detail = match e.downcast_ref::<NotOffered>() {
+        Some(NotOffered(backend)) => format!(
+            "{0} couldn't be reached for about {1} minutes, e.g. because it couldn't list \
+             its models, so nothing looked for what the session left behind. Check that \
+             {0} works, then look for leftovers yourself or hand this item off to a session \
+             that does.",
+            backend.label(),
+            (SCAN_RETRY * (SCAN_TRIES - 1)).as_secs() / 60,
+        ),
+        None => {
+            let mut detail =
+                format!("Looking for what the session left behind failed:\n\n```\n{e:#}\n```\n");
+            // Devin keeps its transcripts where only Devin reads them.
+            if session.backend == AgentBackend::Claude {
+                detail += &format!(
+                    "\nIts full transcript may still be at `{}`.",
+                    transcript_path(session).display()
+                );
+            }
+            detail
+        }
+    };
+    vec![(
+        format!("Couldn't scan \u{201c}{}\u{201d}", session.title),
+        detail,
+    )]
 }
 
 /// Where Claude Code keeps the session's full transcript: its config dir's
