@@ -779,7 +779,8 @@ class AgentTest(ServerTestCase):
         expect(repo.locator("option")).to_have_text(
             [*sorted([scenarios.REPO, self.OTHER_REPO]), "General"]
         )
-        repo.select_option(label="General")
+        # New sessions start in no repository unless one is picked.
+        expect(repo).to_have_value("general")
         # There are no PRs to start from.
         expect(self.page.get_by_label("Start from PR")).to_be_disabled()
         self.page.get_by_label("Permissions").select_option(label="Auto")
@@ -798,7 +799,12 @@ class AgentTest(ServerTestCase):
             self.page.get_by_role("button", name="Merge into checkout")
         ).to_have_count(0)
         expect(self.page.locator(".changes-pane")).to_have_count(0)
-        sessions = self.section("General").locator(".agent-entry")
+        # Deleting it opens a new form, whose draft is listed there too.
+        sessions = (
+            self.section("General")
+            .locator(".agent-entry")
+            .filter(has_not=self.page.locator(".agent-draft"))
+        )
         expect(sessions).to_have_count(1)
 
         # Deleting it takes the directory with it.

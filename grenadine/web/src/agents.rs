@@ -946,7 +946,12 @@ pub fn NewSession(draft: String) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
     let repos = LocalResource::new(api::repos);
     let saved = drafts.open(&draft);
-    let repo = RwSignal::new(saved.repo);
+    // Drafts saved before they defaulted to `GENERAL` have no repository.
+    let repo = RwSignal::new(if saved.repo.is_empty() {
+        GENERAL.to_owned()
+    } else {
+        saved.repo
+    });
     let number = RwSignal::new(saved.pr);
     let prompt = RwSignal::new(saved.prompt);
     let mode = RwSignal::new(saved.mode);
@@ -981,15 +986,6 @@ pub fn NewSession(draft: String) -> impl IntoView {
     on_cleanup(move || drafts.remove_if_blank(&draft));
     let busy = RwSignal::new(false);
 
-    // Default to the first repository once they're known.
-    Effect::new(move |_| {
-        if let Some(Ok(list)) = repos.get()
-            && repo.with_untracked(String::is_empty)
-            && let Some(first) = with_general(list).first()
-        {
-            repo.set(first.clone());
-        }
-    });
     let general = Memo::new(move |_| repo.with(|r| r == GENERAL));
 
     let start = move || {

@@ -2,7 +2,7 @@
 //! kept in local storage so that it survives going to another page and
 //! back, or a reload, until its session starts or it's discarded.
 
-use grenadine_core::api::PermissionMode;
+use grenadine_core::api::{GENERAL, PermissionMode};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,7 @@ const KEY: &str = "grenadine.new-session-drafts";
 #[serde(rename_all = "camelCase")]
 pub struct Draft {
     pub id: String,
-    /// Empty until the repositories are known and the form picks one.
+    /// `GENERAL` until a repository is picked.
     pub repo: String,
     /// The PR to start from, as typed.
     pub pr: String,
@@ -93,7 +93,7 @@ impl Drafts {
         self.0.update(|list| {
             list.push(Draft {
                 id: id.clone(),
-                repo: repo.unwrap_or_default(),
+                repo: repo.unwrap_or_else(|| GENERAL.to_owned()),
                 pr: pr.map(|n| n.to_string()).unwrap_or_default(),
                 prompt: String::new(),
                 // New sessions start out planning, whatever the others go
@@ -117,7 +117,7 @@ impl Drafts {
         }
         let d = Draft {
             id: id.to_owned(),
-            repo: String::new(),
+            repo: GENERAL.to_owned(),
             pr: String::new(),
             prompt: String::new(),
             mode: PermissionMode::Plan,
