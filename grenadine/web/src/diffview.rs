@@ -1,7 +1,7 @@
 //! The diff between two commits, computed in the browser from blobs the
 //! server sends, and the diffs of an agent's file edits and worktree.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
@@ -242,6 +242,7 @@ pub fn DiffView(
         }
         Some(Ok((files, hidden))) => {
             let comments = comments.clone();
+            start_reveal();
             view! {
                 <div class="diff-summary muted">
                     {format!("{} files changed", files.len())}
@@ -434,8 +435,66 @@ fn status_label(s: ChangeStatus) -> &'static str {
     }
 }
 
-/// Counts added and removed lines without laying the diff out.
-fn stats(file: &FileData) -> (usize, usize, bool) {
+/// How many rows of diffs render in one task; files past that wait for a
+/// later one, so the first ones paint without waiting for the rest.
+const ROWS_PER_TASK: usize = 500;
+
+/// The height of a diff row, in pixels, as the stylesheet sets it.
+const ROW_HEIGHT: usize = 20;
+
+thread_local! {
+    /// Files waiting to render: their row counts and their flags.
+    static REVEAL: RefCell<VecDeque<(usize, RwSignal<bool>)>> = RefCell::default();
+    /// The rows that may still render in the current task.
+    static BUDGET: Cell<usize> = const { Cell::new(ROWS_PER_TASK) };
+    static REVEALING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Starts over for a new diff: forgets the files the last one still had
+/// waiting, and gives the current task a full budget.
+fn start_reveal() {
+    REVEAL.with_borrow_mut(VecDeque::clear);
+    BUDGET.set(ROWS_PER_TASK);
+}
+
+/// Whether a file of `rows` rows renders now. If not, `shown` is set once
+/// its turn comes, after the files before it.
+fn reveal(rows: usize, shown: RwSignal<bool>) -> bool {
+    let budget = BUDGET.get();
+    // A file bigger than a whole task's budget still renders, on its own.
+    if REVEAL.with_borrow(VecDeque::is_empty) && (rows <= budget || budget == ROWS_PER_TASK) {
+        BUDGET.set(budget.saturating_sub(rows));
+        return true;
+    }
+    REVEAL.with_borrow_mut(|q| q.push_back((rows, shown)));
+    if !REVEALING.replace(true) {
+        leptos::task::spawn_local(async {
+            loop {
+                highlight::next_task().await;
+                BUDGET.set(ROWS_PER_TASK);
+                while let Some((rows, shown)) = REVEAL.with_borrow_mut(|q| {
+                    let budget = BUDGET.get();
+                    let fits = q
+                        .front()
+                        .is_some_and(|&(rows, _)| rows <= budget || budget == ROWS_PER_TASK);
+                    fits.then(|| q.pop_front()).flatten()
+                }) {
+                    BUDGET.set(BUDGET.get().saturating_sub(rows));
+                    shown.try_set(true);
+                }
+                if REVEAL.with_borrow(VecDeque::is_empty) {
+                    REVEALING.set(false);
+                    return;
+                }
+            }
+        });
+    }
+    false
+}
+
+/// Counts added and removed lines and change blocks without laying the
+/// diff out.
+fn stats(file: &FileData) -> (usize, usize, usize, bool) {
     let (old, new) = (
         text(&file.old).unwrap_or_default(),
         text(&file.new).unwrap_or_default(),
@@ -456,7 +515,7 @@ fn stats(file: &FileData) -> (usize, usize, bool) {
         }
         _ => false,
     };
-    (added, removed, all_upstream)
+    (added, removed, blocks.len(), all_upstream)
 }
 
 /// One side of a file, highlighted in the background.
@@ -538,8 +597,20 @@ fn FileView(
     let binary = [&file.old, &file.new]
         .iter()
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
-    let (added, removed, all_upstream) = if binary { (0, 0, false) } else { stats(&file) };
+    let (added, removed, blocks, all_upstream) = if binary {
+        (0, 0, 0, false)
+    } else {
+        stats(&file)
+    };
     let expanded = RwSignal::new(!all_upstream && added + removed <= BIG_FILE);
+    // Roughly: the changed lines and the context around each block.
+    let rows = if expanded.get_untracked() {
+        added + removed + blocks * (2 * CONTEXT + 1)
+    } else {
+        0
+    };
+    let shown = RwSignal::new(false);
+    shown.set(reveal(rows, shown));
     let old_path = c.old_path.as_deref().unwrap_or(c.path());
     let old_lines = SideLines::new(old_path, &c.old_blob, &file.old, expanded.get_untracked());
     let new_lines = SideLines::new(c.path(), &c.new_blob, &file.new, expanded.get_untracked());
@@ -563,6 +634,10 @@ fn FileView(
         move || {
             if !expanded.get() {
                 return ().into_any();
+            }
+            if !shown.get() {
+                let style = format!("height: {}px", rows * ROW_HEIGHT);
+                return view! { <div class="diff-placeholder" style=style></div> }.into_any();
             }
             if binary {
                 let size = |b: &Option<Arc<Blob>>| {
