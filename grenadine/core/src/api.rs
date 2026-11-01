@@ -1152,6 +1152,8 @@ impl Landed {
 pub struct Approval {
     /// The tool use's ID.
     pub id: String,
+    /// Whether the tool use may go ahead. When `option` is set, the
+    /// option's kind decides instead.
     pub allow: bool,
     /// Told to the agent when the tool call is denied.
     pub message: Option<String>,
@@ -1176,9 +1178,27 @@ pub struct ApprovalOption {
     pub id: String,
     /// What the button says.
     pub label: String,
-    /// What kind of answer it is: `allow_once`, `allow_always`,
-    /// `reject_once`, or a backend's own.
-    pub kind: String,
+    pub kind: ApprovalKind,
+}
+
+/// What kind of answer an `ApprovalOption` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    /// A kind of the backend's own, which doesn't allow the tool use.
+    #[serde(other)]
+    Other,
+}
+
+impl ApprovalKind {
+    /// Whether picking it lets the tool use go ahead.
+    pub fn is_allow(self) -> bool {
+        matches!(self, ApprovalKind::AllowOnce | ApprovalKind::AllowAlways)
+    }
 }
 
 /// Something that happened in an agent session's transcript.

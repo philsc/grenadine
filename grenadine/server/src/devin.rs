@@ -18,7 +18,7 @@ use base64::Engine as _;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
-    AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalOption,
+    AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind, ApprovalOption,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -346,7 +346,7 @@ struct PermissionToolCall {
 struct PermissionOption {
     option_id: String,
     name: String,
-    kind: String,
+    kind: ApprovalKind,
 }
 
 /// An `elicitation/create` request's params: a form whose properties are
@@ -992,13 +992,13 @@ fn permission_options(request: &PermissionRequest) -> Vec<ApprovalOption> {
         .map(|o| ApprovalOption {
             id: o.option_id.clone(),
             label: o.name.clone(),
-            kind: o.kind.clone(),
+            kind: o.kind,
         })
         .collect()
 }
 
 /// The id of the first offered option of `kind`.
-fn first_option(options: &[ApprovalOption], kind: &str) -> Option<String> {
+fn first_option(options: &[ApprovalOption], kind: ApprovalKind) -> Option<String> {
     options
         .iter()
         .find(|o| o.kind == kind)
@@ -1021,9 +1021,9 @@ fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<Strin
                 return Some(want);
             }
         }
-        first_option(options, "allow_once")
+        first_option(options, ApprovalKind::AllowOnce)
     } else {
-        first_option(options, "reject_once")
+        first_option(options, ApprovalKind::RejectOnce)
     }
     .or_else(|| options.first().map(|o| o.id.clone()))
 }
@@ -1044,7 +1044,7 @@ async fn permission(
         .and_then(Value::as_str)
         .is_some_and(|r| r.starts_with("mcp__grenadine__"));
     let outcome = if grenadine {
-        json!({"outcome": "selected", "optionId": first_option(&options, "allow_once")})
+        json!({"outcome": "selected", "optionId": first_option(&options, ApprovalKind::AllowOnce)})
     } else {
         let tool = tools
             .lock()
@@ -1366,23 +1366,23 @@ mod tests {
     /// option, or falls back to allow/reject.
     #[test]
     fn decisions_pick_options() {
-        let option = |id: &str, label: &str, kind: &str| ApprovalOption {
+        let option = |id: &str, label: &str, kind| ApprovalOption {
             id: id.into(),
             label: label.into(),
-            kind: kind.into(),
+            kind,
         };
         let options = [
             option(
                 "plan_accept_edits",
                 "Yes, implement plan and accept edits",
-                "allow_once",
+                ApprovalKind::AllowOnce,
             ),
             option(
                 "plan_bypass",
                 "Yes, implement plan and bypass",
-                "allow_once",
+                ApprovalKind::AllowOnce,
             ),
-            option("reject_once", "No", "reject_once"),
+            option("reject_once", "No", ApprovalKind::RejectOnce),
         ];
         let plan = Tool {
             name: "ExitPlanMode".into(),
@@ -1427,7 +1427,7 @@ mod tests {
         assert_eq!(
             decide(
                 &Decision {
-                    allow: true,
+                    allow: false,
                     option: Some("reject_once".into()),
                     ..Default::default()
                 },

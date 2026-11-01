@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs,
-    AgentSession, AgentStatus, Approval, ApprovalOption, CleanupState, CostUnit, GENERAL, Landed,
-    NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage, WorktreeFile,
-    WrapUp, WrapUpTarget,
+    AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CleanupState, CostUnit,
+    GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage,
+    WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -2326,16 +2326,18 @@ fn ApprovalCard(
                             view! {
                                 <div class="form-buttons">
                                     {options.into_iter().map(|o| {
-                                        let class = if primary && o.kind == "allow_once" {
+                                        let class = if primary && o.kind == ApprovalKind::AllowOnce {
                                             primary = false;
                                             "primary"
                                         } else {
                                             ""
                                         };
-                                        let (id, kind) = (o.id.clone(), o.kind.clone());
+                                        // The server goes by the option's kind
+                                        // either way.
+                                        let (id, allow) = (o.id.clone(), o.kind.is_allow());
                                         let answer = answer.clone();
                                         view! {
-                                            <button class=class disabled=move || busy.get() on:click=move |_| answer(kind.starts_with("allow"), Some(id.clone()))>{o.label}</button>
+                                            <button class=class disabled=move || busy.get() on:click=move |_| answer(allow, Some(id.clone()))>{o.label}</button>
                                         }
                                     }).collect_view()}
                                 </div>

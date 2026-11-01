@@ -1180,13 +1180,21 @@ pub fn request_approval(
     Ok(rx)
 }
 
-/// Whether the permission request `tool_use` waits for offers `option`
-/// among its answers.
-pub fn offers_option(state: &State, id: &str, tool_use: &str, option: &str) -> bool {
+/// The answer with id `option` that the waiting permission request
+/// `tool_use` offers, if it offers one.
+pub fn offered_option(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    option: &str,
+) -> Option<ApprovalOption> {
     state.agents.with_live(id, |l| {
         l.pending
-            .get(tool_use)
-            .is_some_and(|p| p.options.iter().any(|o| o.id == option))
+            .get(tool_use)?
+            .options
+            .iter()
+            .find(|o| o.id == option)
+            .cloned()
     })
 }
 
