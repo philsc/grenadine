@@ -33,6 +33,171 @@ from grenadine.testing.fake_github import COMMENTED, TEAM, TOKEN, FakeGitHub
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
 
+
+def devin_scenario(tmp: Path) -> dict:
+    """What the fake `devin acp` (//grenadine/testing:fake_devin) plays: a
+    turn that asks to run a command with Devin's options, a question when
+    the prompt asks for one, and in plan mode a plan from a plan file with
+    front matter. Resuming a session replays an answer, which the
+    transcript must not show again. It logs what grenadine sends to
+    `devin_acp.log` in `tmp`."""
+
+    def update(u: dict) -> dict:
+        return {"update": u}
+
+    def tool_call(kind: str, raw_input: dict, **meta: str) -> dict:
+        return update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": f"{kind}:{{turn}}",
+                "rawInput": raw_input,
+                "_meta": {"cognition.ai/inferenceToolName": kind, **meta},
+            }
+        )
+
+    def done(kind: str, text: str) -> dict:
+        return update(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": f"{kind}:{{turn}}",
+                "status": "completed",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": text}}
+                ],
+            }
+        )
+
+    def permission(kind: str, options: list[tuple[str, str, str]]) -> dict:
+        return {
+            "request": "session/request_permission",
+            "params": {
+                "sessionId": "devin-test",
+                "toolCall": {"toolCallId": f"{kind}:{{turn}}"},
+                "options": [
+                    {"optionId": id, "name": name, "kind": kind}
+                    for id, name, kind in options
+                ],
+            },
+        }
+
+    plan_file = str(tmp / "devin_plan.md")
+    question = {
+        "question": "Tea or coffee?",
+        "header": "Drink",
+        "options": [
+            {"label": "Tea", "description": "Tea"},
+            {"label": "Coffee", "description": "Coffee"},
+        ],
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "q0": {
+                "title": "Drink",
+                "description": "Tea or coffee?",
+                "oneOf": [
+                    {"const": "Tea", "title": "Tea"},
+                    {"const": "Coffee", "title": "Coffee"},
+                ],
+            }
+        },
+    }
+    end = {"end": "end_turn"}
+    return {
+        "log": str(tmp / "devin_acp.log"),
+        "session_id": "devin-test",
+        "model": "swe-2",
+        "models": [
+            {"value": "swe-2", "name": "SWE-2"},
+            {"value": "swe-2-high", "name": "SWE-2 High"},
+        ],
+        "load": [
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Replayed."},
+            }
+        ],
+        "plan_file": {
+            "path": plan_file,
+            "text": "---\nagent: devin\n---\n# The plan\n\nDo the thing.\n",
+        },
+        "prompts": [
+            {
+                "mode": "plan",
+                "steps": [
+                    tool_call(
+                        "exit_plan_mode",
+                        {"plan": "summary"},
+                        **{"cognition.ai/planFilePath": plan_file},
+                    ),
+                    permission(
+                        "exit_plan_mode",
+                        [
+                            (
+                                "plan_accept_edits",
+                                "Yes, implement and accept edits",
+                                "allow_once",
+                            ),
+                            ("plan_bypass", "Yes, implement and bypass", "allow_once"),
+                            ("reject_once", "No", "reject_once"),
+                        ],
+                    ),
+                    done("exit_plan_mode", "ok"),
+                    end,
+                ],
+            },
+            {
+                "match": "question",
+                "steps": [
+                    tool_call("ask_user_question", {"questions": [question]}),
+                    {
+                        "request": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "sessionId": "devin-test",
+                            "requestedSchema": schema,
+                            "message": "Tea or coffee?",
+                            "_meta": {
+                                "cognition.ai/toolCallId": "ask_user_question:{turn}"
+                            },
+                        },
+                    },
+                    done("ask_user_question", "Tea"),
+                    end,
+                ],
+            },
+            {
+                "steps": [
+                    update(
+                        {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "On it."},
+                        }
+                    ),
+                    tool_call("exec", {"command": "touch note.txt"}),
+                    permission(
+                        "exec",
+                        [
+                            ("allow_once", "Allow", "allow_once"),
+                            ("reject_once", "Reject", "reject_once"),
+                        ],
+                    ),
+                    done("exec", "done"),
+                    update(
+                        {
+                            "sessionUpdate": "usage_update",
+                            "used": 1000,
+                            "size": 200000,
+                            "_meta": {"cognition.ai/totalAcuCost": 0.5},
+                        }
+                    ),
+                    end,
+                ],
+            },
+        ],
+    }
+
+
 # Stands in for `claude -p`: it writes a short turn as stream-json and,
 # when the prompt asks it to write, asks grenadine for permission through
 # the MCP tool first, like Claude Code does. Permission modes other than
@@ -42,145 +207,6 @@ STARTUP_TIMEOUT = 30
 # deleted sessions with a container they left behind, and finds no stale
 # cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME". It
 # says how many images came with the prompt.
-FAKE_DEVIN = r"""
-import json, os, sys
-
-LOG = open(os.environ["DEVIN_FAKE_LOG"], "a", buffering=1)
-PLAN = os.environ.get("DEVIN_PLAN_FILE", "")
-if PLAN:
-    with open(PLAN, "w") as f:
-        f.write("---\nagent: devin\n---\n# The plan\n\nDo the thing.\n")
-
-def send(m):
-    line = json.dumps(m)
-    LOG.write("OUT " + line + "\n")
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
-
-def update(u):
-    send({"jsonrpc": "2.0", "method": "session/update",
-          "params": {"update": u}})
-
-prompt_id = None
-mode = None
-calls = 0
-pid = os.getpid()
-while True:
-    line = sys.stdin.readline()
-    if not line:
-        break
-    LOG.write(line)
-    m = json.loads(line)
-    mid = m.get("id")
-    method = m.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
-    elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "sessionId": "devin-test",
-            "modes": {},
-            "configOptions": [{"id": "model", "currentValue": "swe-2",
-                "options": [{"value": "swe-2", "name": "SWE-2"},
-                            {"value": "swe-2-high", "name": "SWE-2 High"}]}]}})
-    elif method == "session/load":
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "configOptions": [{"id": "model", "currentValue": "swe-2"}]}})
-    elif method in ("session/set_mode", "session/set_config_option",
-                    "session/delete"):
-        if method == "session/set_mode":
-            mode = m["params"].get("modeId")
-        send({"jsonrpc": "2.0", "id": mid, "result": {
-            "configOptions": [{"id": "model", "currentValue": "swe-2"}]}})
-    elif method == "session/prompt":
-        prompt_id = mid
-        calls += 1
-        if mode == "plan":
-            update({"sessionUpdate": "tool_call",
-                "toolCallId": f"exit_plan_mode:{pid}#{calls}",
-                "rawInput": {"plan": "summary"},
-                "_meta": {"cognition.ai/inferenceToolName": "exit_plan_mode",
-                          "cognition.ai/planFilePath": PLAN}})
-            send({"jsonrpc": "2.0", "id": f"plan-{pid}-{calls}",
-                  "method": "session/request_permission",
-                  "params": {"sessionId": "devin-test",
-                      "toolCall": {"toolCallId": f"exit_plan_mode:{pid}#{calls}"},
-                      "options": [
-                          {"optionId": "plan_accept_edits",
-                           "name": "Yes, implement and accept edits",
-                           "kind": "allow_once"},
-                          {"optionId": "plan_bypass",
-                           "name": "Yes, implement and bypass",
-                           "kind": "allow_once"},
-                          {"optionId": "reject_once", "name": "No",
-                           "kind": "reject_once"}]}})
-        elif "question" in json.dumps(m["params"]["prompt"]):
-            update({"sessionUpdate": "tool_call",
-                "toolCallId": f"ask_user_question:{pid}#{calls}",
-                "rawInput": {"questions": [{"question": "Tea or coffee?",
-                    "header": "Drink",
-                    "options": [{"label": "Tea", "description": "Tea"},
-                                {"label": "Coffee",
-                                 "description": "Coffee"}]}]},
-                "_meta": {"cognition.ai/inferenceToolName":
-                          "ask_user_question"}})
-            schema = {"type": "object", "properties": {"q0": {
-                "title": "Drink", "description": "Tea or coffee?",
-                "oneOf": [{"const": "Tea", "title": "Tea"},
-                          {"const": "Coffee", "title": "Coffee"}]}}}
-            send({"jsonrpc": "2.0", "id": f"q-{pid}-{calls}",
-                  "method": "elicitation/create",
-                  "params": {"mode": "form", "sessionId": "devin-test",
-                      "requestedSchema": schema,
-                      "message": "Tea or coffee?",
-                      "_meta": {"cognition.ai/toolCallId":
-                                f"ask_user_question:{pid}#{calls}"}}})
-        else:
-            update({"sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "On it."}})
-            update({"sessionUpdate": "tool_call", "toolCallId": f"exec:{pid}#{calls}",
-                    "rawInput": {"command": "touch note.txt"},
-                    "_meta": {"cognition.ai/inferenceToolName": "exec"}})
-            send({"jsonrpc": "2.0", "id": f"perm-{pid}-{calls}",
-                  "method": "session/request_permission",
-                  "params": {"sessionId": "devin-test",
-                      "toolCall": {"toolCallId": f"exec:{pid}#{calls}"},
-                      "options": [{"optionId": "allow_once", "name": "Allow",
-                                   "kind": "allow_once"},
-                                  {"optionId": "reject_once", "name": "Reject",
-                                   "kind": "reject_once"}]}})
-    elif isinstance(mid, str) and mid.startswith("perm-"):
-        update({"sessionUpdate": "tool_call_update", "toolCallId": f"exec:{pid}#{calls}",
-                "status": "completed",
-                "content": [{"type": "content",
-                             "content": {"type": "text", "text": "done"}}]})
-        update({"sessionUpdate": "usage_update", "used": 1000,
-                "size": 200000,
-                "_meta": {"cognition.ai/totalAcuCost": 0.5}})
-        send({"jsonrpc": "2.0", "id": prompt_id,
-              "result": {"stopReason": "end_turn"}})
-    elif isinstance(mid, str) and mid.startswith("q-"):
-        update({"sessionUpdate": "tool_call_update",
-                "toolCallId": f"ask_user_question:{pid}#{calls}",
-                "status": "completed",
-                "content": [{"type": "content",
-                             "content": {"type": "text", "text": "Tea"}}]})
-        send({"jsonrpc": "2.0", "id": prompt_id,
-              "result": {"stopReason": "end_turn"}})
-    elif isinstance(mid, str) and mid.startswith("plan-"):
-        update({"sessionUpdate": "tool_call_update",
-                "toolCallId": f"exit_plan_mode:{pid}#{calls}",
-                "status": "completed",
-                "content": [{"type": "content",
-                             "content": {"type": "text", "text": "ok"}}]})
-        send({"jsonrpc": "2.0", "id": prompt_id,
-              "result": {"stopReason": "end_turn"}})
-    elif method == "session/cancel":
-        send({"jsonrpc": "2.0", "id": prompt_id,
-              "result": {"stopReason": "cancelled"}})
-
-"""
-
-
 FAKE_CLAUDE = r"""
 import base64
 import json
@@ -377,16 +403,14 @@ class ServerTestCase(unittest.TestCase):
         claude = bin_dir / "claude"
         claude.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}")
         claude.chmod(0o755)
+        scenario = tmp / "devin_scenario.json"
+        scenario.write_text(json.dumps(devin_scenario(tmp)))
         devin = bin_dir / "devin"
-        devin.write_text(f"#!{sys.executable}\n{FAKE_DEVIN}")
+        fake_devin = Path(os.environ["FAKE_DEVIN"]).absolute()
+        devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
         devin.chmod(0o755)
 
-        env = dict(
-            cls.gh.git_env(),
-            PATH=f"{bin_dir}:{os.environ['PATH']}",
-            DEVIN_FAKE_LOG=str(tmp / "devin_acp.log"),
-            DEVIN_PLAN_FILE=str(tmp / "devin_plan.md"),
-        )
+        env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
         repo_flags = []
         cls.clones = {}
         for slug in cls.REPOS:
@@ -1713,6 +1737,10 @@ class AgentTest(ServerTestCase):
         self.devin_saw('"optionId":"plan_accept_edits"')
         expect(revised).to_contain_text("Plan approved")
         expect(transcript.locator(".turn-end")).to_have_count(2)
+        # The second turn resumed the session, whose replayed answer the
+        # transcript already has.
+        self.devin_saw('"method":"session/load"')
+        expect(transcript).not_to_contain_text("Replayed.")
         self.delete_session("make a plan")
 
     def test_general_session(self) -> None:

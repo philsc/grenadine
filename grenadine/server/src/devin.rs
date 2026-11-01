@@ -1167,6 +1167,41 @@ async fn elicitation(
     acp.respond(&rpc_id, answer);
 }
 
+/// The fake `devin acp` in //grenadine/testing, set up in `dir` to play
+/// `scenario` (see fake_devin.py); what the client sends goes to
+/// `dir/devin_log`. Returns the executable to run as devin.
+#[cfg(test)]
+pub fn fake(dir: &Path, mut scenario: Value) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = std::path::absolute(std::env::var("FAKE_DEVIN").unwrap()).unwrap();
+    scenario["log"] = dir.join("devin_log").to_str().unwrap().into();
+    let path = dir.join("scenario.json");
+    std::fs::write(&path, scenario.to_string()).unwrap();
+    let exe = dir.join("devin");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nexec {} --scenario={} \"$@\"\n",
+            fake.display(),
+            path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    exe
+}
+
+/// The messages the client sent the fake devin in `dir`, without a last
+/// line it's still writing.
+#[cfg(test)]
+pub fn fake_log(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("devin_log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use grenadine_core::api::{AgentBackend, PermissionMode};
@@ -1469,53 +1504,71 @@ mod tests {
         assert_eq!(decide(&allow, &tool, &[]), None);
     }
 
-    /// A fake `devin acp` for the listing: it answers the handshake and
-    /// logs every request's method to `log`.
-    #[test]
-    fn lists_models_and_deletes_the_asking_session() {
-        let dir = std::env::temp_dir().join(format!("grenadine-list-{}", crate::agent::uuid()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log = dir.join("methods");
-        let exe = dir.join("devin");
-        std::fs::write(
-            &exe,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  echo "$line" | grep -o '"method":"[^"]*"' >> {log}
-  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-  case "$line" in
-  *'"initialize"'*) echo '{{"jsonrpc":"2.0","id":'$id',"result":{{"protocolVersion":1}}}}' ;;
-  *'"session/new"'*) echo '{{"jsonrpc":"2.0","id":'$id',"result":{{"sessionId":"list-tulip","configOptions":[{{"id":"model","currentValue":"swe-2","options":[{{"value":"swe-2","name":"SWE-2"}},{{"value":"swe-2-high","name":"SWE-2 High"}}]}}]}}}}' ;;
-  *'"session/delete"'*) echo '{{"jsonrpc":"2.0","id":'$id',"result":{{}}}}' ;;
-  esac
-done
-"#,
-                log = log.display()
-            ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let models = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(list_models(&exe))
-            .unwrap();
+    /// The listing asks a throwaway session for its models and deletes
+    /// the session again.
+    #[tokio::test]
+    async fn lists_models_and_deletes_the_asking_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake(
+            dir.path(),
+            json!({
+                "session_id": "list-tulip",
+                "models": [
+                    {"value": "swe-2", "name": "SWE-2"},
+                    {"value": "swe-2-high", "name": "SWE-2 High", "description": "Slower"},
+                ],
+            }),
+        );
+        let models = list_models(&exe).await.unwrap();
         assert_eq!(
             models
                 .iter()
-                .map(|m| (m.value.as_str(), m.display_name.as_str()))
+                .map(|m| (
+                    m.value.as_str(),
+                    m.display_name.as_str(),
+                    m.description.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            [("swe-2", "SWE-2"), ("swe-2-high", "SWE-2 High")]
+            [
+                ("swe-2", "SWE-2", ""),
+                ("swe-2-high", "SWE-2 High", "Slower")
+            ]
         );
-        let methods = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
-            methods.matches("method").count(),
-            3,
-            "the listing ran initialize, session/new and session/delete: {methods}"
+            fake_log(dir.path())
+                .iter()
+                .map(|m| m["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "session/new", "session/delete"]
         );
-        assert!(methods.contains("session/delete"), "{methods}");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            fake_log(dir.path())[2]["params"],
+            json!({"sessionId": "list-tulip"})
+        );
+    }
+
+    /// A listing that runs out of time fails, without leaving its
+    /// directory behind.
+    #[tokio::test]
+    async fn a_listing_that_hangs_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake(
+            dir.path(),
+            json!({"gate": dir.path().join("never").to_str().unwrap()}),
+        );
+        let e = list_models_within(&exe, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("in time"), "{e:#}");
+        let methods: Vec<_> = fake_log(dir.path())
+            .iter()
+            .map(|m| m["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(methods, ["initialize", "session/new"]);
+        let cwd = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
+        let cwd = serde_json::from_str::<Value>(cwd.lines().nth(1).unwrap()).unwrap();
+        let cwd = cwd["params"]["cwd"].as_str().unwrap().to_owned();
+        assert!(!Path::new(&cwd).exists(), "{cwd} is left");
     }
 
     /// Devin's modes and cost unit.

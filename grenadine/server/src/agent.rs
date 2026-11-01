@@ -3492,14 +3492,13 @@ mod devin_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use grenadine_core::api::NewAgent;
+    use serde_json::json;
 
     use super::*;
+    use crate::devin::{fake, fake_log};
 
-    /// A state whose agents run `script` as devin.
-    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, script: &str) -> Arc<State> {
-        let devin = dir.join("devin");
-        std::fs::write(&devin, script).unwrap();
-        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// A state whose agents run `devin` as devin.
+    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, devin: PathBuf) -> Arc<State> {
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
@@ -3512,54 +3511,81 @@ mod devin_tests {
         )
     }
 
-    /// A fake `devin acp` that answers the handshake and one prompt with
-    /// a text answer, asking permission for an `exec` call first. Every
-    /// client message is logged to `log`.
-    fn fake_devin(dir: &Path, session: &str) -> String {
-        fake_devin_slow(dir, session, "0")
+    /// A session/update with a chunk of the answer.
+    fn chunk(text: &str) -> Value {
+        json!({"update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }})
     }
 
-    /// `fake_devin`, but `delay` seconds slow to answer `session/new`.
-    fn fake_devin_slow(dir: &Path, session: &str, delay: &str) -> String {
-        format!(
-            r#"#!/bin/sh
-log={log}
-while IFS= read -r line; do
-  echo "$line" >> "$log"
-  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-  case "$line" in
-  *'"initialize"'*) echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"protocolVersion\":1}}}}" ;;
-  *'"session/new"'*) sleep {delay}; echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"sessionId\":\"{session}\",\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\",\"options\":[]}}]}}}}" ;;
-  *'"session/load"'*)
-    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"replayed"}}}}}}}}'
-    echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\"}}]}}}}" ;;
-  *'"session/set_mode"'* | *'"session/set_config_option"'*) echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\"}}]}}}}" ;;
-  *'"session/prompt"'*)
-    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hi"}}}}}}}}'
-    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call","toolCallId":"exec:0#t","rawInput":{{"command":"touch f"}},"_meta":{{"cognition.ai/inferenceToolName":"exec"}}}}}}}}'
-    echo '{{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{{"sessionId":"{session}","toolCall":{{"toolCallId":"exec:0#t"}},"options":[{{"optionId":"allow_once","name":"Allow","kind":"allow_once"}},{{"optionId":"reject_once","name":"Reject","kind":"reject_once"}}]}}}}'
-    ;;
-  *'"id":"perm-1"'*)
-    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#t","status":"completed","content":[{{"type":"content","content":{{"type":"text","text":"done"}}}}]}}}}}}'
-    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"usage_update","used":100,"size":200000,"_meta":{{"cognition.ai/totalAcuCost":0.25}}}}}}}}'
-    echo "{{\"jsonrpc\":\"2.0\",\"id\":$pid,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
-    ;;
-  *'"session/cancel"'*)
-    echo "{{\"jsonrpc\":\"2.0\",\"id\":$pid,\"result\":{{\"stopReason\":\"cancelled\"}}}}"
-    ;;
-  esac
-  case "$line" in *'"session/prompt"'*) pid=$id;; esac
-done
-"#,
-            log = dir.join("devin_log").display(),
-            session = session,
-            delay = delay,
+    /// A session/update with the process's ACU total.
+    fn usage(acu: f64) -> Value {
+        json!({"update": {
+            "sessionUpdate": "usage_update",
+            "used": 100,
+            "size": 200000,
+            "_meta": {"cognition.ai/totalAcuCost": acu},
+        }})
+    }
+
+    /// The steps that start an `exec` call and ask permission for it,
+    /// waiting for the answer unless `wait` is false.
+    fn exec_asking(wait: bool) -> [Value; 2] {
+        [
+            json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec:0#t",
+                "rawInput": {"command": "touch f"},
+                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+            }}),
+            json!({
+                "request": "session/request_permission",
+                "params": {
+                    "sessionId": "s",
+                    "toolCall": {"toolCallId": "exec:0#t"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+                "wait": wait,
+            }),
+        ]
+    }
+
+    /// A scenario whose prompts take `steps`; resuming the session
+    /// replays an answer.
+    fn scenario(session: &str, steps: Vec<Value>) -> Value {
+        json!({
+            "session_id": session,
+            "model": "swe-2",
+            "load": [chunk("replayed")["update"]],
+            "prompts": [{"steps": steps}],
+        })
+    }
+
+    /// A Devin session that starts on `prompt`.
+    async fn start(state: &Arc<State>, fx: &crate::git::tests::Fixture) -> AgentSession {
+        create(
+            state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
         )
+        .await
+        .unwrap()
     }
 
     /// Waits until the session has finished `turns` turns.
     async fn wait_for_turns(state: &State, id: &str, turns: usize) {
-        for _ in 0..100 {
+        for _ in 0..200 {
             let ended = state
                 .db
                 .agent_events(id)
@@ -3582,14 +3608,35 @@ done
     }
 
     /// Waits until the session's status is `AwaitingApproval`.
-    async fn wait_for_status(state: &State, id: &str) {
-        for _ in 0..200 {
+    async fn wait_for_approval(state: &State, id: &str) {
+        for _ in 0..500 {
             if state.db.agent(id).unwrap().unwrap().status == AgentStatus::AwaitingApproval {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("{id} never waited for approval");
+    }
+
+    /// Waits until the fake devin in `dir` was sent `method`.
+    async fn wait_for_method(dir: &Path, method: &str) {
+        for _ in 0..500 {
+            if fake_log(dir).iter().any(|m| m["method"] == method) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("devin was never sent {method}");
+    }
+
+    /// Allows the `exec` call with its option.
+    fn allow(state: &State, id: &str) {
+        let decision = Decision {
+            allow: true,
+            option: Some("allow_once".into()),
+            ..Default::default()
+        };
+        assert!(approve(state, id, "exec:0#t", decision).unwrap());
     }
 
     /// A devin that can't list its models leaves Devin out of the
@@ -3600,8 +3647,14 @@ done
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
-        let script = format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display());
-        let state = state_with_devin(&fx, dir.path(), &script);
+        let devin = dir.path().join("devin");
+        std::fs::write(
+            &devin,
+            format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
         let backends: Vec<_> = state
             .agents
             .backends()
@@ -3628,54 +3681,42 @@ done
 
     /// A Devin session's turn goes over ACP: the session id is stored,
     /// its permission request waits on the page, and the turn's cost is
-    /// in ACUs.
+    /// in ACUs. The next turn resumes the session without the answers
+    /// session/load replays.
     #[tokio::test]
     async fn a_devin_turn_runs_and_resumes() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_devin(&fx, dir.path(), &fake_devin(dir.path(), "turn-slate"));
-        let session = create(
-            &state,
-            NewAgent {
-                backend: grenadine_core::api::AgentBackend::Devin,
-                repo: fx.clone.slug.clone(),
-                pr: None,
-                prompt: "hi".into(),
-                permission_mode: "accept-edits".into(),
-                model: None,
-                images: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+        let [tool_call, ask] = exec_asking(true);
+        let steps = vec![
+            chunk("Hi"),
+            tool_call,
+            ask,
+            json!({"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec:0#t",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "done"}}],
+            }}),
+            usage(0.25),
+            json!({"end": "end_turn"}),
+        ];
+        let devin = fake(dir.path(), scenario("turn-slate", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
 
-        // The approval the turn asks for gets its option back.
-        wait_for_status(&state, &session.id).await;
-        assert!(
-            approve(
-                &state,
-                &session.id,
-                "exec:0#t",
-                Decision {
-                    allow: true,
-                    option: Some("allow_once".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        );
+        wait_for_approval(&state, &session.id).await;
+        allow(&state, &session.id);
         wait_for_turns(&state, &session.id, 1).await;
-        let session = state.db.agent(&session.id).unwrap().unwrap();
-        assert_eq!(session.cost, 0.25);
-        assert_eq!(session.cost_unit, grenadine_core::api::CostUnit::Acu);
-        assert_eq!(session.model.as_deref(), Some("swe-2"));
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.cost, 0.25);
+        assert_eq!(stored.cost_unit, grenadine_core::api::CostUnit::Acu);
+        assert_eq!(stored.model.as_deref(), Some("swe-2"));
         assert_eq!(
             state.db.backend_session(&session.id).unwrap().as_deref(),
             Some("turn-slate")
         );
 
-        // The transcript has the answer and the tool call, not the load
-        // replay the second turn gets.
         send(
             &state,
             &session.id,
@@ -3683,31 +3724,25 @@ done
             "accept-edits".into(),
             None,
         );
-        wait_for_status(&state, &session.id).await;
-        assert!(
-            approve(
-                &state,
-                &session.id,
-                "exec:0#t",
-                Decision {
-                    allow: true,
-                    option: Some("allow_once".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-        );
+        wait_for_approval(&state, &session.id).await;
+        allow(&state, &session.id);
         wait_for_turns(&state, &session.id, 2).await;
-        let transcript = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
-        assert!(transcript.contains("\"session/load\""));
-        let texts: Vec<_> = state
-            .db
-            .agent_events(&session.id)
-            .unwrap()
+        let load = fake_log(dir.path())
             .into_iter()
-            .filter(|e| matches!(e.kind, AgentEventKind::Text(_)))
+            .find(|m| m["method"] == "session/load")
+            .expect("the second turn resumed the session");
+        assert_eq!(load["params"]["sessionId"], "turn-slate");
+        let events = state.db.agent_events(&session.id).unwrap();
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                AgentEventKind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
             .collect();
-        assert_eq!(texts.len(), 2, "no replayed text duplicated");
+        assert_eq!(texts, ["Hi", "Hi"], "no replayed answer");
+        // Each turn's process reports its own total.
+        assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, 0.5);
     }
 
     /// A prompt asked to stop before its turn got to running it never
@@ -3717,81 +3752,110 @@ done
     async fn an_early_interrupt_skips_the_prompt() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let state = state_with_devin(
-            &fx,
-            dir.path(),
-            &fake_devin_slow(dir.path(), "early-oak", "0.5"),
-        );
-        let session = create(
-            &state,
-            NewAgent {
-                backend: grenadine_core::api::AgentBackend::Devin,
-                repo: fx.clone.slug.clone(),
-                pr: None,
-                prompt: "hi".into(),
-                permission_mode: "accept-edits".into(),
-                model: None,
-                images: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-        // As soon as devin picked the session up — still busy answering
-        // session/new — stop it.
-        let log = dir.path().join("devin_log");
-        for _ in 0..200 {
-            if std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .contains("\"session/new\"")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let gate = dir.path().join("gate");
+        let mut scenario = scenario("early-oak", vec![json!({"end": "end_turn"})]);
+        scenario["gate"] = gate.to_str().unwrap().into();
+        let devin = fake(dir.path(), scenario);
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        // Devin holds session/new until the interrupt is in.
+        wait_for_method(dir.path(), "session/new").await;
         interrupt(&state, &session.id);
+        std::fs::write(&gate, "").unwrap();
         wait_for_turns(&state, &session.id, 1).await;
         assert_eq!(
             state.db.agent(&session.id).unwrap().unwrap().status,
             AgentStatus::Interrupted
         );
-        // Whatever point the interrupt landed, no prompt ran.
-        let transcript = std::fs::read_to_string(&log).unwrap();
+        let methods: Vec<_> = fake_log(dir.path())
+            .iter()
+            .filter_map(|m| m["method"].as_str().map(str::to_owned))
+            .collect();
         assert!(
-            !transcript.contains("\"session/prompt\""),
-            "fake devin received a prompt: {transcript}"
+            !methods.iter().any(|m| m == "session/prompt"),
+            "fake devin received a prompt: {methods:?}"
         );
     }
 
-    /// An interrupt asks Devin to cancel, which ends the turn.
+    /// An interrupt asks Devin to cancel, which ends the turn, and the
+    /// ACUs spent so far are billed.
     #[tokio::test]
     async fn an_interrupt_cancels() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        // The permission request never gets an answer; the interrupt's
+        // Devin ignores the answer to its permission request, so only
         // session/cancel ends the turn.
-        let state = state_with_devin(&fx, dir.path(), &fake_devin(dir.path(), "stop-pine"));
-        let session = create(
-            &state,
-            NewAgent {
-                backend: grenadine_core::api::AgentBackend::Devin,
-                repo: fx.clone.slug.clone(),
-                pr: None,
-                prompt: "hi".into(),
-                permission_mode: "accept-edits".into(),
-                model: None,
-                images: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-        wait_for_status(&state, &session.id).await;
+        let [tool_call, ask] = exec_asking(false);
+        let steps = vec![usage(0.125), tool_call, ask];
+        let devin = fake(dir.path(), scenario("stop-pine", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        wait_for_approval(&state, &session.id).await;
         interrupt(&state, &session.id);
         wait_for_turns(&state, &session.id, 1).await;
-        assert_eq!(
-            state.db.agent(&session.id).unwrap().unwrap().status,
-            AgentStatus::Interrupted
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.status, AgentStatus::Interrupted);
+        assert_eq!(stored.cost, 0.125);
+        assert!(
+            fake_log(dir.path())
+                .iter()
+                .any(|m| m["method"] == "session/cancel")
         );
-        let transcript = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
-        assert!(transcript.contains("\"session/cancel\""));
+        let ended: Vec<_> = state
+            .db
+            .agent_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::TurnEnded { error, .. } => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [Some("interrupted".to_owned())]);
+    }
+
+    /// A devin that dies while a permission request waits takes the
+    /// request with it, and the error says what devin printed. The ACUs
+    /// it reported are billed.
+    #[tokio::test]
+    async fn a_dead_devin_drops_its_approvals() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let [tool_call, ask] = exec_asking(false);
+        let steps = vec![
+            usage(0.0625),
+            tool_call,
+            ask,
+            json!({"stderr": "Not logged in"}),
+            json!({"exit": true}),
+        ];
+        let devin = fake(dir.path(), scenario("gone-fern", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        wait_for_turns(&state, &session.id, 1).await;
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.status, AgentStatus::Failed);
+        assert_eq!(stored.cost, 0.0625);
+        let error = state
+            .db
+            .agent_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                AgentEventKind::TurnEnded { error, .. } => error,
+                _ => None,
+            })
+            .unwrap();
+        assert!(error.contains("Not logged in"), "{error}");
+        for _ in 0..100 {
+            if state
+                .agents
+                .with_live(&session.id, |l| l.pending.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the request outlived the turn");
     }
 }
