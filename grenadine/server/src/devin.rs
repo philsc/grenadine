@@ -6,23 +6,26 @@
 //! `session/request_permission` and `elicitation/create` requests, which
 //! the page answers through the same approval flow as Claude's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalOption,
 };
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::agent::{
     Backend, Decision, Stopper, StructuredJob, Turn, TurnSink, backend_command, queue_next,
@@ -92,12 +95,298 @@ impl Backend for Devin {
     }
 }
 
+/// A JSON-RPC request id. The client's are numbers and Devin's are
+/// strings, so they can't collide.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RequestId {
+    Number(u64),
+    String(String),
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestId::Number(n) => write!(f, "{n}"),
+            RequestId::String(s) => f.write_str(s),
+        }
+    }
+}
+
+/// A message `devin acp` writes, one per line.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Incoming {
+    /// A request the agent makes of the client.
+    Request(Request),
+    /// The answer to one of the client's requests.
+    Response(Response),
+    /// A notification, such as `session/update` or Devin's own
+    /// `_cognition.ai/*` ones.
+    Notification(Notification),
+}
+
+#[derive(Debug, Deserialize)]
+struct Request {
+    id: RequestId,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct Response {
+    id: u64,
+    #[serde(default)]
+    result: Value,
+    #[serde(default)]
+    error: Option<RpcError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Notification {
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcError {
+    message: String,
+}
+
+/// `T` from a result or params.
+fn parse<T: DeserializeOwned>(v: Value) -> Result<T> {
+    Ok(serde_json::from_value(v)?)
+}
+
+/// A `session/update` notification's params.
+#[derive(Debug, Deserialize)]
+struct SessionNotification {
+    update: SessionUpdate,
+}
+
+/// What a `session/update` reports. `_meta` holds Devin's `cognition.ai/*`
+/// extensions.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+enum SessionUpdate {
+    AgentMessageChunk {
+        content: ContentBlock,
+        #[serde(rename = "_meta", default)]
+        meta: Value,
+    },
+    ToolCall(ToolCall),
+    ToolCallUpdate(ToolCallUpdate),
+    UsageUpdate(UsageUpdate),
+    /// Thoughts, plans, mode changes and whatever else the transcript
+    /// doesn't show.
+    #[serde(other)]
+    Other,
+}
+
+impl SessionUpdate {
+    fn meta(&self) -> Option<&Value> {
+        match self {
+            SessionUpdate::AgentMessageChunk { meta, .. } => Some(meta),
+            SessionUpdate::ToolCall(c) => Some(&c.meta),
+            SessionUpdate::ToolCallUpdate(u) => Some(&u.meta),
+            SessionUpdate::UsageUpdate(u) => Some(&u.meta),
+            SessionUpdate::Other => None,
+        }
+    }
+}
+
+/// A piece of content; only text is shown.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlock {
+    Text {
+        text: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCall {
+    tool_call_id: String,
+    #[serde(default)]
+    raw_input: Value,
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallUpdate {
+    tool_call_id: String,
+    #[serde(default)]
+    status: Option<ToolCallStatus>,
+    #[serde(default)]
+    content: Vec<ToolCallContent>,
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolCallStatus {
+    Completed,
+    Failed,
+    /// Pending, in progress, or one ACP adds.
+    #[serde(other)]
+    Other,
+}
+
+/// What a tool call produced; only content is shown, not diffs.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ToolCallContent {
+    Content {
+        content: ContentBlock,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageUpdate {
+    #[serde(default)]
+    used: Option<u64>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+/// The `cognition.ai/<key>` extension in a `_meta`.
+fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
+    meta.get(format!("cognition.ai/{key}"))
+}
+
+/// The answer to `session/new`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewSessionResponse {
+    session_id: String,
+    #[serde(default)]
+    config_options: Vec<ConfigOption>,
+}
+
+/// The answer to `session/load` and the requests that set the mode or a
+/// config option; it may be `null`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigResponse {
+    #[serde(default)]
+    config_options: Vec<ConfigOption>,
+}
+
+/// A session config option, such as the model.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigOption {
+    id: String,
+    #[serde(default)]
+    current_value: Option<String>,
+    #[serde(default)]
+    options: Vec<ConfigValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigValue {
+    value: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// The `model` config option among a session answer's.
+fn model_option(options: &[ConfigOption]) -> Option<&ConfigOption> {
+    options.iter().find(|o| o.id == "model")
+}
+
+/// The models the session's `model` config option offers.
+fn models(options: &[ConfigOption]) -> Vec<AgentModelInfo> {
+    model_option(options)
+        .map(|o| {
+            o.options
+                .iter()
+                .map(|m| AgentModelInfo {
+                    value: m.value.clone(),
+                    display_name: m.name.clone(),
+                    description: m.description.clone().unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The model the session's `model` config option is set to.
+fn current_model(options: &[ConfigOption]) -> Option<String> {
+    model_option(options)?.current_value.clone()
+}
+
+/// The answer to `session/prompt`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptResponse {
+    stop_reason: String,
+}
+
+/// A `session/request_permission` request's params.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionRequest {
+    tool_call: PermissionToolCall,
+    options: Vec<PermissionOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionToolCall {
+    tool_call_id: String,
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionOption {
+    option_id: String,
+    name: String,
+    kind: String,
+}
+
+/// An `elicitation/create` request's params: a form whose properties are
+/// the questions, with each question's text as its description.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Elicitation {
+    requested_schema: ElicitationSchema,
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ElicitationSchema {
+    #[serde(default)]
+    properties: BTreeMap<String, ElicitationProperty>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElicitationProperty {
+    #[serde(default)]
+    description: Option<String>,
+}
+
 /// A `devin acp` process's stdin, shared by the turn and the tasks that
 /// answer its requests.
 struct Acp {
     writer: mpsc::UnboundedSender<Value>,
-    /// The next request id; the agent's request ids are strings, ours are
-    /// numbers so they can't collide.
+    /// The next request id.
     next: AtomicU64,
 }
 
@@ -125,73 +414,131 @@ impl Acp {
     }
 
     /// Answers a request the agent made.
-    fn respond(&self, id: &Value, result: Value) {
+    fn respond(&self, id: &RequestId, result: Value) {
         self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
-    /// Tells a request the agent made that the method is unknown.
-    fn respond_unknown(&self, id: &Value) {
+    /// Answers a request the agent made with an error.
+    fn respond_error(&self, id: &RequestId, code: i64, message: &str) {
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": {"code": -32601, "message": "unknown method"},
+            "error": {"code": code, "message": message},
         }));
     }
 }
 
-/// What the pump makes of one stdout line.
-enum Msg {
-    /// A response to a client request: its id and the result or error.
-    Response(u64, Result<Value, String>),
-    /// A request the agent makes of the client: its id and method+params.
-    Request(Value),
-    /// A `session/update` notification's update.
-    Update(Value),
-    /// Anything else, such as `_cognition.ai/*` notifications.
-    Ignored,
-    /// Stdout closed.
-    Eof,
+/// A running `devin acp`: its stdin behind a writer task, its stdout as
+/// parsed messages and its stderr's tail.
+struct Rpc {
+    child: tokio::process::Child,
+    acp: Arc<Acp>,
+    incoming: mpsc::UnboundedReceiver<Incoming>,
+    stderr: tokio::task::JoinHandle<String>,
+    /// Closes stdin.
+    close: oneshot::Sender<()>,
 }
 
-/// Reads the process's stdout and feeds the parsed lines to a channel;
-/// the turn reads them in order while requests answer on their own tasks.
-fn pump(stdout: tokio::process::ChildStdout) -> mpsc::UnboundedReceiver<Msg> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            let msg = match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let Ok(m) = serde_json::from_str::<Value>(&line) else {
-                        continue;
-                    };
-                    if m["method"] == "session/update" {
-                        Msg::Update(m["params"]["update"].clone())
-                    } else if m["method"].is_string() && m["id"].is_null() {
-                        Msg::Ignored
-                    } else if m["method"].is_string() {
-                        Msg::Request(m)
-                    } else if m["id"].is_u64() {
-                        let id = m["id"].as_u64().unwrap();
-                        let r = if m["error"].is_object() {
-                            Err(m["error"]["message"].as_str().unwrap_or("error").to_owned())
-                        } else {
-                            Ok(m["result"].clone())
-                        };
-                        Msg::Response(id, r)
-                    } else {
-                        Msg::Ignored
+impl Rpc {
+    /// Starts `cmd`, a `devin acp`, with its stdio piped.
+    fn spawn(mut cmd: tokio::process::Command) -> std::io::Result<Rpc> {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stderr = stderr_tail(child.stderr.take().unwrap());
+        let mut stdin = child.stdin.take().unwrap();
+        let (writer, mut write_rx) = mpsc::unbounded_channel::<Value>();
+        let (close, closed) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut closed = std::pin::pin!(closed);
+            loop {
+                tokio::select! {
+                    m = write_rx.recv() => {
+                        let Some(m) = m else { return };
+                        if stdin.write_all(format!("{m}\n").as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ = &mut closed => return,
+                }
+            }
+        });
+        let stdout = child.stdout.take().unwrap();
+        let (tx, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match serde_json::from_str::<Incoming>(&line) {
+                    Ok(m) => {
+                        if tx.send(m).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("devin wrote a line that isn't JSON-RPC ({e}): {line}")
                     }
                 }
-                Ok(None) | Err(_) => Msg::Eof,
-            };
-            let eof = matches!(msg, Msg::Eof);
-            if tx.send(msg).is_err() || eof {
-                return;
+            }
+        });
+        Ok(Rpc {
+            child,
+            acp: Arc::new(Acp {
+                writer,
+                next: AtomicU64::new(0),
+            }),
+            incoming,
+            stderr,
+            close,
+        })
+    }
+
+    /// Sends `method` and returns its result; whatever else arrives
+    /// meanwhile goes to `other`.
+    async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut other: impl FnMut(&Arc<Acp>, Incoming) -> Result<()>,
+    ) -> Result<Value> {
+        let id = self.acp.request(method, params);
+        while let Some(m) = self.incoming.recv().await {
+            match m {
+                Incoming::Response(r) if r.id == id => {
+                    return match r.error {
+                        Some(e) => Err(anyhow!("{method}: {}", e.message)),
+                        None => Ok(r.result),
+                    };
+                }
+                m => other(&self.acp, m)?,
             }
         }
-    });
-    rx
+        bail!("devin closed its stdout")
+    }
+
+    /// Closes stdin, which lets devin exit on its own, and kills it if it
+    /// doesn't in time; returns how it exited and its stderr's tail.
+    async fn close(mut self) -> Result<(std::process::ExitStatus, String)> {
+        let _ = self.close.send(());
+        let exit = tokio::select! {
+            s = self.child.wait() => s?,
+            _ = tokio::time::sleep(crate::agent::STOP_TIMEOUT) => {
+                let _ = self.child.kill().await;
+                self.child.wait().await?
+            }
+        };
+        Ok((exit, self.stderr.await.unwrap_or_default()))
+    }
+}
+
+/// Declines whatever the agent asks a client that runs no turn.
+fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
+    if let Incoming::Request(r) = m {
+        acp.respond_error(&r.id, -32601, "unknown method");
+    }
+    Ok(())
 }
 
 /// The models Devin offers, from a throwaway `devin acp` session's model
@@ -200,109 +547,36 @@ fn pump(stdout: tokio::process::ChildStdout) -> mpsc::UnboundedReceiver<Msg> {
 async fn list_models(exe: &Path) -> Result<Vec<AgentModelInfo>> {
     let dir = std::env::temp_dir().join(format!("grenadine-models-{}", crate::agent::uuid()));
     std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
-    let mut child = tokio::process::Command::new(exe)
-        .arg("acp")
-        .current_dir(&dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("running {}", exe.display()))?;
-    let mut stdin = child.stdin.take().unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    /// Sends `request` and returns its result; requests the agent makes
-    /// are declined and other lines skipped.
-    async fn call(
-        stdin: &mut tokio::process::ChildStdin,
-        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-        id: u64,
-        method: &str,
-        params: Value,
-    ) -> Result<Value> {
-        let request = json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params,
-        });
-        stdin.write_all(format!("{request}\n").as_bytes()).await?;
-        while let Some(line) = lines.next_line().await? {
-            let Ok(m) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if m["id"].as_u64() == Some(id) && m["method"].is_null() {
-                if m["error"].is_object() {
-                    bail!("{}", m["error"]["message"].as_str().unwrap_or("error"));
-                }
-                return Ok(m["result"].clone());
-            }
-            if m["method"].is_string() && !m["id"].is_null() {
-                let answer = json!({
-                    "jsonrpc": "2.0", "id": m["id"],
-                    "error": {"code": -32601, "message": "unknown method"},
-                });
-                stdin.write_all(format!("{answer}\n").as_bytes()).await?;
-            }
-        }
-        bail!("devin exited without answering {method}")
-    }
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("acp").current_dir(&dir);
+    let mut rpc = Rpc::spawn(cmd).with_context(|| format!("running {}", exe.display()))?;
     let models = async {
-        call(&mut stdin, &mut lines, 1, "initialize", initialize_params()).await?;
-        let dir_str = dir.to_string_lossy();
-        let session = call(
-            &mut stdin,
-            &mut lines,
-            2,
-            "session/new",
-            json!({"cwd": dir_str, "mcpServers": []}),
-        )
-        .await?;
-        let models = session["configOptions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|o| o["id"] == "model")
-            .map(|o| {
-                o["options"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|m| {
-                        Some(AgentModelInfo {
-                            value: m["value"].as_str()?.to_owned(),
-                            display_name: m["name"].as_str()?.to_owned(),
-                            description: m["description"].as_str().unwrap_or_default().to_owned(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        rpc.call("initialize", initialize_params(), decline).await?;
+        let session: NewSessionResponse = parse(
+            rpc.call(
+                "session/new",
+                json!({"cwd": dir, "mcpServers": []}),
+                decline,
+            )
+            .await?,
+        )?;
         // The session only existed to ask; it doesn't belong in the
         // user's history. An error here doesn't fail the listing.
-        let _ = call(
-            &mut stdin,
-            &mut lines,
-            3,
-            "session/delete",
-            json!({"sessionId": session["sessionId"]}),
-        )
-        .await;
-        Ok(models)
+        let _ = rpc
+            .call(
+                "session/delete",
+                json!({"sessionId": session.session_id}),
+                decline,
+            )
+            .await;
+        Ok(models(&session.config_options))
     };
     let models = tokio::time::timeout(Duration::from_secs(30), models)
         .await
         .context("devin didn't list its models in time")?;
-    let _ = child.kill().await;
+    drop(rpc);
     let _ = std::fs::remove_dir_all(&dir);
     models
-}
-
-/// The current value of the `model` config option in a session answer.
-fn current_model(result: &Value) -> Option<String> {
-    result["configOptions"]
-        .as_array()?
-        .iter()
-        .find(|o| o["id"] == "model")?["currentValue"]
-        .as_str()
-        .map(str::to_owned)
 }
 
 /// What the turn remembers of a tool call: the transcript's name and
@@ -331,14 +605,13 @@ fn tool_name(inference: &str) -> &str {
 
 /// The plan an `exit_plan_mode` call carries: the plan file's contents
 /// without its front matter, or else the `plan` in its input.
-fn plan_input(update: &Value) -> Value {
-    let mut input = update["rawInput"].clone();
-    let path = update["_meta"]["cognition.ai/planFilePath"].as_str();
-    if let Some(body) = path
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| strip_front_matter(&s).to_owned())
-    {
-        input["plan"] = body.into();
+fn plan_input(call: &ToolCall) -> Value {
+    let mut input = call.raw_input.clone();
+    let body = extension(&call.meta, "planFilePath")
+        .and_then(Value::as_str)
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    if let (Some(body), Some(fields)) = (body, input.as_object_mut()) {
+        fields.insert("plan".into(), strip_front_matter(&body).into());
     }
     input
 }
@@ -355,15 +628,17 @@ fn strip_front_matter(text: &str) -> &str {
     }
 }
 
+/// The turn's tool calls by their ids, shared with the tasks that answer
+/// the requests about them.
+type Tools = Arc<Mutex<HashMap<String, Tool>>>;
+
 /// The events a `session/update` means for the transcript, tracked across
 /// a turn.
 struct Updates {
     /// The agent's answer so far, flushed as one Text when something else
     /// happens.
     text: String,
-    /// The turn's tool calls, by their ids, shared with the tasks that
-    /// answer the requests about them.
-    tools: Arc<Mutex<HashMap<String, Tool>>>,
+    tools: Tools,
     /// The turn process's running ACU total, from the latest usage.
     acu: Option<f64>,
 }
@@ -372,13 +647,11 @@ impl Updates {
     fn new() -> Updates {
         Updates {
             text: String::new(),
-            tools: Arc::new(Mutex::new(HashMap::new())),
+            tools: Tools::default(),
             acu: None,
         }
     }
-}
 
-impl Updates {
     /// Ends the answer in progress; the `Text` event if it says anything.
     fn flush(&mut self) -> Vec<AgentEventKind> {
         if self.text.is_empty() {
@@ -390,32 +663,35 @@ impl Updates {
 
     /// The events one `session/update` means; updates of subagents are
     /// skipped.
-    fn update(&mut self, u: &Value) -> Vec<AgentEventKind> {
-        if u["_meta"]["cognition.ai/subagent_context"]["parentAgentId"]
-            .as_str()
-            .is_some_and(|p| p != "root")
-        {
+    fn update(&mut self, u: &SessionUpdate) -> Vec<AgentEventKind> {
+        let parent = u
+            .meta()
+            .and_then(|m| extension(m, "subagent_context"))
+            .and_then(|c| c.get("parentAgentId"))
+            .and_then(Value::as_str);
+        if parent.is_some_and(|p| p != "root") {
             return Vec::new();
         }
-        match u["sessionUpdate"].as_str() {
-            Some("agent_message_chunk") => {
-                let text = u["content"]["text"].as_str().unwrap_or_default();
+        match u {
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text },
+                ..
+            } => {
                 self.text += text;
-                vec![AgentEventKind::TextDelta(text.to_owned())]
+                vec![AgentEventKind::TextDelta(text.clone())]
             }
-            Some("tool_call") => {
-                let id = u["toolCallId"].as_str().unwrap_or_default().to_owned();
-                let inference = u["_meta"]["cognition.ai/inferenceToolName"]
-                    .as_str()
+            SessionUpdate::ToolCall(call) => {
+                let inference = extension(&call.meta, "inferenceToolName")
+                    .and_then(Value::as_str)
                     .unwrap_or_default();
                 let name = tool_name(inference).to_owned();
                 let input = if name == "ExitPlanMode" {
-                    plan_input(u)
+                    plan_input(call)
                 } else {
-                    u["rawInput"].clone()
+                    call.raw_input.clone()
                 };
                 self.tools.lock().unwrap().insert(
-                    id.clone(),
+                    call.tool_call_id.clone(),
                     Tool {
                         name: name.clone(),
                         input: input.clone(),
@@ -425,142 +701,122 @@ impl Updates {
                 self.flush()
                     .into_iter()
                     .chain([AgentEventKind::ToolUse {
-                        id,
+                        id: call.tool_call_id.clone(),
                         name,
                         input: input.to_string(),
                     }])
                     .collect()
             }
-            Some("tool_call_update") => {
-                let id = u["toolCallId"].as_str().unwrap_or_default();
-                let status = u["status"].as_str().unwrap_or_default();
+            SessionUpdate::ToolCallUpdate(update) => {
                 let mut events = self.flush();
-                let tool = self.tools.lock().unwrap().get_mut(id).cloned();
-                if let Some(mut tool) = tool {
-                    // Devin repeats the full output across updates, so the
-                    // latest non-empty text wins over accumulation.
-                    let text = u["content"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|c| c["type"] == "content")
-                        .filter_map(|c| c["content"]["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        tool.content = text;
-                    }
-                    if matches!(status, "completed" | "failed") {
-                        events.push(AgentEventKind::ToolResult {
-                            id: id.to_owned(),
-                            content: tool.content.clone(),
-                            is_error: status == "failed",
-                            patch: Vec::new(),
-                            images: Vec::new(),
-                        });
-                    }
-                    self.tools.lock().unwrap().insert(id.to_owned(), tool);
+                let mut tools = self.tools.lock().unwrap();
+                let Some(tool) = tools.get_mut(&update.tool_call_id) else {
+                    return events;
+                };
+                // Devin repeats the full output across updates, so the
+                // latest non-empty text wins over accumulation.
+                let text = update
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ToolCallContent::Content {
+                            content: ContentBlock::Text { text },
+                        } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    tool.content = text;
+                }
+                if let Some(status @ (ToolCallStatus::Completed | ToolCallStatus::Failed)) =
+                    &update.status
+                {
+                    events.push(AgentEventKind::ToolResult {
+                        id: update.tool_call_id.clone(),
+                        content: tool.content.clone(),
+                        is_error: *status == ToolCallStatus::Failed,
+                        patch: Vec::new(),
+                        images: Vec::new(),
+                    });
                 }
                 events
             }
-            Some("usage_update") => {
-                self.acu = u["_meta"]["cognition.ai/totalAcuCost"].as_f64();
+            SessionUpdate::UsageUpdate(usage) => {
+                self.acu = extension(&usage.meta, "totalAcuCost").and_then(Value::as_f64);
                 vec![AgentEventKind::Usage {
-                    tokens: u["used"].as_u64(),
-                    window: u["size"].as_u64(),
+                    tokens: usage.used,
+                    window: usage.size,
                 }]
             }
-            _ => Vec::new(),
+            SessionUpdate::AgentMessageChunk { .. } | SessionUpdate::Other => Vec::new(),
         }
     }
 }
 
-/// What a turn tracks between its request/response exchanges.
+/// What a turn tracks while it talks to devin.
 struct TurnCtx<'a, 'b> {
     state: &'b Arc<State>,
     id: &'b str,
     sink: &'b mut TurnSink<'a>,
     /// The update→event mapping's state.
     updates: Updates,
-    /// The turn's tool calls, shared with the request tasks.
-    tools: Arc<Mutex<HashMap<String, Tool>>>,
-    /// Responses to requests that haven't been awaited yet, by id.
-    responses: HashMap<u64, Result<Value, String>>,
+    /// The tasks that answer the agent's requests, and the one that stops
+    /// the turn when the server shuts down; they end with the turn.
+    tasks: JoinSet<()>,
     /// While a `session/load` replays the conversation, its updates are
     /// discarded.
     loading: bool,
-    /// `session/cancel` was already sent.
-    cancelled: bool,
-    /// Devin's session id, once `session/new` or `session/load` answered.
-    backend_session: String,
 }
 
-/// The process's pipes and how to stop it, threaded through a turn.
-struct Pipes {
-    acp: Arc<Acp>,
-    pump: mpsc::UnboundedReceiver<Msg>,
-    cancel_rx: mpsc::UnboundedReceiver<()>,
-}
-
-/// Sends `method` and returns its result, meanwhile feeding updates to
-/// the sink, requests to their own tasks, and `session/cancel` on stop.
-async fn call(
-    io: &mut Pipes,
-    ctx: &mut TurnCtx<'_, '_>,
-    method: &str,
-    params: Value,
-) -> Result<Value> {
-    let acp = io.acp.clone();
-    let state = ctx.state.clone();
-    let id = ctx.id;
-    let pump = &mut io.pump;
-    let cancel_rx = &mut io.cancel_rx;
-    let request_id = acp.request(method, params);
-    loop {
-        if let Some(r) = ctx.responses.remove(&request_id) {
-            return r.map_err(|e| anyhow::anyhow!(e));
-        }
-        tokio::select! {
-            msg = pump.recv() => match msg {
-                Some(Msg::Response(id, r)) => {
-                    if id == request_id {
-                        return r.map_err(|e| anyhow::anyhow!(e));
+impl TurnCtx<'_, '_> {
+    /// Takes what devin sent while the turn waited for a response.
+    fn handle(&mut self, acp: &Arc<Acp>, m: Incoming) -> Result<()> {
+        match m {
+            Incoming::Notification(n) if n.method == "session/update" => {
+                let n = match serde_json::from_value::<SessionNotification>(n.params) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("agent {}: an update that doesn't parse: {e}", self.id);
+                        return Ok(());
                     }
-                    ctx.responses.insert(id, r);
-                }
-                Some(Msg::Update(u)) => {
-                    if !ctx.loading {
-                        for e in ctx.updates.update(&u) {
-                            ctx.sink.event(e)?;
-                        }
+                };
+                if !self.loading {
+                    for e in self.updates.update(&n.update) {
+                        self.sink.event(e)?;
                     }
                 }
-                Some(Msg::Request(m)) => request(
-                    acp.clone(),
-                    state.clone(),
-                    id.to_owned(),
-                    Arc::clone(&ctx.tools),
-                    m,
-                ),
-                Some(Msg::Ignored) => {}
-                Some(Msg::Eof) | None => bail!("devin closed its stdout"),
-            },
-            _ = cancel_rx.recv(), if !ctx.cancelled => {
-                ctx.cancelled = true;
-                cancel_turn(&acp, ctx);
-            },
-            _ = state.shutdown.cancelled(), if !ctx.cancelled => {
-                ctx.cancelled = true;
-                cancel_turn(&acp, ctx);
-            },
+            }
+            Incoming::Request(r) => self.request(acp, r),
+            Incoming::Notification(_) | Incoming::Response(_) => {}
         }
+        Ok(())
     }
-}
 
-/// Asks Devin to stop the turn.
-fn cancel_turn(acp: &Arc<Acp>, ctx: &TurnCtx) {
-    if !ctx.backend_session.is_empty() {
-        acp.notify("session/cancel", json!({"sessionId": ctx.backend_session}));
+    /// Answers the request `r` the agent made, on a task of its own.
+    fn request(&mut self, acp: &Arc<Acp>, r: Request) {
+        let (acp, state, id, tools) = (
+            acp.clone(),
+            self.state.clone(),
+            self.id.to_owned(),
+            self.updates.tools.clone(),
+        );
+        match r.method.as_str() {
+            "session/request_permission" => match parse::<PermissionRequest>(r.params) {
+                Ok(p) => {
+                    self.tasks.spawn(permission(acp, state, id, tools, r.id, p));
+                }
+                Err(e) => acp.respond_error(&r.id, -32602, &format!("{e}")),
+            },
+            "elicitation/create" => match parse::<Elicitation>(r.params) {
+                Ok(e) => {
+                    self.tasks
+                        .spawn(elicitation(acp, state, id, tools, r.id, e));
+                }
+                Err(e) => acp.respond_error(&r.id, -32602, &format!("{e}")),
+            },
+            _ => acp.respond_error(&r.id, -32601, "unknown method"),
+        }
     }
 }
 
@@ -574,71 +830,22 @@ async fn turn(
     t: Turn<'_>,
     mut sink: TurnSink<'_>,
 ) -> Result<AgentStatus> {
-    let id = &session.id;
-    let mut child = backend_command(state, session, exe)
-        .arg("acp")
-        .spawn()
-        .with_context(|| format!("can't run {}", exe.display()))?;
-    let stderr_task = stderr_tail(child.stderr.take().unwrap());
-    let mut stdin = child.stdin.take().unwrap();
-    let (writer, mut write_rx) = mpsc::unbounded_channel::<Value>();
-    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let mut close_rx = std::pin::pin!(close_rx);
-        loop {
-            tokio::select! {
-                m = write_rx.recv() => match m {
-                    Some(m) => {
-                        if stdin
-                            .write_all(format!("{m}\n").as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    None => return,
-                },
-                _ = &mut close_rx => return,
-            }
-        }
-    });
-    let acp = Arc::new(Acp {
-        writer,
-        next: AtomicU64::new(0),
-    });
-    let pump = pump(child.stdout.take().unwrap());
-    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel::<()>();
-    let mut io = Pipes {
-        acp,
-        pump,
-        cancel_rx,
-    };
+    let mut cmd = backend_command(state, session, exe);
+    cmd.arg("acp");
+    let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", exe.display()))?;
     let result = {
-        let updates = Updates::new();
         let mut ctx = TurnCtx {
             state,
-            id,
+            id: &session.id,
             sink: &mut sink,
-            tools: updates.tools.clone(),
-            updates,
-            responses: HashMap::new(),
+            updates: Updates::new(),
+            tasks: JoinSet::new(),
             loading: false,
-            cancelled: false,
-            backend_session: String::new(),
         };
-        run_turn(&mut io, cancel_tx, session, &t, &mut ctx).await
+        run_turn(&mut rpc, session, &t, &mut ctx).await
     };
     // The turn is over; stdin closing lets devin go on its own.
-    let _ = close_tx.send(());
-    let exit = tokio::select! {
-        s = child.wait() => s?,
-        _ = tokio::time::sleep(crate::agent::STOP_TIMEOUT) => {
-            let _ = child.kill().await;
-            child.wait().await?
-        }
-    };
-    let stderr = stderr_task.await.unwrap_or_default();
+    let (exit, stderr) = rpc.close().await?;
     result?;
     sink.finish(|| {
         let mut message = format!("devin exited without finishing the turn ({exit})");
@@ -651,88 +858,87 @@ async fn turn(
 
 /// The handshake and the prompt of one turn.
 async fn run_turn(
-    io: &mut Pipes,
-    cancel_tx: mpsc::UnboundedSender<()>,
+    rpc: &mut Rpc,
     session: &AgentSession,
     t: &Turn<'_>,
     ctx: &mut TurnCtx<'_, '_>,
 ) -> Result<()> {
-    let acp = io.acp.clone();
     let state = ctx.state.clone();
     let id = &session.id;
-    call(io, ctx, "initialize", initialize_params()).await?;
+    rpc.call("initialize", initialize_params(), |acp, m| {
+        ctx.handle(acp, m)
+    })
+    .await?;
     let mcp = json!([{
         "type": "http",
         "name": "grenadine",
         "url": t.mcp_url,
         "headers": [],
     }]);
-    let mut model;
-    if let Some(backend) = state.db.backend_session(id)? {
+    let (backend_session, mut model) = if let Some(backend) = state.db.backend_session(id)? {
         // Resuming replays the whole conversation as updates; the
         // transcript already has them.
         ctx.loading = true;
-        let result = call(
-            io,
-            ctx,
-            "session/load",
-            json!({"sessionId": backend, "cwd": session.worktree, "mcpServers": mcp}),
-        )
-        .await?;
+        let result = rpc
+            .call(
+                "session/load",
+                json!({"sessionId": backend, "cwd": session.worktree, "mcpServers": mcp}),
+                |acp, m| ctx.handle(acp, m),
+            )
+            .await?;
         ctx.loading = false;
-        ctx.backend_session = backend;
-        model = current_model(&result);
+        let loaded = parse::<Option<ConfigResponse>>(result)?.unwrap_or_default();
+        (backend, current_model(&loaded.config_options))
     } else {
-        let result = call(
-            io,
-            ctx,
-            "session/new",
-            json!({"cwd": session.worktree, "mcpServers": mcp}),
-        )
-        .await?;
-        ctx.backend_session = result["sessionId"].as_str().unwrap_or_default().to_owned();
-        model = current_model(&result);
-    }
-    // Interrupt and shutdown now know how to stop the turn. An interrupt
-    // that beat the session's setup lands here, and a later one lands in
-    // `call`'s select, so check between the steps.
-    // Stopping again only sends to the channel again, which the turn
-    // ignores once it cancelled.
-    state.agents.set_stopper(
-        id,
-        Stopper::new(move || {
-            let _ = cancel_tx.send(());
-        }),
-    );
-    if state.agents.interrupted(id) && !ctx.cancelled {
-        ctx.cancelled = true;
-        cancel_turn(&acp, ctx);
-    }
-    if ctx.cancelled {
+        let result = rpc
+            .call(
+                "session/new",
+                json!({"cwd": session.worktree, "mcpServers": mcp}),
+                |acp, m| ctx.handle(acp, m),
+            )
+            .await?;
+        let created: NewSessionResponse = parse(result)?;
+        let model = current_model(&created.config_options);
+        (created.session_id, model)
+    };
+    // Interrupts and shutdown now stop the turn with session/cancel; Devin
+    // ignores one with nothing running, so stopping again is harmless.
+    let stopper = {
+        let (acp, backend_session) = (rpc.acp.clone(), backend_session.clone());
+        Stopper::new(move || acp.notify("session/cancel", json!({"sessionId": backend_session})))
+    };
+    state.agents.set_stopper(id, stopper.clone());
+    ctx.tasks.spawn({
+        let state = state.clone();
+        async move {
+            state.shutdown.cancelled().await;
+            stopper.stop();
+        }
+    });
+    // An interrupt that came before the prompt started had nothing to
+    // cancel, so the prompt doesn't start.
+    if state.agents.interrupted(id) {
         return Ok(());
     }
-    call(
-        io,
-        ctx,
+    rpc.call(
         "session/set_mode",
-        json!({"sessionId": ctx.backend_session, "modeId": t.mode.as_str()}),
+        json!({"sessionId": backend_session, "modeId": t.mode.as_str()}),
+        |acp, m| ctx.handle(acp, m),
     )
     .await?;
-    if ctx.cancelled {
-        return Ok(());
-    }
     if let Some(m) = t.model.as_deref().filter(|m| *m != "default") {
-        let result = call(
-            io,
-            ctx,
-            "session/set_config_option",
-            json!({"sessionId": ctx.backend_session, "configId": "model", "value": m}),
-        )
-        .await?;
-        model = current_model(&result).or(model);
+        let result = rpc
+            .call(
+                "session/set_config_option",
+                json!({"sessionId": backend_session, "configId": "model", "value": m}),
+                |acp, m| ctx.handle(acp, m),
+            )
+            .await?;
+        let set = parse::<Option<ConfigResponse>>(result)?.unwrap_or_default();
+        model = current_model(&set.config_options).or(model);
     }
-    ctx.sink.started(&ctx.backend_session.clone(), model)?;
-    if ctx.cancelled {
+    ctx.sink.started(&backend_session, model)?;
+    if state.agents.interrupted(id) {
         return Ok(());
     }
 
@@ -755,75 +961,55 @@ async fn run_turn(
     if !t.prompt.trim().is_empty() {
         blocks.push(json!({"type": "text", "text": t.prompt}));
     }
-    let result = call(
-        io,
-        ctx,
-        "session/prompt",
-        json!({"sessionId": ctx.backend_session, "prompt": blocks}),
-    )
-    .await;
+    let result = rpc
+        .call(
+            "session/prompt",
+            json!({"sessionId": backend_session, "prompt": blocks}),
+            |acp, m| ctx.handle(acp, m),
+        )
+        .await;
     for e in ctx.updates.flush() {
         ctx.sink.event(e)?;
     }
-    let (error, cost) = match result {
-        Ok(r) => match r["stopReason"].as_str().unwrap_or_default() {
+    let acu = ctx.updates.acu;
+    let error = match result.and_then(parse::<PromptResponse>) {
+        Ok(r) => match r.stop_reason.as_str() {
             // The interrupt's TurnEnded comes from `finish`.
             "cancelled" => return Ok(()),
-            "end_turn" => (None, ctx.updates.acu),
-            other => (Some(other.to_owned()), ctx.updates.acu),
+            "end_turn" => None,
+            other => Some(other.to_owned()),
         },
-        Err(e) => (Some(format!("{e:#}")), ctx.updates.acu),
+        Err(e) => Some(format!("{e:#}")),
     };
-    ctx.sink.event(AgentEventKind::TurnEnded { error, cost })
+    ctx.sink
+        .event(AgentEventKind::TurnEnded { error, cost: acu })
 }
 
-/// Answers the request `m` the agent made, on its own task.
-fn request(
-    acp: Arc<Acp>,
-    state: Arc<State>,
-    id: String,
-    tools: Arc<Mutex<HashMap<String, Tool>>>,
-    m: Value,
-) {
-    match m["method"].as_str() {
-        Some("session/request_permission") => {
-            tokio::spawn(permission(acp, state, id, tools, m));
-        }
-        Some("elicitation/create") => {
-            tokio::spawn(elicitation(acp, state, id, tools, m));
-        }
-        _ => acp.respond_unknown(&m["id"]),
-    }
-}
-
-/// The offered `(id, name, kind)` triples of a permission request.
-fn permission_options(params: &Value) -> Vec<(String, String, String)> {
-    params["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|o| {
-            (
-                o["optionId"].as_str().unwrap_or_default().to_owned(),
-                o["name"].as_str().unwrap_or_default().to_owned(),
-                o["kind"].as_str().unwrap_or_default().to_owned(),
-            )
+/// The offered answers of a permission request.
+fn permission_options(request: &PermissionRequest) -> Vec<ApprovalOption> {
+    request
+        .options
+        .iter()
+        .map(|o| ApprovalOption {
+            id: o.option_id.clone(),
+            label: o.name.clone(),
+            kind: o.kind.clone(),
         })
         .collect()
 }
 
 /// The id of the first offered option of `kind`.
-fn first_option(options: &[(String, String, String)], kind: &str) -> Option<String> {
+fn first_option(options: &[ApprovalOption], kind: &str) -> Option<String> {
     options
         .iter()
-        .find(|(_, _, k)| k == kind)
-        .map(|(i, _, _)| i.clone())
+        .find(|o| o.kind == kind)
+        .map(|o| o.id.clone())
 }
 
 /// The `optionId` the user's decision picks: their explicit choice, a
 /// plan approval's `plan_<mode>` option, the first allow, or the first
 /// reject.
-fn decide(d: &Decision, tool: &Tool, options: &[(String, String, String)]) -> Option<String> {
+fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<String> {
     if let Some(o) = &d.option {
         return Some(o.clone());
     }
@@ -832,7 +1018,7 @@ fn decide(d: &Decision, tool: &Tool, options: &[(String, String, String)]) -> Op
             && let Some(m) = &d.mode
         {
             let want = format!("plan_{}", m.as_str().replace('-', "_"));
-            if options.iter().any(|(i, _, _)| *i == want) {
+            if options.iter().any(|o| o.id == want) {
                 return Some(want);
             }
         }
@@ -840,7 +1026,7 @@ fn decide(d: &Decision, tool: &Tool, options: &[(String, String, String)]) -> Op
     } else {
         first_option(options, "reject_once")
     }
-    .or_else(|| options.first().map(|(i, _, _)| i.clone()))
+    .or_else(|| options.first().map(|o| o.id.clone()))
 }
 
 /// Answers a `session/request_permission` request.
@@ -848,19 +1034,15 @@ async fn permission(
     acp: Arc<Acp>,
     state: Arc<State>,
     id: String,
-    tools: Arc<Mutex<HashMap<String, Tool>>>,
-    m: Value,
+    tools: Tools,
+    rpc_id: RequestId,
+    request: PermissionRequest,
 ) {
-    let rpc_id = m["id"].clone();
-    let params = &m["params"];
-    let tool_call = params["toolCall"]["toolCallId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let options = permission_options(params);
+    let tool_call = request.tool_call.tool_call_id.clone();
+    let options = permission_options(&request);
     // Grenadine's own MCP tools never ask the user.
-    let grenadine = params["toolCall"]["_meta"]["cognition.ai/permissionRule"]
-        .as_str()
+    let grenadine = extension(&request.tool_call.meta, "permissionRule")
+        .and_then(Value::as_str)
         .is_some_and(|r| r.starts_with("mcp__grenadine__"));
     let outcome = if grenadine {
         json!({"outcome": "selected", "optionId": first_option(&options, "allow_once")})
@@ -877,14 +1059,7 @@ async fn permission(
             &tool_call,
             &tool.name,
             &tool.input,
-            options
-                .iter()
-                .map(|(i, n, k)| ApprovalOption {
-                    id: i.clone(),
-                    label: n.clone(),
-                    kind: k.clone(),
-                })
-                .collect(),
+            options.clone(),
         ) {
             Ok(rx) => rx,
             Err(e) => {
@@ -920,15 +1095,15 @@ async fn elicitation(
     acp: Arc<Acp>,
     state: Arc<State>,
     id: String,
-    tools: Arc<Mutex<HashMap<String, Tool>>>,
-    m: Value,
+    tools: Tools,
+    rpc_id: RequestId,
+    request: Elicitation,
 ) {
-    let rpc_id = m["id"].clone();
-    let params = &m["params"];
-    let tool_call = params["_meta"]["cognition.ai/toolCallId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    // The request names the tool call it asks for; without one, it gets
+    // a card of its own.
+    let tool_call = extension(&request.meta, "toolCallId")
+        .and_then(Value::as_str)
+        .map_or_else(|| format!("request-{rpc_id}"), str::to_owned);
     let input = tools
         .lock()
         .unwrap()
@@ -959,13 +1134,13 @@ async fn elicitation(
             let answers = d.answers.unwrap_or_default();
             // The schema's questions are keyed q0, q1, ...; their text is
             // each property's description, which the answers are keyed by.
-            let content: serde_json::Map<_, _> = params["requestedSchema"]["properties"]
-                .as_object()
-                .into_iter()
-                .flatten()
+            let content: serde_json::Map<_, _> = request
+                .requested_schema
+                .properties
+                .iter()
                 .filter_map(|(qid, prop)| {
-                    let q = prop["description"].as_str()?;
-                    answers.get(q).map(|a| (qid.clone(), json!(a)))
+                    let a = answers.get(prop.description.as_deref()?)?;
+                    Some((qid.clone(), json!(a)))
                 })
                 .collect();
             json!({"action": "accept", "content": content})
@@ -983,7 +1158,7 @@ mod tests {
 
     /// An update as `devin acp` writes it inside a session/update's
     /// `update` field.
-    fn update(body: &str) -> Value {
+    fn update(body: &str) -> SessionUpdate {
         serde_json::from_str(body).unwrap()
     }
 
@@ -1032,6 +1207,38 @@ mod tests {
                     window: Some(262000),
                 },
             ]
+        );
+    }
+
+    /// Devin's messages sort into requests, responses and notifications
+    /// by their fields; updates the transcript doesn't show are `Other`,
+    /// and one without a field it needs doesn't parse.
+    #[test]
+    fn messages_are_typed() {
+        let incoming = |line: &str| serde_json::from_str::<Incoming>(line).unwrap();
+        assert!(matches!(
+            incoming(r#"{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{}}"#),
+            Incoming::Request(Request { id: RequestId::String(id), .. }) if id == "perm-1"
+        ));
+        assert!(matches!(
+            incoming(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"no"}}"#),
+            Incoming::Response(Response {
+                id: 3,
+                error: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            incoming(r#"{"jsonrpc":"2.0","method":"_cognition.ai/status","params":{}}"#),
+            Incoming::Notification(_)
+        ));
+        assert!(matches!(
+            update(r#"{"sessionUpdate":"plan","entries":[]}"#),
+            SessionUpdate::Other
+        ));
+        assert!(
+            serde_json::from_str::<SessionUpdate>(r#"{"sessionUpdate":"tool_call","rawInput":{}}"#)
+                .is_err()
         );
     }
 
@@ -1160,22 +1367,23 @@ mod tests {
     /// option, or falls back to allow/reject.
     #[test]
     fn decisions_pick_options() {
-        let options = vec![
-            (
-                "plan_accept_edits".to_owned(),
-                "Yes, implement plan and accept edits".to_owned(),
-                "allow_once".to_owned(),
+        let option = |id: &str, label: &str, kind: &str| ApprovalOption {
+            id: id.into(),
+            label: label.into(),
+            kind: kind.into(),
+        };
+        let options = [
+            option(
+                "plan_accept_edits",
+                "Yes, implement plan and accept edits",
+                "allow_once",
             ),
-            (
-                "plan_bypass".to_owned(),
-                "Yes, implement plan and bypass".to_owned(),
-                "allow_once".to_owned(),
+            option(
+                "plan_bypass",
+                "Yes, implement plan and bypass",
+                "allow_once",
             ),
-            (
-                "reject_once".to_owned(),
-                "No".to_owned(),
-                "reject_once".to_owned(),
-            ),
+            option("reject_once", "No", "reject_once"),
         ];
         let plan = Tool {
             name: "ExitPlanMode".into(),
