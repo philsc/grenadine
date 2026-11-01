@@ -447,6 +447,21 @@ fn parse_line(line: &str) -> Parsed {
     Parsed::Events(events)
 }
 
+/// The settings that have this binary check each of a job's Bash commands
+/// as its PreToolUse hook, `cleanup::bash_hook`.
+fn bash_hook_settings() -> Result<Value> {
+    let exe = std::env::current_exe().context("can't find the server's executable")?;
+    let exe = exe
+        .to_str()
+        .and_then(|e| shlex::try_quote(e).ok())
+        .ok_or_else(|| anyhow!("can't quote {}", exe.display()))?;
+    let hook = format!("{exe} {}", crate::cleanup::BASH_HOOK_ARG);
+    Ok(json!({"hooks": {"PreToolUse": [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": hook}],
+    }]}}))
+}
+
 /// The model `kind` of job runs on.
 fn job_model(kind: JobKind) -> &'static str {
     match kind {
@@ -475,7 +490,10 @@ async fn structured(claude: &Path, job: &JobSpec<'_>, cwd: &Path) -> Result<Valu
     .args(["--setting-sources", "user"]);
     let (tools, allowed): (_, &[&str]) = match job.tools {
         JobTools::None => ("", &[]),
-        JobTools::ReadOnly => ("Read,Glob,Grep,Bash", crate::cleanup::READ_ONLY_TOOLS),
+        JobTools::ReadOnly => {
+            cmd.arg("--settings").arg(bash_hook_settings()?.to_string());
+            ("Read,Glob,Grep,Bash", crate::cleanup::READ_ONLY_TOOLS)
+        }
     };
     cmd.arg("--tools").arg(tools);
     cmd.args(["--permission-mode", "dontAsk", "--max-budget-usd"])

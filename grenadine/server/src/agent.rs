@@ -2681,6 +2681,11 @@ esac
         assert!(args.starts_with("-p --model haiku "), "{args}");
         assert!(args.contains(" --permission-mode dontAsk "), "{args}");
         assert!(args.contains(" --allowedTools Read Glob Grep "), "{args}");
+        assert!(!args.contains("git log"), "{args}");
+        // Each Bash command goes through the hook, which checks its
+        // options.
+        assert!(args.contains("--settings {\"hooks\""), "{args}");
+        assert!(args.contains(crate::cleanup::BASH_HOOK_ARG), "{args}");
         let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
         assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
 

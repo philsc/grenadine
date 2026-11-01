@@ -49,7 +49,9 @@ const RESULT_LIMIT: usize = 300;
 
 /// Read-only tools, so that a scan can only look, as Claude Code's
 /// allowed tools. Not `gh api` or bare `git branch`, which can change
-/// things too.
+/// things too, and not `git ls-remote` or `git log`, whose options can run
+/// commands or write files. Claude Code only matches these by prefix, so
+/// the `bash_hook` checks each command's options as well.
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "Read",
     "Glob",
@@ -65,9 +67,7 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "Bash(podman ps:*)",
     "Bash(podman images:*)",
     "Bash(systemctl --user list-units:*)",
-    "Bash(git ls-remote:*)",
     "Bash(git cat-file:*)",
-    "Bash(git log:*)",
     "Bash(git branch --contains:*)",
     "Bash(git branch --list:*)",
     "Bash(gh pr view:*)",
@@ -109,43 +109,31 @@ it. If there's nothing, report no items."
     )
 }
 
-/// How to use the tools on `backend`, for both scans and checks for stale
-/// items, and where the job runs, for `repo`: its clone, or a directory of
-/// its own when the server has none. Devin's jobs can't run `git
-/// ls-remote`, since checking its options isn't worth it when `gh` can
-/// tell about remote branches too.
-fn tool_notes(backend: AgentBackend, repo: &str, clone: Option<&Path>) -> String {
-    let (ls_remote, origin, github) = match backend {
-        AgentBackend::Claude => (
-            " `git ls-remote`,",
-            "`git ls-remote origin` and ",
-            "`git ls-remote https://github.com/OWNER/NAME` and ",
-        ),
-        AgentBackend::Devin => ("", "", ""),
-    };
+/// How to use the tools, for both scans and checks for stale items, and
+/// where the job runs, for `repo`: its clone, or a directory of its own
+/// when the server has none.
+fn tool_notes(repo: &str, clone: Option<&Path>) -> String {
     let place = match clone {
         Some(clone) => format!(
             "The working directory is the clone of {repo} at {}, with `origin` on \
-             GitHub, so {origin}`gh pr view NUMBER --json state,headRefName` work as \
-             they are.",
+             GitHub, so `gh pr view NUMBER --json state,headRefName` works as it is.",
             clone.display()
         ),
-        None => format!(
-            "There is no clone here. The repos are on GitHub as `owner/name`: use \
-             {github}`gh pr view NUMBER --repo OWNER/NAME --json state,headRefName`."
-        ),
+        None => "There is no clone here. The repos are on GitHub as `owner/name`: use \
+                 `gh pr view NUMBER --repo OWNER/NAME --json state,headRefName`."
+            .to_owned(),
     };
     format!(
         "Run each shell command on its own, without pipes, `&&`, `;`, redirections, \
          `$` or globs: anything else is denied, and so are options that could change \
          things. The shell commands you can run are `ls`, `stat`, `du`, `file`, \
-         `docker`/`podman` listings, `systemctl --user list-units`,{ls_remote} `git \
-         cat-file`, `git log`, `git branch --contains`, `git branch --list`, `gh pr \
-         view`, `gh pr list` and `gh repo view`. {place}"
+         `docker`/`podman` listings, `systemctl --user list-units`, `git cat-file`, \
+         `git branch --contains`, `git branch --list`, `gh pr view`, `gh pr list` \
+         and `gh repo view`. {place}"
     )
 }
 
-/// A read-only command a Devin job may run: its leading words, and the
+/// A read-only command a cleanup job may run: its leading words, and the
 /// options it may take after them. Any other option is refused, since
 /// some would run commands or write files, e.g. `git log --output=FILE`.
 struct ReadOnlyCommand {
@@ -181,7 +169,7 @@ impl ReadOnlyCommand {
     }
 }
 
-/// The commands Devin's jobs may run, the read-only ones of
+/// The commands the cleanup jobs may run, the read-only ones of
 /// `READ_ONLY_TOOLS` with the options that only read.
 const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
     ReadOnlyCommand {
@@ -258,31 +246,6 @@ const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
         short: "tesp",
         long: &[],
     },
-    // Not the options that show diffs, which can run diff drivers.
-    ReadOnlyCommand {
-        words: &["git", "log"],
-        short: "n0123456789",
-        long: &[
-            "all",
-            "author",
-            "branches",
-            "date",
-            "decorate",
-            "first-parent",
-            "format",
-            "graph",
-            "grep",
-            "max-count",
-            "no-walk",
-            "oneline",
-            "pretty",
-            "remotes",
-            "reverse",
-            "since",
-            "tags",
-            "until",
-        ],
-    },
     ReadOnlyCommand {
         words: &["git", "branch", "--contains"],
         short: "arv",
@@ -329,6 +292,45 @@ const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
         long: &["jq", "json"],
     },
 ];
+
+/// The argument that has the server binary act as `bash_hook`.
+pub const BASH_HOOK_ARG: &str = "cleanup-bash-hook";
+
+/// Claude Code's PreToolUse hook for the cleanup jobs: reads the hook's
+/// input on stdin and returns the exit status, 2 to block a Bash command
+/// that `allowed_command` refuses. Claude Code's allowed tools only match
+/// a command's prefix, so this keeps out the options that would run
+/// commands or write files.
+pub fn bash_hook() -> i32 {
+    let mut input = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    match hook_decision(&input) {
+        Ok(()) => 0,
+        Err(why) => {
+            eprintln!("{why}");
+            2
+        }
+    }
+}
+
+/// Whether the tool call in a PreToolUse hook's `input` may go ahead;
+/// why not if it may not.
+fn hook_decision(input: &str) -> Result<(), String> {
+    let input: Value =
+        serde_json::from_str(input).map_err(|e| format!("the hook's input doesn't parse: {e}"))?;
+    if input["tool_name"] != "Bash" {
+        return Ok(());
+    }
+    let command = input["tool_input"]["command"].as_str().unwrap_or_default();
+    if allowed_command(command) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Denied: only the listed read-only commands, with options that only read, \
+             may run, one at a time: {command}"
+        ))
+    }
+}
 
 /// Whether `cmd` is one of the read-only commands the cleanup jobs may
 /// run, with only options that read. It's split into words the way a
@@ -507,7 +509,7 @@ async fn run(
         "{}\n\n{}\n\n\
          The session \u{201c}{}\u{201d} worked {place}.\n",
         instructions(session.backend),
-        tool_notes(session.backend, &session.repo, clone.as_deref()),
+        tool_notes(&session.repo, clone.as_deref()),
         session.title,
     );
     if session.backend == AgentBackend::Claude && transcript.exists() {
@@ -681,7 +683,7 @@ async fn prune_in(
     let mut input = format!(
         "{}\n\n{}\n\n# Items\n",
         prune_instructions(backend),
-        tool_notes(backend, &items[0].repo, clone)
+        tool_notes(&items[0].repo, clone)
     );
     for item in items {
         input += &format!(
@@ -1016,6 +1018,25 @@ mod tests {
 mod command_tests {
     use super::*;
 
+    /// The hook lets through the commands `allowed_command` allows, and
+    /// other tools.
+    #[test]
+    fn the_hook_checks_bash_commands() {
+        let call = |tool: &str, command: &str| {
+            json!({"tool_name": tool, "tool_input": {"command": command}}).to_string()
+        };
+        assert_eq!(hook_decision(&call("Bash", "ls -la")), Ok(()));
+        assert_eq!(hook_decision(&call("Read", "")), Ok(()));
+        for cmd in [
+            "git ls-remote --upload-pack='touch ~/pwned' .",
+            "git log --output=/home/me/.bashrc -1",
+            "git branch --list -D x",
+        ] {
+            assert!(hook_decision(&call("Bash", cmd)).is_err(), "{cmd}");
+        }
+        assert!(hook_decision("not json").is_err());
+    }
+
     /// The read-only commands the allowlist lets through, and what it
     /// keeps out: other commands, shell syntax, and options that run
     /// commands, write files or change things.
@@ -1030,9 +1051,6 @@ mod command_tests {
             "docker ps -a",
             "docker volume ls --filter name=e2e",
             "systemctl --user list-units --all",
-            "git log -1",
-            "git log -n 5 --oneline origin/main",
-            "git log --format=%H -1 abc123 -- src",
             "git cat-file -t abc123",
             "git branch --contains abc123 -r",
             "git branch --list 'dev/*'",
@@ -1050,6 +1068,7 @@ mod command_tests {
             "git branch -D x",
             "git push origin :x",
             "git ls-remote origin",
+            "git log -1",
             // Shell syntax.
             "ls; rm x",
             "ls $(pwd)",

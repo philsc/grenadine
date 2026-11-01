@@ -170,6 +170,10 @@ impl Signals {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Claude Code runs the server's binary as the cleanup jobs' hook.
+    if std::env::args().nth(1).as_deref() == Some(cleanup::BASH_HOOK_ARG) {
+        std::process::exit(cleanup::bash_hook());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
