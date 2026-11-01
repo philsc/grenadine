@@ -7,8 +7,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeState, Person, PrKey, Review,
-    ReviewComment, ReviewDecision, ReviewInfo, ReviewState, Side, StackPr, ThreadCounts,
+    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeState, NewThread, Person, PrKey,
+    Review, ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr,
+    SubmitReview, ThreadCounts,
 };
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
@@ -83,6 +84,9 @@ pub struct PrData {
     /// says why.
     pub review: Option<ReviewInfo>,
     pub review_error: Option<String>,
+    /// The comments of the viewer's pending review. Empty when `review` is
+    /// `None`, as they're part of what `review_error` is about.
+    pub pending: Vec<ReviewComment>,
 }
 
 /// A review thread of a PR, as `GitHub::review_threads` reports it.
@@ -94,6 +98,28 @@ pub struct ThreadState {
     pub resolved_by: Option<Person>,
     /// The viewer may resolve the thread, or unresolve it if it's resolved.
     pub can_resolve: bool,
+    pub side: Side,
+}
+
+/// The viewer's pending review on a PR, as `GitHub::pending_review`
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingReview {
+    /// The PR's GraphQL ID.
+    pub pr_id: String,
+    /// The review's GraphQL ID; `None` when the viewer has no pending
+    /// review on the PR.
+    pub review: Option<String>,
+    /// How many comments the review has.
+    pub comments: usize,
+}
+
+/// Something to add to the viewer's pending review, see
+/// `GitHub::add_to_review`.
+#[derive(Clone, Copy, Debug)]
+pub enum ReviewItem<'a> {
+    Thread(&'a NewThread),
+    Reply { thread: &'a str, body: &'a str },
 }
 
 /// Which branch of a PR `GitHub::prs_by_ref` matches.
@@ -256,6 +282,19 @@ query($owner: String!, $name: String!, $number: Int!) {
       reviews(last: 100) {
         nodes { state body submittedAt url author { ...Who } }
       }
+      pending: reviews(states: [PENDING], first: 1) {
+        nodes {
+          id viewerDidAuthor
+          comments(first: 100) {
+            nodes {
+              id databaseId body path line startLine originalLine originalStartLine
+              subjectType createdAt url
+              replyTo { databaseId }
+              originalCommit { oid }
+            }
+          }
+        }
+      }
       reviewRequests(first: 20) {
         nodes {
           requestedReviewer {
@@ -301,7 +340,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id
+          id diffSide
           isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -336,8 +375,8 @@ fn author_at(v: &Value) -> Person {
     })
 }
 
-/// The fields of `PR_QUERY` that `review_info` reads, as the start of the
-/// `path` of an error in them.
+/// The fields of `PR_QUERY` that `review_info` and `pending_review` read,
+/// as the start of the `path` of an error in them.
 const REVIEW_FIELDS: &[&[&str]] = &[
     &["viewer"],
     &["repository", "mergeCommitAllowed"],
@@ -350,6 +389,7 @@ const REVIEW_FIELDS: &[&[&str]] = &[
     &["repository", "pullRequest", "mergeStateStatus"],
     &["repository", "pullRequest", "viewerCanMergeAsAdmin"],
     &["repository", "pullRequest", "reviews"],
+    &["repository", "pullRequest", "pending"],
     &["repository", "pullRequest", "reviewRequests"],
     &["repository", "pullRequest", "comments"],
     &["repository", "pullRequest", "head"],
@@ -468,6 +508,59 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             delete_branch_on_merge: repo["deleteBranchOnMerge"].as_bool().unwrap_or(false),
             can_merge_as_admin: pr["viewerCanMergeAsAdmin"].as_bool().unwrap_or(false),
         },
+        pending_review: None,
+    }
+}
+
+/// The viewer's pending review in a `PR_QUERY` response: its ID and its
+/// comments.
+fn pending_review(pr: &Value, viewer: &str) -> (Option<String>, Vec<ReviewComment>) {
+    let Some(review) = nodes(pr, "/pending/nodes").find(|r| r["viewerDidAuthor"] == true) else {
+        return (None, Vec::new());
+    };
+    let line = |c: &Value, ptr: &str| c.pointer(ptr).and_then(Value::as_u64).map(|n| n as u32);
+    let comments = nodes(review, "/comments/nodes")
+        .filter_map(|c| {
+            Some(ReviewComment {
+                id: c["databaseId"].as_u64()?,
+                in_reply_to: c.pointer("/replyTo/databaseId").and_then(Value::as_u64),
+                author: viewer.to_owned(),
+                body: str_at(c, "/body").to_owned(),
+                path: str_at(c, "/path").to_owned(),
+                original_commit: str_at(c, "/originalCommit/oid").to_owned(),
+                original_line: line(c, "/originalLine"),
+                original_start_line: line(c, "/originalStartLine"),
+                line: line(c, "/line"),
+                start_line: line(c, "/startLine"),
+                // Comments don't say which side they're on, their threads
+                // do; the sync fills it in from those.
+                side: Side::Right,
+                on_file: str_at(c, "/subjectType") == "FILE",
+                created_at: str_at(c, "/createdAt").to_owned(),
+                url: str_at(c, "/url").to_owned(),
+                resolved: false,
+                resolved_by: None,
+                thread_id: None,
+                can_resolve: false,
+                pending: true,
+                node_id: Some(str_at(c, "/id").to_owned()),
+            })
+        })
+        .collect();
+    (Some(str_at(review, "/id").to_owned()), comments)
+}
+
+/// The viewer's pending review from a `GitHub::pending_review` lookup of
+/// the PR's node.
+fn read_pending_review(pr: &Value) -> PendingReview {
+    let review = nodes(pr, "/reviews/nodes").find(|r| r["viewerDidAuthor"] == true);
+    PendingReview {
+        pr_id: str_at(pr, "/id").to_owned(),
+        review: review.map(|r| str_at(r, "/id").to_owned()),
+        comments: review
+            .and_then(|r| r.pointer("/comments/totalCount"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
     }
 }
 
@@ -648,15 +741,221 @@ impl GitHub {
         Ok(str_at(&self.pr_node(key, "").await?, "/id").to_owned())
     }
 
-    /// Adds a reply to a review thread.
-    pub async fn reply_to_thread(&self, thread_id: &str, body: &str) -> Result<()> {
+    /// The PR's GraphQL ID and the viewer's pending review on it, if any.
+    pub async fn pending_review(&self, key: &PrKey) -> Result<PendingReview> {
+        let pr = self
+            .pr_node(
+                key,
+                "reviews(states: [PENDING], first: 1) {
+                   nodes { id viewerDidAuthor comments { totalCount } }
+                 }",
+            )
+            .await?;
+        Ok(read_pending_review(&pr))
+    }
+
+    /// Adds `item` to the viewer's pending review on the PR, starting one
+    /// if there's none. Callers hold `State::lock_review`, so that two
+    /// additions don't both start a review.
+    pub async fn add_to_review(&self, key: &PrKey, item: ReviewItem<'_>) -> Result<()> {
+        let pending = self.pending_review(key).await?;
+        if let Some(review) = &pending.review {
+            return self.add_to(review, item).await;
+        }
+        let started = match item {
+            // A line comment starts the review itself, so that if GitHub
+            // refuses it, there's no empty review left behind.
+            ReviewItem::Thread(t) if t.line.is_some() => self
+                .start_review(&pending.pr_id, Some(t))
+                .await
+                .map(|_| None),
+            // GitHub can't start a review with a file comment or a reply,
+            // so these start an empty one, which is deleted again if the
+            // comment fails.
+            _ => self.start_review(&pending.pr_id, None).await.map(Some),
+        };
+        match started {
+            Ok(None) => Ok(()),
+            Ok(Some(review)) => {
+                let added = self.add_to(&review, item).await;
+                if added.is_err()
+                    && let Err(e) = self.delete_review(&review).await
+                {
+                    tracing::warn!("can't delete the review {review} again: {e:#}");
+                }
+                added
+            }
+            // Started elsewhere in the meantime, e.g. on github.com.
+            Err(e) if format!("{e:#}").contains("one pending review") => {
+                match self.pending_review(key).await?.review {
+                    Some(review) => self.add_to(&review, item).await,
+                    None => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Starts a pending review on the PR `pr_id`, with `thread` as its
+    /// first comment if given. Returns the review's ID.
+    async fn start_review(&self, pr_id: &str, thread: Option<&NewThread>) -> Result<String> {
+        let threads = thread.map(|t| {
+            [json!({
+                "path": t.path,
+                "body": t.body,
+                "line": t.line,
+                "side": t.side.as_github(),
+            })]
+        });
+        let data = self
+            .mutate(
+                "mutation($pr: ID!, $threads: [DraftPullRequestReviewThread]) {
+                   addPullRequestReview(input: { pullRequestId: $pr, threads: $threads }) {
+                     pullRequestReview { id }
+                   }
+                 }",
+                json!({ "pr": pr_id, "threads": threads }),
+            )
+            .await?;
+        Some(str_at(&data, "/addPullRequestReview/pullRequestReview/id"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("GitHub didn't start a review"))
+    }
+
+    /// Adds `item` to the pending review `review`.
+    async fn add_to(&self, review: &str, item: ReviewItem<'_>) -> Result<()> {
+        match item {
+            ReviewItem::Thread(t) => self.add_review_thread(review, t).await,
+            ReviewItem::Reply { thread, body } => {
+                self.reply_to_thread(thread, body, Some(review)).await
+            }
+        }
+    }
+
+    /// Adds a reply to a review thread: to the pending review `review` if
+    /// given, and otherwise posted right away.
+    pub async fn reply_to_thread(
+        &self,
+        thread_id: &str,
+        body: &str,
+        review: Option<&str>,
+    ) -> Result<()> {
         self.mutate(
-            "mutation($thread: ID!, $body: String!) {
-               addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) {
+            "mutation($thread: ID!, $body: String!, $review: ID) {
+               addPullRequestReviewThreadReply(input: {
+                 pullRequestReviewThreadId: $thread, body: $body, pullRequestReviewId: $review
+               }) {
                  clientMutationId
                }
              }",
-            json!({ "thread": thread_id, "body": body }),
+            json!({ "thread": thread_id, "body": body, "review": review }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Adds a thread to the pending review `review`.
+    async fn add_review_thread(&self, review: &str, t: &NewThread) -> Result<()> {
+        self.mutate(
+            "mutation($review: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide,
+                      $subject: PullRequestReviewThreadSubjectType) {
+               addPullRequestReviewThread(input: {
+                 pullRequestReviewId: $review, path: $path, body: $body, line: $line, side: $side,
+                 subjectType: $subject
+               }) {
+                 clientMutationId
+               }
+             }",
+            json!({
+                "review": review,
+                "path": t.path,
+                "body": t.body,
+                "line": t.line,
+                "side": t.line.map(|_| t.side.as_github()),
+                "subject": if t.line.is_some() { "LINE" } else { "FILE" },
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Edits a pending review comment by its GraphQL ID.
+    pub async fn edit_review_comment(&self, comment: &str, body: &str) -> Result<()> {
+        self.mutate(
+            "mutation($comment: ID!, $body: String!) {
+               updatePullRequestReviewComment(input: { pullRequestReviewCommentId: $comment, body: $body }) {
+                 clientMutationId
+               }
+             }",
+            json!({ "comment": comment, "body": body }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Deletes a pending review comment by its GraphQL ID.
+    pub async fn delete_review_comment(&self, comment: &str) -> Result<()> {
+        self.mutate(
+            "mutation($comment: ID!) {
+               deletePullRequestReviewComment(input: { id: $comment }) { clientMutationId }
+             }",
+            json!({ "comment": comment }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Submits the viewer's pending review, or, without one, reviews the PR
+    /// with no comments.
+    pub async fn submit_review(&self, pending: &PendingReview, s: &SubmitReview) -> Result<()> {
+        let event = match s.event {
+            ReviewEvent::Comment => "COMMENT",
+            ReviewEvent::Approve => "APPROVE",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+        };
+        match &pending.review {
+            Some(review) => {
+                self.mutate(
+                    "mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) {
+                       submitPullRequestReview(input: { pullRequestReviewId: $review, event: $event, body: $body }) {
+                         clientMutationId
+                       }
+                     }",
+                    json!({ "review": review, "event": event, "body": s.body }),
+                )
+                .await?
+            }
+            None => {
+                self.mutate(
+                    "mutation($pr: ID!, $event: PullRequestReviewEvent!, $body: String) {
+                       addPullRequestReview(input: { pullRequestId: $pr, event: $event, body: $body }) {
+                         clientMutationId
+                       }
+                     }",
+                    json!({ "pr": pending.pr_id, "event": event, "body": s.body }),
+                )
+                .await?
+            }
+        };
+        Ok(())
+    }
+
+    /// Discards the viewer's pending review and its comments.
+    pub async fn discard_review(&self, key: &PrKey) -> Result<()> {
+        match self.pending_review(key).await?.review {
+            Some(review) => self.delete_review(&review).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Deletes the pending review `review` and its comments.
+    async fn delete_review(&self, review: &str) -> Result<()> {
+        self.mutate(
+            "mutation($review: ID!) {
+               deletePullRequestReview(input: { pullRequestReviewId: $review }) { clientMutationId }
+             }",
+            json!({ "review": review }),
         )
         .await?;
         Ok(())
@@ -908,6 +1207,20 @@ impl GitHub {
             })
             .collect();
 
+        let (review, pending) = match review_error {
+            Some(_) => (None, Vec::new()),
+            None => {
+                let review = review_info(&data, pr);
+                let (pending_review, pending) = pending_review(pr, &review.viewer);
+                (
+                    Some(ReviewInfo {
+                        pending_review,
+                        ..review
+                    }),
+                    pending,
+                )
+            }
+        };
         Ok(PrData {
             title: str_at(pr, "/title").to_owned(),
             body: str_at(pr, "/body").to_owned(),
@@ -926,8 +1239,9 @@ impl GitHub {
             force_pushes,
             commits,
             ci: ci_status(str_at(pr, "/head/nodes/0/commit/statusCheckRollup/state")),
-            review: review_error.is_none().then(|| review_info(&data, pr)),
+            review,
             review_error,
+            pending,
         })
     }
 
@@ -1041,11 +1355,7 @@ impl GitHub {
                 original_start_line: c.original_start_line,
                 line: c.line,
                 start_line: c.start_line,
-                side: if c.side.as_deref() == Some("LEFT") {
-                    Side::Left
-                } else {
-                    Side::Right
-                },
+                side: Side::from_github(c.side.as_deref().unwrap_or_default()),
                 on_file: c.subject_type.as_deref() == Some("file"),
                 created_at: c.created_at,
                 url: c.html_url,
@@ -1053,6 +1363,8 @@ impl GitHub {
                 resolved_by: None,
                 thread_id: None,
                 can_resolve: false,
+                pending: false,
+                node_id: None,
             })
             .collect())
     }
@@ -1098,6 +1410,7 @@ impl GitHub {
                         resolved,
                         resolved_by: resolved.then(|| person_at(&t["resolvedBy"])).flatten(),
                         can_resolve: t[can].as_bool() == Some(true),
+                        side: Side::from_github(str_at(t, "/diffSide")),
                     },
                 ))
             }));
@@ -1468,6 +1781,105 @@ mod tests {
                 default_method: Some(MergeMethod::Rebase),
                 delete_branch_on_merge: true,
                 can_merge_as_admin: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reads_the_pending_review() {
+        let pr = json!({
+            "pending": { "nodes": [
+                // Someone else's, which GitHub doesn't show the viewer
+                // anyway.
+                { "id": "R0", "viewerDidAuthor": false, "comments": { "nodes": [] } },
+                { "id": "R1", "viewerDidAuthor": true, "comments": { "nodes": [
+                    { "id": "C1", "databaseId": 11, "body": "nit", "path": "a.rs",
+                      "line": 3, "startLine": null, "originalLine": 2,
+                      "originalStartLine": null, "subjectType": "LINE", "createdAt": "t",
+                      "url": "u", "replyTo": null, "originalCommit": { "oid": "c" } },
+                    { "id": "C2", "databaseId": 12, "body": "file", "path": "b.rs",
+                      "line": null, "subjectType": "FILE", "replyTo": { "databaseId": 5 },
+                      "originalCommit": { "oid": "c" } },
+                    // Not yet given a database ID: skipped.
+                    { "id": "C3", "databaseId": null, "body": "?" },
+                ] } },
+            ] },
+        });
+        let (review, comments) = pending_review(&pr, "me");
+        assert_eq!(review.as_deref(), Some("R1"));
+        let read: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                (
+                    c.id,
+                    c.node_id.as_deref(),
+                    c.in_reply_to,
+                    c.author.as_str(),
+                    c.path.as_str(),
+                    c.line,
+                    c.original_line,
+                    c.on_file,
+                    c.pending,
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (
+                    11,
+                    Some("C1"),
+                    None,
+                    "me",
+                    "a.rs",
+                    Some(3),
+                    Some(2),
+                    false,
+                    true
+                ),
+                (
+                    12,
+                    Some("C2"),
+                    Some(5),
+                    "me",
+                    "b.rs",
+                    None,
+                    None,
+                    true,
+                    true
+                ),
+            ]
+        );
+        assert_eq!(comments[0].original_commit, "c");
+
+        assert_eq!(pending_review(&json!({}), "me"), (None, Vec::new()));
+        let others =
+            json!({ "pending": { "nodes": [ { "id": "R0", "viewerDidAuthor": false } ] } });
+        assert_eq!(pending_review(&others, "me"), (None, Vec::new()));
+    }
+
+    #[test]
+    fn reads_the_pending_review_lookup() {
+        let pr = json!({
+            "id": "PR",
+            "reviews": { "nodes": [
+                { "id": "R1", "viewerDidAuthor": true, "comments": { "totalCount": 2 } },
+            ] },
+        });
+        assert_eq!(
+            read_pending_review(&pr),
+            PendingReview {
+                pr_id: "PR".into(),
+                review: Some("R1".into()),
+                comments: 2,
+            }
+        );
+        assert_eq!(
+            read_pending_review(&json!({ "id": "PR", "reviews": { "nodes": [] } })),
+            PendingReview {
+                pr_id: "PR".into(),
+                review: None,
+                comments: 0,
             }
         );
     }

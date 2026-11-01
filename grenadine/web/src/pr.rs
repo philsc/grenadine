@@ -1,7 +1,7 @@
 //! One PR: its title and description, the version picker, the review
 //! comments that don't fit into the diff, and the diff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use grenadine_core::api::{
@@ -10,10 +10,11 @@ use grenadine_core::api::{
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::composer::{ComposerToggle, OpenBoxes, sender};
+use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
+use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
-use crate::review::{conversation, merge_box, review_summary};
+use crate::review::{ReviewChoice, ReviewPanel, conversation, merge_box, review_summary};
 use crate::{Updates, api, hash_for, markdown};
 
 /// A review comment and its replies.
@@ -135,7 +136,8 @@ fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u3
         .map(|v| (v.sha.as_str(), v.number))
         .collect();
     let mut counts: HashMap<u32, (u32, u32)> = HashMap::new();
-    for t in threads(comments) {
+    // Pending threads aren't threads until the review is submitted.
+    for t in threads(comments).into_iter().filter(|t| !t.root.pending) {
         if let Some(&n) = numbers.get(t.root.original_commit.as_str()) {
             let (resolved, total) = counts.entry(n).or_default();
             *resolved += u32::from(t.root.resolved);
@@ -182,6 +184,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(OpenBoxes::new());
+    provide_context(ReviewChoice::new());
 
     move || {
         match pr.get() {
@@ -219,7 +222,11 @@ pub(crate) struct PrLinks {
 /// The PR whose page this is, for the comments and actions that change it
 /// on GitHub. Missing on pages that only show diffs, e.g. an agent's.
 #[derive(Clone)]
-pub(crate) struct ReviewTarget(pub(crate) PrKey);
+pub(crate) struct ReviewTarget {
+    pub(crate) key: PrKey,
+    /// The viewer has a pending review on the PR.
+    pub(crate) reviewing: bool,
+}
 
 /// Routes clicks on the `data-grenadine` links that markdown rendering put
 /// on PR references and that the stack list has. Shift+click — or a plain
@@ -289,7 +296,24 @@ fn PrBody(
         repo: pr.summary.key.repo.clone(),
         invert: pr_links,
     });
-    provide_context(ReviewTarget(pr.summary.key.clone()));
+    provide_context(ReviewTarget {
+        key: pr.summary.key.clone(),
+        reviewing: pr
+            .review
+            .as_ref()
+            .is_some_and(|r| r.pending_review.is_some()),
+    });
+    // Edits of comments that are no longer pending, because they were
+    // deleted or their review submitted or discarded, e.g. on github.com,
+    // can't be saved anymore.
+    let pending: HashSet<String> = pr
+        .comments
+        .iter()
+        .filter(|c| c.pending)
+        .map(|c| edit_draft(&pr.summary.key, c.id))
+        .collect();
+    expect_context::<OpenBoxes>()
+        .close_unless(&edit_prefix(&pr.summary.key), |d| pending.contains(d));
     let latest = pr.versions.len() as u32;
     let selection = {
         let pr = pr.clone();
@@ -349,6 +373,17 @@ fn PrBody(
                 .and_then(|(a, b)| Some((a?, b?)))
                 .filter(|(a, b)| a != b);
             let (inline, panel) = place(&pr.comments, &pr.versions, sel);
+            // GitHub anchors new comments to the PR's diff from the merge
+            // base to the head, and refuses lines outside it. Against an
+            // earlier version, a line can be changed in the diff shown but
+            // not in GitHub's, e.g. one the latest push changed back.
+            let commenting = (pr.review.is_some()
+                && pr.summary.state == "OPEN"
+                && sel.base == 0
+                && sel.head == latest)
+                .then(|| Commenting {
+                    key: pr.summary.key.clone(),
+                });
             view! {
                 <CommentPanel threads=panel chosen=chosen selection=selection />
                 <DiffView
@@ -357,6 +392,7 @@ fn PrBody(
                     right=head.sha.clone()
                     upstream=upstream
                     comments=Arc::new(inline)
+                    commenting=commenting
                     side_by_side=side_by_side.into()
                     inline_changes=inline_changes.into()
                 />
@@ -391,6 +427,12 @@ fn PrBody(
             {review.filter(|_| s.state == "OPEN").map(merge_box)}
             <div class="toolbar">
                 <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
+                {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
+                    <ReviewPanel
+                        pending=pr.comments.iter().filter(|c| c.pending).count()
+                        own=info.viewer == s.author
+                    />
+                })}
                 <label class="toggle">
                     <input
                         type="checkbox"
@@ -685,39 +727,148 @@ fn comment_time(ts: &str) -> String {
 
 /// A comment: its author (the children), its time linked to the comment
 /// on GitHub, and its body rendered like the description, if it has one.
+/// `pending` marks a comment of the viewer's pending review, and `actions`
+/// are shown after its time. While `editor`'s signal is on, its view is
+/// shown instead of the body.
 #[component]
 pub(crate) fn CommentFrame(
     at: String,
     url: String,
     body: String,
     children: Children,
+    #[prop(optional)] pending: bool,
+    #[prop(optional)] actions: Option<AnyView>,
+    #[prop(optional)] editor: Option<(Signal<bool>, ViewFn)>,
 ) -> impl IntoView {
     let links = expect_context::<PrLinks>();
-    let body = (!body.trim().is_empty()).then(|| {
-        view! {
-            <div class="markdown" inner_html=markdown::to_html(&body, &links.repo)
-                on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
-        }
-    });
+    let html = (!body.trim().is_empty()).then(|| markdown::to_html(&body, &links.repo));
+    let body = move || match editor.as_ref().filter(|(on, _)| on.get()) {
+        Some((_, view)) => Some(view.run()),
+        None => html.clone().map(|html| {
+            view! {
+                <div class="markdown" inner_html=html
+                    on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
+            }
+            .into_any()
+        }),
+    };
     view! {
-        <div class="comment">
+        <div class="comment" class:pending=pending>
             <div class="comment-meta">
                 {children()}
                 " "
                 <a class="muted" href=url target="_blank" rel="noopener">{comment_time(&at)}</a>
+                {actions}
             </div>
             {body}
         </div>
     }
 }
 
+/// What the names of the drafts that edit pending comments on `key`
+/// start with.
+fn edit_prefix(key: &PrKey) -> String {
+    format!("edit.{}#{}.", key.repo, key.number)
+}
+
+/// The name of the draft that edits the pending comment `id` on `key`.
+fn edit_draft(key: &PrKey, id: u64) -> String {
+    format!("{}{id}", edit_prefix(key))
+}
+
+/// A review comment. A pending one has a badge, and Edit and Delete.
 #[component]
 pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
+    let pending = comment
+        .node_id
+        .clone()
+        .filter(|_| comment.pending)
+        .zip(use_context::<ReviewTarget>());
+    let Some((node, target)) = pending else {
+        return view! {
+            <CommentFrame at=comment.created_at url=comment.url body=comment.body>
+                <strong>{comment.author}</strong>
+            </CommentFrame>
+        }
+        .into_any();
+    };
+    let links = expect_context::<PrLinks>();
+    // Open while the comment is being edited, in the same set as the boxes
+    // for new comments so that a refetch doesn't close it.
+    let boxes = expect_context::<OpenBoxes>();
+    let draft = edit_draft(&target.key, comment.id);
+    let editing = {
+        let draft = draft.clone();
+        Signal::derive(move || boxes.is_open(&draft))
+    };
+    let editor = {
+        let (draft, body, key, node) = (
+            draft.clone(),
+            comment.body.clone(),
+            target.key.clone(),
+            node.clone(),
+        );
+        ViewFn::from(move || {
+            let (key, node) = (key.clone(), node.clone());
+            let send = sender(move |body| {
+                let (key, node) = (key.clone(), node.clone());
+                async move { api::edit_review_comment(&key, &node, body).await }
+            });
+            view! {
+                <Composer
+                    draft=draft.clone()
+                    repo=links.repo.clone()
+                    label="Save"
+                    placeholder="Edit the comment…"
+                    send=send
+                    initial=body.clone()
+                    autofocus=true
+                />
+            }
+        })
+    };
+    // Named like the edit's draft, so that each disables the other.
+    let deleting = format!("delete.{draft}");
+    let busy = {
+        let (draft, deleting) = (draft.clone(), deleting.clone());
+        Signal::derive(move || boxes.sending(&draft) || boxes.sending(&deleting))
+    };
+    let error = {
+        let deleting = deleting.clone();
+        Signal::derive(move || boxes.error(&deleting))
+    };
+    let delete = move |_| {
+        if !window()
+            .confirm_with_message("Delete this pending comment?")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let (key, node) = (target.key.clone(), node.clone());
+        // On success the page is rebuilt once the PR has synced.
+        boxes.send(
+            &deleting,
+            async move { api::delete_review_comment(&key, &node).await },
+            || {},
+        );
+    };
+    let actions = view! {
+        <span class="comment-actions">
+            <button type="button" class="link" disabled=move || busy.get()
+                on:click=move |_| boxes.set(&draft, true)>"Edit"</button>
+            <button type="button" class="link" disabled=move || busy.get() on:click=delete>"Delete"</button>
+            {move || error.get().map(|e| view! { <span class="error">{e}</span> })}
+        </span>
+    }
+    .into_any();
     view! {
-        <CommentFrame at=comment.created_at url=comment.url body=comment.body>
+        <CommentFrame at=comment.created_at url=comment.url body=comment.body pending=true
+            actions=actions editor=(editing, editor)>
             <strong>{comment.author}</strong>
+            " " <span class="badge pending-badge">"Pending"</span>
         </CommentFrame>
     }
+    .into_any()
 }
 
 /// A thread under a header that folds and unfolds it. Resolved threads
@@ -779,13 +930,17 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
     }
 }
 
-/// Replying to a thread and resolving it, under its comments.
+/// Replying to a thread and resolving it, under its comments. Not for a
+/// thread of the viewer's pending review, which isn't on the PR yet.
 #[component]
 fn ThreadActions(root: ReviewComment) -> impl IntoView {
-    let (Some(ReviewTarget(key)), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id)
-    else {
+    let (Some(target), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id) else {
         return ().into_any();
     };
+    if root.pending {
+        return ().into_any();
+    }
+    let key = target.key;
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let resolved = root.resolved;
@@ -806,17 +961,32 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
             });
         }
     };
-    let send = {
+    let reply = |review: bool| -> SendComment {
         let (key, thread) = (key.clone(), thread.clone());
         sender(move |body| {
             let (key, thread) = (key.clone(), thread.clone());
-            async move { api::reply_to_thread(&key, &thread, body).await }
+            async move { api::reply_to_thread(&key, &thread, body, review).await }
         })
+    };
+    // While a review is pending, replies go into it unless asked otherwise.
+    let (label, send, alt) = if target.reviewing {
+        (
+            "Add to review",
+            reply(true),
+            ("Reply now".to_owned(), reply(false)),
+        )
+    } else {
+        (
+            "Reply",
+            reply(false),
+            ("Add to review".to_owned(), reply(true)),
+        )
     };
     let can_resolve = root.can_resolve;
     view! {
         <div class="thread-actions">
-            <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…" send=send>
+            <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…"
+                send_label=label send=send alt=alt>
                 {can_resolve.then(|| view! {
                     <button type="button" disabled=move || busy.get() on:click=toggle.clone()>
                         {if resolved { "Unresolve" } else { "Resolve" }}
@@ -920,6 +1090,8 @@ mod tests {
             resolved_by: None,
             thread_id: None,
             can_resolve: false,
+            pending: false,
+            node_id: None,
         }
     }
 

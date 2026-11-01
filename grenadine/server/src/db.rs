@@ -967,6 +967,22 @@ impl Db {
             .any(|c| c.thread_id.as_deref() == Some(thread)))
     }
 
+    /// The viewer's pending comments on the PR, as of its last sync.
+    pub fn pending_comments(&self, key: &PrKey) -> Result<Vec<ReviewComment>> {
+        let mut comments = self.comments(key)?;
+        comments.retain(|c| c.pending);
+        Ok(comments)
+    }
+
+    /// Whether `comment` is the GraphQL ID of one of the viewer's pending
+    /// comments on the PR, as of its last sync.
+    pub fn has_pending_comment(&self, key: &PrKey, comment: &str) -> Result<bool> {
+        Ok(self
+            .pending_comments(key)?
+            .iter()
+            .any(|c| c.node_id.as_deref() == Some(comment)))
+    }
+
     fn comments(&self, key: &PrKey) -> Result<Vec<ReviewComment>> {
         let conn = self.conn();
         let mut stmt =
@@ -1554,7 +1570,15 @@ mod tests {
             }),
             thread_id: Some("T3".into()),
             can_resolve: true,
+            pending: false,
+            node_id: None,
         }];
+        // One of the viewer's pending comments, which only has a GraphQL ID.
+        let mut comments = [comments.clone(), comments].concat();
+        comments[1].id = 4;
+        comments[1].thread_id = None;
+        comments[1].pending = true;
+        comments[1].node_id = Some("C4".into());
         let review = ReviewInfo {
             viewer: "me".into(),
             decision: Some(ReviewDecision::Approved),
@@ -1577,6 +1601,7 @@ mod tests {
                 url: None,
             }],
             ci: Some(CiStatus::Passing),
+            pending_review: None,
             merge: MergeInfo {
                 conflicting: Some(false),
                 state: MergeState::Clean,
@@ -1596,6 +1621,8 @@ mod tests {
         assert_eq!(pr.comments, comments);
         assert!(db.has_thread(&key, "T3").unwrap());
         assert!(!db.has_thread(&key, "T4").unwrap());
+        assert!(db.has_pending_comment(&key, "C4").unwrap());
+        assert!(!db.has_pending_comment(&key, "C3").unwrap());
         assert_eq!(pr.review.as_ref(), Some(&review));
         assert_eq!(pr.summary.version_count, 2);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));

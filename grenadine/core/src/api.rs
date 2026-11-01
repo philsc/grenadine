@@ -233,6 +233,22 @@ pub enum Side {
     Right,
 }
 
+impl Side {
+    /// The side as GitHub's `DiffSide` names it.
+    pub fn as_github(self) -> &'static str {
+        match self {
+            Side::Left => "LEFT",
+            Side::Right => "RIGHT",
+        }
+    }
+
+    /// The side GitHub names `s`; anything but `"LEFT"` is the right side,
+    /// which is also GitHub's default.
+    pub fn from_github(s: &str) -> Side {
+        if s == "LEFT" { Side::Left } else { Side::Right }
+    }
+}
+
 /// A review comment on a line (or a file) of the PR.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewComment {
@@ -271,11 +287,70 @@ pub struct ReviewComment {
     /// it if it's resolved. Only meaningful on a thread's root comment.
     #[serde(default)]
     pub can_resolve: bool,
+    /// The comment is part of the viewer's pending review: only the viewer
+    /// sees it until the review is submitted.
+    #[serde(default)]
+    pub pending: bool,
+    /// The comment's GraphQL ID, which editing and deleting a pending
+    /// comment need. Only set on pending comments.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
-/// The body of a request that comments on a PR or replies to a thread.
+/// The body of a request that comments on a PR or edits a pending
+/// comment.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewComment {
+    pub body: String,
+}
+
+/// The body of a request that replies to a review thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewReply {
+    pub body: String,
+    /// Add the reply to the viewer's pending review, starting one if
+    /// needed, rather than posting it right away.
+    #[serde(default)]
+    pub review: bool,
+}
+
+/// The body of a request that adds a thread to the viewer's pending
+/// review, starting one if needed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewThread {
+    pub path: String,
+    pub side: Side,
+    /// The 1-based line on `side`; `None` comments on the whole file.
+    pub line: Option<u32>,
+    pub body: String,
+}
+
+/// What submitting a review says about the PR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+/// Why a review can't be submitted as it is, if it can't: Request changes
+/// needs a summary, and Comment needs a summary or `pending` comments.
+pub fn submit_blocker(event: ReviewEvent, body: &str, pending: usize) -> Option<&'static str> {
+    let empty = body.trim().is_empty();
+    match event {
+        ReviewEvent::RequestChanges if empty => Some("Say what needs to change."),
+        ReviewEvent::Comment if empty && pending == 0 => {
+            Some("Write a summary or add comments to the review.")
+        }
+        _ => None,
+    }
+}
+
+/// The body of a request that submits the viewer's review.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitReview {
+    pub event: ReviewEvent,
+    /// The review's summary; may be empty.
     pub body: String,
 }
 
@@ -396,6 +471,10 @@ pub struct ReviewInfo {
     pub checks: Vec<Check>,
     pub ci: Option<CiStatus>,
     pub merge: MergeInfo,
+    /// The GraphQL ID of the viewer's pending review, if they started one.
+    /// Its comments are among the PR's comments, marked `pending`.
+    #[serde(default)]
+    pub pending_review: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -944,4 +1023,28 @@ pub struct AgentEvent {
     /// The event's position in the transcript; `None` for ephemeral events.
     pub seq: Option<u64>,
     pub kind: AgentEventKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_review_needs() {
+        use ReviewEvent::*;
+        assert_eq!(submit_blocker(Approve, "", 0), None);
+        assert!(submit_blocker(RequestChanges, " ", 3).is_some());
+        assert_eq!(submit_blocker(RequestChanges, "Fix it", 0), None);
+        assert!(submit_blocker(Comment, "", 0).is_some());
+        assert_eq!(submit_blocker(Comment, "", 1), None);
+        assert_eq!(submit_blocker(Comment, "Hm", 0), None);
+    }
+
+    #[test]
+    fn sides_on_github() {
+        for side in [Side::Left, Side::Right] {
+            assert_eq!(Side::from_github(side.as_github()), side);
+        }
+        assert_eq!(Side::from_github(""), Side::Right);
+    }
 }
