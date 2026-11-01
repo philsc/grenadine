@@ -1290,28 +1290,63 @@ async fn elicitation(
     acp.respond(&rpc_id, answer);
 }
 
-/// The JSON object in `reply`: the last fenced block's contents, else the
-/// text from the first `{` to the last `}`.
+/// The JSON object in `reply`: all of it, else the last fenced block
+/// that holds one, else the last object in the text. A fence only counts
+/// at the start of a line, so one quoted inside a JSON string doesn't.
 fn parse_reply(name: &str, reply: &str) -> Result<Value> {
-    let reply = reply.trim();
-    let json = reply
-        .rsplit("```")
-        .nth(1)
-        .map(|s| s.trim_start_matches(['j', 's', 'o', 'n', '\n']).trim())
-        .unwrap_or(reply);
-    let json = match (json.find('{'), json.rfind('}')) {
-        (Some(a), Some(b)) if a <= b => &json[a..=b],
-        _ => bail!(
-            "the {name} didn't reply with JSON: {}",
-            crate::cleanup::cut(reply, 300)
-        ),
+    let object = |s: &str| {
+        serde_json::from_str::<Value>(s.trim())
+            .ok()
+            .filter(Value::is_object)
     };
-    serde_json::from_str(json).with_context(|| {
-        format!(
-            "the {name} didn't reply with JSON: {}",
-            crate::cleanup::cut(reply, 300)
-        )
-    })
+    object(reply)
+        .or_else(|| fenced(reply).iter().rev().find_map(|b| object(b)))
+        .or_else(|| last_object(reply))
+        .ok_or_else(|| {
+            anyhow!(
+                "the {name} didn't reply with JSON: {}",
+                crate::cleanup::cut(reply, 300)
+            )
+        })
+}
+
+/// The contents of the fenced blocks in `text`, in order; an unclosed one
+/// runs to the end.
+fn fenced(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<String> = None;
+    for line in text.lines() {
+        match open.as_mut() {
+            None if line.starts_with("```") => open = Some(String::new()),
+            None => {}
+            Some(_) if line.starts_with("```") => blocks.extend(open.take()),
+            Some(block) => {
+                block.push_str(line);
+                block.push('\n');
+            }
+        }
+    }
+    blocks.extend(open);
+    blocks
+}
+
+/// The last JSON object in `text` that starts at a `{`, braces in prose
+/// and objects inside it aside.
+fn last_object(text: &str) -> Option<Value> {
+    let mut found = None;
+    let mut i = 0;
+    while let Some(at) = text[i..].find('{') {
+        let start = i + at;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(v)) if v.is_object() => {
+                found = Some(v);
+                i = start + stream.byte_offset();
+            }
+            _ => i = start + 1,
+        }
+    }
+    found
 }
 
 /// Runs `job` on `model` as a `devin acp` session in `cwd`, in ask mode, and returns
@@ -2269,20 +2304,41 @@ mod job_tests {
         assert_eq!(texts, ["Half whole"]);
     }
 
-    /// The reply parser takes the last fenced block, a bare object, or
-    /// the object in prose, and fails on garbage.
+    /// The reply parser takes the whole reply, the last fenced block
+    /// with an object, or the last object in prose, and fails on garbage.
     #[test]
     fn extracts_the_json_reply() {
-        let fenced = "Here you go.\n```json\n{\"a\": 1}\n```\nDone.";
-        assert_eq!(parse_reply("t", fenced).unwrap(), json!({"a": 1}));
+        let parse = |reply: &str| parse_reply("t", reply).unwrap();
+        // A fence quoted inside a string of the JSON isn't one.
+        let quoted = r#"{"items":[{"title":"t","detail":"Run:\n```sh\ndocker rm x\n```"}]}"#;
         assert_eq!(
-            parse_reply("t", "the answer\n{\"a\": 2}\n").unwrap(),
+            parse(quoted),
+            json!({"items": [{"title": "t", "detail": "Run:\n```sh\ndocker rm x\n```"}]})
+        );
+        assert_eq!(
+            parse("Here you go.\n```json\n{\"a\": 1}\n```\nDone."),
+            json!({"a": 1})
+        );
+        // The last fenced block with an object wins, whatever its info.
+        assert_eq!(
+            parse("```jsonc\n{\"a\": 1}\n```\nor\n```\n{\"a\": 2}\n```\n```sh\nls\n```"),
             json!({"a": 2})
         );
+        // Fences that aren't at the start of a line don't count, and an
+        // unclosed one runs to the end.
         assert_eq!(
-            parse_reply("t", "sure {\"a\": 3} cheers").unwrap(),
+            parse("Use ``` for code.\n```json\n{\"a\": 3}\n"),
             json!({"a": 3})
         );
+        // Braces in prose before the object, and objects inside it.
+        assert_eq!(
+            parse("use {x} like {this}: {\"a\": {\"b\": 4}} cheers"),
+            json!({"a": {"b": 4}})
+        );
+        assert_eq!(parse("first {\"a\": 1}, then {\"b\": 5}"), json!({"b": 5}));
+        // An unclosed fence with prose after the object.
+        assert_eq!(parse("```json\n{\"a\": 6}\nThat's all."), json!({"a": 6}));
         assert!(parse_reply("t", "no json here").is_err());
+        assert!(parse_reply("t", "[1, 2]").is_err());
     }
 }
