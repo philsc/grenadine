@@ -1688,6 +1688,41 @@ class AgentTest(ServerTestCase):
         sessions = self.section("General").locator(".agent-entry")
         expect(sessions.filter(has_text=title)).to_have_count(0)
 
+    def test_backends_keep_their_own_models(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        backend = self.page.get_by_label("Backend")
+        model = self.page.get_by_label("Model")
+        model.select_option("sonnet")
+        backend.select_option(label="Devin")
+        # Devin doesn't offer Claude's pick, and resetting it doesn't
+        # count as a pick for Devin.
+        expect(model).to_have_value("default")
+        backend.select_option(label="Claude Code")
+        expect(model).to_have_value("sonnet")
+        backend.select_option(label="Devin")
+        model.select_option("swe-2-high")
+        backend.select_option(label="Claude Code")
+        expect(model).to_have_value("sonnet")
+        backend.select_option(label="Devin")
+        expect(model).to_have_value("swe-2-high")
+
+    def test_a_draft_leaves_a_backend_no_longer_offered(self) -> None:
+        # The last session was Devin's, but Devin can't list its models
+        # any more, so the server offers Claude Code alone.
+        self.page.add_init_script(
+            "localStorage.setItem('grenadine.agent-backend', 'devin')"
+        )
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(json=[{"backend": "claude", "models": []}]),
+        )
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.get_by_label("Prompt")).to_have_attribute(
+            "placeholder", re.compile(r"^What should Claude do\?")
+        )
+        # With nothing else to pick, there's no picker.
+        expect(self.page.get_by_label("Backend")).to_have_count(0)
+
     def test_devin_session(self) -> None:
         transcript = self.start_devin_session("Code", "write a note")
         expect(transcript.locator(".turn-text")).to_contain_text("On it.")

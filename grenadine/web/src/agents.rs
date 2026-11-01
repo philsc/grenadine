@@ -919,14 +919,13 @@ fn save_backend(backend: AgentBackend) {
 }
 
 /// The model the next prompt goes with: the last one picked for the
-/// backend, which follows it when it changes.
+/// backend, again whenever the backend changes. `ModelSelect` saves the
+/// picks.
 fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
     let model = RwSignal::new(last_model(backend.get_untracked()));
-    Effect::new(move |_| model.set(last_model(backend.get())));
-    // Only a new pick is saved, under the backend it was picked for.
     Effect::watch(
-        move || model.get(),
-        move |m, _, _| save_model(backend.get_untracked(), m),
+        move || backend.get(),
+        move |b, _, _| model.set(last_model(*b)),
         false,
     );
     model
@@ -996,7 +995,14 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
             aria-label="Model"
             title=move || format!("The model {} runs with", backend.get().agent_name())
             prop:value=move || model.get()
-            on:change=move |ev| model.set(event_target_value(&ev))
+            on:change=move |ev| {
+                // Only a pick is saved, under the backend it was picked
+                // for; a model reset because the backend doesn't offer it
+                // isn't, so it can't overwrite another backend's pick.
+                let picked = event_target_value(&ev);
+                save_model(backend.get_untracked(), &picked);
+                model.set(picked);
+            }
         >
             {move || options.get().into_iter().map(|m| {
                 let value = m.value.clone();
@@ -1046,7 +1052,9 @@ pub fn NewSession(draft: String) -> impl IntoView {
     let prompt = RwSignal::new(saved.prompt);
     let backend = RwSignal::new(saved.backend);
     let mode = RwSignal::new(offered_mode(saved.backend, Some(saved.mode.as_str())));
-    let model = RwSignal::new(saved.model);
+    // The draft's model goes until the backend changes.
+    let model = model_signal(backend.into());
+    model.set(saved.model);
     // A mode the backend doesn't offer goes back to its default.
     Effect::new(move |_| {
         let m = mode.get_untracked();
@@ -1081,12 +1089,17 @@ pub fn NewSession(draft: String) -> impl IntoView {
             }
         });
     });
-    // The model picked is the one the next draft for it starts with.
-    Effect::watch(
-        move || model.get(),
-        move |m, _, _| save_model(backend.get_untracked(), m),
-        false,
-    );
+    // A backend the server doesn't offer, e.g. Devin once it can't list
+    // its models, can't start the session, so the draft goes over to
+    // one it does.
+    Effect::new(move |_| {
+        if let Some(Ok(list)) = backends().get()
+            && !list.iter().any(|i| i.backend == backend.get_untracked())
+            && let Some(first) = list.first()
+        {
+            backend.set(first.backend);
+        }
+    });
     // A form left without writing anything isn't worth keeping.
     on_cleanup(move || drafts.remove_if_blank(&draft));
     let busy = RwSignal::new(false);
@@ -1163,7 +1176,9 @@ pub fn NewSession(draft: String) -> impl IntoView {
                     </label>
                     {move || {
                         let list = backends().get().and_then(Result::ok).unwrap_or_default();
-                        (list.len() > 1).then(|| view! {
+                        // Hidden only when there's nothing else to pick.
+                        let only = matches!(list.as_slice(), [i] if i.backend == backend.get());
+                        (!list.is_empty() && !only).then(|| view! {
                             <label>"Backend"
                                 <select
                                     prop:value=move || backend.get().as_str()
