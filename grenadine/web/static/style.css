@@ -1494,6 +1494,9 @@ textarea {
   padding: 0 4px;
   font-weight: 600;
 }
+.approval .question legend .badge {
+  font-weight: normal;
+}
 .approval .question-other {
   font: inherit;
 }
