@@ -20,7 +20,7 @@ use grenadine_core::api::{
 };
 use serde_json::{Value, json};
 
-use crate::agent::StructuredJob;
+use crate::agent::{Budget, JobKind, JobSpec, JobTools};
 use crate::sync::State;
 
 /// How long a scan may take before it's killed.
@@ -42,10 +42,7 @@ impl Format for str {
     }
 }
 
-const SCAN_BUDGET_USD: &str = "2.00";
-
-/// What a Devin scan may spend, in ACU.
-const SCAN_BUDGET_ACU: f64 = 1.0;
+const SCAN_BUDGET: Budget = Budget { usd: 2.0, acu: 1.0 };
 
 /// How often the cleanup items are checked for stale ones.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -53,11 +50,8 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// How long a check for stale items may take before it's killed.
 const PRUNE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// What a check for stale items may spend, in USD.
-const PRUNE_BUDGET_USD: &str = "1.00";
-
-/// What a Devin prune may spend, in ACU.
-const PRUNE_BUDGET_ACU: f64 = 0.5;
+/// What a check for stale items may spend.
+const PRUNE_BUDGET: Budget = Budget { usd: 1.0, acu: 0.5 };
 
 /// About how much of the transcript a scan gets, in bytes. Its beginning
 /// and end are kept, and the full transcript is there to read.
@@ -68,9 +62,10 @@ const PROMPT_LIMIT: usize = 2_000;
 const TEXT_LIMIT: usize = 300;
 const RESULT_LIMIT: usize = 300;
 
-/// Read-only tools, so that a scan can only look. Not `gh api` or bare
-/// `git branch`, which can change things too.
-const ALLOWED_TOOLS: &[&str] = &[
+/// Read-only tools, so that a scan can only look, as Claude Code's
+/// allowed tools. Not `gh api` or bare `git branch`, which can change
+/// things too.
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "Read",
     "Glob",
     "Grep",
@@ -141,7 +136,7 @@ fn where_note(repo: &str, clone: Option<&Path>) -> String {
 }
 
 /// Whether `cmd` is one of the read-only commands the cleanup jobs may
-/// run, from `ALLOWED_TOOLS`' `Bash(prefix:*)` entries.
+/// run, from `READ_ONLY_TOOLS`' `Bash(prefix:*)` entries.
 pub(crate) fn allowed_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
     if cmd
@@ -151,7 +146,7 @@ pub(crate) fn allowed_command(cmd: &str) -> bool {
     {
         return false;
     }
-    ALLOWED_TOOLS
+    READ_ONLY_TOOLS
         .iter()
         .filter_map(|t| t.strip_prefix("Bash(").and_then(|t| t.strip_suffix(":*)")))
         .any(|prefix| cmd == prefix || cmd.starts_with(&format!("{prefix} ")))
@@ -337,76 +332,48 @@ async fn run(
         "required": ["items"],
     });
     let projects = transcript.parent().filter(|_| transcript.exists());
-    let output = match session.backend {
-        AgentBackend::Claude => {
-            ask(
-                state,
-                &SCAN,
-                &session.id,
-                &schema,
-                &input,
-                clone.as_deref(),
-                projects,
-            )
-            .await?
-        }
-        AgentBackend::Devin => {
-            // A scan in the clone loads that repo's Devin rules and
-            // hooks; Devin has no `setting-sources` to switch off.
-            let cwd = clone.as_deref().map(|c| c.to_path_buf());
-            let dir = scan_dir(&session.id)?;
-            let result = crate::devin::structured(
-                state.agents.devin(),
-                &crate::devin::DevinJob {
-                    name: "scan",
-                    model: state.agents.devin_summary_model(),
-                    schema: &schema,
-                    input: &input,
-                    mode: "ask",
-                    allow: &allowed_command,
-                    budget_acu: SCAN_BUDGET_ACU,
-                    cwd: cwd.as_deref().unwrap_or(&dir),
-                    timeout: SCAN_TIMEOUT,
-                },
-            )
-            .await;
-            let _ = std::fs::remove_dir_all(&dir);
-            result?
-        }
-    };
+    let output = ask(
+        state,
+        session.backend,
+        &SCAN,
+        &session.id,
+        &schema,
+        &input,
+        clone.as_deref(),
+        projects,
+    )
+    .await?;
     parse_items(&output)
 }
 
-/// How a background run of claude goes.
+/// How a background job of the cleanup goes.
 struct Job {
-    /// What it's called in errors.
-    name: &'static str,
-    model: &'static str,
-    /// What it may spend, in USD.
-    budget_usd: &'static str,
+    kind: JobKind,
+    budget: Budget,
     /// How long it may take before it's killed.
     timeout: Duration,
 }
 
 const SCAN: Job = Job {
-    name: "scan",
-    model: "haiku",
-    budget_usd: SCAN_BUDGET_USD,
+    kind: JobKind::Scan,
+    budget: SCAN_BUDGET,
     timeout: SCAN_TIMEOUT,
 };
 
 const PRUNE: Job = Job {
-    name: "prune",
-    model: "sonnet",
-    budget_usd: PRUNE_BUDGET_USD,
+    kind: JobKind::Prune,
+    budget: PRUNE_BUDGET,
     timeout: PRUNE_TIMEOUT,
 };
 
-/// Runs `job` on `input` with only the read-only tools, in `cwd` or else
-/// a directory of its own named after `id`, and returns its output as
-/// `schema` has it. `add_dir` is a directory it may read too.
+/// Runs `job` on `backend` on `input` with only the read-only tools, in
+/// `cwd` or else a directory of its own named after `id`, and returns
+/// its output as `schema` has it. `add_dir` is a directory it may read
+/// too.
+#[allow(clippy::too_many_arguments)]
 async fn ask(
     state: &State,
+    backend: AgentBackend,
     job: &Job,
     id: &str,
     schema: &Value,
@@ -415,23 +382,21 @@ async fn ask(
     add_dir: Option<&Path>,
 ) -> Result<Value> {
     let dir = scan_dir(id)?;
-    // The models and tools are Claude Code's.
     let result = state
         .agents
-        .backend(AgentBackend::Claude)
-        .structured(&StructuredJob {
-            name: job.name,
-            model: job.model,
-            schema,
-            input,
-            tools: Some("Read,Glob,Grep,Bash"),
-            allowed: ALLOWED_TOOLS,
-            budget_usd: job.budget_usd,
-            setting_sources_user: true,
-            add_dir,
-            cwd: cwd.unwrap_or(&dir),
-            timeout: job.timeout,
-        })
+        .structured(
+            backend,
+            &JobSpec {
+                kind: job.kind,
+                schema,
+                input,
+                tools: JobTools::ReadOnly,
+                budget: job.budget,
+                add_dir,
+                cwd: cwd.unwrap_or(&dir),
+                timeout: job.timeout,
+            },
+        )
         .await;
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -494,8 +459,11 @@ pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     let mut failed = None;
     for ((backend_key, clone), items) in by_group {
         let backend = AgentBackend::parse(backend_key).unwrap_or_default();
-        if backend == AgentBackend::Devin && !state.agents.offers(AgentBackend::Devin, None).await {
-            tracing::warn!("Devin isn't offered, skipping its cleanup items");
+        if !state.agents.offered(backend).await {
+            tracing::warn!(
+                "{} isn't offered, skipping its cleanup items",
+                backend.label()
+            );
             continue;
         }
         match prune_in(state, backend, clone.as_deref(), &items).await {
@@ -558,30 +526,10 @@ async fn prune_in(
         },
         "required": ["stale"],
     });
-    let output = match backend {
-        AgentBackend::Claude => ask(state, &PRUNE, "prune", &schema, &input, clone, None).await?,
-        AgentBackend::Devin => {
-            let dir = scan_dir("prune")?;
-            let cwd = clone.map(|c| c.to_path_buf());
-            let result = crate::devin::structured(
-                state.agents.devin(),
-                &crate::devin::DevinJob {
-                    name: "prune",
-                    model: state.agents.devin_prune_model(),
-                    schema: &schema,
-                    input: &input,
-                    mode: "ask",
-                    allow: &allowed_command,
-                    budget_acu: PRUNE_BUDGET_ACU,
-                    cwd: cwd.as_deref().unwrap_or(&dir),
-                    timeout: PRUNE_TIMEOUT,
-                },
-            )
-            .await;
-            let _ = std::fs::remove_dir_all(&dir);
-            result?
-        }
-    };
+    let output = ask(
+        state, backend, &PRUNE, "prune", &schema, &input, clone, None,
+    )
+    .await?;
     let mut deleted = 0;
     for (id, reason) in parse_stale(&output, items) {
         if state.db.delete_cleanup_item(id)? {

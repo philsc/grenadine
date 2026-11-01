@@ -130,8 +130,9 @@ pub trait Backend: Send + Sync {
         sink: TurnSink<'a>,
     ) -> BoxFuture<'a, Result<AgentStatus>>;
 
-    /// Runs `job` and returns its answer, in the shape of its schema.
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>>;
+    /// Runs `job` on a model of its own for the job's kind and returns
+    /// the answer, in the shape of the job's schema.
+    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>>;
 }
 
 /// One prompt's turn: what it says and how it runs.
@@ -148,23 +149,58 @@ pub struct Turn<'a> {
     pub notes: &'a [String],
 }
 
-/// A run that answers in a JSON schema's shape without a session, for the
-/// background jobs like summaries and cleanup scans.
-pub struct StructuredJob<'a> {
+/// What a background job is for. Each backend runs each kind on a model
+/// of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// A title for a new session's first prompt.
+    Summary,
+    /// What a deleted session left behind.
+    Scan,
+    /// Which cleanup items are stale.
+    Prune,
+}
+
+impl JobKind {
     /// What it's called in errors.
-    pub name: &'a str,
-    pub model: &'a str,
+    pub fn name(self) -> &'static str {
+        match self {
+            JobKind::Summary => "summary",
+            JobKind::Scan => "scan",
+            JobKind::Prune => "prune",
+        }
+    }
+}
+
+/// What a background job may use besides its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobTools {
+    /// Nothing.
+    None,
+    /// Reading files, and the read-only commands that `cleanup` lists.
+    ReadOnly,
+}
+
+/// What a background job may spend on each backend, in the backend's
+/// cost unit.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    /// On Claude Code, in USD.
+    pub usd: f64,
+    /// On Devin, in ACU.
+    pub acu: f64,
+}
+
+/// A background job, like a summary or a cleanup scan, that answers in a
+/// JSON schema's shape without a session: what it's for, what it may use
+/// and spend, and where it runs.
+pub struct JobSpec<'a> {
+    pub kind: JobKind,
     pub schema: &'a Value,
     pub input: &'a str,
-    /// The tools it has, comma-separated; `None` leaves the backend's.
-    pub tools: Option<&'a str>,
-    /// The tools it may use without asking.
-    pub allowed: &'a [&'a str],
-    /// What it may spend, in USD.
-    pub budget_usd: &'a str,
-    /// Whether to load only the user's settings, not a project's.
-    pub setting_sources_user: bool,
-    /// A directory it may read besides `cwd`.
+    pub tools: JobTools,
+    pub budget: Budget,
+    /// A directory it may read besides `cwd`, on a backend that can.
     pub add_dir: Option<&'a Path>,
     pub cwd: &'a Path,
     /// How long it may take before it's killed.
@@ -754,14 +790,16 @@ pub fn remove_orphaned_worktrees(
 
 impl Agents {
     /// Marks the sessions that were running when the server last stopped as
-    /// interrupted. With `slices`, each session's processes go into their
-    /// own systemd user slice. With `scans`, deleting a session scans its
-    /// transcript for what it left behind. With `summaries`, Haiku
-    /// summarizes each new session's first prompt.
+    /// interrupted. `claude` is the executable Claude Code sessions run.
+    /// With `slices`, each session's processes go into their own systemd
+    /// user slice. With `scans`, deleting a session scans its transcript
+    /// for what it left behind. With `summaries`, each new session's first
+    /// prompt is summarized.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: &crate::db::Db,
-        // The claude executable, and devin's with its job models.
-        exes: (PathBuf, (PathBuf, String, String)),
+        claude: PathBuf,
+        devin: devin::DevinConfig,
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
@@ -773,8 +811,8 @@ impl Agents {
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude: claude::Claude::new(exes.0),
-            devin: devin::Devin::new(exes.1.0, exes.1.1, exes.1.2),
+            claude: claude::Claude::new(claude),
+            devin: devin::Devin::new(devin),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
@@ -837,21 +875,6 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The `devin` executable.
-    pub fn devin(&self) -> &Path {
-        self.devin.exe()
-    }
-
-    /// The model Devin's summaries and scans run on.
-    pub fn devin_summary_model(&self) -> &str {
-        self.devin.summary_model()
-    }
-
-    /// The model Devin's prunes run on.
-    pub fn devin_prune_model(&self) -> &str {
-        self.devin.prune_model()
-    }
-
     /// The backends sessions can pick, with their models: the default
     /// one always, its models empty when they can't be listed, and the
     /// others when they can list theirs.
@@ -867,6 +890,20 @@ impl Agents {
                 Err(_) => None,
             })
             .collect()
+    }
+
+    /// Whether sessions can pick `backend`, as `backends` has it.
+    pub async fn offered(&self, backend: AgentBackend) -> bool {
+        backend == AgentBackend::default() || self.backend(backend).models().await.is_ok()
+    }
+
+    /// Runs `job` on `backend` and returns its answer, in the shape of its
+    /// schema. A backend that isn't offered doesn't run it.
+    pub async fn structured(&self, backend: AgentBackend, job: &JobSpec<'_>) -> Result<Value> {
+        if !self.offered(backend).await {
+            bail!("{} isn't offered", backend.label());
+        }
+        self.backend(backend).structured(job).await
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
@@ -3925,7 +3962,7 @@ mod devin_job_tests {
     fn devin_job_fake(dir: &Path, matching: &str, answer: Value) -> PathBuf {
         fake(
             dir,
-            json!({"prompts": [{"match": matching, "steps": [
+            json!({"models": [{"value": "swe", "name": "SWE"}], "prompts": [{"match": matching, "steps": [
                 {"update": {
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": answer.to_string()},

@@ -28,8 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::agent::{
-    Backend, Decision, ModelList, Stopper, StructuredJob, Turn, TurnSink, await_approval,
-    backend_command, queue_next, stderr_tail,
+    Backend, Decision, JobKind, JobSpec, JobTools, ModelList, Stopper, Turn, TurnSink,
+    await_approval, backend_command, queue_next, stderr_tail,
 };
 use crate::mcp::ALLOWED_TOOLS;
 use crate::sync::State;
@@ -47,47 +47,45 @@ fn initialize_params() -> Value {
     })
 }
 
-/// The Devin backend: the `devin` executable and what it offers.
-pub struct Devin {
+/// How Devin runs: its executable and the models of its background jobs.
+pub struct DevinConfig {
     /// The `devin` executable.
-    exe: PathBuf,
+    pub exe: PathBuf,
+    /// The model summaries and cleanup scans run on.
+    pub job_model: String,
+    /// The model checks for stale cleanup items run on.
+    pub prune_model: String,
+}
+
+/// The Devin backend: how it runs and what it offers.
+pub struct Devin {
+    config: DevinConfig,
     /// The models Devin offers.
     models: ModelList,
-    /// The model summaries and scans run on.
-    summary_model: String,
-    /// The model prunes run on.
-    prune_model: String,
 }
 
 impl Devin {
-    pub fn new(exe: PathBuf, summary_model: String, prune_model: String) -> Devin {
+    pub fn new(config: DevinConfig) -> Devin {
         Devin {
-            exe,
+            config,
             models: ModelList::default(),
-            summary_model,
-            prune_model,
         }
     }
 
-    /// The `devin` executable.
-    pub fn exe(&self) -> &Path {
-        &self.exe
-    }
-
-    /// The model summaries and scans run on.
-    pub fn summary_model(&self) -> &str {
-        &self.summary_model
-    }
-
-    /// The model prunes run on.
-    pub fn prune_model(&self) -> &str {
-        &self.prune_model
+    /// The model `kind` of job runs on.
+    fn job_model(&self, kind: JobKind) -> &str {
+        match kind {
+            JobKind::Summary | JobKind::Scan => &self.config.job_model,
+            JobKind::Prune => &self.config.prune_model,
+        }
     }
 }
 
 impl Backend for Devin {
     fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>> {
-        self.models.get("Devin", || list_models(&self.exe)).boxed()
+        self.models
+            .get("Devin", || list_models(&self.config.exe))
+            .boxed()
     }
 
     fn turn<'a>(
@@ -97,12 +95,11 @@ impl Backend for Devin {
         t: Turn<'a>,
         sink: TurnSink<'a>,
     ) -> BoxFuture<'a, Result<AgentStatus>> {
-        turn(&self.exe, state, session, t, sink).boxed()
+        turn(&self.config.exe, state, session, t, sink).boxed()
     }
 
-    /// Summaries and cleanup scans run on Claude Code.
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>> {
-        async move { bail!("{} can't run on Devin", job.name) }.boxed()
+    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.config.exe, self.job_model(job.kind), job).boxed()
     }
 }
 
@@ -1277,29 +1274,6 @@ async fn elicitation(
     acp.respond(&rpc_id, answer);
 }
 
-/// A structured-output background job for Devin: what it answers, what it
-/// may do and spend, and where.
-pub struct DevinJob<'a> {
-    /// What it's called in errors.
-    pub name: &'a str,
-    /// The model, e.g. claude-haiku-5-5-medium.
-    pub model: &'a str,
-    /// The JSON schema the reply must match.
-    pub schema: &'a Value,
-    /// The prompt's text.
-    pub input: &'a str,
-    /// The permission mode, e.g. "ask".
-    pub mode: &'a str,
-    /// Which exec commands get allowed; everything else is rejected.
-    pub allow: &'a (dyn Fn(&str) -> bool + Send + Sync),
-    /// What it may spend, in ACU.
-    pub budget_acu: f64,
-    /// Where it runs.
-    pub cwd: &'a Path,
-    /// How long it may take before it's killed.
-    pub timeout: Duration,
-}
-
 /// The JSON object in `reply`: the last fenced block's contents, else the
 /// text from the first `{` to the last `}`.
 fn parse_reply(name: &str, reply: &str) -> Result<Value> {
@@ -1324,14 +1298,15 @@ fn parse_reply(name: &str, reply: &str) -> Result<Value> {
     })
 }
 
-/// Runs `job` as a `devin acp` session and returns its reply parsed as
-/// `job.schema`. The job's session is deleted, on every way out, so it
-/// doesn't stay in the user's Devin history.
-pub async fn structured(devin: &Path, job: &DevinJob<'_>) -> Result<Value> {
+/// Runs `job` on `model` as a `devin acp` session in ask mode and returns
+/// its reply parsed as JSON; the schema is only in the prompt. The job's
+/// session is deleted, on every way out, so it doesn't stay in the user's
+/// Devin history.
+async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>) -> Result<Value> {
     let mut cmd = tokio::process::Command::new(devin);
     cmd.arg("acp").current_dir(job.cwd);
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
-    let (result, session) = run_job(&mut rpc, job).await;
+    let (result, session) = run_job(&mut rpc, model, job).await;
     if let Some(session) = session {
         // The session only existed for the job; it doesn't belong in the
         // user's history. A hung delete doesn't keep the job.
@@ -1344,7 +1319,7 @@ pub async fn structured(devin: &Path, job: &DevinJob<'_>) -> Result<Value> {
 
 /// What a job tracks while its prompt runs.
 struct JobRun<'a> {
-    job: &'a DevinJob<'a>,
+    job: &'a JobSpec<'a>,
     /// Devin's session id.
     session: String,
     /// The root's text, reset when it starts a tool call.
@@ -1368,12 +1343,12 @@ impl JobRun<'_> {
             Incoming::Request(r) => self.request(acp, r),
             Incoming::Notification(_) | Incoming::Response(_) => {}
         }
-        if self.acu > self.job.budget_acu {
+        if self.acu > self.job.budget.acu {
             acp.notify("session/cancel", json!({"sessionId": self.session}));
             bail!(
                 "the {} went over its budget of {} ACU",
-                self.job.name,
-                self.job.budget_acu
+                self.job.kind.name(),
+                self.job.budget.acu
             );
         }
         Ok(())
@@ -1413,8 +1388,8 @@ impl JobRun<'_> {
         }
     }
 
-    /// Allows an exec whose command the job allows, rejects every other
-    /// permission request, and declines questions.
+    /// Allows an exec of a read-only command if the job may run those,
+    /// rejects every other permission request, and declines questions.
     fn request(&mut self, acp: &Arc<Acp>, r: Request) {
         match r.method.as_str() {
             "session/request_permission" => match parse::<PermissionRequest>(r.params) {
@@ -1424,7 +1399,11 @@ impl JobRun<'_> {
                         .and_then(Value::as_str)
                         .or(self.execs.get(call).map(String::as_str));
                     let kind = match command {
-                        Some(c) if self.execs.contains_key(call) && (self.job.allow)(c) => {
+                        Some(c)
+                            if self.job.tools == JobTools::ReadOnly
+                                && self.execs.contains_key(call)
+                                && crate::cleanup::allowed_command(c) =>
+                        {
                             ApprovalKind::AllowOnce
                         }
                         _ => ApprovalKind::RejectOnce,
@@ -1441,7 +1420,7 @@ impl JobRun<'_> {
 }
 
 /// The job's outcome, beside the session id it got to.
-async fn run_job(rpc: &mut Rpc, job: &DevinJob<'_>) -> (Result<Value>, Option<String>) {
+async fn run_job(rpc: &mut Rpc, model: &str, job: &JobSpec<'_>) -> (Result<Value>, Option<String>) {
     let mut session = None;
     let result = tokio::time::timeout(job.timeout, async {
         rpc.call("initialize", initialize_params(), |_, _| Ok(()))
@@ -1458,13 +1437,13 @@ async fn run_job(rpc: &mut Rpc, job: &DevinJob<'_>) -> (Result<Value>, Option<St
         let id = created.session_id;
         rpc.call(
             "session/set_config_option",
-            json!({"sessionId": id, "configId": "model", "value": job.model}),
+            json!({"sessionId": id, "configId": "model", "value": model}),
             |_, _| Ok(()),
         )
         .await?;
         rpc.call(
             "session/set_mode",
-            json!({"sessionId": id, "modeId": job.mode}),
+            json!({"sessionId": id, "modeId": "ask"}),
             |_, _| Ok(()),
         )
         .await?;
@@ -1488,15 +1467,15 @@ async fn run_job(rpc: &mut Rpc, job: &DevinJob<'_>) -> (Result<Value>, Option<St
             )
             .await?;
         match parse::<PromptResponse>(result)?.stop_reason.as_str() {
-            "end_turn" => parse_reply(job.name, &run.text),
-            r => bail!("the {} stopped: {r}", job.name),
+            "end_turn" => parse_reply(job.kind.name(), &run.text),
+            r => bail!("the {} stopped: {r}", job.kind.name()),
         }
     })
     .await;
     let result = result.unwrap_or_else(|_| {
         Err(anyhow!(
             "the {} took longer than {}s",
-            job.name,
+            job.kind.name(),
             job.timeout.as_secs()
         ))
     });
@@ -2076,17 +2055,16 @@ mod job_tests {
         )
     }
 
-    fn job(dir: &Path) -> DevinJob<'_> {
+    fn job(dir: &Path) -> JobSpec<'_> {
         static SCHEMA: std::sync::LazyLock<Value> =
             std::sync::LazyLock::new(|| json!({"type": "object"}));
-        DevinJob {
-            name: "job",
-            model: "swe-2-high",
+        JobSpec {
+            kind: JobKind::Scan,
             schema: &SCHEMA,
             input: "do it",
-            mode: "ask",
-            allow: &|c| c.starts_with("ls"),
-            budget_acu: 1.0,
+            tools: JobTools::ReadOnly,
+            budget: crate::agent::Budget { usd: 1.0, acu: 1.0 },
+            add_dir: None,
             cwd: dir,
             timeout: Duration::from_secs(20),
         }
@@ -2109,7 +2087,9 @@ mod job_tests {
             dir.path(),
             vec![chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})],
         );
-        let out = structured(&exe, &job(dir.path())).await.unwrap();
+        let out = structured(&exe, "swe-2-high", &job(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(out, json!({"ok": true}));
         assert_eq!(
             methods(dir.path()),
@@ -2146,7 +2126,9 @@ mod job_tests {
                 json!({"end": "end_turn"}),
             ],
         );
-        let e = structured(&exe, &job(dir.path())).await.unwrap_err();
+        let e = structured(&exe, "swe-2-high", &job(dir.path()))
+            .await
+            .unwrap_err();
         assert!(format!("{e:#}").contains("budget"), "{e:#}");
         let methods = methods(dir.path());
         assert!(
@@ -2171,7 +2153,9 @@ mod job_tests {
         steps.push(chunk(r#"{"a": 1}"#));
         steps.push(json!({"end": "end_turn"}));
         let exe = fake_job(dir.path(), steps);
-        let out = structured(&exe, &job(dir.path())).await.unwrap();
+        let out = structured(&exe, "swe-2-high", &job(dir.path()))
+            .await
+            .unwrap();
         assert_eq!(out, json!({"a": 1}));
         let log = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
         assert!(log.contains("allow_once"), "{log}");
@@ -2187,7 +2171,7 @@ mod job_tests {
         let exe = fake_job(dir.path(), Vec::new());
         let mut job = job(dir.path());
         job.timeout = Duration::from_millis(500);
-        let e = structured(&exe, &job).await.unwrap_err();
+        let e = structured(&exe, "swe-2-high", &job).await.unwrap_err();
         assert!(format!("{e:#}").contains("took longer"), "{e:#}");
         assert_eq!(methods(dir.path()).last().unwrap(), "session/delete");
     }

@@ -14,7 +14,9 @@ use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentSta
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::agent::{Backend, ModelList, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
+use crate::agent::{
+    Backend, JobKind, JobSpec, JobTools, ModelList, OutputLines, Stopper, Turn, TurnSink,
+};
 use crate::sync::State;
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
@@ -67,7 +69,7 @@ impl Backend for Claude {
         turn(&self.exe, state, session, t, sink).boxed()
     }
 
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>> {
+    fn structured<'a>(&'a self, job: &'a JobSpec<'a>) -> BoxFuture<'a, Result<Value>> {
         structured(&self.exe, job).boxed()
     }
 }
@@ -441,34 +443,45 @@ fn parse_line(line: &str) -> Parsed {
     Parsed::Events(events)
 }
 
+/// The model `kind` of job runs on.
+fn job_model(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Summary | JobKind::Scan => "haiku",
+        JobKind::Prune => "sonnet",
+    }
+}
+
 /// Runs `claude -p --output-format json --json-schema` for `job` on its
 /// input and returns its `structured_output`.
-async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
+async fn structured(claude: &Path, job: &JobSpec<'_>) -> Result<Value> {
+    let name = job.kind.name();
     let mut cmd = tokio::process::Command::new(claude);
-    cmd.args(["-p", "--model", job.model, "--output-format", "json"])
-        .arg("--json-schema")
-        .arg(job.schema.to_string())
-        .args(["--no-session-persistence", "--strict-mcp-config"]);
-    // Not the project settings of a clone it runs in, which could allow
-    // more tools or add hooks.
-    if job.setting_sources_user {
-        cmd.args(["--setting-sources", "user"]);
-    }
-    if let Some(tools) = job.tools {
-        cmd.arg("--tools").arg(tools);
-    }
     cmd.args([
-        "--permission-mode",
-        "dontAsk",
-        "--max-budget-usd",
-        job.budget_usd,
-    ]);
+        "-p",
+        "--model",
+        job_model(job.kind),
+        "--output-format",
+        "json",
+    ])
+    .arg("--json-schema")
+    .arg(job.schema.to_string())
+    .args(["--no-session-persistence", "--strict-mcp-config"])
+    // Not the project settings of a clone it runs in, which could
+    // allow more tools or add hooks.
+    .args(["--setting-sources", "user"]);
+    let (tools, allowed): (_, &[&str]) = match job.tools {
+        JobTools::None => ("", &[]),
+        JobTools::ReadOnly => ("Read,Glob,Grep,Bash", crate::cleanup::READ_ONLY_TOOLS),
+    };
+    cmd.arg("--tools").arg(tools);
+    cmd.args(["--permission-mode", "dontAsk", "--max-budget-usd"])
+        .arg(job.budget.usd.to_string());
     if let Some(add_dir) = job.add_dir {
         cmd.arg("--add-dir").arg(add_dir);
     }
     // Last, since it takes every value up to the next flag.
-    if !job.allowed.is_empty() {
-        cmd.arg("--allowedTools").args(job.allowed);
+    if !allowed.is_empty() {
+        cmd.arg("--allowedTools").args(allowed);
     }
     cmd.current_dir(job.cwd)
         .stdin(Stdio::piped())
@@ -483,14 +496,8 @@ async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
     drop(stdin);
     let out = tokio::time::timeout(job.timeout, child.wait_with_output())
         .await
-        .map_err(|_| {
-            anyhow!(
-                "the {} took longer than {}s",
-                job.name,
-                job.timeout.as_secs()
-            )
-        })??;
-    structured_output(job.name, &out.stdout).with_context(|| {
+        .map_err(|_| anyhow!("the {name} took longer than {}s", job.timeout.as_secs()))??;
+    structured_output(name, &out.stdout).with_context(|| {
         let stderr = String::from_utf8_lossy(&out.stderr);
         format!("claude exited with {}: {}", out.status, stderr.trim())
     })

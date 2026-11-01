@@ -1,5 +1,5 @@
-//! Short summaries of what agent sessions were asked to do. Haiku writes
-//! one from a new session's first prompt in the background, and the
+//! Short summaries of what agent sessions were asked to do. The session's
+//! backend writes one from its first prompt in the background, and the
 //! sidebar shows it in place of the prompt's first line.
 
 use std::sync::Arc;
@@ -10,19 +10,19 @@ use anyhow::{Result, anyhow, bail};
 use grenadine_core::api::{AgentBackend, ServerEvent};
 use serde_json::{Value, json};
 
-use crate::agent::StructuredJob;
+use crate::agent::{Budget, JobKind, JobSpec, JobTools};
 use crate::sync::State;
 
 /// How long writing a summary may take before it's killed.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What writing a summary may spend, in USD.
-const BUDGET_USD: &str = "0.05";
+/// What writing a summary may spend.
+const BUDGET: Budget = Budget {
+    usd: 0.05,
+    acu: 0.02,
+};
 
-/// What a Devin summary may spend, in ACU.
-const SUMMARY_BUDGET_ACU: f64 = 0.02;
-
-/// How much of the prompt Haiku gets, in bytes.
+/// How much of the prompt the summary gets, in bytes.
 const PROMPT_LIMIT: usize = 8_000;
 
 /// The longest summary kept, in bytes.
@@ -66,47 +66,23 @@ async fn run(state: &State, backend: AgentBackend, input: &str) -> Result<String
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"],
     });
-    if backend == AgentBackend::Devin {
-        if !state.agents.offers(backend, None).await {
-            bail!("Devin isn't offered");
-        }
-        let dir = std::env::temp_dir();
-        let output = crate::devin::structured(
-            state.agents.devin(),
-            &crate::devin::DevinJob {
-                name: "summary",
-                model: state.agents.devin_summary_model(),
+    let output = state
+        .agents
+        .structured(
+            backend,
+            &JobSpec {
+                kind: JobKind::Summary,
                 schema: &schema,
                 input,
-                mode: "ask",
-                allow: &|_| false,
-                budget_acu: SUMMARY_BUDGET_ACU,
-                cwd: &dir,
+                tools: JobTools::None,
+                budget: BUDGET,
+                add_dir: None,
+                // Away from any repository, whose instructions would only
+                // distract.
+                cwd: &std::env::temp_dir(),
                 timeout: TIMEOUT,
             },
         )
-        .await?;
-        return parse_result(&output);
-    }
-    // The model is one of Claude Code's.
-    let output = state
-        .agents
-        .backend(AgentBackend::Claude)
-        .structured(&StructuredJob {
-            name: "summary",
-            model: "haiku",
-            schema: &schema,
-            input,
-            tools: Some(""),
-            allowed: &[],
-            budget_usd: BUDGET_USD,
-            setting_sources_user: false,
-            add_dir: None,
-            // Away from any repository, whose CLAUDE.md would only
-            // distract.
-            cwd: &std::env::temp_dir(),
-            timeout: TIMEOUT,
-        })
         .await?;
     parse_result(&output)
 }
