@@ -785,6 +785,11 @@ impl TurnCtx<'_, '_> {
                     for e in self.updates.update(&n.update) {
                         self.sink.event(e)?;
                     }
+                    // ACUs are billed as they're spent, so a turn that
+                    // never ends pays for what it used too.
+                    if let Some(total) = self.updates.acu {
+                        self.sink.bill(total)?;
+                    }
                 }
             }
             Incoming::Request(r) => self.request(acp, r),
@@ -833,7 +838,7 @@ async fn turn(
     let mut cmd = backend_command(state, session, exe);
     cmd.arg("acp");
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", exe.display()))?;
-    let result = {
+    let (result, acu) = {
         let mut ctx = TurnCtx {
             state,
             id: &session.id,
@@ -842,18 +847,40 @@ async fn turn(
             tasks: JoinSet::new(),
             loading: false,
         };
-        run_turn(&mut rpc, session, &t, &mut ctx).await
+        let result = run_turn(&mut rpc, session, &t, &mut ctx).await;
+        (result, ctx.updates.acu)
     };
     // The turn is over; stdin closing lets devin go on its own.
     let (exit, stderr) = rpc.close().await?;
-    result?;
-    sink.finish(|| {
-        let mut message = format!("devin exited without finishing the turn ({exit})");
-        if !stderr.is_empty() {
-            message += &format!(":\n{stderr}");
+    // What devin said on its way out explains why it went, e.g. that the
+    // user isn't logged in.
+    let explain = |message: String| {
+        if stderr.is_empty() {
+            format!("{message} ({exit})")
+        } else {
+            format!("{message} ({exit}):\n{stderr}")
         }
-        message
-    })
+    };
+    let error = match result.map_err(|e| anyhow!(explain(format!("{e:#}"))))? {
+        Prompted::No => None,
+        Prompted::Stopped(reason) if reason == "end_turn" => Some(None),
+        Prompted::Stopped(reason) => Some(Some(reason)),
+        Prompted::Failed(e) => Some(Some(explain(format!("{e:#}")))),
+    };
+    if let Some(error) = error {
+        sink.event(AgentEventKind::TurnEnded { error, cost: acu })?;
+    }
+    sink.finish(|| explain("devin didn't finish the turn".into()))
+}
+
+/// How a turn's prompt went.
+enum Prompted {
+    /// It didn't run, or it was cancelled; `TurnSink::finish` tells which.
+    No,
+    /// Devin answered it with this stop reason.
+    Stopped(String),
+    /// Devin went away, or answered with an error.
+    Failed(anyhow::Error),
 }
 
 /// The handshake and the prompt of one turn.
@@ -862,7 +889,7 @@ async fn run_turn(
     session: &AgentSession,
     t: &Turn<'_>,
     ctx: &mut TurnCtx<'_, '_>,
-) -> Result<()> {
+) -> Result<Prompted> {
     let state = ctx.state.clone();
     let id = &session.id;
     rpc.call("initialize", initialize_params(), |acp, m| {
@@ -918,7 +945,7 @@ async fn run_turn(
     // An interrupt that came before the prompt started had nothing to
     // cancel, so the prompt doesn't start.
     if state.agents.interrupted(id) {
-        return Ok(());
+        return Ok(Prompted::No);
     }
     rpc.call(
         "session/set_mode",
@@ -939,7 +966,7 @@ async fn run_turn(
     }
     ctx.sink.started(&backend_session, model)?;
     if state.agents.interrupted(id) {
-        return Ok(());
+        return Ok(Prompted::No);
     }
 
     // The prompt's blocks: the notes first, then the images, then the
@@ -971,18 +998,12 @@ async fn run_turn(
     for e in ctx.updates.flush() {
         ctx.sink.event(e)?;
     }
-    let acu = ctx.updates.acu;
-    let error = match result.and_then(parse::<PromptResponse>) {
-        Ok(r) => match r.stop_reason.as_str() {
-            // The interrupt's TurnEnded comes from `finish`.
-            "cancelled" => return Ok(()),
-            "end_turn" => None,
-            other => Some(other.to_owned()),
-        },
-        Err(e) => Some(format!("{e:#}")),
-    };
-    ctx.sink
-        .event(AgentEventKind::TurnEnded { error, cost: acu })
+    Ok(match result.and_then(parse::<PromptResponse>) {
+        // The interrupt's TurnEnded comes from `finish`.
+        Ok(r) if r.stop_reason == "cancelled" => Prompted::No,
+        Ok(r) => Prompted::Stopped(r.stop_reason),
+        Err(e) => Prompted::Failed(e),
+    })
 }
 
 /// The offered answers of a permission request.

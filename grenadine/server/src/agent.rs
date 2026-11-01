@@ -1875,12 +1875,10 @@ impl<'a> TurnSink<'a> {
             return record_usage(self.state, self.id, tokens, window);
         }
         if let AgentEventKind::TurnEnded { error, cost } = &kind {
-            // The cost is the process's total so far, and a process can
-            // report several results: one more for each background task
-            // that finishes after the answer.
+            // A process can report several results: one more for each
+            // background task that finishes after the answer.
             if let Some(cost) = cost {
-                self.state.db.add_agent_cost(self.id, cost - self.billed)?;
-                self.billed = *cost;
+                self.bill(*cost)?;
             }
             let repeat = self.ended == Some(true) && self.last_was_end && error.is_none();
             self.ended = Some(error.is_none());
@@ -1892,6 +1890,16 @@ impl<'a> TurnSink<'a> {
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
+    }
+
+    /// Adds what the turn's process has cost since it was last billed to
+    /// the session's cost; `total` is the process's total so far.
+    pub fn bill(&mut self, total: f64) -> Result<()> {
+        if total != self.billed {
+            self.state.db.add_agent_cost(self.id, total - self.billed)?;
+            self.billed = total;
+        }
+        Ok(())
     }
 
     /// How the turn went once the backend's output is done: `unfinished`
