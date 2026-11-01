@@ -2069,7 +2069,7 @@ fn QuestionCard(
                     view! {
                         <fieldset class="question">
                             <legend>
-                                {(!q.header.is_empty()).then(|| view! { <span class="tool-name">{q.header}</span> " " })}
+                                {(!q.header.is_empty()).then(|| view! { <span class="badge">{q.header}</span> " " })}
                                 {q.question}
                             </legend>
                             {options}
