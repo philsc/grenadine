@@ -170,7 +170,8 @@ impl ReadOnlyCommand {
 }
 
 /// The commands the cleanup jobs may run, the read-only ones of
-/// `READ_ONLY_TOOLS` with the options that only read.
+/// `READ_ONLY_TOOLS` with the options that only read. Not `gh`'s `--jq`,
+/// whose `env` would show the environment.
 const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
     ReadOnlyCommand {
         words: &["ls"],
@@ -276,20 +277,20 @@ const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
     },
     ReadOnlyCommand {
         words: &["gh", "pr", "view"],
-        short: "cqR",
-        long: &["comments", "jq", "json", "repo"],
+        short: "cR",
+        long: &["comments", "json", "repo"],
     },
     ReadOnlyCommand {
         words: &["gh", "pr", "list"],
-        short: "ABHLlqRsS",
+        short: "ABHLlRsS",
         long: &[
-            "author", "base", "head", "jq", "json", "label", "limit", "repo", "search", "state",
+            "author", "base", "head", "json", "label", "limit", "repo", "search", "state",
         ],
     },
     ReadOnlyCommand {
         words: &["gh", "repo", "view"],
-        short: "q",
-        long: &["jq", "json"],
+        short: "",
+        long: &["json"],
     },
 ];
 
@@ -332,6 +333,34 @@ fn hook_decision(input: &str) -> Result<(), String> {
     }
 }
 
+/// Whether the `gh` command `words` only asks github.com: no URLs, which
+/// could name any host, and repos only as `OWNER/NAME`, not
+/// `HOST/OWNER/NAME`.
+fn stays_on_github(words: &[String]) -> bool {
+    let repo = |r: &str| r.matches('/').count() <= 1;
+    let mut repo_next = false;
+    for (i, w) in words.iter().enumerate() {
+        if w.contains("://") {
+            return false;
+        }
+        let is_repo = std::mem::take(&mut repo_next)
+            // `gh repo view` takes the repo as its argument.
+            || (words.get(1).is_some_and(|c| c == "repo") && i >= 3 && !w.starts_with('-'));
+        if is_repo && !repo(w) {
+            return false;
+        }
+        match w.strip_prefix("--repo=") {
+            Some(r) if !repo(r) => return false,
+            Some(_) => {}
+            None => {
+                repo_next = w == "--repo"
+                    || (!w.starts_with("--") && w.starts_with('-') && w.ends_with('R'))
+            }
+        }
+    }
+    true
+}
+
 /// Whether `cmd` is one of the read-only commands the cleanup jobs may
 /// run, with only options that read. It's split into words the way a
 /// shell would; what a shell would expand or run besides, like `$`,
@@ -352,6 +381,9 @@ pub(crate) fn allowed_command(cmd: &str) -> bool {
     // A glob or brace expansion at the start of a word could expand to
     // file names that are options.
     if words.iter().any(|w| w.starts_with(['*', '?', '[', '{'])) {
+        return false;
+    }
+    if words.first().is_some_and(|w| w == "gh") && !stays_on_github(&words) {
         return false;
     }
     READ_ONLY_COMMANDS.iter().any(|c| c.allows(&words))
@@ -1057,6 +1089,7 @@ mod command_tests {
             "gh pr view 5 --json state",
             "gh pr view 5 --repo o/n --json state,headRefName",
             "gh pr list --head dev/x --state all",
+            "gh pr list --head dev/a/b -R o/n",
             "gh repo view o/n --json name",
         ] {
             assert!(allowed_command(cmd), "{cmd}");
@@ -1065,6 +1098,7 @@ mod command_tests {
             // Not on the list.
             "rm -rf /tmp/x",
             "lsblk",
+            "gh",
             "git branch -D x",
             "git push origin :x",
             "git ls-remote origin",
@@ -1104,6 +1138,17 @@ mod command_tests {
             "docker -H tcp://x ps",
             "docker ps --host x",
             "gh pr view 5 --web",
+            // gh asking other hosts, or showing the environment.
+            "gh pr view https://evil.example/o/n/pull/1",
+            "gh pr view 5 -R evil.example/o/n",
+            "gh pr view 5 -cR evil.example/o/n",
+            "gh pr view 5 --repo evil.example/o/n",
+            "gh pr view 5 --repo=evil.example/o/n",
+            "gh pr list --repo evil.example/o/n",
+            "gh repo view evil.example/o/n",
+            "gh repo view https://evil.example/o/n",
+            "gh pr view 5 --json state --jq env",
+            "gh pr view 5 --json state -q env",
             "gh pr list --config x",
             "file -C -m x",
             "du --files0-from=/etc/shadow",
