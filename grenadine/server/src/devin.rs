@@ -1447,12 +1447,12 @@ async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) ->
     let mut cmd = tokio::process::Command::new(devin);
     cmd.arg("acp").current_dir(cwd);
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
-    let (result, session) = run_job(&mut rpc, model, job, cwd).await;
+    let (result, session, cancelled) = run_job(&mut rpc, model, job, cwd).await;
     if let Some(session) = session {
         // A prompt may still be running, e.g. after a timeout, and Devin
         // might not delete a session that's busy. It ignores a cancel with
         // nothing running.
-        if result.is_err() {
+        if result.is_err() && !cancelled {
             rpc.acp
                 .notify("session/cancel", json!({"sessionId": session}));
         }
@@ -1466,8 +1466,12 @@ async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) ->
 }
 
 /// What a job tracks while its prompt runs.
-struct JobRun<'a> {
+struct JobRun<'a, 'c> {
     job: &'a JobSpec<'a>,
+    /// Set once the job has sent `session/cancel`.
+    cancelled: &'c mut bool,
+    /// The root's `agent_stopped` total, which counts the subagents too.
+    stopped: Option<f64>,
     /// Devin's session id.
     session: String,
     /// The root's text, reset when it starts a tool call.
@@ -1487,7 +1491,7 @@ fn exec_command(raw_input: &Value) -> Option<String> {
     (!raw_input.is_null()).then(|| raw_input["command"].as_str().unwrap_or_default().to_owned())
 }
 
-impl JobRun<'_> {
+impl JobRun<'_, '_> {
     /// Takes what devin sent while the prompt ran; an error once the job
     /// has gone over its budget.
     fn handle(&mut self, acp: &Arc<Acp>, m: Incoming) -> Result<()> {
@@ -1497,11 +1501,19 @@ impl JobRun<'_> {
                     self.update(n.update);
                 }
             }
+            Incoming::Notification(n) if n.method == "_cognition.ai/agent_stopped" => {
+                let stopped = parse::<AgentStopped>(n.params).unwrap_or_default();
+                if subagent_of(&stopped.meta).is_none() {
+                    self.stopped = stopped.stats.acu_cost.or(self.stopped);
+                }
+            }
             Incoming::Request(r) => self.request(acp, r),
             Incoming::Notification(_) | Incoming::Response(_) => {}
         }
-        if self.spent.values().sum::<f64>() > self.job.budget.acu {
+        let spent = self.spent.values().sum::<f64>();
+        if spent.max(self.stopped.unwrap_or_default()) > self.job.budget.acu {
             acp.notify("session/cancel", json!({"sessionId": self.session}));
+            *self.cancelled = true;
             bail!(
                 "the {} went over its budget of {} ACU",
                 self.job.kind.name(),
@@ -1588,14 +1600,16 @@ impl JobRun<'_> {
     }
 }
 
-/// The job's outcome, beside the session id it got to.
+/// The job's outcome, beside the session id it got to and whether it
+/// cancelled its prompt already.
 async fn run_job(
     rpc: &mut Rpc,
     model: &str,
     job: &JobSpec<'_>,
     cwd: &Path,
-) -> (Result<Value>, Option<String>) {
+) -> (Result<Value>, Option<String>, bool) {
     let mut session = None;
+    let mut cancelled = false;
     let result = tokio::time::timeout(job.timeout, async {
         rpc.call("initialize", initialize_params()).await?;
         let result = rpc
@@ -1616,6 +1630,8 @@ async fn run_job(
         .await?;
         let mut run = JobRun {
             job,
+            cancelled: &mut cancelled,
+            stopped: None,
             session: id.clone(),
             text: String::new(),
             spent: HashMap::new(),
@@ -1646,7 +1662,7 @@ async fn run_job(
             job.timeout.as_secs()
         ))
     });
-    (result, session)
+    (result, session, cancelled)
 }
 
 /// The fake `devin acp` in //grenadine/testing, set up in `dir` to play
@@ -2359,12 +2375,42 @@ mod job_tests {
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("budget"), "{e:#}");
-        let methods = methods(dir.path());
-        assert!(
-            methods.contains(&"session/cancel".to_owned()),
-            "{methods:?}"
+        // Cancelled once, then deleted.
+        assert_eq!(
+            methods(dir.path())[4..],
+            ["session/prompt", "session/cancel", "session/delete"]
         );
-        assert_eq!(methods.last().unwrap(), "session/delete");
+    }
+
+    /// The root's `agent_stopped` total counts toward the budget; a
+    /// subagent's doesn't.
+    #[tokio::test]
+    async fn the_budget_counts_agent_stopped() {
+        let stopped = |meta: Value| {
+            json!({
+                "notify": "_cognition.ai/agent_stopped",
+                "params": {"stats": {"acuCost": 1.5}, "_meta": meta},
+            })
+        };
+        let steps = |meta| {
+            vec![
+                usage("root", 0.2),
+                stopped(meta),
+                chunk(r#"{"ok": true}"#),
+                json!({"end": "end_turn"}),
+            ]
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sub = json!({"cognition.ai/subagent_context": {"parentAgentId": "sub-1"}});
+        let exe = fake_job(dir.path(), steps(sub));
+        let out = structured(&exe, "swe-2-high", &job(), dir.path()).await;
+        assert_eq!(out.unwrap(), json!({"ok": true}));
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(json!({})));
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
     }
 
     /// An exec the allowlist passes gets allow_once, one it doesn't gets
