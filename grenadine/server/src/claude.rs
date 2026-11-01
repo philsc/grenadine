@@ -77,7 +77,7 @@ impl Backend for Claude {
 
     fn turn<'a>(
         &'a self,
-        state: &'a State,
+        state: &'a std::sync::Arc<State>,
         session: &'a AgentSession,
         t: Turn<'a>,
         sink: TurnSink<'a>,

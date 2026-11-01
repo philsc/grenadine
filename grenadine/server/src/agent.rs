@@ -17,14 +17,15 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage,
-    ServerEvent, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey,
+    PromptImage, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::claude;
+use crate::devin;
 use crate::git::Repo;
 use crate::reflow::reflow;
 use crate::sync::State;
@@ -49,7 +50,7 @@ const IMAGE_TYPES: [(&str, &str); 4] = [
 
 /// How long a deleted session's processes get to exit before they're
 /// killed.
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much of a backend's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
@@ -100,6 +101,9 @@ pub struct Decision {
     pub message: Option<String>,
     /// The mode an approved plan goes on in.
     pub mode: Option<PermissionMode>,
+    /// The id of the offered option the user picked, if the request
+    /// offered any.
+    pub option: Option<String>,
     /// The answers to `AskUserQuestion`, by question.
     pub answers: Option<BTreeMap<String, String>>,
 }
@@ -116,7 +120,7 @@ pub trait Backend: Send + Sync {
     /// up in; `sink` gets what the turn's output means for the transcript.
     fn turn<'a>(
         &'a self,
-        state: &'a State,
+        state: &'a Arc<State>,
         session: &'a AgentSession,
         turn: Turn<'a>,
         sink: TurnSink<'a>,
@@ -135,7 +139,8 @@ pub struct Turn<'a> {
     pub model: Option<String>,
     /// The session's grenadine MCP endpoint.
     pub mcp_url: &'a str,
-    /// Appended to the agent's system prompt.
+    /// What the agent is told beyond the prompt: Claude gets them
+    /// appended to its system prompt, Devin as the prompt's first block.
     pub notes: &'a [String],
 }
 
@@ -278,6 +283,8 @@ impl<R: AsyncRead + Unpin> OutputLines<R> {
 pub struct Agents {
     /// The Claude Code backend.
     claude: claude::Claude,
+    /// The Devin backend.
+    devin: devin::Devin,
     /// Worktrees go to `<dir>/<owner>/<name>/<id>`.
     worktrees: PathBuf,
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
@@ -297,6 +304,14 @@ pub struct Agents {
     pub terminals: crate::terminal::Terminals,
 }
 
+/// A permission request waiting for the user's answer.
+struct PendingRequest {
+    /// Answers the request's waiter.
+    tx: oneshot::Sender<Decision>,
+    /// The answers the backend offers beyond allow/deny.
+    options: Vec<ApprovalOption>,
+}
+
 /// What only exists while the server runs: the event channel open pages
 /// listen to, queued prompts and the pending permission requests.
 struct Live {
@@ -312,7 +327,10 @@ struct Live {
     /// The user stopped the current turn.
     interrupted: bool,
     /// Permission requests by tool use ID.
-    pending: HashMap<String, oneshot::Sender<Decision>>,
+    pending: HashMap<String, PendingRequest>,
+    /// The mode and model the running turn goes with, for follow-ups a
+    /// denied request queues.
+    turn: Option<(PermissionMode, Option<String>)>,
     /// The wrap-up in progress, if any.
     wrap_up: Option<Pending>,
 }
@@ -336,6 +354,7 @@ impl Live {
             stopper: None,
             interrupted: false,
             pending: HashMap::new(),
+            turn: None,
             wrap_up: None,
         }
     }
@@ -358,7 +377,7 @@ fn random_hex(n: usize) -> String {
 }
 
 /// A random (version 4) UUID, the format Claude Code's session IDs need.
-fn uuid() -> String {
+pub fn uuid() -> String {
     let mut b = random_bytes::<16>();
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -685,7 +704,8 @@ impl Agents {
     /// summarizes each new session's first prompt.
     pub fn new(
         db: &crate::db::Db,
-        claude: PathBuf,
+        // The claude and devin executables the backends run.
+        exes: (PathBuf, PathBuf),
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
@@ -697,7 +717,8 @@ impl Agents {
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude: claude::Claude::new(claude),
+            claude: claude::Claude::new(exes.0),
+            devin: devin::Devin::new(exes.1),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
@@ -719,6 +740,7 @@ impl Agents {
     pub fn backend(&self, backend: AgentBackend) -> &dyn Backend {
         match backend {
             AgentBackend::Claude => &self.claude,
+            AgentBackend::Devin => &self.devin,
         }
     }
 
@@ -746,7 +768,7 @@ impl Agents {
     }
 
     /// Whether the user stopped the current turn.
-    fn interrupted(&self, id: &str) -> bool {
+    pub fn interrupted(&self, id: &str) -> bool {
         self.with_live(id, |l| l.interrupted)
     }
 
@@ -759,12 +781,16 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The models each backend offers, for the pickers: empty when they
-    /// can't be listed.
+    /// The backends sessions can pick, with their models: the default
+    /// one always, its models empty when they can't be listed, and the
+    /// others once they list theirs.
     pub async fn backends(&self) -> Vec<AgentBackendInfo> {
         let mut infos = Vec::new();
         for backend in AgentBackend::ALL {
-            infos.push(backend.info(self.backend(backend).models().await));
+            let models = self.backend(backend).models().await;
+            if backend == AgentBackend::default() || !models.is_empty() {
+                infos.push(backend.info(models));
+            }
         }
         infos
     }
@@ -1049,8 +1075,8 @@ pub fn interrupt(state: &State, id: &str) {
     if let Some(stopper) = stopper {
         stopper.stop();
     }
-    for (tool_use, tx) in pending {
-        let _ = tx.send(Decision {
+    for (tool_use, pending) in pending {
+        let _ = pending.tx.send(Decision {
             allow: false,
             message: Some("The user interrupted the turn.".into()),
             ..Decision::default()
@@ -1068,16 +1094,24 @@ pub fn interrupt(state: &State, id: &str) {
 }
 
 /// Registers a permission request; the receiver gets the user's answer.
+/// `options` are the answers the backend offers beyond allow/deny.
 pub fn request_approval(
     state: &State,
     id: &str,
     tool_use: &str,
     tool_name: &str,
     input: &Value,
+    options: Vec<ApprovalOption>,
 ) -> Result<oneshot::Receiver<Decision>> {
     let (tx, rx) = oneshot::channel();
     state.agents.with_live(id, |l| {
-        l.pending.insert(tool_use.to_owned(), tx);
+        l.pending.insert(
+            tool_use.to_owned(),
+            PendingRequest {
+                tx,
+                options: options.clone(),
+            },
+        );
     });
     emit(
         state,
@@ -1086,10 +1120,42 @@ pub fn request_approval(
             id: tool_use.to_owned(),
             tool_name: tool_name.to_owned(),
             input: input.to_string(),
+            options,
         },
     )?;
     set_status(state, id, AgentStatus::AwaitingApproval);
     Ok(rx)
+}
+
+/// Whether the permission request `tool_use` waits for offers `option`
+/// among its answers.
+pub fn offers_option(state: &State, id: &str, tool_use: &str, option: &str) -> bool {
+    state.agents.with_live(id, |l| {
+        l.pending
+            .get(tool_use)
+            .is_some_and(|p| p.options.iter().any(|o| o.id == option))
+    })
+}
+
+/// Queues `prompt` next, before the ones already waiting, with the
+/// running turn's mode and model unless the follow-up plans again.
+pub fn queue_next(state: &State, id: &str, prompt: String, plan: bool) {
+    state.agents.with_live(id, |l| {
+        // An interrupted turn doesn't send the denial's feedback again.
+        if l.interrupted {
+            return;
+        }
+        let (mode, model) = l
+            .turn
+            .clone()
+            .unwrap_or_else(|| (PermissionMode::plan(), None));
+        l.queue.push_front(Queued {
+            prompt,
+            images: Vec::new(),
+            mode: if plan { PermissionMode::plan() } else { mode },
+            model,
+        });
+    });
 }
 
 /// Forgets a permission request that Claude Code stopped waiting for.
@@ -1101,7 +1167,7 @@ pub fn drop_approval(state: &State, id: &str, tool_use: &str) {
 /// false when no such request is waiting.
 pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> Result<bool> {
     let (tx, still_pending) = state.agents.with_live(id, |l| {
-        let tx = l.pending.remove(tool_use);
+        let tx = l.pending.remove(tool_use).map(|p| p.tx);
         (tx, !l.pending.is_empty())
     });
     let Some(tx) = tx else {
@@ -1232,6 +1298,7 @@ async fn run(state: Arc<State>, id: String) {
             let prompt = l.queue.pop_front();
             l.running = prompt.is_some();
             l.interrupted = false;
+            l.turn = prompt.as_ref().map(|q| (q.mode.clone(), q.model.clone()));
             (prompt, l.wrap_up.is_some())
         });
         let Some(queued) = prompt else {
@@ -1263,6 +1330,7 @@ async fn run(state: Arc<State>, id: String) {
         };
         let interrupted = state.agents.with_live(&id, |l| {
             l.stopper = None;
+            l.turn = None;
             l.interrupted
         });
         let status = if interrupted {
@@ -1914,6 +1982,7 @@ pub(crate) mod tests {
         crate::sync::test_state_with_agents(
             [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
             claude,
+            "devin".into(),
             dir.join("worktrees"),
         )
     }
@@ -3305,5 +3374,280 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             )),
             "{args}"
         );
+    }
+}
+
+#[cfg(test)]
+mod devin_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use grenadine_core::api::NewAgent;
+
+    use super::*;
+
+    /// A state whose agents run `script` as devin.
+    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, script: &str) -> Arc<State> {
+        let devin = dir.join("devin");
+        std::fs::write(&devin, script).unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        crate::sync::test_state_with_agents(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+            "claude".into(),
+            devin,
+            dir.join("worktrees"),
+        )
+    }
+
+    /// A fake `devin acp` that answers the handshake and one prompt with
+    /// a text answer, asking permission for an `exec` call first. Every
+    /// client message is logged to `log`.
+    fn fake_devin(dir: &Path, session: &str) -> String {
+        fake_devin_slow(dir, session, "0")
+    }
+
+    /// `fake_devin`, but `delay` seconds slow to answer `session/new`.
+    fn fake_devin_slow(dir: &Path, session: &str, delay: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+log={log}
+while IFS= read -r line; do
+  echo "$line" >> "$log"
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  case "$line" in
+  *'"initialize"'*) echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"protocolVersion\":1}}}}" ;;
+  *'"session/new"'*) sleep {delay}; echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"sessionId\":\"{session}\",\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\",\"options\":[]}}]}}}}" ;;
+  *'"session/load"'*)
+    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"replayed"}}}}}}}}'
+    echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\"}}]}}}}" ;;
+  *'"session/set_mode"'* | *'"session/set_config_option"'*) echo "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"configOptions\":[{{\"id\":\"model\",\"currentValue\":\"swe-2\"}}]}}}}" ;;
+  *'"session/prompt"'*)
+    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Hi"}}}}}}}}'
+    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call","toolCallId":"exec:0#t","rawInput":{{"command":"touch f"}},"_meta":{{"cognition.ai/inferenceToolName":"exec"}}}}}}}}'
+    echo '{{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{{"sessionId":"{session}","toolCall":{{"toolCallId":"exec:0#t"}},"options":[{{"optionId":"allow_once","name":"Allow","kind":"allow_once"}},{{"optionId":"reject_once","name":"Reject","kind":"reject_once"}}]}}}}'
+    ;;
+  *'"id":"perm-1"'*)
+    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#t","status":"completed","content":[{{"type":"content","content":{{"type":"text","text":"done"}}}}]}}}}}}'
+    echo '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"usage_update","used":100,"size":200000,"_meta":{{"cognition.ai/totalAcuCost":0.25}}}}}}}}'
+    echo "{{\"jsonrpc\":\"2.0\",\"id\":$pid,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+    ;;
+  *'"session/cancel"'*)
+    echo "{{\"jsonrpc\":\"2.0\",\"id\":$pid,\"result\":{{\"stopReason\":\"cancelled\"}}}}"
+    ;;
+  esac
+  case "$line" in *'"session/prompt"'*) pid=$id;; esac
+done
+"#,
+            log = dir.join("devin_log").display(),
+            session = session,
+            delay = delay,
+        )
+    }
+
+    /// Waits until the session has finished `turns` turns.
+    async fn wait_for_turns(state: &State, id: &str, turns: usize) {
+        for _ in 0..100 {
+            let ended = state
+                .db
+                .agent_events(id)
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        AgentEventKind::TurnEnded { .. } | AgentEventKind::Error(_)
+                    )
+                })
+                .count();
+            let running = state.agents.with_live(id, |l| l.running);
+            if ended >= turns && !running {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{id} didn't finish its turns");
+    }
+
+    /// Waits until the session's status is `AwaitingApproval`.
+    async fn wait_for_status(state: &State, id: &str) {
+        for _ in 0..200 {
+            if state.db.agent(id).unwrap().unwrap().status == AgentStatus::AwaitingApproval {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never waited for approval");
+    }
+
+    /// A Devin session's turn goes over ACP: the session id is stored,
+    /// its permission request waits on the page, and the turn's cost is
+    /// in ACUs.
+    #[tokio::test]
+    async fn a_devin_turn_runs_and_resumes() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_devin(&fx, dir.path(), &fake_devin(dir.path(), "turn-slate"));
+        let session = create(
+            &state,
+            NewAgent {
+                backend: grenadine_core::api::AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The approval the turn asks for gets its option back.
+        wait_for_status(&state, &session.id).await;
+        assert!(
+            approve(
+                &state,
+                &session.id,
+                "exec:0#t",
+                Decision {
+                    allow: true,
+                    option: Some("allow_once".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        );
+        wait_for_turns(&state, &session.id, 1).await;
+        let session = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(session.cost, 0.25);
+        assert_eq!(session.cost_unit, grenadine_core::api::CostUnit::Acu);
+        assert_eq!(session.model.as_deref(), Some("swe-2"));
+        assert_eq!(
+            state.db.backend_session(&session.id).unwrap().as_deref(),
+            Some("turn-slate")
+        );
+
+        // The transcript has the answer and the tool call, not the load
+        // replay the second turn gets.
+        send(
+            &state,
+            &session.id,
+            "again".into(),
+            "accept-edits".into(),
+            None,
+        );
+        wait_for_status(&state, &session.id).await;
+        assert!(
+            approve(
+                &state,
+                &session.id,
+                "exec:0#t",
+                Decision {
+                    allow: true,
+                    option: Some("allow_once".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        );
+        wait_for_turns(&state, &session.id, 2).await;
+        let transcript = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
+        assert!(transcript.contains("\"session/load\""));
+        let texts: Vec<_> = state
+            .db
+            .agent_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::Text(_)))
+            .collect();
+        assert_eq!(texts.len(), 2, "no replayed text duplicated");
+    }
+
+    /// A prompt asked to stop before its turn got to running it never
+    /// reaches Devin: the interrupt that landed while the session was
+    /// being set up ends it as Interrupted without a `session/prompt`.
+    #[tokio::test]
+    async fn an_early_interrupt_skips_the_prompt() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_devin(
+            &fx,
+            dir.path(),
+            &fake_devin_slow(dir.path(), "early-oak", "0.5"),
+        );
+        let session = create(
+            &state,
+            NewAgent {
+                backend: grenadine_core::api::AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // As soon as devin picked the session up — still busy answering
+        // session/new — stop it.
+        let log = dir.path().join("devin_log");
+        for _ in 0..200 {
+            if std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("\"session/new\"")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        interrupt(&state, &session.id);
+        wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Interrupted
+        );
+        // Whatever point the interrupt landed, no prompt ran.
+        let transcript = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !transcript.contains("\"session/prompt\""),
+            "fake devin received a prompt: {transcript}"
+        );
+    }
+
+    /// An interrupt asks Devin to cancel, which ends the turn.
+    #[tokio::test]
+    async fn an_interrupt_cancels() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // The permission request never gets an answer; the interrupt's
+        // session/cancel ends the turn.
+        let state = state_with_devin(&fx, dir.path(), &fake_devin(dir.path(), "stop-pine"));
+        let session = create(
+            &state,
+            NewAgent {
+                backend: grenadine_core::api::AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_status(&state, &session.id).await;
+        interrupt(&state, &session.id);
+        wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Interrupted
+        );
+        let transcript = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
+        assert!(transcript.contains("\"session/cancel\""));
     }
 }

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs,
-    AgentSession, AgentStatus, Approval, CleanupState, CostUnit, GENERAL, Landed, NewAgent,
-    NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage, WorktreeFile, WrapUp,
-    WrapUpTarget,
+    AgentSession, AgentStatus, Approval, ApprovalOption, CleanupState, CostUnit, GENERAL, Landed,
+    NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage, WorktreeFile,
+    WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -56,6 +56,7 @@ fn status_class(s: AgentStatus) -> &'static str {
 fn cost(amount: f64, unit: CostUnit) -> String {
     match unit {
         CostUnit::Usd => format!("${amount:.2}"),
+        CostUnit::Acu => format!("{amount:.3} ACU"),
     }
 }
 
@@ -464,7 +465,7 @@ pub fn CleanupView() -> impl IntoView {
     // What items describe is outside any worktree, so the session needs
     // none unless a repository is picked.
     let repo = RwSignal::new(GENERAL.to_owned());
-    let model = model_signal();
+    let model = model_signal(Signal::stored(AgentBackend::Claude));
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
 
@@ -878,28 +879,56 @@ fn ModeSelect(
 }
 
 const MODEL_KEY: &str = "grenadine.agent-model";
+const BACKEND_KEY: &str = "grenadine.agent-backend";
 
 /// What the model picker shows for the backend's configured default.
 const DEFAULT_MODEL: &str = "default";
 
-/// The model picked last, an `AgentModelInfo::value`; the backend's
+/// Each backend's model memory, so a model never lands on a backend that
+/// doesn't offer it.
+fn model_key(backend: AgentBackend) -> String {
+    format!("{MODEL_KEY}.{}", backend.as_str())
+}
+
+/// The model picked last for `backend`, an `AgentModelInfo::value`; its
 /// default at first.
-pub(crate) fn last_model() -> String {
+pub(crate) fn last_model(backend: AgentBackend) -> String {
     storage()
-        .and_then(|s| s.get_item(MODEL_KEY).ok().flatten())
+        .and_then(|s| s.get_item(&model_key(backend)).ok().flatten())
         .unwrap_or_else(|| DEFAULT_MODEL.to_owned())
 }
 
-fn save_model(model: &str) {
+fn save_model(backend: AgentBackend, model: &str) {
     if let Some(s) = storage() {
-        let _ = s.set_item(MODEL_KEY, model);
+        let _ = s.set_item(&model_key(backend), model);
     }
 }
 
-/// The model the next prompt goes with: the last one picked.
-fn model_signal() -> RwSignal<String> {
-    let model = RwSignal::new(last_model());
-    Effect::new(move |_| model.with(|m| save_model(m)));
+/// The backend picked last; the default at first.
+pub(crate) fn last_backend() -> AgentBackend {
+    storage()
+        .and_then(|s| s.get_item(BACKEND_KEY).ok().flatten())
+        .and_then(|v| AgentBackend::parse(&v))
+        .unwrap_or_default()
+}
+
+fn save_backend(backend: AgentBackend) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(BACKEND_KEY, backend.as_str());
+    }
+}
+
+/// The model the next prompt goes with: the last one picked for the
+/// backend, which follows it when it changes.
+fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
+    let model = RwSignal::new(last_model(backend.get_untracked()));
+    Effect::new(move |_| model.set(last_model(backend.get())));
+    // Only a new pick is saved, under the backend it was picked for.
+    Effect::watch(
+        move || model.get(),
+        move |m, _, _| save_model(backend.get_untracked(), m),
+        false,
+    );
     model
 }
 
@@ -1052,8 +1081,12 @@ pub fn NewSession(draft: String) -> impl IntoView {
             }
         });
     });
-    // The model picked is the one the next draft starts with.
-    Effect::watch(move || model.get(), |m, _, _| save_model(m), false);
+    // The model picked is the one the next draft for it starts with.
+    Effect::watch(
+        move || model.get(),
+        move |m, _, _| save_model(backend.get_untracked(), m),
+        false,
+    );
     // A form left without writing anything isn't worth keeping.
     on_cleanup(move || drafts.remove_if_blank(&draft));
     let busy = RwSignal::new(false);
@@ -1061,6 +1094,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
     let general = Memo::new(move |_| repo.with(|r| r == GENERAL));
 
     let start = move || {
+        save_backend(backend.get_untracked());
         if busy.get_untracked() || prompt.with_untracked(|p| p.trim().is_empty()) {
             return;
         }
@@ -1342,7 +1376,7 @@ pub fn AgentView(id: String) -> impl IntoView {
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
-    let model = model_signal();
+    let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
 
     let terminal_id = id.clone();
     view! {
@@ -1801,7 +1835,7 @@ fn Transcript(
                         AgentEventKind::Image { id: image, caption } => view! {
                             <TranscriptImage id=image caption=caption />
                         }.into_any(),
-                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "ExitPlanMode" => {
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input, .. } if tool_name == "ExitPlanMode" => {
                             let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
                             let plan = value["plan"].as_str().unwrap_or_default();
                             let open = {
@@ -1822,7 +1856,7 @@ fn Transcript(
                                 />
                             }.into_any()
                         }
-                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input } if tool_name == "AskUserQuestion" => {
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input, .. } if tool_name == "AskUserQuestion" => {
                             let questions = serde_json::from_str::<Questions>(&input)
                                 .map(|q| q.questions)
                                 .unwrap_or_default();
@@ -1837,7 +1871,7 @@ fn Transcript(
                                 />
                             }.into_any()
                         }
-                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input } => {
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input, options } => {
                             let value = serde_json::from_str(&input).unwrap_or_default();
                             let summary = tool_summary(&tool_name, &value);
                             let diff = edit_fragments(&tool_name, &value, &[]);
@@ -1850,6 +1884,7 @@ fn Transcript(
                                     summary=summary
                                     input=pretty(&input)
                                     diff=diff
+                                    options=options
                                     resolved=resolved
                                     waiting=waiting
                                 />
@@ -1986,6 +2021,7 @@ fn PlanCard(
                 allow,
                 message: message.filter(|_| !allow),
                 mode: allow.then_some(next),
+                option: None,
                 answers: None,
             };
             send_approval(agent.clone(), approval, busy, error);
@@ -2121,6 +2157,7 @@ fn QuestionCard(
                 allow,
                 message: None,
                 mode: None,
+                option: None,
                 answers: allow.then(answers),
             };
             send_approval(agent.clone(), approval, busy, error);
@@ -2230,6 +2267,8 @@ fn ApprovalCard(
     input: String,
     /// What a file tool would change, shown instead of `input`.
     diff: Option<(String, Vec<Fragment>)>,
+    /// The answers the backend offers beyond allow/deny.
+    options: Vec<ApprovalOption>,
     resolved: Memo<HashMap<String, bool>>,
     /// Whether the backend is running and so may wait for an answer;
     /// requests from before a restart stay unanswered.
@@ -2239,18 +2278,20 @@ fn ApprovalCard(
     let busy = RwSignal::new(false);
     let answer = {
         let tool = tool.clone();
-        move |allow: bool| {
+        move |allow: bool, option: Option<String>| {
             let approval = Approval {
                 id: tool.clone(),
                 allow,
                 message: None,
                 mode: None,
+                option,
                 answers: None,
             };
             send_approval(agent.clone(), approval, busy, error);
         }
     };
     let deny = answer.clone();
+    let options = StoredValue::new(options);
     let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
     view! {
         <div class="approval" class:pending=move || state.get().is_none() && waiting.get()>
@@ -2264,16 +2305,43 @@ fn ApprovalCard(
                 <span class="tool-name">{tool_name}</span> " " <code>{summary}</code>
             </p>
             {move || (state.get().is_none() && waiting.get()).then(|| {
-                let (allow, deny) = (answer.clone(), deny.clone());
+                let (answer, deny) = (answer.clone(), deny.clone());
                 view! {
                     {match diff.clone() {
                         Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
                         None => view! { <pre class="tool-input">{input.clone()}</pre> }.into_any(),
                     }}
-                    <div class="form-buttons">
-                        <button class="primary" disabled=move || busy.get() on:click=move |_| allow(true)>"Allow"</button>
-                        <button disabled=move || busy.get() on:click=move |_| deny(false)>"Deny"</button>
-                    </div>
+                    {move || {
+                        let options = options.get_value();
+                        if options.is_empty() {
+                            let (allow, deny) = (answer.clone(), deny.clone());
+                            view! {
+                                <div class="form-buttons">
+                                    <button class="primary" disabled=move || busy.get() on:click=move |_| allow(true, None)>"Allow"</button>
+                                    <button disabled=move || busy.get() on:click=move |_| deny(false, None)>"Deny"</button>
+                                </div>
+                            }.into_any()
+                        } else {
+                            let mut primary = true;
+                            view! {
+                                <div class="form-buttons">
+                                    {options.into_iter().map(|o| {
+                                        let class = if primary && o.kind == "allow_once" {
+                                            primary = false;
+                                            "primary"
+                                        } else {
+                                            ""
+                                        };
+                                        let (id, kind) = (o.id.clone(), o.kind.clone());
+                                        let answer = answer.clone();
+                                        view! {
+                                            <button class=class disabled=move || busy.get() on:click=move |_| answer(kind.starts_with("allow"), Some(id.clone()))>{o.label}</button>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            }.into_any()
+                        }
+                    }}
                 }
             })}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}

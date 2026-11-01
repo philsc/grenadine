@@ -6,6 +6,7 @@ mod assets;
 mod claude;
 mod cleanup;
 mod db;
+mod devin;
 mod git;
 mod github;
 mod inboxes;
@@ -71,6 +72,10 @@ struct Args {
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
+
+    /// The Devin executable that agent sessions run.
+    #[arg(long, default_value = "devin")]
+    devin: PathBuf,
 
     /// The shell that terminals in agent sessions run, as a login shell.
     /// Defaults to the user's login shell.
@@ -194,7 +199,7 @@ async fn main() -> Result<()> {
     });
     let mut agents = agent::Agents::new(
         &db,
-        args.claude,
+        (args.claude, args.devin),
         worktrees,
         local_url(addr),
         slices,

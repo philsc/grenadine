@@ -227,24 +227,30 @@ pub async fn handle(
                 Some(t) => t.to_owned(),
                 None => format!("request-{rpc_id}"),
             };
-            let decision =
-                match agent::request_approval(&state, &id, &tool_use, tool_name, &args["input"]) {
-                    Ok(rx) => {
-                        let _guard = PendingGuard {
-                            state: &state,
-                            id: &id,
-                            tool_use: &tool_use,
-                        };
-                        tokio::select! {
-                            d = rx => d.ok(),
-                            _ = state.shutdown.cancelled() => None,
-                        }
+            let decision = match agent::request_approval(
+                &state,
+                &id,
+                &tool_use,
+                tool_name,
+                &args["input"],
+                Vec::new(),
+            ) {
+                Ok(rx) => {
+                    let _guard = PendingGuard {
+                        state: &state,
+                        id: &id,
+                        tool_use: &tool_use,
+                    };
+                    tokio::select! {
+                        d = rx => d.ok(),
+                        _ = state.shutdown.cancelled() => None,
                     }
-                    Err(e) => {
-                        tracing::warn!("agent {id}: {e:#}");
-                        None
-                    }
-                };
+                }
+                Err(e) => {
+                    tracing::warn!("agent {id}: {e:#}");
+                    None
+                }
+            };
             let answer = match decision {
                 Some(Decision {
                     allow: true,
@@ -580,6 +586,7 @@ mod tests {
                     id: "toolu_1".into(),
                     tool_name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    options: Vec::new(),
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_1".into(),
@@ -590,6 +597,7 @@ mod tests {
                     id: "toolu_2".into(),
                     tool_name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    options: Vec::new(),
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_2".into(),

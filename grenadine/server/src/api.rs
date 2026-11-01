@@ -605,6 +605,7 @@ async fn agent_backends(AxState(state): St) -> Json<Vec<AgentBackendInfo>> {
 }
 
 const UNKNOWN_MODE: &str = "the backend has no such permission mode";
+const UNKNOWN_OPTION: &str = "unknown approval option";
 
 /// Whether `backend` offers `model` and `mode`; the response when not.
 async fn offers(
@@ -899,10 +900,16 @@ async fn approve(
     {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
     }
+    if let Some(option) = &approval.option
+        && !agent::offers_option(&state, &id, &approval.id, option)
+    {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_OPTION).into_response());
+    }
     let decision = Decision {
         allow: approval.allow,
         message: approval.message,
         mode: approval.mode,
+        option: approval.option,
         answers: approval.answers,
     };
     Ok(if agent::approve(&state, &id, &approval.id, decision)? {
@@ -1376,6 +1383,7 @@ mod tests {
             allow: true,
             message: None,
             mode,
+            option: None,
             answers: None,
         };
         let response = approve(

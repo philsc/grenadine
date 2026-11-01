@@ -42,6 +42,145 @@ STARTUP_TIMEOUT = 30
 # deleted sessions with a container they left behind, and finds no stale
 # cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME". It
 # says how many images came with the prompt.
+FAKE_DEVIN = r"""
+import json, os, sys
+
+LOG = open(os.environ["DEVIN_FAKE_LOG"], "a", buffering=1)
+PLAN = os.environ.get("DEVIN_PLAN_FILE", "")
+if PLAN:
+    with open(PLAN, "w") as f:
+        f.write("---\nagent: devin\n---\n# The plan\n\nDo the thing.\n")
+
+def send(m):
+    line = json.dumps(m)
+    LOG.write("OUT " + line + "\n")
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+def update(u):
+    send({"jsonrpc": "2.0", "method": "session/update",
+          "params": {"update": u}})
+
+prompt_id = None
+mode = None
+calls = 0
+pid = os.getpid()
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    LOG.write(line)
+    m = json.loads(line)
+    mid = m.get("id")
+    method = m.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "devin-test",
+            "modes": {},
+            "configOptions": [{"id": "model", "currentValue": "swe-2",
+                "options": [{"value": "swe-2", "name": "SWE-2"},
+                            {"value": "swe-2-high", "name": "SWE-2 High"}]}]}})
+    elif method == "session/load":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "configOptions": [{"id": "model", "currentValue": "swe-2"}]}})
+    elif method in ("session/set_mode", "session/set_config_option",
+                    "session/delete"):
+        if method == "session/set_mode":
+            mode = m["params"].get("modeId")
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "configOptions": [{"id": "model", "currentValue": "swe-2"}]}})
+    elif method == "session/prompt":
+        prompt_id = mid
+        calls += 1
+        if mode == "plan":
+            update({"sessionUpdate": "tool_call",
+                "toolCallId": f"exit_plan_mode:{pid}#{calls}",
+                "rawInput": {"plan": "summary"},
+                "_meta": {"cognition.ai/inferenceToolName": "exit_plan_mode",
+                          "cognition.ai/planFilePath": PLAN}})
+            send({"jsonrpc": "2.0", "id": f"plan-{pid}-{calls}",
+                  "method": "session/request_permission",
+                  "params": {"sessionId": "devin-test",
+                      "toolCall": {"toolCallId": f"exit_plan_mode:{pid}#{calls}"},
+                      "options": [
+                          {"optionId": "plan_accept_edits",
+                           "name": "Yes, implement and accept edits",
+                           "kind": "allow_once"},
+                          {"optionId": "plan_bypass",
+                           "name": "Yes, implement and bypass",
+                           "kind": "allow_once"},
+                          {"optionId": "reject_once", "name": "No",
+                           "kind": "reject_once"}]}})
+        elif "question" in json.dumps(m["params"]["prompt"]):
+            update({"sessionUpdate": "tool_call",
+                "toolCallId": f"ask_user_question:{pid}#{calls}",
+                "rawInput": {"questions": [{"question": "Tea or coffee?",
+                    "header": "Drink",
+                    "options": [{"label": "Tea", "description": "Tea"},
+                                {"label": "Coffee",
+                                 "description": "Coffee"}]}]},
+                "_meta": {"cognition.ai/inferenceToolName":
+                          "ask_user_question"}})
+            schema = {"type": "object", "properties": {"q0": {
+                "title": "Drink", "description": "Tea or coffee?",
+                "oneOf": [{"const": "Tea", "title": "Tea"},
+                          {"const": "Coffee", "title": "Coffee"}]}}}
+            send({"jsonrpc": "2.0", "id": f"q-{pid}-{calls}",
+                  "method": "elicitation/create",
+                  "params": {"mode": "form", "sessionId": "devin-test",
+                      "requestedSchema": schema,
+                      "message": "Tea or coffee?",
+                      "_meta": {"cognition.ai/toolCallId":
+                                f"ask_user_question:{pid}#{calls}"}}})
+        else:
+            update({"sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "On it."}})
+            update({"sessionUpdate": "tool_call", "toolCallId": f"exec:{pid}#{calls}",
+                    "rawInput": {"command": "touch note.txt"},
+                    "_meta": {"cognition.ai/inferenceToolName": "exec"}})
+            send({"jsonrpc": "2.0", "id": f"perm-{pid}-{calls}",
+                  "method": "session/request_permission",
+                  "params": {"sessionId": "devin-test",
+                      "toolCall": {"toolCallId": f"exec:{pid}#{calls}"},
+                      "options": [{"optionId": "allow_once", "name": "Allow",
+                                   "kind": "allow_once"},
+                                  {"optionId": "reject_once", "name": "Reject",
+                                   "kind": "reject_once"}]}})
+    elif isinstance(mid, str) and mid.startswith("perm-"):
+        update({"sessionUpdate": "tool_call_update", "toolCallId": f"exec:{pid}#{calls}",
+                "status": "completed",
+                "content": [{"type": "content",
+                             "content": {"type": "text", "text": "done"}}]})
+        update({"sessionUpdate": "usage_update", "used": 1000,
+                "size": 200000,
+                "_meta": {"cognition.ai/totalAcuCost": 0.5}})
+        send({"jsonrpc": "2.0", "id": prompt_id,
+              "result": {"stopReason": "end_turn"}})
+    elif isinstance(mid, str) and mid.startswith("q-"):
+        update({"sessionUpdate": "tool_call_update",
+                "toolCallId": f"ask_user_question:{pid}#{calls}",
+                "status": "completed",
+                "content": [{"type": "content",
+                             "content": {"type": "text", "text": "Tea"}}]})
+        send({"jsonrpc": "2.0", "id": prompt_id,
+              "result": {"stopReason": "end_turn"}})
+    elif isinstance(mid, str) and mid.startswith("plan-"):
+        update({"sessionUpdate": "tool_call_update",
+                "toolCallId": f"exit_plan_mode:{pid}#{calls}",
+                "status": "completed",
+                "content": [{"type": "content",
+                             "content": {"type": "text", "text": "ok"}}]})
+        send({"jsonrpc": "2.0", "id": prompt_id,
+              "result": {"stopReason": "end_turn"}})
+    elif method == "session/cancel":
+        send({"jsonrpc": "2.0", "id": prompt_id,
+              "result": {"stopReason": "cancelled"}})
+
+"""
+
+
 FAKE_CLAUDE = r"""
 import base64
 import json
@@ -238,8 +377,16 @@ class ServerTestCase(unittest.TestCase):
         claude = bin_dir / "claude"
         claude.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}")
         claude.chmod(0o755)
+        devin = bin_dir / "devin"
+        devin.write_text(f"#!{sys.executable}\n{FAKE_DEVIN}")
+        devin.chmod(0o755)
 
-        env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
+        env = dict(
+            cls.gh.git_env(),
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+            DEVIN_FAKE_LOG=str(tmp / "devin_acp.log"),
+            DEVIN_PLAN_FILE=str(tmp / "devin_plan.md"),
+        )
         repo_flags = []
         cls.clones = {}
         for slug in cls.REPOS:
@@ -263,6 +410,7 @@ class ServerTestCase(unittest.TestCase):
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
+        cls.devin_log = tmp / "devin_acp.log"
         cls.server_args = (
             [
                 os.environ["GRENADINE_SERVER"],
@@ -270,6 +418,7 @@ class ServerTestCase(unittest.TestCase):
                 f"--port={port}",
                 f"--db={tmp / 'grenadine.db'}",
                 f"--github-api={api}",
+                f"--devin={devin}",
                 f"--poll-interval={cls.POLL_INTERVAL}",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
@@ -1488,6 +1637,83 @@ class AgentTest(ServerTestCase):
         other.get_by_role("link", name="Start one").click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
+
+    def devin_saw(self, needle: str) -> None:
+        # Waits until the fake devin's client log holds `needle`.
+        for _ in range(200):
+            if needle in self.devin_log.read_text():
+                return
+            time.sleep(0.05)
+        self.fail(f"devin never saw {needle}: {self.devin_log.read_text()}")
+
+    def start_devin_session(self, permissions: str, prompt: str) -> Locator:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Backend").select_option(label="Devin")
+        self.page.get_by_label("Permissions").select_option(label=permissions)
+        self.page.get_by_label("Prompt").fill(prompt)
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        return self.page.locator(".transcript")
+
+    def delete_session(self, title: str) -> None:
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        # Deleting scans the worktree for leftovers, which may leave a
+        # cleanup entry; the session's own entry is gone.
+        sessions = self.section("General").locator(".agent-entry")
+        expect(sessions.filter(has_text=title)).to_have_count(0)
+
+    def test_devin_session(self) -> None:
+        transcript = self.start_devin_session("Code", "write a note")
+        expect(transcript.locator(".turn-text")).to_contain_text("On it.")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Devin wants to use Bash")
+        # Devin's options render as a button each.
+        approval.get_by_role("button", name="Allow").click()
+        expect(approval).to_contain_text("Allowed Bash")
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.500 ACU"])
+        expect(self.page.locator(".composer .agent-model")).to_have_text("swe-2")
+        self.delete_session("write a note")
+
+    def test_devin_question(self) -> None:
+        transcript = self.start_devin_session("Code", "ask me a question")
+        question = transcript.locator(".approval")
+        expect(question).to_contain_text("Devin asks")
+        question.get_by_text("Tea", exact=True).click()
+        question.get_by_role("button", name="Answer").click()
+        # The answer goes back to Devin as the elicitation's q0.
+        self.devin_saw('"action":"accept"')
+        self.devin_saw('"q0":"Tea"')
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        self.delete_session("ask me a question")
+
+    def test_devin_plan(self) -> None:
+        transcript = self.start_devin_session("Plan first", "make a plan")
+        plan = transcript.locator(".approval.plan")
+        # The card shows the plan file's text, without its front matter.
+        expect(plan).to_contain_text("Devin's plan is waiting for your approval")
+        expect(plan.locator(".plan-text")).to_contain_text("Do the thing.")
+        expect(plan.locator(".plan-text")).not_to_contain_text("agent: devin")
+        # Devin's after-plan modes are Code and Bypass permissions.
+        expect(plan.get_by_label("After the plan")).to_have_value("accept-edits")
+        # Sent back with feedback, the plan's denial goes to Devin as
+        # reject_once and the feedback runs as the next prompt.
+        plan.get_by_label("Feedback").fill("more detail")
+        plan.get_by_role("button", name="Keep planning").click()
+        self.devin_saw('"optionId":"reject_once"')
+        expect(transcript.locator(".turn-prompt").last).to_have_text("more detail")
+        self.devin_saw("more detail")
+
+        # The next turn plans again; approving it picks the option that
+        # names the mode the turn goes on in.
+        revised = transcript.locator(".approval.plan").last
+        expect(revised).to_contain_text("Devin's plan is waiting for your approval")
+        revised.get_by_role("button", name="Approve plan").click()
+        self.devin_saw('"optionId":"plan_accept_edits"')
+        expect(revised).to_contain_text("Plan approved")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        self.delete_session("make a plan")
 
     def test_general_session(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})
