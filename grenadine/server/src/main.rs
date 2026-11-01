@@ -3,6 +3,7 @@
 mod agent;
 mod api;
 mod assets;
+mod claude;
 mod cleanup;
 mod db;
 mod git;

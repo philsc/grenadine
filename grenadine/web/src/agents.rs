@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs, AgentSession, AgentStatus, Approval,
-    CleanupState, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    PromptImage, WorktreeFile, WrapUp, WrapUpTarget,
+    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs,
+    AgentSession, AgentStatus, Approval, CleanupState, CostUnit, GENERAL, Landed, ModeInfo,
+    NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage, WorktreeFile,
+    WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -51,8 +52,31 @@ fn status_class(s: AgentStatus) -> &'static str {
     }
 }
 
-fn cost(usd: f64) -> String {
-    format!("${usd:.2}")
+/// `amount` in `unit`, as the page shows it.
+fn cost(amount: f64, unit: CostUnit) -> String {
+    match unit {
+        CostUnit::Usd => format!("${amount:.2}"),
+    }
+}
+
+/// The backends the server offers, loaded once for the page.
+fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
+    expect_context()
+}
+
+/// The models `backend` offers: `None` until the backends are in, an
+/// empty list when they can't be.
+fn listed_models(backend: Signal<AgentBackend>) -> Memo<Option<Vec<AgentModelInfo>>> {
+    Memo::new(move |_| {
+        let backend = backend.get();
+        backends().get().map(|r| {
+            r.unwrap_or_default()
+                .into_iter()
+                .find(|i| i.backend == backend)
+                .map(|i| i.models)
+                .unwrap_or_default()
+        })
+    })
 }
 
 /// A token count in a few characters, e.g. `950`, `41.5k` or `1M`.
@@ -474,6 +498,7 @@ pub fn CleanupView() -> impl IntoView {
         let req = NewCleanupSession {
             ids,
             repo: repo.get_untracked(),
+            backend: AgentBackend::Claude,
             model: model_arg(model),
         };
         busy.set(true);
@@ -483,7 +508,7 @@ pub fn CleanupView() -> impl IntoView {
                 Ok(session) => {
                     // The server starts it out planning.
                     if let Some(s) = storage() {
-                        let _ = s.set_item(&mode_key(&session.id), PermissionMode::Plan.as_str());
+                        let _ = s.set_item(&mode_key(&session.id), PermissionMode::plan().as_str());
                     }
                     go(&agent_hash(&session.id));
                 }
@@ -585,7 +610,7 @@ pub fn CleanupView() -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </label>
-                <label>"Model" <ModelSelect model=model /></label>
+                <label>"Model" <ModelSelect model=model models=listed_models(Signal::stored(AgentBackend::Claude)) /></label>
                 <button
                     class="primary"
                     disabled=move || busy.get() || picked.with(Vec::is_empty)
@@ -665,7 +690,7 @@ fn RepoSessions(
                             };
                             let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
                             // A general session has no branch.
-                            let mut meta: Vec<String> = [a.branch.clone(), cost(a.cost_usd)]
+                            let mut meta: Vec<String> = [a.branch.clone(), cost(a.cost, a.cost_unit)]
                                 .into_iter()
                                 .filter(|m| !m.is_empty())
                                 .collect();
@@ -725,7 +750,14 @@ fn DraftEntry(id: String, route: Signal<Route>) -> impl IntoView {
         move || {
             drafts
                 .with(&id, |d| {
-                    let mut meta = vec![d.mode.label().to_owned()];
+                    let info = d.backend.info(Vec::new());
+                    let label = info
+                        .modes
+                        .iter()
+                        .find(|m| m.value == d.mode.as_str())
+                        .map(|m| m.label.clone())
+                        .unwrap_or_else(|| d.mode.as_str().to_owned());
+                    let mut meta = vec![label];
                     let pr = d.pr.trim().trim_start_matches('#');
                     if !pr.is_empty() {
                         meta.insert(0, format!("#{pr}"));
@@ -778,16 +810,20 @@ fn mode_key(id: &str) -> String {
     format!("grenadine.agent-permission-mode.{id}")
 }
 
-/// The permission mode the session's next prompt goes with: the last one
-/// picked for it, Auto at first.
-fn mode_signal(id: &str) -> RwSignal<PermissionMode> {
+/// The permission mode the session's next prompt goes with: the last
+/// one picked for it, or the backend's default mode. A stored mode the
+/// backend doesn't offer falls back to the default.
+fn mode_signal(id: &str, backend: Signal<AgentBackend>) -> RwSignal<PermissionMode> {
     let key = mode_key(id);
-    let mode = RwSignal::new(
-        storage()
-            .and_then(|s| s.get_item(&key).ok().flatten())
-            .and_then(|v| PermissionMode::parse(&v))
-            .unwrap_or(PermissionMode::Auto),
-    );
+    let stored = storage().and_then(|s| s.get_item(&key).ok().flatten());
+    let mode = RwSignal::new(PermissionMode::new(stored.unwrap_or_default()));
+    Effect::new(move |_| {
+        let info = backend.get().info(Vec::new());
+        let m = mode.get_untracked();
+        if !info.modes.iter().any(|i| i.value == m.as_str()) {
+            mode.set(PermissionMode::new(info.default_mode.clone()));
+        }
+    });
     Effect::new(move |_| {
         let mode = mode.get();
         if let Some(s) = storage() {
@@ -797,17 +833,10 @@ fn mode_signal(id: &str) -> RwSignal<PermissionMode> {
     mode
 }
 
-/// The modes the turn can go on in once a plan is approved.
-const AFTER_PLAN: [PermissionMode; 3] = [
-    PermissionMode::Manual,
-    PermissionMode::AcceptEdits,
-    PermissionMode::Auto,
-];
-
 #[component]
 fn ModeSelect(
     mode: RwSignal<PermissionMode>,
-    #[prop(default = &PermissionMode::ALL)] modes: &'static [PermissionMode],
+    modes: Memo<Vec<ModeInfo>>,
     #[prop(default = "Permissions")] label: &'static str,
 ) -> impl IntoView {
     view! {
@@ -815,15 +844,14 @@ fn ModeSelect(
             class="agent-mode"
             aria-label=label
             title="What Claude may do without asking here"
-            prop:value=move || mode.get().as_str()
-            on:change=move |ev| {
-                if let Some(m) = PermissionMode::parse(&event_target_value(&ev)) {
-                    mode.set(m);
-                }
-            }
+            prop:value=move || mode.with(|m| m.as_str().to_owned())
+            on:change=move |ev| mode.set(PermissionMode::new(event_target_value(&ev)))
         >
-            {modes.iter().map(|&m| view! {
-                <option value=m.as_str() selected=move || mode.get() == m>{m.label()}</option>
+            {move || modes.get().into_iter().map(|m| {
+                let value = m.value.clone();
+                view! {
+                    <option value=m.value selected=move || mode.with(|m| m.as_str() == value)>{m.label}</option>
+                }
             }).collect_view()}
         </select>
     }
@@ -861,18 +889,22 @@ fn draft_key(id: &str) -> String {
     format!("grenadine.agent-draft.{id}")
 }
 
-/// The model a request asks for; `None` leaves it to Claude Code.
+/// The model a request asks for; `None` leaves it to the backend's
+/// default.
 fn model_arg(model: RwSignal<String>) -> Option<String> {
     Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL)
 }
 
-/// Picks one of the models Claude Code offers. Until they're listed, or
-/// when they can't be, only its default is offered.
+/// Picks one of the backend's models; `models` is `None` until the
+/// backends are in, an empty list when its models can't be listed. The
+/// backend's configured default is offered either way.
 #[component]
-fn ModelSelect(model: RwSignal<String>) -> impl IntoView {
-    let listed = LocalResource::new(api::agent_models);
-    let models = Memo::new(move |_| {
-        let mut models = listed.get().and_then(Result::ok).unwrap_or_default();
+fn ModelSelect(
+    model: RwSignal<String>,
+    models: Memo<Option<Vec<AgentModelInfo>>>,
+) -> impl IntoView {
+    let options = Memo::new(move |_| {
+        let mut models = models.get().unwrap_or_default();
         if !models.iter().any(|m| m.value == DEFAULT_MODEL) {
             models.insert(
                 0,
@@ -887,8 +919,8 @@ fn ModelSelect(model: RwSignal<String>) -> impl IntoView {
     });
     // A pick that's no longer offered goes back to the default.
     Effect::new(move |_| {
-        if listed.get().is_some()
-            && !models.with(|ms| model.with_untracked(|m| ms.iter().any(|i| &i.value == m)))
+        if models.get().is_some()
+            && !options.with(|ms| model.with_untracked(|m| ms.iter().any(|i| &i.value == m)))
         {
             model.set(DEFAULT_MODEL.into());
         }
@@ -901,7 +933,7 @@ fn ModelSelect(model: RwSignal<String>) -> impl IntoView {
             prop:value=move || model.get()
             on:change=move |ev| model.set(event_target_value(&ev))
         >
-            {move || models.get().into_iter().map(|m| {
+            {move || options.get().into_iter().map(|m| {
                 let value = m.value.clone();
                 let selected = move || model.with(|v| *v == value);
                 view! {
@@ -933,18 +965,31 @@ pub fn NewSession(draft: String) -> impl IntoView {
     });
     let number = RwSignal::new(saved.pr);
     let prompt = RwSignal::new(saved.prompt);
+    let backend = RwSignal::new(saved.backend);
     let mode = RwSignal::new(saved.mode);
     let model = RwSignal::new(saved.model);
+    // A mode the backend doesn't offer goes back to its default.
+    Effect::new(move |_| {
+        let info = backend.get().info(Vec::new());
+        if !info
+            .modes
+            .iter()
+            .any(|m| m.value == mode.get_untracked().as_str())
+        {
+            mode.set(PermissionMode::new(info.default_mode.clone()));
+        }
+    });
     // Drafts keep only the text; images last as long as the form.
     let images = RwSignal::new(Vec::<PromptImage>::new());
     let error = RwSignal::new(None::<String>);
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
-        let (repo, pr, prompt, mode, model) = (
+        let (repo, pr, prompt, backend, mode, model) = (
             repo.get(),
             number.get(),
             prompt.get(),
+            backend.get(),
             mode.get(),
             model.get(),
         );
@@ -953,6 +998,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 repo,
                 pr,
                 prompt,
+                backend,
                 mode,
                 model,
                 ..d.clone()
@@ -983,6 +1029,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
             },
         };
         let req = NewAgent {
+            backend: backend.get_untracked(),
             repo: repo.get_untracked(),
             pr,
             prompt: prompt.get_untracked(),
@@ -1033,6 +1080,26 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             }).collect_view()}
                         </select>
                     </label>
+                    {move || {
+                        let list = backends().get().and_then(Result::ok).unwrap_or_default();
+                        (list.len() > 1).then(|| view! {
+                            <label>"Backend"
+                                <select
+                                    prop:value=move || backend.get().as_str()
+                                    on:change=move |ev| {
+                                        backend.set(AgentBackend::parse(&event_target_value(&ev)).unwrap_or_default());
+                                    }
+                                >
+                                    {list.into_iter().map(|i| {
+                                        let b = i.backend;
+                                        view! {
+                                            <option value=b.as_str() selected=move || backend.get() == b>{i.label.clone()}</option>
+                                        }
+                                    }).collect_view()}
+                                </select>
+                            </label>
+                        })
+                    }}
                     <label>"Start from PR"
                         <input
                             type="text"
@@ -1043,8 +1110,15 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             on:input=move |ev| number.set(event_target_value(&ev))
                         />
                     </label>
-                    <label>"Permissions" <ModeSelect mode=mode /></label>
-                    <label>"Model" <ModelSelect model=model /></label>
+                    <label>"Permissions"
+                        <ModeSelect
+                            mode=mode
+                            modes=Memo::new(move |_| backend.get().info(Vec::new()).modes)
+                        />
+                    </label>
+                    <label>"Model"
+                        <ModelSelect model=model models=listed_models(Signal::derive(move || backend.get())) />
+                    </label>
                 </div>
                 <textarea
                     class="agent-prompt"
@@ -1224,7 +1298,8 @@ pub fn AgentView(id: String) -> impl IntoView {
     let live_model = RwSignal::new(None);
     follow(&id, events, streaming, live_usage, live_model);
     // Approving a plan also picks the mode the follow-ups go with.
-    let mode = mode_signal(&id);
+    let backend = Signal::derive(move || current.get().map(|s| s.backend).unwrap_or_default());
+    let mode = mode_signal(&id, backend);
     let model = model_signal();
 
     let terminal_id = id.clone();
@@ -1383,7 +1458,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                         <p class="muted">
                             <StatusBadge status=s.status />
                             " in no repository"
-                            {format!(" · {}", cost(s.cost_usd))}
+                            {format!(" · {}", cost(s.cost, s.cost_unit))}
                         </p>
                         <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
                     }
@@ -1405,7 +1480,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                         <StatusBadge status=s.status />
                         " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
                         " on " <code>{s.branch.clone()}</code>
-                        {format!(" · {}", cost(s.cost_usd))}
+                        {format!(" · {}", cost(s.cost, s.cost_unit))}
                         {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l /> })}
                     </p>
                     <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
@@ -1559,7 +1634,8 @@ fn Transcript(
             )
         })
     });
-    let (repo, id) = session.with_untracked(|s| (s.repo.clone(), s.id.clone()));
+    let (repo, id, unit, backend) =
+        session.with_untracked(|s| (s.repo.clone(), s.id.clone(), s.cost_unit, s.backend));
 
     // Keeps the newest output in view, starting with the bottom of the
     // transcript, until the user scrolls up. Scrolling back down follows
@@ -1695,6 +1771,7 @@ fn Transcript(
                                     agent=id
                                     tool=tool
                                     plan=markdown::to_html(plan, &repo)
+                                    backend=backend
                                     resolved=resolved
                                     open=open
                                     waiting=waiting
@@ -1737,8 +1814,8 @@ fn Transcript(
                         AgentEventKind::TurnEnded { error: Some(e), .. } => view! {
                             <p class="turn-end error">{format!("The turn ended: {e}")}</p>
                         }.into_any(),
-                        AgentEventKind::TurnEnded { error: None, cost_usd } => view! {
-                            <p class="turn-end muted">{format!("Done · {}", cost(cost_usd.unwrap_or_default()))}</p>
+                        AgentEventKind::TurnEnded { error: None, cost: c } => view! {
+                            <p class="turn-end muted">{format!("Done · {}", cost(c.unwrap_or_default(), unit))}</p>
                         }.into_any(),
                         AgentEventKind::Error(e) => view! {
                             <pre class="turn-error">{e}</pre>
@@ -1822,6 +1899,8 @@ fn PlanCard(
     tool: String,
     /// The plan as HTML.
     plan: String,
+    /// The session's backend, for the modes the turn can go on in.
+    backend: AgentBackend,
     resolved: Memo<HashMap<String, bool>>,
     /// Whether this is the plan the last turn ended on, still unanswered.
     open: Signal<bool>,
@@ -1834,7 +1913,15 @@ fn PlanCard(
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
-    let then = RwSignal::new(PermissionMode::Auto);
+    let info = backend.info(Vec::new());
+    let then = RwSignal::new(PermissionMode::new(info.default_mode.clone()));
+    let then_modes = Memo::new(move |_| {
+        info.modes
+            .iter()
+            .filter(|m| info.after_plan.contains(&m.value))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     let state = {
         let tool = tool.clone();
         Signal::derive(move || resolved.with(|r| r.get(&tool).copied()))
@@ -1844,10 +1931,10 @@ fn PlanCard(
         let next = if allow {
             then.get_untracked()
         } else {
-            PermissionMode::Plan
+            PermissionMode::plan()
         };
-        if allow && mode.get_untracked() == PermissionMode::Plan {
-            mode.set(next);
+        if allow && mode.get_untracked() == PermissionMode::plan() {
+            mode.set(next.clone());
         }
         if waiting.get_untracked() {
             // Without feedback the server tells Claude to keep planning.
@@ -1901,7 +1988,7 @@ fn PlanCard(
                     on:input=move |ev| feedback.set(event_target_value(&ev))
                 ></textarea>
                 <div class="form-buttons">
-                    <label>"Then " <ModeSelect mode=then modes=&AFTER_PLAN label="After the plan" /></label>
+                    <label>"Then " <ModeSelect mode=then modes=then_modes label="After the plan" /></label>
                     <button class="primary" disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(true))>"Approve plan"</button>
                     <button disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(false))>"Keep planning"</button>
                 </div>
@@ -2156,6 +2243,7 @@ fn Composer(
     model: RwSignal<String>,
 ) -> impl IntoView {
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
+    let models = listed_models(Signal::derive(move || session.with(|s| s.backend)));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
     let images = RwSignal::new(Vec::<PromptImage>::new());
@@ -2224,8 +2312,11 @@ fn Composer(
             <Attachments images=images />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
-                <ModeSelect mode=mode />
-                <ModelSelect model=model />
+                <ModeSelect
+                    mode=mode
+                    modes=Memo::new(move |_| session.with(|s| s.backend).info(Vec::new()).modes)
+                />
+                <ModelSelect model=model models=models />
                 <button type="submit" class="primary" disabled=blank>"Send"</button>
                 <AttachButton images=images error=error />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
@@ -2292,7 +2383,7 @@ mod tests {
         };
         let ended = |error: Option<&str>| AgentEventKind::TurnEnded {
             error: error.map(Into::into),
-            cost_usd: Some(1.0),
+            cost: Some(1.0),
         };
         let events = [
             event(1, AgentEventKind::Text("a".into())),
@@ -2374,6 +2465,7 @@ mod tests {
     fn session(id: &str, repo: &str) -> AgentSession {
         AgentSession {
             id: id.into(),
+            backend: AgentBackend::Claude,
             repo: repo.into(),
             pr: None,
             title: String::new(),
@@ -2383,7 +2475,8 @@ mod tests {
             base_sha: String::new(),
             status: AgentStatus::Idle,
             created_at: 0,
-            cost_usd: 0.0,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
             context_tokens: None,
             context_window: None,
             model: None,

@@ -14,10 +14,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentEvent, AgentMessage, AgentModelInfo, AgentSession, Approval, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PrDetail, PrKey, PrMissing, ServerEvent,
-    SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest,
+    BlobsResponse, Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, MergeRequest, Merged,
+    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
+    PrMissing, ServerEvent, SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -108,7 +108,7 @@ fn api_routes() -> Router<Arc<State>> {
                 .post(create_agent)
                 .layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
-        .route("/api/agents/models", get(agent_models))
+        .route("/api/agents/backends", get(agent_backends))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route(
             "/api/agents/{id}/messages",
@@ -599,12 +599,29 @@ async fn with_unstaged(state: &State, sessions: Vec<AgentSession>) -> ApiResult<
     .await?)
 }
 
-/// The models prompts may ask for, as Claude Code lists them.
-async fn agent_models(AxState(state): St) -> Json<Vec<AgentModelInfo>> {
-    Json(state.agents.models().await)
+/// The backends, with the permission modes and models each offers.
+async fn agent_backends(AxState(state): St) -> Json<Vec<AgentBackendInfo>> {
+    Json(state.agents.backends().await)
 }
 
 const UNKNOWN_MODEL: &str = "Claude Code doesn't offer that model";
+const UNKNOWN_MODE: &str = "the backend has no such permission mode";
+
+/// Whether `backend` offers `model` and `mode`; the response when not.
+async fn offers(
+    state: &State,
+    backend: grenadine_core::api::AgentBackend,
+    model: Option<&str>,
+    mode: &PermissionMode,
+) -> Option<Response> {
+    if !state.agents.has_mode(backend, mode) {
+        return Some((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
+    }
+    if !state.agents.offers(backend, model).await {
+        return Some((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    }
+    None
+}
 
 /// Whether sessions can start in `repo`: a configured repository, or
 /// none for a general session.
@@ -619,8 +636,15 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
     if let Some(e) = agent::check_images(&req.images) {
         return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
-    if !state.agents.offers(req.model.as_deref()).await {
-        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    if let Some(r) = offers(
+        &state,
+        req.backend,
+        req.model.as_deref(),
+        &req.permission_mode,
+    )
+    .await
+    {
+        return Ok(r);
     }
     if !can_start_in(&state, &req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
@@ -646,8 +670,15 @@ async fn create_cleanup_session(
     AxState(state): St,
     Json(req): Json<NewCleanupSession>,
 ) -> ApiResult<Response> {
-    if !state.agents.offers(req.model.as_deref()).await {
-        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    if let Some(r) = offers(
+        &state,
+        req.backend,
+        req.model.as_deref(),
+        &PermissionMode::plan(),
+    )
+    .await
+    {
+        return Ok(r);
     }
     if !can_start_in(&state, &req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
@@ -767,9 +798,9 @@ async fn agent_message(
     Path(id): Path<String>,
     Json(msg): Json<AgentMessage>,
 ) -> ApiResult<Response> {
-    if find_agent(&state, &id)?.is_none() {
+    let Some(session) = find_agent(&state, &id)? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
-    }
+    };
     // An image can say it all.
     if msg.prompt.trim().is_empty() && msg.images.is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
@@ -777,8 +808,15 @@ async fn agent_message(
     if let Some(e) = agent::check_images(&msg.images) {
         return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
-    if !state.agents.offers(msg.model.as_deref()).await {
-        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    if let Some(r) = offers(
+        &state,
+        session.backend,
+        msg.model.as_deref(),
+        &msg.permission_mode,
+    )
+    .await
+    {
+        return Ok(r);
     }
     let images = agent::save_images(&state, &id, &msg.images).await?;
     agent::send_with_images(
@@ -824,11 +862,18 @@ async fn wrap_up_agent(
     Path(id): Path<String>,
     Json(req): Json<WrapUp>,
 ) -> ApiResult<Response> {
-    if find_agent(&state, &id)?.is_none() {
+    let Some(session) = find_agent(&state, &id)? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
-    }
-    if !state.agents.offers(req.model.as_deref()).await {
-        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+    };
+    if let Some(r) = offers(
+        &state,
+        session.backend,
+        req.model.as_deref(),
+        &req.permission_mode,
+    )
+    .await
+    {
+        return Ok(r);
     }
     if !agent::wrap_up(&state, &id, req).await {
         return Ok((StatusCode::CONFLICT, "the session is already wrapping up").into_response());
@@ -841,9 +886,17 @@ async fn approve(
     AxState(state): St,
     Path(id): Path<String>,
     Json(approval): Json<Approval>,
-) -> ApiResult<StatusCode> {
-    if find_agent(&state, &id)?.is_none() {
-        return Ok(StatusCode::NOT_FOUND);
+) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    // The mode a plan approval carries goes on the turn, so it has to be
+    // one the backend offers there.
+    if let Some(mode) = &approval.mode {
+        let info = session.backend.info(Vec::new());
+        if !info.after_plan.iter().any(|m| m == mode.as_str()) {
+            return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
+        }
     }
     let decision = Decision {
         allow: approval.allow,
@@ -852,9 +905,9 @@ async fn approve(
         answers: approval.answers,
     };
     Ok(if agent::approve(&state, &id, &approval.id, decision)? {
-        StatusCode::NO_CONTENT
+        StatusCode::NO_CONTENT.into_response()
     } else {
-        StatusCode::NOT_FOUND
+        StatusCode::NOT_FOUND.into_response()
     })
 }
 
@@ -1034,6 +1087,7 @@ mod tests {
             .db
             .create_agent(&AgentSession {
                 id: id.into(),
+                backend: grenadine_core::api::AgentBackend::Claude,
                 repo: fx.clone.slug.clone(),
                 pr: None,
                 title: "t".into(),
@@ -1043,7 +1097,8 @@ mod tests {
                 base_sha: "s".into(),
                 status: grenadine_core::api::AgentStatus::Idle,
                 created_at: 0,
-                cost_usd: 0.0,
+                cost: 0.0,
+                cost_unit: grenadine_core::api::CostUnit::Usd,
                 context_tokens: None,
                 context_window: None,
                 model: None,
@@ -1310,6 +1365,96 @@ mod tests {
         assert!(state.db.pr_sync_error(&key(6)).unwrap().is_some());
         // 8 is in an inbox, so it's the poller's.
         assert_eq!(state.db.pr_sync_error(&key(8)).unwrap(), None);
+    }
+
+    /// A mode a plan approval carries that the turn can't go on in is a
+    /// 400, like an unknown permission mode on a prompt.
+    #[tokio::test]
+    async fn an_unknown_after_plan_mode_is_rejected() {
+        let state = crate::sync::test_state();
+        let id = "00000000-0000-0000-0000-000000000000";
+        state
+            .db
+            .create_agent(&AgentSession {
+                id: id.into(),
+                backend: grenadine_core::api::AgentBackend::Claude,
+                repo: "o/n".into(),
+                pr: None,
+                title: "t".into(),
+                summary: None,
+                branch: "x".into(),
+                worktree: "/w".into(),
+                base_sha: "s".into(),
+                status: grenadine_core::api::AgentStatus::AwaitingApproval,
+                created_at: 0,
+                cost: 0.0,
+                cost_unit: grenadine_core::api::CostUnit::Usd,
+                context_tokens: None,
+                context_window: None,
+                model: None,
+                landed: None,
+                prs: None,
+                unstaged: 0,
+            })
+            .unwrap();
+        let approval = |mode| Approval {
+            id: "t".into(),
+            allow: true,
+            message: None,
+            mode,
+            answers: None,
+        };
+        let response = approve(
+            AxState(state.clone()),
+            Path(id.to_owned()),
+            Json(approval(Some("plan".into()))),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = approve(
+            AxState(state.clone()),
+            Path(id.to_owned()),
+            Json(approval(Some("auto".into()))),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        // Valid, but nothing was waiting for an answer.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = approve(AxState(state), Path(id.to_owned()), Json(approval(None)))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A permission mode the backend doesn't list is a 400, like an
+    /// unknown model.
+    #[tokio::test]
+    async fn an_unknown_permission_mode_is_rejected() {
+        let state = crate::sync::test_state();
+        let req = |mode: &str| NewAgent {
+            backend: grenadine_core::api::AgentBackend::Claude,
+            repo: GENERAL.into(),
+            pr: None,
+            prompt: "hi".into(),
+            permission_mode: mode.into(),
+            model: None,
+            images: Vec::new(),
+        };
+        let response = create_agent(AxState(state.clone()), Json(req("nonsense")))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await, UNKNOWN_MODE);
+        let response = create_agent(AxState(state), Json(req("auto")))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// An inbox PR is the poller's: no on-demand sync starts for it.

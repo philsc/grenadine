@@ -2,7 +2,7 @@
 //! kept in local storage so that it survives going to another page and
 //! back, or a reload, until its session starts or it's discarded.
 
-use grenadine_core::api::{GENERAL, PermissionMode};
+use grenadine_core::api::{AgentBackend, GENERAL, PermissionMode};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,9 @@ pub struct Draft {
     /// The PR to start from, as typed.
     pub pr: String,
     pub prompt: String,
+    /// Which agent backend runs the session's turns.
+    #[serde(default)]
+    pub backend: AgentBackend,
     pub mode: PermissionMode,
     pub model: String,
     /// When the form was opened, in milliseconds since the epoch.
@@ -96,9 +99,10 @@ impl Drafts {
                 repo: repo.unwrap_or_else(|| GENERAL.to_owned()),
                 pr: pr.map(|n| n.to_string()).unwrap_or_default(),
                 prompt: String::new(),
+                backend: AgentBackend::Claude,
                 // New sessions start out planning, whatever the others go
                 // on with.
-                mode: PermissionMode::Plan,
+                mode: PermissionMode::plan(),
                 model: crate::agents::last_model(),
                 created_at: now,
             })
@@ -120,7 +124,8 @@ impl Drafts {
             repo: GENERAL.to_owned(),
             pr: String::new(),
             prompt: String::new(),
-            mode: PermissionMode::Plan,
+            backend: AgentBackend::Claude,
+            mode: PermissionMode::plan(),
             model: crate::agents::last_model(),
             created_at: js_sys::Date::now(),
         };
@@ -168,7 +173,8 @@ mod tests {
             repo: repo.into(),
             pr: String::new(),
             prompt: prompt.into(),
-            mode: PermissionMode::Plan,
+            backend: AgentBackend::Claude,
+            mode: PermissionMode::plan(),
             model: "default".into(),
             created_at,
         }

@@ -7,9 +7,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus, CleanupItem, Inbox,
-    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, ReviewDecision,
-    ReviewInfo, Stack, ThreadCounts, Version, VersionKind,
+    AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus,
+    CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary,
+    ReviewComment, ReviewDecision, ReviewInfo, Stack, ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -287,6 +287,20 @@ const MIGRATIONS: &[Migration] = &[
     -- string (Approved, ChangesRequested, ...) like in prs.review; NULL
     -- when there's none.
     ALTER TABLE inbox_prs ADD COLUMN review_decision TEXT;
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- Which agent backend runs the session, and the backend's own session
+    -- ID once it created the session, when later turns resume it.
+    ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';
+    ALTER TABLE agents ADD COLUMN backend_session_id TEXT;
+    UPDATE agents SET backend_session_id = id WHERE started = 1;
+    ALTER TABLE agents DROP COLUMN started;
+
+    -- The unit of cost: usd.
+    ALTER TABLE agents RENAME COLUMN cost_usd TO cost;
+    ALTER TABLE agents ADD COLUMN cost_unit TEXT NOT NULL DEFAULT 'usd';
 "#,
     ),
 ];
@@ -1025,11 +1039,12 @@ impl Db {
     pub fn create_agent(&self, a: &AgentSession) -> Result<()> {
         self.conn().execute(
             "INSERT INTO agents
-                (id, repo, pr_number, title, branch, worktree, base_sha, status, cost_usd,
-                 context_tokens, context_window, model, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, backend, repo, pr_number, title, branch, worktree, base_sha, status,
+                 cost, cost_unit, context_tokens, context_window, model, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
+                a.backend.as_str(),
                 a.repo,
                 a.pr,
                 a.title,
@@ -1037,7 +1052,8 @@ impl Db {
                 a.worktree,
                 a.base_sha,
                 status_str(a.status),
-                a.cost_usd,
+                a.cost,
+                a.cost_unit.as_str(),
                 a.context_tokens,
                 a.context_window,
                 a.model,
@@ -1076,27 +1092,32 @@ impl Db {
         Ok(())
     }
 
-    /// Whether Claude Code created the session, so it can be resumed.
-    pub fn agent_started(&self, id: &str) -> Result<bool> {
+    /// The backend's own session ID once it created the session, when
+    /// later turns resume it.
+    pub fn backend_session(&self, id: &str) -> Result<Option<String>> {
         Ok(self
             .conn()
-            .query_row("SELECT started FROM agents WHERE id = ?", [id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT backend_session_id FROM agents WHERE id = ?",
+                [id],
+                |r| r.get(0),
+            )
             .optional()?
-            .unwrap_or(false))
+            .flatten())
     }
 
-    pub fn set_agent_started(&self, id: &str) -> Result<()> {
-        self.conn()
-            .execute("UPDATE agents SET started = 1 WHERE id = ?", [id])?;
+    pub fn set_backend_session(&self, id: &str, backend_session_id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET backend_session_id = ? WHERE id = ?",
+            params![backend_session_id, id],
+        )?;
         Ok(())
     }
 
-    pub fn add_agent_cost(&self, id: &str, cost_usd: f64) -> Result<()> {
+    pub fn add_agent_cost(&self, id: &str, cost: f64) -> Result<()> {
         self.conn().execute(
-            "UPDATE agents SET cost_usd = cost_usd + ? WHERE id = ?",
-            params![cost_usd, id],
+            "UPDATE agents SET cost = cost + ? WHERE id = ?",
+            params![cost, id],
         )?;
         Ok(())
     }
@@ -1329,8 +1350,8 @@ impl Db {
     }
 }
 
-const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_sha, status, \
-     created_at, cost_usd, context_tokens, context_window, landed, model, summary, \
+const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktree, base_sha, \
+     status, created_at, cost, cost_unit, context_tokens, context_window, landed, model, summary, \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state = 'MERGED'), \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state != 'CLOSED'), \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id), \
@@ -1340,26 +1361,28 @@ const AGENT_COLUMNS: &str = "id, repo, pr_number, title, branch, worktree, base_
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
         id: r.get(0)?,
-        repo: r.get(1)?,
-        pr: r.get(2)?,
-        title: r.get(3)?,
-        branch: r.get(4)?,
-        worktree: r.get(5)?,
-        base_sha: r.get(6)?,
-        status: parse_status(&r.get::<_, String>(7)?),
-        created_at: r.get(8)?,
-        cost_usd: r.get(9)?,
-        context_tokens: r.get(10)?,
-        context_window: r.get(11)?,
+        backend: AgentBackend::parse(&r.get::<_, String>(1)?).unwrap_or_default(),
+        repo: r.get(2)?,
+        pr: r.get(3)?,
+        title: r.get(4)?,
+        branch: r.get(5)?,
+        worktree: r.get(6)?,
+        base_sha: r.get(7)?,
+        status: parse_status(&r.get::<_, String>(8)?),
+        created_at: r.get(9)?,
+        cost: r.get(10)?,
+        cost_unit: CostUnit::parse(&r.get::<_, String>(11)?).unwrap_or_default(),
+        context_tokens: r.get(12)?,
+        context_window: r.get(13)?,
         landed: r
-            .get::<_, Option<String>>(12)?
+            .get::<_, Option<String>>(14)?
             .and_then(|j| serde_json::from_str(&j).ok()),
-        model: r.get(13)?,
-        summary: r.get(14)?,
-        prs: (r.get::<_, u32>(17)? > 0).then_some(AgentPrs {
-            merged: r.get(15)?,
-            total: r.get(16)?,
-            conflicting: r.get(18)?,
+        model: r.get(15)?,
+        summary: r.get(16)?,
+        prs: (r.get::<_, u32>(19)? > 0).then_some(AgentPrs {
+            merged: r.get(17)?,
+            total: r.get(18)?,
+            conflicting: r.get(20)?,
         }),
         // The listing looks at the worktree for these.
         unstaged: 0,
@@ -1950,9 +1973,38 @@ mod tests {
         assert_eq!(listed, 0);
     }
 
+    /// The last migration moves `started` to `backend_session_id` and
+    /// renames `cost_usd`, keeping the rows' data.
+    #[test]
+    fn migrates_agents_to_backends() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        for (id, started) in [("started", 1), ("fresh", 0)] {
+            conn.execute(
+                "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status,
+                                     started, cost_usd, created_at)
+                 VALUES (?, 'o/n', 't', 'b', '/w', 's', 'idle', ?, 1.5, 0)",
+                params![id, started],
+            )
+            .unwrap();
+        }
+        let db = Db::init(conn, None).unwrap();
+        let started = db.agent("started").unwrap().unwrap();
+        assert_eq!(started.backend, AgentBackend::Claude);
+        assert_eq!(started.cost, 1.5);
+        assert_eq!(started.cost_unit, CostUnit::Usd);
+        assert_eq!(
+            db.backend_session("started").unwrap().as_deref(),
+            Some("started")
+        );
+        assert_eq!(db.backend_session("fresh").unwrap(), None);
+    }
+
     fn agent(id: &str, status: AgentStatus) -> AgentSession {
         AgentSession {
             id: id.into(),
+            backend: AgentBackend::Claude,
             repo: "o/n".into(),
             pr: Some(7),
             title: "t".into(),
@@ -1962,7 +2014,8 @@ mod tests {
             base_sha: "s".into(),
             status,
             created_at: 1,
-            cost_usd: 0.0,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
             context_tokens: None,
             context_window: None,
             model: None,
@@ -1985,12 +2038,15 @@ mod tests {
         );
         assert_eq!(db.agent("x").unwrap(), None);
 
-        assert!(!db.agent_started("a").unwrap());
-        db.set_agent_started("a").unwrap();
-        assert!(db.agent_started("a").unwrap());
+        assert_eq!(db.backend_session("a").unwrap(), None);
+        db.set_backend_session("a", "session-a").unwrap();
+        assert_eq!(
+            db.backend_session("a").unwrap().as_deref(),
+            Some("session-a")
+        );
         db.add_agent_cost("a", 0.25).unwrap();
         db.add_agent_cost("a", 0.5).unwrap();
-        assert_eq!(db.agent("a").unwrap().unwrap().cost_usd, 0.75);
+        assert_eq!(db.agent("a").unwrap().unwrap().cost, 0.75);
         db.set_agent_usage("a", None, Some(200_000)).unwrap();
         db.set_agent_usage("a", Some(1_000), None).unwrap();
         let a = db.agent("a").unwrap().unwrap();
@@ -2138,11 +2194,16 @@ mod tests {
             .position(|m| matches!(m, Migration::BackfillAgentPrs))
             .unwrap();
         migrate(&mut conn, backfill).unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status, created_at)
+             VALUES ('a', 'o/n', 't', 'b', '/w', 's', 'idle', 0)",
+            [],
+        )
+        .unwrap();
         let db = Db {
             conn: Mutex::new(conn),
             _lock: None,
         };
-        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
         let events = [
             AgentEventKind::ToolUse {
                 id: "t".into(),

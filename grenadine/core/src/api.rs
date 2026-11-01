@@ -692,7 +692,11 @@ pub struct NewCleanupSession {
     pub ids: Vec<i64>,
     /// The repo the session's worktree is in.
     pub repo: String,
-    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    /// Which agent backend runs the session's turns.
+    #[serde(default)]
+    pub backend: AgentBackend,
+    /// An `AgentModelInfo::value` of the backend; `None` keeps its
+    /// default.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -702,9 +706,9 @@ pub struct NewCleanupSession {
 pub enum AgentStatus {
     /// Waiting for a prompt.
     Idle,
-    /// Claude is working on a prompt.
+    /// The agent is working on a prompt.
     Running,
-    /// Claude is waiting for the user to allow or deny a tool call.
+    /// The agent is waiting for the user to allow or deny a tool call.
     AwaitingApproval,
     /// The user stopped the last turn, or the server restarted during it.
     Interrupted,
@@ -712,19 +716,22 @@ pub enum AgentStatus {
     Failed,
 }
 
-/// A Claude Code session working in its own git worktree.
+/// An agent session working in its own git worktree.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
-    /// Also Claude Code's session ID, a UUID.
+    /// The session's ID, a UUID.
     pub id: String,
+    /// Which agent runs the session's turns.
+    #[serde(default)]
+    pub backend: AgentBackend,
     /// `owner/name`.
     pub repo: String,
     /// The PR whose head the worktree started from; `None` for trunk.
     pub pr: Option<u64>,
     /// The first line of the first prompt.
     pub title: String,
-    /// Haiku's short summary of the first prompt; `None` until it's
-    /// written, or if writing it failed.
+    /// A short summary of the first prompt, written in the background;
+    /// `None` until it's written, or if writing it failed.
     #[serde(default)]
     pub summary: Option<String>,
     /// The local branch checked out in the worktree.
@@ -734,15 +741,19 @@ pub struct AgentSession {
     pub status: AgentStatus,
     /// Unix seconds.
     pub created_at: i64,
-    /// What all of the session's turns cost, as Claude Code reported it.
-    pub cost_usd: f64,
+    /// What all of the session's turns cost, as the backend reported it,
+    /// in `cost_unit`.
+    pub cost: f64,
+    /// The unit `cost` is in.
+    #[serde(default)]
+    pub cost_unit: CostUnit,
     /// How many tokens the context holds after the latest assistant
-    /// message; `None` until Claude Code reports it.
+    /// message; `None` until the backend reports it.
     pub context_tokens: Option<u64>,
     /// The size of the model's context window, in tokens.
     pub context_window: Option<u64>,
-    /// The model Claude Code runs the session with, as its init line names
-    /// it; `None` until it starts.
+    /// The model the backend runs the session with, as it names it;
+    /// `None` until it starts.
     #[serde(default)]
     pub model: Option<String>,
     /// Where the session's work was last landed by wrapping up.
@@ -768,63 +779,163 @@ pub struct AgentPrs {
     pub conflicting: u32,
 }
 
-/// How Claude Code decides about tool uses during a turn; the user picks
-/// it with every prompt. Whatever the mode doesn't decide on its own is
-/// asked on the page.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionMode {
-    /// Ask before every tool use.
+/// Which agent backend runs a session's turns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackend {
+    /// Claude Code.
     #[default]
-    Manual,
-    /// Allow file edits, ask for the rest.
-    AcceptEdits,
-    /// A classifier allows routine tool uses and asks for risky ones.
-    Auto,
-    /// Research without changing anything, then ask the user to approve a
-    /// plan; the turn goes on in the mode picked with the approval.
-    Plan,
+    Claude,
 }
 
-impl PermissionMode {
-    pub const ALL: [PermissionMode; 4] = [
-        PermissionMode::Manual,
-        PermissionMode::AcceptEdits,
-        PermissionMode::Auto,
-        PermissionMode::Plan,
-    ];
-
-    /// The value of Claude Code's `--permission-mode`.
+impl AgentBackend {
+    /// The value requests and the database name it with.
     pub fn as_str(self) -> &'static str {
         match self {
-            PermissionMode::Manual => "manual",
-            PermissionMode::AcceptEdits => "acceptEdits",
-            PermissionMode::Auto => "auto",
-            PermissionMode::Plan => "plan",
+            AgentBackend::Claude => "claude",
         }
     }
 
-    /// The mode `as_str` returns, if any.
-    pub fn parse(s: &str) -> Option<PermissionMode> {
-        PermissionMode::ALL.into_iter().find(|m| m.as_str() == s)
+    /// The backend `as_str` names, if any.
+    pub fn parse(s: &str) -> Option<AgentBackend> {
+        match s {
+            "claude" => Some(AgentBackend::Claude),
+            _ => None,
+        }
     }
 
+    /// What the backend picker calls it.
     pub fn label(self) -> &'static str {
         match self {
-            PermissionMode::Manual => "Ask for everything",
-            PermissionMode::AcceptEdits => "Accept edits",
-            PermissionMode::Auto => "Auto",
-            PermissionMode::Plan => "Plan first",
+            AgentBackend::Claude => "Claude Code",
+        }
+    }
+
+    /// What the backend offers sessions besides `models`, which are
+    /// listed at runtime and are empty when they can't be.
+    pub fn info(self, models: Vec<AgentModelInfo>) -> AgentBackendInfo {
+        let mode = |value: &str, label: &str| ModeInfo {
+            value: value.to_owned(),
+            label: label.to_owned(),
+        };
+        match self {
+            AgentBackend::Claude => AgentBackendInfo {
+                backend: self,
+                label: self.label().to_owned(),
+                modes: vec![
+                    // Ask before every tool use.
+                    mode("manual", "Ask for everything"),
+                    // Allow file edits, ask for the rest.
+                    mode("acceptEdits", "Accept edits"),
+                    // A classifier allows routine tool uses and asks for
+                    // risky ones.
+                    mode("auto", "Auto"),
+                    // Research without changing anything, then ask the
+                    // user to approve a plan; the turn goes on in the
+                    // mode picked with the approval.
+                    mode("plan", "Plan first"),
+                ],
+                default_mode: "auto".to_owned(),
+                after_plan: ["manual", "acceptEdits", "auto"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                models,
+            },
         }
     }
 }
 
-/// A model Claude Code offers, as it lists them to the Agent SDK.
+/// The unit a session's or a turn's cost is in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostUnit {
+    /// US dollars.
+    #[default]
+    Usd,
+}
+
+impl CostUnit {
+    /// The value the database names it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CostUnit::Usd => "usd",
+        }
+    }
+
+    /// The unit `as_str` names, if any.
+    pub fn parse(s: &str) -> Option<CostUnit> {
+        match s {
+            "usd" => Some(CostUnit::Usd),
+            _ => None,
+        }
+    }
+}
+
+/// A permission mode a backend offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModeInfo {
+    /// The mode's value, as a `PermissionMode`.
+    pub value: String,
+    /// What the picker calls it.
+    pub label: String,
+}
+
+/// What a backend offers sessions: its permission modes and models.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBackendInfo {
+    pub backend: AgentBackend,
+    /// What the backend picker calls it.
+    pub label: String,
+    /// The permission modes, in picker order.
+    pub modes: Vec<ModeInfo>,
+    /// The mode a session starts with until the user picks one.
+    pub default_mode: String,
+    /// The modes a turn can go on in once a plan is approved.
+    pub after_plan: Vec<String>,
+    /// The models; empty when they can't be listed.
+    pub models: Vec<AgentModelInfo>,
+}
+
+/// How an agent decides about tool uses during a turn; the user picks it
+/// with every prompt. Whatever the mode doesn't decide on its own is
+/// asked on the page. The values are the backend's, in
+/// `AgentBackendInfo::modes`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PermissionMode(String);
+
+impl PermissionMode {
+    pub fn new(mode: impl Into<String>) -> PermissionMode {
+        PermissionMode(mode.into())
+    }
+
+    /// The value the backend names the mode with.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Research without changing anything, then ask the user to approve a
+    /// plan; every backend's modes include one named "plan".
+    pub fn plan() -> PermissionMode {
+        PermissionMode("plan".into())
+    }
+}
+
+impl From<&str> for PermissionMode {
+    fn from(mode: &str) -> PermissionMode {
+        PermissionMode(mode.to_owned())
+    }
+}
+
+/// A model a backend offers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentModelInfo {
-    /// What `--model` takes, e.g. `sonnet` or `claude-opus-4-8`;
-    /// `default` is Claude Code's configured default.
+    /// What the backend's model option takes, e.g. `sonnet` or
+    /// `claude-opus-4-8`; `default` is its configured default.
     pub value: String,
     pub display_name: String,
     #[serde(default)]
@@ -839,13 +950,17 @@ pub const GENERAL: &str = "general";
 /// The body of a request that starts an agent session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgent {
+    /// Which agent backend runs the session's turns.
+    #[serde(default)]
+    pub backend: AgentBackend,
     pub repo: String,
     /// Start from this PR's head rather than from the trunk.
     pub pr: Option<u64>,
     pub prompt: String,
-    #[serde(default)]
+    /// A `ModeInfo::value` of the backend.
     pub permission_mode: PermissionMode,
-    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    /// An `AgentModelInfo::value` of the backend; `None` keeps its
+    /// default.
     #[serde(default)]
     pub model: Option<String>,
     /// Images that go with the prompt, e.g. pasted screenshots.
@@ -857,9 +972,10 @@ pub struct NewAgent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessage {
     pub prompt: String,
-    #[serde(default)]
+    /// A `ModeInfo::value` of the session's backend.
     pub permission_mode: PermissionMode,
-    /// An `AgentModelInfo::value`; `None` keeps Claude Code's default.
+    /// An `AgentModelInfo::value` of the backend; `None` keeps its
+    /// default.
     #[serde(default)]
     pub model: Option<String>,
     /// Images that go with the prompt, e.g. pasted screenshots.
@@ -888,14 +1004,16 @@ pub enum WrapUpTarget {
     PullRequest,
 }
 
-/// Asks to land an agent session's work. Claude may first get prompts to
-/// commit its changes or to resolve conflicts; those turns go with
+/// Asks to land an agent session's work. The agent may first get prompts
+/// to commit its changes or to resolve conflicts; those turns go with
 /// `permission_mode` and `model`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapUp {
     pub target: WrapUpTarget,
-    #[serde(default)]
+    /// A `ModeInfo::value` of the session's backend.
     pub permission_mode: PermissionMode,
+    /// An `AgentModelInfo::value` of the backend; `None` keeps its
+    /// default.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -955,7 +1073,7 @@ pub struct Approval {
     /// The tool use's ID.
     pub id: String,
     pub allow: bool,
-    /// Told to Claude when the tool call is denied.
+    /// Told to the agent when the tool call is denied.
     pub message: Option<String>,
     /// For `ExitPlanMode`: the mode the turn goes on in once the plan is
     /// approved.
@@ -991,7 +1109,7 @@ pub enum AgentEventKind {
         id: String,
         content: String,
         is_error: bool,
-        /// The change a file tool made, when Claude Code reports one.
+        /// The change a file tool made, when the backend reports one.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         patch: Vec<PatchHunk>,
         /// The ids of the images in the result, such as screenshots, which
@@ -999,14 +1117,14 @@ pub enum AgentEventKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
     },
-    /// An image Claude showed the user with the `show_image` tool.
+    /// An image the agent showed the user with the `show_image` tool.
     Image {
         /// The id that `/api/images/{id}` serves the image under.
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
     },
-    /// Claude wants to use a tool and waits for the user's `Approval`.
+    /// The agent wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
         id: String,
         tool_name: String,
@@ -1020,10 +1138,12 @@ pub enum AgentEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
-    /// A turn ended; `error` is set when it failed.
+    /// A turn ended; `error` is set when it failed. `cost` is in the
+    /// session's `cost_unit`.
     TurnEnded {
         error: Option<String>,
-        cost_usd: Option<f64>,
+        #[serde(alias = "cost_usd")]
+        cost: Option<f64>,
     },
     /// How full the context window is. Never stored; the session keeps
     /// the latest values. `None` leaves a value unchanged.
@@ -1031,10 +1151,10 @@ pub enum AgentEventKind {
         tokens: Option<u64>,
         window: Option<u64>,
     },
-    /// The model Claude Code runs the session with. Never stored; the
+    /// The model the backend runs the session with. Never stored; the
     /// session keeps the latest.
     Model(String),
-    /// Grenadine couldn't run Claude Code, or it crashed.
+    /// Grenadine couldn't run the agent, or it crashed.
     Error(String),
     /// Wrapping up landed the session's work.
     Landed(Landed),
@@ -1042,7 +1162,7 @@ pub enum AgentEventKind {
     WrapUpFailed(String),
 }
 
-/// One hunk of the change a file tool made, as Claude Code reports it.
+/// One hunk of the change a file tool made, as the backend reports it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PatchHunk {
     /// The 1-based line the hunk starts on in the old file.

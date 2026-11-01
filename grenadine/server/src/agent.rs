@@ -1,9 +1,9 @@
-//! Claude Code sessions driven from the UI. Each session works in its own
-//! git worktree; every prompt runs one `claude -p` process that resumes
-//! the session and reads the prompt as a stream-json message, and its
-//! stream-json output becomes the session's transcript. Each prompt comes with a permission mode; Claude asks about
-//! the tool uses that the mode doesn't decide on its own through the MCP
-//! tool in `mcp.rs`, which waits for the user's answer from the page.
+//! Agent sessions driven from the UI. Each session works in its own git
+//! worktree; every prompt runs one turn with the session's backend (the
+//! Claude Code backend is in `claude.rs`), and the turn's output becomes
+//! the session's transcript. Each prompt comes with a permission mode;
+//! the backend asks about the tool uses that the mode doesn't decide on
+//! its own, and the user answers on the page.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::ffi::OsStrExt as _;
@@ -15,34 +15,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, GENERAL, Landed,
-    LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, PromptImage, ServerEvent, WrapUp,
-    WrapUpTarget,
+    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentSession, AgentStatus,
+    CostUnit, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage, ServerEvent,
+    WrapUp, WrapUpTarget,
 };
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{OnceCell, broadcast, oneshot};
+use serde_json::Value;
+use tokio::sync::{broadcast, oneshot};
 
+use crate::claude;
 use crate::git::Repo;
 use crate::reflow::reflow;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
 const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
-
-/// How long Claude Code waits for an MCP tool call, in milliseconds. The
-/// permission tool waits for a person, so make it the most Claude Code
-/// allows (about 24 days). 0 doesn't mean "never" here; it becomes 1s.
-const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
-
-/// How long Claude Code lets an MCP tool call go without a response or
-/// progress before it gives up, in milliseconds. It's 5 minutes for HTTP
-/// servers by default, which would cut off a person who's away from the
-/// page. 0 turns the check off.
-const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
-
-/// How much of claude's stderr is kept to explain a crash.
-const STDERR_TAIL: usize = 4096;
 
 /// The most images one prompt may come with.
 pub const MAX_IMAGES: usize = 20;
@@ -114,8 +100,8 @@ pub struct Decision {
 }
 
 pub struct Agents {
-    /// The `claude` executable.
-    claude: PathBuf,
+    /// The Claude Code backend.
+    claude: claude::Claude,
     /// Worktrees go to `<dir>/<owner>/<name>/<id>`.
     worktrees: PathBuf,
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
@@ -127,8 +113,6 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
-    /// The models Claude Code offers, once it has listed them.
-    models: OnceCell<Vec<AgentModelInfo>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether Haiku summarizes each new session's first prompt.
@@ -235,7 +219,7 @@ pub fn now() -> i64 {
 }
 
 /// Asks a process to stop the way Ctrl-C would.
-fn interrupt_pid(pid: u32) {
+pub(crate) fn interrupt_pid(pid: u32) {
     // SAFETY: kill has no memory-safety preconditions.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGINT);
@@ -529,17 +513,16 @@ impl Agents {
         summaries: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
-        // Claude Code runs in the worktrees, so a relative path would
+        // The backend runs in the worktrees, so a relative path would
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude,
+            claude: claude::Claude::new(claude),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
             slices,
             live: std::sync::Mutex::default(),
-            models: OnceCell::new(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
             terminals: crate::terminal::Terminals::default(),
@@ -554,7 +537,7 @@ impl Agents {
 
     /// The `claude` executable.
     pub fn claude(&self) -> &Path {
-        &self.claude
+        self.claude.exe()
     }
 
     /// Where the images sent with prompts go.
@@ -568,6 +551,20 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
+    /// Remembers the turn's process so it can be interrupted; returns
+    /// whether an interrupt came before the process existed.
+    pub(crate) fn set_pid(&self, id: &str, pid: u32) -> bool {
+        self.with_live(id, |l| {
+            l.pid = Some(pid);
+            l.interrupted
+        })
+    }
+
+    /// Whether the user stopped the current turn.
+    pub(crate) fn interrupted(&self, id: &str) -> bool {
+        self.with_live(id, |l| l.interrupted)
+    }
+
     /// The secret the session's MCP endpoint expects.
     pub fn secret(&self, id: &str) -> String {
         self.with_live(id, |l| l.secret.clone())
@@ -577,92 +574,32 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The models Claude Code offers, listed once and kept; none while it
-    /// can't list them.
-    pub async fn models(&self) -> Vec<AgentModelInfo> {
-        match self
-            .models
-            .get_or_try_init(|| list_models(&self.claude))
-            .await
-        {
-            Ok(models) => models.clone(),
-            Err(e) => {
-                tracing::warn!("listing Claude Code's models: {e:#}");
-                Vec::new()
-            }
-        }
+    /// What each backend offers sessions, for the pickers: Claude always,
+    /// its models empty when they can't be listed.
+    pub async fn backends(&self) -> Vec<AgentBackendInfo> {
+        vec![self.claude.info().await]
     }
 
-    /// Whether prompts may ask for `model`: Claude Code's default, or one
-    /// it lists.
-    pub async fn offers(&self, model: Option<&str>) -> bool {
+    /// Whether `backend` lets prompts ask for `model`: its default, or
+    /// one it lists.
+    pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
+        let models = match backend {
+            AgentBackend::Claude => self.claude.models().await,
+        };
         match model {
             None => true,
-            Some(m) => self.models().await.iter().any(|i| i.value == m),
+            Some(m) => models.iter().any(|i| i.value == m),
         }
     }
-}
 
-/// The `initialize` control request the Agent SDK starts with. Claude Code
-/// answers it without calling a model.
-const INITIALIZE: &str =
-    r#"{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}"#;
-
-/// Asks Claude Code for its models the way the Agent SDK does.
-async fn list_models(claude: &Path) -> Result<Vec<AgentModelInfo>> {
-    let mut child = tokio::process::Command::new(claude)
-        .args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--no-session-persistence",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("running {}", claude.display()))?;
-    // Stdin stays open until the answer is in, so claude waits for more.
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(format!("{INITIALIZE}\n").as_bytes())
-        .await?;
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let read = async {
-        while let Some(line) = lines.next_line().await? {
-            if let Some(models) = parse_models(&line) {
-                return Ok(models);
-            }
-        }
-        bail!("claude exited without listing its models")
-    };
-    let models = tokio::time::timeout(std::time::Duration::from_secs(30), read)
-        .await
-        .context("claude didn't list its models in time")?;
-    drop(stdin);
-    let _ = child.kill().await;
-    models
-}
-
-/// The models in the answer to `INITIALIZE`, if `line` is that answer.
-/// Entries that don't parse are skipped.
-fn parse_models(line: &str) -> Option<Vec<AgentModelInfo>> {
-    let v = serde_json::from_str::<Value>(line).ok()?;
-    let response = &v["response"];
-    if v["type"] != "control_response" || response["request_id"] != "models" {
-        return None;
-    }
-    Some(
-        response["response"]["models"]
-            .as_array()?
+    /// Whether `backend` has `mode` among its permission modes.
+    pub fn has_mode(&self, backend: AgentBackend, mode: &PermissionMode) -> bool {
+        backend
+            .info(Vec::new())
+            .modes
             .iter()
-            .filter_map(|m| serde_json::from_value(m.clone()).ok())
-            .collect(),
-    )
+            .any(|m| m.value == mode.as_str())
+    }
 }
 
 /// Stores an event (unless it's ephemeral) and sends it to open pages. The
@@ -714,6 +651,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
 
     let session = AgentSession {
         id: id.clone(),
+        backend: req.backend,
         repo: req.repo,
         pr: req.pr,
         title: title(&req.prompt),
@@ -723,7 +661,8 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         base_sha,
         status: AgentStatus::Idle,
         created_at: now(),
-        cost_usd: 0.0,
+        cost: 0.0,
+        cost_unit: CostUnit::Usd,
         context_tokens: None,
         context_window: None,
         model: None,
@@ -799,7 +738,7 @@ async fn add_worktree(
 }
 
 /// Queues a prompt; it runs once the turns before it are done, with
-/// `model` or else Claude Code's default.
+/// `model` or else the backend's default.
 pub fn send(
     state: &Arc<State>,
     id: &str,
@@ -833,7 +772,7 @@ pub fn send_with_images(
     }
 }
 
-/// Why Claude can't take `images`, if it can't.
+/// Why the agent can't take `images`, if it can't.
 pub fn check_images(images: &[PromptImage]) -> Option<String> {
     if images.len() > MAX_IMAGES {
         return Some(format!("a prompt can have at most {MAX_IMAGES} images"));
@@ -862,7 +801,7 @@ fn extension(media_type: &str) -> Option<&'static str> {
 }
 
 /// The media type of the image stored as `name`.
-fn media_type(name: &str) -> Option<&'static str> {
+pub(crate) fn media_type(name: &str) -> Option<&'static str> {
     let (_, ext) = name.rsplit_once('.')?;
     IMAGE_TYPES.iter().find(|(_, e)| *e == ext).map(|(t, _)| *t)
 }
@@ -914,35 +853,6 @@ pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The stream-json user message that gives Claude `prompt` with the images
-/// in `dir` named `images`. The text goes last: Claude Code only takes a
-/// prompt for a slash command when its last block is the command.
-async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<String> {
-    let mut content = Vec::new();
-    for name in images {
-        let bytes = tokio::fs::read(dir.join(name))
-            .await
-            .with_context(|| format!("can't read the image {name}"))?;
-        content.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type(name).unwrap_or("image/png"),
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            },
-        }));
-    }
-    if !prompt.trim().is_empty() {
-        content.push(json!({"type": "text", "text": prompt}));
-    }
-    let message = json!({
-        "type": "user",
-        "message": {"role": "user", "content": content},
-        "parent_tool_use_id": null,
-    });
-    Ok(format!("{message}\n"))
 }
 
 /// Stops the current turn and drops the queued prompts.
@@ -1495,14 +1405,6 @@ fn terminals_note(state: &State, id: &str) -> Option<String> {
     ))
 }
 
-/// The grenadine MCP server's tools that Claude may use without asking.
-const ALLOWED_TOOLS: [&str; 4] = [
-    "mcp__grenadine__list_terminals",
-    "mcp__grenadine__read_terminal",
-    "mcp__grenadine__wait_for_terminal",
-    "mcp__grenadine__show_image",
-];
-
 /// A PR's title and body for a commit with `message`. The body is
 /// rewrapped at 72 columns so GitHub's squash merge doesn't wrap it again.
 fn pr_text(message: &str) -> (String, String) {
@@ -1510,7 +1412,8 @@ fn pr_text(message: &str) -> (String, String) {
     (subject.trim().to_owned(), reflow(body.trim(), 72))
 }
 
-/// Runs one prompt and returns the status the session ends up in.
+/// Runs one prompt with the session's backend and returns the status the
+/// session ends up in.
 async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatus> {
     let Queued {
         prompt,
@@ -1533,204 +1436,128 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         tokio::fs::create_dir_all(&session.worktree).await?;
     }
 
-    let mcp = json!({
-        "mcpServers": {
-            "grenadine": {
-                "type": "http",
-                "url": format!("{}/mcp/{id}/{}", state.agents.base_url, state.agents.secret(id)),
-            }
-        }
-    });
+    let mcp_url = format!(
+        "{}/mcp/{id}/{}",
+        state.agents.base_url,
+        state.agents.secret(id)
+    );
     let notes: Vec<_> = [landed_note(&session), terminals_note(state, id)]
         .into_iter()
         .flatten()
         .collect();
-    // `systemd-run --scope` execs claude, so the PID stays claude's.
-    let mut cmd = if state.agents.slices {
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "--collect"])
-            .arg(format!("--slice={}", slice(id)))
-            .arg("--")
-            .arg(&state.agents.claude);
-        cmd
-    } else {
-        tokio::process::Command::new(&state.agents.claude)
+    let sink = TurnSink::new(state, id, &session.repo);
+    let turn = claude::Turn {
+        prompt: &prompt,
+        images: &images,
+        mode: &mode,
+        model,
+        mcp_url: &mcp_url,
+        notes: &notes,
     };
-    cmd.arg("-p");
-    if state.db.agent_started(id)? {
-        cmd.args(["--resume", id]);
-    } else {
-        cmd.args(["--session-id", id]);
+    match session.backend {
+        AgentBackend::Claude => claude::turn(state, &session, turn, sink).await,
     }
-    cmd.args([
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--permission-mode",
-        mode.as_str(),
-        "--permission-prompt-tool",
-        "mcp__grenadine__approve",
-    ])
-    .arg("--allowedTools")
-    .args(ALLOWED_TOOLS)
-    .arg("--mcp-config")
-    .arg(mcp.to_string())
-    .args(
-        (!notes.is_empty())
-            .then(|| notes.join("\n\n"))
-            .into_iter()
-            .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
-    )
-    .current_dir(&session.worktree)
-    .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
-    .env(
-        "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
-        MCP_TOOL_IDLE_TIMEOUT_MS,
-    )
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
-    if let Some(model) = model.filter(|m| m != "default") {
-        cmd.arg("--model").arg(model);
-    }
-    let input = user_message(&prompt, &state.agents.images.join(id), &images).await?;
-    // Keep claude out of the terminal's process group, like git in
-    // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
-    // SAFETY: setsid is async-signal-safe and the closure touches no
-    // memory outside the call.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("can't run {}", state.agents.claude.display()))?;
-    if let Some(pid) = child.id() {
-        // An interrupt that came before the process existed applies now.
-        if state.agents.with_live(id, |l| {
-            l.pid = Some(pid);
-            l.interrupted
-        }) {
-            interrupt_pid(pid);
-        }
-    }
-    // The prompt goes through stdin so that one starting with `-` isn't
-    // taken for a flag. If claude exits without reading it, its exit status
-    // and stderr below say why.
-    let mut stdin = child.stdin.take().unwrap();
-    if let Err(e) = stdin.write_all(input.as_bytes()).await
-        && e.kind() != std::io::ErrorKind::BrokenPipe
-    {
-        return Err(e.into());
-    }
-    drop(stdin);
+}
 
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
-        let text = String::from_utf8_lossy(&buf).trim().to_owned();
-        let start = text.len().saturating_sub(STDERR_TAIL);
-        let start = (start..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        text[start..].to_owned()
-    });
+/// What a backend's turn feeds its output into: the session's transcript
+/// and the bookkeeping that goes with it.
+pub struct TurnSink<'a> {
+    state: &'a State,
+    id: &'a str,
+    repo: &'a str,
+    /// Whether the turn ended, and successfully.
+    ended: Option<bool>,
+    /// The cost already added to the session's.
+    billed: f64,
+    /// Whether the last event shown ended the turn.
+    last_was_end: bool,
+    prs: OpenedPrs,
+}
 
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut ended = None;
-    // The cost already added to the session's, and whether the last event
-    // shown ended the turn.
-    let mut billed = 0.0;
-    let mut last_was_end = false;
-    let mut stopping = false;
-    let mut prs = OpenedPrs::default();
-    loop {
-        let line = tokio::select! {
-            line = lines.next_line() => line?,
-            _ = state.shutdown.cancelled(), if !stopping => {
-                stopping = true;
-                if let Some(pid) = child.id() {
-                    interrupt_pid(pid);
-                }
-                continue;
-            }
-        };
-        let Some(line) = line else { break };
-        match parse_line(&line) {
-            Parsed::Started { model } => {
-                state.db.set_agent_started(id)?;
-                // The window is only known once a turn's result reports it;
-                // the model's name doesn't tell, since Claude Code leaves
-                // `[1m]` off it.
-                if let Some(model) = model {
-                    state.db.set_agent_model(id, &model)?;
-                    emit(state, id, AgentEventKind::Model(model))?;
-                }
-            }
-            Parsed::Events(events) => {
-                for mut kind in events {
-                    store_images(state, id, &mut kind)?;
-                    if let AgentEventKind::Usage { tokens, window } = kind {
-                        record_usage(state, id, tokens, window)?;
-                        continue;
-                    }
-                    if let AgentEventKind::TurnEnded { error, cost_usd } = &kind {
-                        // The cost is the process's total so far, and a
-                        // process can report several results: one more for
-                        // each background task that finishes after the
-                        // answer.
-                        if let Some(cost) = cost_usd {
-                            state.db.add_agent_cost(id, cost - billed)?;
-                            billed = *cost;
-                        }
-                        let repeat = ended == Some(true) && last_was_end && error.is_none();
-                        ended = Some(error.is_none());
-                        if repeat {
-                            continue;
-                        }
-                    }
-                    last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
-                    let opened = prs.see(&session.repo, &kind);
-                    emit(state, id, kind)?;
-                    record_prs(state, id, &opened)?;
-                }
-            }
+impl<'a> TurnSink<'a> {
+    pub fn new(state: &'a State, id: &'a str, repo: &'a str) -> TurnSink<'a> {
+        TurnSink {
+            state,
+            id,
+            repo,
+            ended: None,
+            billed: 0.0,
+            last_was_end: false,
+            prs: OpenedPrs::default(),
         }
     }
-    let exit = child.wait().await?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    Ok(match ended {
-        Some(true) => AgentStatus::Idle,
-        Some(false) => AgentStatus::Failed,
-        None if state.agents.with_live(id, |l| l.interrupted) => {
-            emit(
-                state,
-                id,
-                AgentEventKind::TurnEnded {
-                    error: Some("interrupted".into()),
-                    cost_usd: None,
-                },
-            )?;
-            AgentStatus::Interrupted
+
+    /// The backend created (or resumed) its session, which later turns
+    /// resume by `backend_session_id`, with `model` if it's known.
+    pub fn started(&mut self, backend_session_id: &str, model: Option<String>) -> Result<()> {
+        self.state
+            .db
+            .set_backend_session(self.id, backend_session_id)?;
+        // The window is only known once a turn's result reports it; the
+        // model's name doesn't tell, since Claude Code leaves `[1m]` off
+        // it.
+        if let Some(model) = model {
+            self.state.db.set_agent_model(self.id, &model)?;
+            emit(self.state, self.id, AgentEventKind::Model(model))?;
         }
-        None => {
-            let mut message = format!("claude exited without finishing the turn ({exit})");
-            if !stderr.is_empty() {
-                message += &format!(":\n{stderr}");
+        Ok(())
+    }
+
+    /// Stores `kind` in the transcript the way a turn's events are kept:
+    /// images into the database, usage into the session's row, costs
+    /// billed and repeated turn ends suppressed.
+    pub fn event(&mut self, mut kind: AgentEventKind) -> Result<()> {
+        store_images(self.state, self.id, &mut kind)?;
+        if let AgentEventKind::Usage { tokens, window } = kind {
+            return record_usage(self.state, self.id, tokens, window);
+        }
+        if let AgentEventKind::TurnEnded { error, cost } = &kind {
+            // The cost is the process's total so far, and a process can
+            // report several results: one more for each background task
+            // that finishes after the answer.
+            if let Some(cost) = cost {
+                self.state.db.add_agent_cost(self.id, cost - self.billed)?;
+                self.billed = *cost;
             }
-            emit(state, id, AgentEventKind::Error(message))?;
-            AgentStatus::Failed
+            let repeat = self.ended == Some(true) && self.last_was_end && error.is_none();
+            self.ended = Some(error.is_none());
+            if repeat {
+                return Ok(());
+            }
         }
-    })
+        self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        let opened = self.prs.see(self.repo, &kind);
+        emit(self.state, self.id, kind)?;
+        record_prs(self.state, self.id, &opened)
+    }
+
+    /// How the turn went, without the backend's output: `unfinished`
+    /// explains a turn that never reported an end.
+    pub fn finish(
+        self,
+        interrupted: bool,
+        unfinished: impl FnOnce() -> String,
+    ) -> Result<AgentStatus> {
+        Ok(match self.ended {
+            Some(true) => AgentStatus::Idle,
+            Some(false) => AgentStatus::Failed,
+            None if interrupted => {
+                emit(
+                    self.state,
+                    self.id,
+                    AgentEventKind::TurnEnded {
+                        error: Some("interrupted".into()),
+                        cost: None,
+                    },
+                )?;
+                AgentStatus::Interrupted
+            }
+            None => {
+                emit(self.state, self.id, AgentEventKind::Error(unfinished()))?;
+                AgentStatus::Failed
+            }
+        })
+    }
 }
 
 /// The PRs that GitHub URLs in `text` point to.
@@ -1812,53 +1639,6 @@ fn record_prs(state: &State, id: &str, prs: &[PrKey]) -> Result<()> {
     Ok(())
 }
 
-/// What one line of `--output-format stream-json` means for the transcript.
-#[derive(Debug, PartialEq)]
-enum Parsed {
-    /// Claude Code created (or resumed) its session with `model`.
-    Started {
-        model: Option<String>,
-    },
-    Events(Vec<AgentEventKind>),
-}
-
-/// The text of a tool result, whose content is a string or a list of blocks.
-fn result_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|b| match b["type"].as_str() {
-                Some("text") => b["text"].as_str().unwrap_or_default().to_owned(),
-                Some(other) => format!("[{other}]"),
-                None => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
-/// The images in a tool result as `data:` URLs, which `store_images`
-/// replaces with ids before the result is stored.
-fn result_images(content: &Value) -> Vec<String> {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|b| b["type"] == "image" && b["source"]["type"] == "base64")
-        .filter_map(|b| {
-            let source = &b["source"];
-            Some(format!(
-                "data:{};base64,{}",
-                source["media_type"].as_str()?,
-                source["data"].as_str()?
-            ))
-        })
-        .collect()
-}
-
 /// Stores an image of session `id`'s transcript and returns its new id.
 pub fn store_image(state: &State, id: &str, mime: &str, data: &[u8]) -> Result<String> {
     let image = uuid();
@@ -1890,135 +1670,10 @@ fn store_images(state: &State, id: &str, kind: &mut AgentEventKind) -> Result<()
     Ok(())
 }
 
-/// The hunks of a file tool's `structuredPatch`, or none when the result
-/// has no patch.
-fn patch(result: &Value) -> Vec<PatchHunk> {
-    result["structuredPatch"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|h| {
-            Some(PatchHunk {
-                old_start: h["oldStart"].as_u64()? as usize,
-                new_start: h["newStart"].as_u64()? as usize,
-                lines: h["lines"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(|l| Some(l.as_str()?.to_owned()))
-                    .collect(),
-            })
-        })
-        .collect()
-}
-
-/// How many tokens the context holds after an assistant message.
-fn context_tokens(usage: &Value) -> Option<u64> {
-    if !usage.is_object() {
-        return None;
-    }
-    let fields = [
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    ];
-    Some(fields.iter().filter_map(|f| usage[f].as_u64()).sum())
-}
-
-/// Picks the parts of a stream-json line that the transcript shows. Lines
-/// of subagents (with a `parent_tool_use_id`) and unknown lines are
-/// skipped, so a newer Claude Code degrades to showing less.
-fn parse_line(line: &str) -> Parsed {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return Parsed::Events(Vec::new());
-    };
-    if !v["parent_tool_use_id"].is_null() {
-        return Parsed::Events(Vec::new());
-    }
-    let blocks = || v["message"]["content"].as_array().into_iter().flatten();
-    let events = match v["type"].as_str() {
-        Some("system") if v["subtype"] == "init" => {
-            let model = v["model"].as_str().unwrap_or_default();
-            return Parsed::Started {
-                model: (!model.is_empty()).then(|| model.to_owned()),
-            };
-        }
-        Some("stream_event") => {
-            let delta = &v["event"]["delta"];
-            match (v["event"]["type"].as_str(), delta["type"].as_str()) {
-                (Some("content_block_delta"), Some("text_delta")) => delta["text"]
-                    .as_str()
-                    .map(|t| AgentEventKind::TextDelta(t.to_owned()))
-                    .into_iter()
-                    .collect(),
-                _ => Vec::new(),
-            }
-        }
-        Some("assistant") => blocks()
-            .filter_map(|b| match b["type"].as_str()? {
-                "text" => Some(AgentEventKind::Text(b["text"].as_str()?.to_owned())),
-                "tool_use" => Some(AgentEventKind::ToolUse {
-                    id: b["id"].as_str()?.to_owned(),
-                    name: b["name"].as_str()?.to_owned(),
-                    input: b["input"].to_string(),
-                }),
-                _ => None,
-            })
-            .chain(
-                context_tokens(&v["message"]["usage"]).map(|tokens| AgentEventKind::Usage {
-                    tokens: Some(tokens),
-                    window: None,
-                }),
-            )
-            .collect(),
-        Some("user") => blocks()
-            .filter(|b| b["type"] == "tool_result")
-            .map(|b| AgentEventKind::ToolResult {
-                id: b["tool_use_id"].as_str().unwrap_or_default().to_owned(),
-                content: result_text(&b["content"]),
-                is_error: b["is_error"].as_bool().unwrap_or(false),
-                // A message carries one tool result, and its patch is
-                // beside it.
-                patch: patch(&v["tool_use_result"]),
-                images: result_images(&b["content"]),
-            })
-            .collect(),
-        Some("result") => {
-            let error = v["is_error"].as_bool().unwrap_or(false).then(|| {
-                v["result"]
-                    .as_str()
-                    .filter(|r| !r.is_empty())
-                    .or(v["subtype"].as_str())
-                    .unwrap_or("error")
-                    .to_owned()
-            });
-            // The main model has the largest window; subagents' may be
-            // smaller.
-            let window = v["modelUsage"]
-                .as_object()
-                .into_iter()
-                .flat_map(|m| m.values())
-                .filter_map(|m| m["contextWindow"].as_u64())
-                .max();
-            let usage = window.map(|w| AgentEventKind::Usage {
-                tokens: None,
-                window: Some(w),
-            });
-            usage
-                .into_iter()
-                .chain([AgentEventKind::TurnEnded {
-                    error,
-                    cost_usd: v["total_cost_usd"].as_f64(),
-                }])
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    Parsed::Events(events)
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -2030,17 +1685,18 @@ mod tests {
         assert!(!valid_id("../../etc"));
     }
 
-    /// The page sends permission modes as JSON; Claude Code gets them as
-    /// arguments. Both use its names.
+    /// Prompts carry the backend's mode names as strings; a message
+    /// without one is rejected.
     #[test]
     fn permission_modes() {
-        for mode in PermissionMode::ALL {
-            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
-            assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
-        }
         let msg: grenadine_core::api::AgentMessage =
-            serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();
-        assert_eq!(msg.permission_mode, PermissionMode::Manual);
+            serde_json::from_str(r#"{"prompt":"hi","permission_mode":"auto"}"#).unwrap();
+        assert_eq!(msg.permission_mode.as_str(), "auto");
+        assert_eq!(serde_json::to_value(&msg.permission_mode).unwrap(), "auto");
+        assert!(
+            serde_json::from_str::<grenadine_core::api::AgentMessage>(r#"{"prompt":"hi"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2048,142 +1704,6 @@ mod tests {
         assert_eq!(title("\n  Fix the bug  \nin detail"), "Fix the bug");
         assert_eq!(title(&"é".repeat(100)), format!("{}…", "é".repeat(80)));
         assert_eq!(title(""), "");
-    }
-
-    fn events(line: &str) -> Vec<AgentEventKind> {
-        match parse_line(line) {
-            Parsed::Events(e) => e,
-            Parsed::Started { .. } => panic!("{line} started a session"),
-        }
-    }
-
-    /// Lines as Claude Code 2.1 writes them, shortened.
-    #[test]
-    fn parses_stream_json() {
-        assert_eq!(
-            parse_line(
-                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
-            ),
-            Parsed::Started {
-                model: Some("claude-opus-4-6".into())
-            }
-        );
-        assert_eq!(
-            parse_line(
-                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
-            ),
-            Parsed::Started {
-                model: Some("claude-opus-4-6[1m]".into())
-            }
-        );
-        assert_eq!(
-            events(r#"{"type":"system","subtype":"hook_started","session_id":"s"}"#),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::TextDelta("Hel".into())]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}},"parent_tool_use_id":null}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"},{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/w/b.txt","content":"hello\n"},"caller":{"type":"direct"}}],"usage":{"input_tokens":3,"cache_creation_input_tokens":1000,"cache_read_input_tokens":40000,"output_tokens":500,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"s"}"#
-            ),
-            [
-                AgentEventKind::Text("Hello".into()),
-                AgentEventKind::ToolUse {
-                    id: "toolu_1".into(),
-                    name: "Write".into(),
-                    input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
-                },
-                AgentEventKind::Usage {
-                    tokens: Some(41_503),
-                    window: None,
-                },
-            ]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"No shell for you","is_error":true}]},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_1".into(),
-                content: "No shell for you".into(),
-                is_error: true,
-                patch: vec![],
-                images: vec![],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"a"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]}]},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_2".into(),
-                content: "a\n[image]".into(),
-                is_error: false,
-                patch: vec![],
-                images: vec!["data:image/png;base64,iVBO".into()],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_3","type":"tool_result","content":"Updated"}]},"parent_tool_use_id":null,"tool_use_result":{"filePath":"/w/a.rs","structuredPatch":[{"oldStart":4,"oldLines":2,"newStart":4,"newLines":2,"lines":[" a","-b","+c"]}]}}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_3".into(),
-                content: "Updated".into(),
-                is_error: false,
-                patch: vec![PatchHunk {
-                    old_start: 4,
-                    new_start: 4,
-                    lines: vec![" a".into(), "-b".into(), "+c".into()],
-                }],
-                images: vec![],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_9"}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.5,"modelUsage":{"claude-haiku-4-5":{"contextWindow":200000},"claude-opus-4-6":{"inputTokens":3,"contextWindow":1000000}}}"#
-            ),
-            [
-                AgentEventKind::Usage {
-                    tokens: None,
-                    window: Some(1_000_000),
-                },
-                AgentEventKind::TurnEnded {
-                    error: None,
-                    cost_usd: Some(0.5)
-                },
-            ]
-        );
-        assert_eq!(
-            events(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
-            [AgentEventKind::TurnEnded {
-                error: Some("error_during_execution".into()),
-                cost_usd: None
-            }]
-        );
-        assert_eq!(events("not json"), []);
     }
 
     /// A state whose agents run `script` as claude, with the git fixture's
@@ -2274,7 +1794,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             id,
             "what's this?".into(),
             names.clone(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         let events = wait_for_turns(&state, id, 2).await;
@@ -2306,65 +1826,6 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(!file.exists());
     }
 
-    /// Claude Code lists its models in its answer to `initialize`, as
-    /// 2.1 writes it, shortened.
-    #[tokio::test]
-    async fn lists_models() {
-        let fx = crate::git::tests::fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("log");
-        let script = format!(
-            r#"#!/bin/sh
-read -r request
-echo "$* | $request" >> {log}
-echo '{{"type":"system","subtype":"hook_started"}}'
-echo '{{"type":"control_response","response":{{"subtype":"success","request_id":"models","response":{{"commands":[],"models":[{{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)","description":"Opus 5.5"}},{{"value":"sonnet","displayName":"Sonnet 5.5","description":"Efficient","supportsEffort":true}},{{"displayName":"no value"}}]}}}}}}'
-"#,
-            log = log.display()
-        );
-        let state = state_with_claude(&fx, dir.path(), &script);
-        let models = state.agents.models().await;
-        assert_eq!(
-            models,
-            [
-                AgentModelInfo {
-                    value: "default".into(),
-                    display_name: "Default (recommended)".into(),
-                    description: "Opus 5.5".into(),
-                },
-                AgentModelInfo {
-                    value: "sonnet".into(),
-                    display_name: "Sonnet 5.5".into(),
-                    description: "Efficient".into(),
-                },
-            ]
-        );
-        assert!(state.agents.offers(None).await);
-        assert!(state.agents.offers(Some("sonnet")).await);
-        assert!(!state.agents.offers(Some("--help")).await);
-
-        // Claude Code is asked once, without a prompt or a session to keep.
-        let log = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            log,
-            format!(
-                "-p --input-format stream-json --output-format stream-json --verbose \
-                 --no-session-persistence | {INITIALIZE}\n"
-            )
-        );
-    }
-
-    /// Without a list, prompts can only go with Claude Code's default.
-    #[tokio::test]
-    async fn offers_only_the_default_without_models() {
-        let fx = crate::git::tests::fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
-        assert_eq!(state.agents.models().await, []);
-        assert!(state.agents.offers(None).await);
-        assert!(!state.agents.offers(Some("sonnet")).await);
-    }
-
     /// Reads the prompt's text from the stream-json message on stdin into
     /// `$prompt`, for fake claudes in shell. Only for text without quotes,
     /// backslashes or newlines, which JSON would escape.
@@ -2391,10 +1852,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "-first".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: Some("sonnet".into()),
                 images: Vec::new(),
             },
@@ -2412,7 +1874,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             &state,
             &session.id,
             "second".into(),
-            PermissionMode::Manual,
+            PermissionMode::from("manual"),
             None,
         );
         let transcript = wait_for_turns(&state, &session.id, 2).await;
@@ -2423,14 +1885,14 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 AgentEventKind::Text("Hi there".into()),
                 AgentEventKind::TurnEnded {
                     error: None,
-                    cost_usd: Some(0.25),
+                    cost: Some(0.25),
                 },
             ]
         };
         assert_eq!(transcript, [turn("-first"), turn("second")].concat());
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
-        assert_eq!(session.cost_usd, 0.5);
+        assert_eq!(session.cost, 0.5);
         assert_eq!(session.context_tokens, Some(15));
         assert_eq!(session.context_window, Some(200_000));
         assert_eq!(session.model.as_deref(), Some("claude-test"));
@@ -2512,10 +1974,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2526,7 +1989,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
 
         let ended = |cost| AgentEventKind::TurnEnded {
             error: None,
-            cost_usd: Some(cost),
+            cost: Some(cost),
         };
         assert_eq!(
             transcript,
@@ -2540,7 +2003,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         );
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
-        assert_eq!(session.cost_usd, 0.5);
+        assert_eq!(session.cost, 0.5);
     }
 
     /// A general session runs in an empty directory of its own, outside any
@@ -2560,10 +2023,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         );
         let state = state_with_claude(&fx, dir.path(), &script);
         let new = |pr| NewAgent {
+            backend: AgentBackend::Claude,
             repo: GENERAL.into(),
             pr,
             prompt: "what's a monad?".into(),
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
         };
@@ -2626,10 +2090,11 @@ esac
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "please write a note\nin notes.txt".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2693,10 +2158,11 @@ esac
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "Run the e2e tests".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2757,6 +2223,7 @@ esac
             grenadine_core::api::NewCleanupSession {
                 ids: vec![items[0].id],
                 repo: "owner/name".into(),
+                backend: AgentBackend::Claude,
                 model: None,
             },
         )
@@ -2791,6 +2258,7 @@ esac
             grenadine_core::api::NewCleanupSession {
                 ids: vec![items[0].id],
                 repo: "owner/name".into(),
+                backend: AgentBackend::Claude,
                 model: None,
             },
         )
@@ -2822,6 +2290,7 @@ cat {dir}/answer
 
         let session = AgentSession {
             id: "gone".into(),
+            backend: AgentBackend::Claude,
             repo: "owner/name".into(),
             pr: None,
             title: "Run the e2e tests".into(),
@@ -2831,7 +2300,8 @@ cat {dir}/answer
             base_sha: "s".into(),
             status: AgentStatus::Idle,
             created_at: 0,
-            cost_usd: 0.0,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
             context_tokens: None,
             context_window: None,
             model: None,
@@ -2944,10 +2414,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "build".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2970,6 +2441,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
         AgentSession {
             id: id.into(),
+            backend: AgentBackend::Claude,
             repo: repo.into(),
             pr: None,
             title: "t".into(),
@@ -2979,7 +2451,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             base_sha: "0".repeat(40),
             status: AgentStatus::Idle,
             created_at: now(),
-            cost_usd: 0.0,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
             context_tokens: None,
             context_window: None,
             model: None,
@@ -3125,10 +2598,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::default(),
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3143,7 +2617,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Failed);
         // Never started, so the next turn creates the session again.
-        assert!(!state.db.agent_started(&session.id).unwrap());
+        assert_eq!(state.db.backend_session(&session.id).unwrap(), None);
     }
 
     #[tokio::test]
@@ -3159,10 +2633,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::default(),
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3173,7 +2648,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             &session.id,
             "queued".into(),
-            PermissionMode::default(),
+            PermissionMode::from("auto"),
             None,
         );
         for _ in 0..100 {
@@ -3314,10 +2789,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: prompt.into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3332,7 +2808,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     async fn wrap(state: &Arc<State>, id: &str, target: WrapUpTarget) -> AgentEventKind {
         let req = WrapUp {
             target,
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
         };
         assert!(wrap_up(state, id, req).await);
@@ -3368,12 +2844,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit b more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         let req = || WrapUp {
             target: WrapUpTarget::Checkout,
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
         };
         assert!(wrap_up(&state, id, req()).await);
@@ -3421,7 +2897,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit b more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         wait_for_turns(&state, id, 3).await;
@@ -3526,7 +3002,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit c more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         // What's left uncommitted becomes a third commit.
@@ -3534,7 +3010,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "write d last".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         wait_for_turns(&state, id, 3).await;
@@ -3633,7 +3109,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             url: "https://github.com/owner/name/pull/24".into(),
         };
         record_landed(&state, id, &landed).unwrap();
-        send(&state, id, "what PR?".into(), PermissionMode::Auto, None);
+        send(
+            &state,
+            id,
+            "what PR?".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
         wait_for_turns(&state, id, 2).await;
         let args = args();
         let last = args
