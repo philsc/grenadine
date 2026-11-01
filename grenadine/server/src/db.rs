@@ -309,6 +309,15 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE cleanup_items ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- search_fetched and search_found record a truncated search: how
+    -- many hits were fetched out of how many GitHub found, NULL
+    -- otherwise.
+    ALTER TABLE inboxes ADD COLUMN search_fetched INTEGER;
+    ALTER TABLE inboxes ADD COLUMN search_found INTEGER;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -534,6 +543,22 @@ impl Db {
             .flatten())
     }
 
+    /// How much of the inbox's last search wasn't fetched, if it was
+    /// truncated.
+    pub fn inbox_truncation(&self, id: i64) -> Result<Option<grenadine_core::api::Truncation>> {
+        let row: Option<(Option<u32>, Option<u32>)> = self
+            .conn()
+            .query_row(
+                "SELECT search_fetched, search_found FROM inboxes WHERE id = ?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .and_then(|(f, n)| f.zip(n))
+            .map(|(fetched, found)| grenadine_core::api::Truncation { fetched, found }))
+    }
+
     pub fn create_inbox(&self, edit: &InboxEdit) -> Result<i64> {
         let conn = self.conn();
         let position = match edit.position {
@@ -569,11 +594,14 @@ impl Db {
 
     /// Records the outcome of an inbox's search. The rows reflect exactly
     /// the latest search, in rank order; a PR that is listed again keeps
-    /// its sync_error.
+    /// its sync_error. `truncated` says how much of the search GitHub
+    /// found that wasn't fetched; a failed search keeps the old rows and
+    /// the old truncation.
     pub fn set_inbox_results(
         &self,
         id: i64,
         result: std::result::Result<&[crate::github::Hit], &str>,
+        truncated: Option<grenadine_core::api::Truncation>,
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -623,7 +651,11 @@ impl Db {
                     args.push(&h.key.number);
                 }
                 tx.execute(&sql, rusqlite::params_from_iter(args))?;
-                tx.execute("UPDATE inboxes SET error = NULL WHERE id = ?", [id])?;
+                tx.execute(
+                    "UPDATE inboxes SET error = NULL, search_fetched = ?, search_found = ?
+                     WHERE id = ?",
+                    params![truncated.map(|t| t.fetched), truncated.map(|t| t.found), id],
+                )?;
             }
             // Keep the previous results; a transient error shouldn't empty
             // the inbox.
@@ -1563,6 +1595,7 @@ mod tests {
             },
             ci: Some(CiStatus::Failing),
             review_decision: Some(ReviewDecision::ChangesRequested),
+            facts: Default::default(),
         }
     }
 
@@ -1637,7 +1670,7 @@ mod tests {
             repo: "o/n".into(),
             number: 7,
         };
-        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
         // Listed, but not synced yet: the search's metadata shows.
         let prs = db.inbox_prs(1).unwrap();
@@ -1797,7 +1830,7 @@ mod tests {
             Some("boom")
         );
 
-        db.set_inbox_results(1, Err("bad filter")).unwrap();
+        db.set_inbox_results(1, Err("bad filter"), None).unwrap();
         assert_eq!(db.inbox_error(1).unwrap().as_deref(), Some("bad filter"));
         assert_eq!(db.inbox_prs(1).unwrap().len(), 1);
     }
@@ -1809,7 +1842,7 @@ mod tests {
             repo: "o/n".into(),
             number: 7,
         };
-        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
         db.store_sync_error(&key, "boom").unwrap();
         assert_eq!(
@@ -1818,7 +1851,7 @@ mod tests {
         );
 
         // Re-listing the same PR keeps the error.
-        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
         assert_eq!(
             db.inbox_prs(1).unwrap()[0].sync_error.as_deref(),
@@ -1859,7 +1892,7 @@ mod tests {
             repo: "o/n".into(),
             number: 7,
         };
-        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))))
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
         db.store_sync(&meta(&key), &[], &[], None, false, None)
             .unwrap();
@@ -1907,11 +1940,11 @@ mod tests {
             number: 7,
         };
         assert!(!db.in_any_inbox(&key).unwrap());
-        db.set_inbox_results(2, Ok(std::slice::from_ref(&hit(&key))))
+        db.set_inbox_results(2, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
         assert!(db.in_any_inbox(&key).unwrap());
         // A search that no longer reports the PR uncovers it again.
-        db.set_inbox_results(2, Ok(&[])).unwrap();
+        db.set_inbox_results(2, Ok(&[]), None).unwrap();
         assert!(!db.in_any_inbox(&key).unwrap());
     }
 
@@ -2003,6 +2036,25 @@ mod tests {
     }
 
     #[test]
+    fn truncation_round_trip() {
+        use grenadine_core::api::Truncation;
+        let db = Db::in_memory();
+        assert_eq!(db.inbox_truncation(1).unwrap(), None);
+        let t = Truncation {
+            fetched: 100,
+            found: 250,
+        };
+        db.set_inbox_results(1, Ok(&[]), Some(t)).unwrap();
+        assert_eq!(db.inbox_truncation(1).unwrap(), Some(t));
+        // A failed search keeps the truncation, like the rows.
+        db.set_inbox_results(1, Err("boom"), None).unwrap();
+        assert_eq!(db.inbox_truncation(1).unwrap(), Some(t));
+        // A complete search clears it.
+        db.set_inbox_results(1, Ok(&[]), None).unwrap();
+        assert_eq!(db.inbox_truncation(1).unwrap(), None);
+    }
+
+    #[test]
     fn migration_4_replaces_inboxes() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -2033,14 +2085,18 @@ mod tests {
         assert_eq!(listed, 0);
     }
 
-    /// The last migration moves `started` to `backend_session_id` and
-    /// renames `cost_usd`, keeping the rows' data.
+    /// The backends migration moves `started` to `backend_session_id`
+    /// and renames `cost_usd`, keeping the rows' data.
     #[test]
     fn migrates_agents_to_backends() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         // Stop before the backends migration, which moves `started`.
-        migrate(&mut conn, MIGRATIONS.len() - 2).unwrap();
+        let backends = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::Sql(sql) if sql.contains("DROP COLUMN started")))
+            .unwrap();
+        migrate(&mut conn, backends).unwrap();
         for (id, started) in [("started", 1), ("fresh", 0)] {
             conn.execute(
                 "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status,

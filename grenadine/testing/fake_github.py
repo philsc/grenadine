@@ -52,6 +52,8 @@ COMMENTED = "COMMENTED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
 # The name of the team whose members `team_review_requests` holds.
 TEAM = "Reviewers"
+DISMISSED = "DISMISSED"
+PENDING = "PENDING"
 
 OPEN = "OPEN"
 CLOSED = "CLOSED"
@@ -180,6 +182,13 @@ class PullRequest:
 
     def touch(self) -> None:
         self.updated_at = self.repo.gh.tick()
+
+    def submit_review(self, author: str, state: str) -> None:
+        """Adds a review by `author`. Like GitHub, submitting a review
+        removes the author's pending review request."""
+        self.reviews.append(Review(author, state))
+        self.review_requests.discard(author)
+        self.touch()
 
     def review_decision(self) -> str | None:
         """APPROVED or CHANGES_REQUESTED from each reviewer's latest
@@ -681,11 +690,24 @@ class FakeGitHub:
 
     def _root(self) -> dict[str, Any]:
         def search(
-            info: Any, type: str, query: str, first: int | None = None, **_: Any
+            info: Any,
+            type: str,
+            query: str,
+            first: int | None = None,
+            after: str | None = None,
+            **_: Any,
         ) -> Any:
-            hits = search_prs(self.prs(), query)[:first]
+            # The cursor is how many hits came before this page.
+            start = int(after) if after else 0
+            found = search_prs(self.prs(), query)
+            hits = found[start : start + (first or 100)]
+            end = start + len(hits)
             return {
-                "issueCount": len(hits),
+                "issueCount": len(found),
+                "pageInfo": {
+                    "hasNextPage": end < len(found),
+                    "endCursor": str(end),
+                },
                 "nodes": [self._pr_node(pr) for pr in hits],
             }
 
@@ -1015,6 +1037,7 @@ class FakeGitHub:
         return {
             "__typename": "Repository",
             "nameWithOwner": repo.slug,
+            "isArchived": False,
             "pullRequest": pull_request,
             "pullRequests": pull_requests,
             "object": object_,
@@ -1211,6 +1234,7 @@ class FakeGitHub:
             "timelineItems": timeline,
             "commits": commits,
             "reviewThreads": review_threads,
+            "isInMergeQueue": pr.queued,
             "reviewDecision": pr.review_decision(),
             "mergeStateStatus": pr.merge_state_status(),
             "viewerCanMergeAsAdmin": pr.can_merge_as_admin,
@@ -1353,10 +1377,16 @@ def _term(pr: PullRequest, term: str) -> bool:
         case "team-review-requested-user", _:
             return _me(value) in pr.team_review_requests
         case "reviewed-by", _:
-            return any(r.author == _me(value) for r in pr.reviews)
+            return any(
+                r.author == _me(value) and r.state != PENDING for r in pr.reviews
+            )
         case "review", "none":
-            # GitHub ignores comment-only reviews here.
-            return all(r.state == COMMENTED for r in pr.reviews)
+            # Only verdicts count; comments and dismissals don't.
+            return not any(r.state in (APPROVED, CHANGES_REQUESTED) for r in pr.reviews)
+        case "gr", _:
+            # gr: qualifiers are grenadine's own; one reaching the fake
+            # means the widening didn't drop it.
+            raise SearchError(f"a gr: qualifier reached GitHub: {term!r}")
         case "review", "approved":
             return pr.review_decision() == APPROVED
         case "review", "changes_requested":

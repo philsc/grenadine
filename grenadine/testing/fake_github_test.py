@@ -18,6 +18,7 @@ from grenadine.testing.fake_github import (
     CheckRun,
     FakeGitHub,
     PullRequest,
+    Review,
     SearchError,
     matches,
     search_prs,
@@ -121,15 +122,24 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 
 SEARCH_QUERY = """
 query($q0: String!, $q1: String!) {
+  viewer { login }
   s0: search(type: ISSUE_ADVANCED, query: $q0, first: 100) {
-    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner }
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid
       reviewThreads(first: 100) { totalCount nodes { isResolved } }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      isInMergeQueue reviewDecision repository { nameWithOwner isArchived }
+      reviews(first: 100) { nodes { author { login } state } }
+      reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } } } }
   }
   s1: search(type: ISSUE_ADVANCED, query: $q1, first: 100) {
-    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid repository { nameWithOwner }
+    issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { number title author { login } state isDraft url updatedAt headRefOid
       reviewThreads(first: 100) { totalCount nodes { isResolved } }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      isInMergeQueue reviewDecision repository { nameWithOwner isArchived }
+      reviews(first: 100) { nodes { author { login } state } }
+      reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } } } }
   }
 }
 """
@@ -562,6 +572,78 @@ class FakeGitHubTest(unittest.TestCase):
         )
         self.assertIn("Cannot delete", out["errors"][0]["message"])
         self.assertNotIn(pr.head, self.repo.deleted_branches)
+
+    def test_search_reports_facts_and_pages(self) -> None:
+        out = self.query(SEARCH_QUERY, q0="is:pr", q1="is:pr sort:created-asc")
+        self.assertEqual(out["data"]["viewer"], {"login": "me"})
+        s0 = out["data"]["s0"]
+        # issueCount is the total, not the page's size.
+        total = len(self.gh.prs())
+        self.assertEqual(s0["issueCount"], total)
+        self.assertFalse(s0["pageInfo"]["hasNextPage"])
+
+        pr = self.inboxes.prs["Ask me for a review"]
+        node = next(n for n in s0["nodes"] if n["number"] == pr.number)
+        self.assertFalse(node["isInMergeQueue"])
+        self.assertEqual(node["reviewDecision"], "REVIEW_REQUIRED")
+        self.assertEqual(
+            node["reviewRequests"],
+            {"nodes": [{"requestedReviewer": {"__typename": "User", "login": "me"}}]},
+        )
+        self.assertEqual(node["repository"]["isArchived"], False)
+
+        queued = self.inboxes.prs["Sit in the merge queue"]
+        node = next(n for n in s0["nodes"] if n["number"] == queued.number)
+        self.assertTrue(node["isInMergeQueue"])
+        self.assertEqual(node["reviewDecision"], "APPROVED")
+        self.assertEqual(
+            node["reviews"],
+            {"nodes": [{"author": {"login": "other"}, "state": "APPROVED"}]},
+        )
+
+        team = self.inboxes.prs["Ask my team for a review"]
+        node = next(n for n in s0["nodes"] if n["number"] == team.number)
+        self.assertEqual(
+            node["reviewRequests"]["nodes"][0]["requestedReviewer"]["__typename"],
+            "Team",
+        )
+
+        # A small page size paginates with cursors.
+        out = self.query(
+            "query($q: String!, $a: String) {"
+            " s: search(type: ISSUE_ADVANCED, query: $q, first: 3, after: $a) {"
+            "   issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number } } } }",
+            q="is:pr sort:created-asc",
+        )
+        page = out["data"]["s"]
+        seen = [n["number"] for n in page["nodes"]]
+        while page["pageInfo"]["hasNextPage"]:
+            out = self.query(
+                "query($q: String!, $a: String) {"
+                " s: search(type: ISSUE_ADVANCED, query: $q, first: 3, after: $a) {"
+                "   issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { number } } } }",
+                q="is:pr sort:created-asc",
+                a=page["pageInfo"]["endCursor"],
+            )
+            page = out["data"]["s"]
+            seen += [n["number"] for n in page["nodes"]]
+        self.assertEqual(len(seen), page["issueCount"])
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_gr_qualifiers_never_reach_the_fake(self) -> None:
+        pr = self.inboxes.prs["Get changes requested"]
+        with self.assertRaises(SearchError):
+            matches(pr, "gr:review:active")
+        with self.assertRaises(SearchError):
+            matches(pr, "-gr:review:active")
+
+    def test_dismissed_reviews(self) -> None:
+        pr = self.inboxes.prs["Get changes requested"]
+        self.assertTrue(matches(pr, "review:changes_requested"))
+        pr.reviews.append(Review("other", "DISMISSED"))
+        self.assertFalse(matches(pr, "review:changes_requested"))
+        # The change request still happened, so the PR isn't review:none.
+        self.assertFalse(matches(pr, "review:none"))
 
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')

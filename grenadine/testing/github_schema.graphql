@@ -166,6 +166,7 @@ enum SearchType {
 
 type SearchResultItemConnection {
   issueCount: Int!
+  pageInfo: PageInfo!
   nodes: [SearchResultItem]
 }
 
@@ -178,6 +179,7 @@ type Issue {
 
 type Repository {
   nameWithOwner: String!
+  isArchived: Boolean!
   pullRequest(number: Int!): PullRequest
   pullRequests(
     headRefName: String
@@ -260,6 +262,7 @@ type PullRequest {
   ): PullRequestTimelineItemsConnection!
   commits(first: Int, after: String, last: Int): PullRequestCommitConnection!
   reviewThreads(first: Int, after: String): PullRequestReviewThreadConnection!
+  isInMergeQueue: Boolean!
   reviewDecision: PullRequestReviewDecision
   mergeStateStatus: MergeStateStatus!
   viewerCanMergeAsAdmin: Boolean!

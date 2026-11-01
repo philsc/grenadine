@@ -9,6 +9,7 @@ mod db;
 mod devin;
 mod git;
 mod github;
+mod inbox_search;
 mod inboxes;
 mod mcp;
 mod reflow;

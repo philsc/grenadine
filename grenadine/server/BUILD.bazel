@@ -36,6 +36,7 @@ rust_binary(
     srcs = [
         "src/bin/validate_inboxes.rs",
         "src/github.rs",
+        "src/inbox_search.rs",
         "src/inboxes.rs",
     ],
     crate_root = "src/bin/validate_inboxes.rs",

@@ -95,7 +95,12 @@ fn InboxSection(
     let collapsed_key = format!("inbox-collapsed-{}", inbox.inbox.id);
     let collapsed = RwSignal::new(load_flag(&collapsed_key, false));
     let editing = RwSignal::new(false);
-    let InboxWithPrs { inbox, prs, error } = inbox;
+    let InboxWithPrs {
+        inbox,
+        prs,
+        error,
+        truncated,
+    } = inbox;
     let count = prs.len();
     let updates = expect_context::<Updates>();
 
@@ -146,6 +151,11 @@ fn InboxSection(
                 }
             })}
             {error.map(|e| view! { <p class="error inbox-error">{e}</p> })}
+            {truncated.map(|t| view! {
+                <p class="inbox-truncated">
+                    {format!("GitHub found {} PRs; grenadine fetched {}. Tighten the filter to see the rest.", t.found, t.fetched)}
+                </p>
+            })}
             <ul class="pr-list" class:hidden=move || collapsed.get()>
                 {if prs.is_empty() {
                     view! { <li class="muted none">"No PRs"</li> }.into_any()
@@ -358,7 +368,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             <label>"GitHub filter"
                 <input type="text" class="mono" prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
             </label>
-            <p class="hint muted">"is:pr and repo: qualifiers for the configured repositories are added automatically."</p>
+            <p class="hint muted">"is:pr and repo: qualifiers for the configured repositories are added automatically. gr: qualifiers, described in the README, are evaluated by grenadine."</p>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <button type="submit" class="primary">"Save"</button>

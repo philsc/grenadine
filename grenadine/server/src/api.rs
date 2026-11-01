@@ -147,15 +147,23 @@ async fn inboxes(AxState(state): St) -> ApiResult<Json<Vec<InboxWithPrs>>> {
         out.push(InboxWithPrs {
             prs: state.db.inbox_prs(inbox.id)?,
             error: state.db.inbox_error(inbox.id)?,
+            truncated: state.db.inbox_truncation(inbox.id)?,
             inbox,
         });
     }
     Ok(Json(out))
 }
 
-fn check_edit(edit: &InboxEdit) -> Result<(), (StatusCode, &'static str)> {
+fn check_edit(edit: &InboxEdit) -> Result<(), (StatusCode, String)> {
     if edit.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "the inbox needs a name"));
+        return Err((StatusCode::BAD_REQUEST, "the inbox needs a name".into()));
+    }
+    // A filter without gr: terms is GitHub's problem; one with them is
+    // parsed now so that a bad one fails the save.
+    if grenadine_core::filter::has_local_terms(&edit.filter)
+        && let Err(e) = grenadine_core::filter::parse(&edit.filter)
+    {
+        return Err((StatusCode::BAD_REQUEST, e));
     }
     Ok(())
 }
@@ -1301,6 +1309,7 @@ mod tests {
                         threads: Default::default(),
                         ci: None,
                         review_decision: None,
+                        facts: Default::default(),
                     },
                     crate::github::Hit {
                         key: key(8),
@@ -1314,8 +1323,10 @@ mod tests {
                         threads: Default::default(),
                         ci: None,
                         review_decision: None,
+                        facts: Default::default(),
                     },
                 ]),
+                None,
             )
             .unwrap();
         state
@@ -1538,7 +1549,9 @@ mod tests {
                     threads: Default::default(),
                     ci: None,
                     review_decision: None,
+                    facts: Default::default(),
                 }]),
+                None,
             )
             .unwrap();
         let response = pr(
