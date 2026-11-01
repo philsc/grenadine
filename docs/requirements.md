@@ -702,3 +702,23 @@ _Why:_ deleting a branch that other PRs target closes them.
 **REVIEW-MERGE-12.** When the PR targets another open PR's branch, the
 merge box must warn that merging puts its changes there, not into the
 branch the bottom of the stack targets.
+
+## Inboxes
+
+**REVIEW-INBOX-1.** Each PR in an inbox must show GitHub's review decision
+as an icon before its CI icon: a person with a check in green for
+approved, a file with a plus and a minus in red for changes requested and
+an eye in amber for review required, titled "Approved", "Changes
+requested" and "Review required" and coloured like the decision on the
+PR's page. The icons must not look like the CI or thread icons. A PR
+without a decision, or with one grenadine doesn't know, shows no icon.
+_Why:_ it tells at a glance which of one's PRs can be merged and which
+need work, without opening them.
+
+**REVIEW-INBOX-2.** The decision must come from the inbox search, like the
+thread count and the CI status, so that it costs no extra requests. Once
+a sync of the PR has read its reviews, the inbox must show that sync's
+decision instead.
+_Why:_ after the viewer reviews a PR from grenadine, its resync updates
+the decision right away, so the inbox agrees with the PR's page instead
+of lagging until the next search.

@@ -1,7 +1,9 @@
 //! The landing page: the list of inboxes, each with the PRs its filter
 //! matches. Inboxes can be added, edited, reordered and deleted in place.
 
-use grenadine_core::api::{CiStatus, Inbox, InboxEdit, InboxWithPrs, PrKey, ThreadCounts};
+use grenadine_core::api::{
+    CiStatus, Inbox, InboxEdit, InboxWithPrs, PrKey, ReviewDecision, ThreadCounts,
+};
 use grenadine_core::stack::{Link, group_inbox};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -195,6 +197,7 @@ fn InboxSection(
                                     </span>
                                     <span class="pr-status">
                                         {pr.threads.filter(|t| t.total > 0).map(|t| view! { <ThreadCount threads=t /> })}
+                                        {pr.review_decision.map(|d| view! { <ReviewIcon decision=d /> })}
                                         {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
                                     </span>
                                 </a>
@@ -234,6 +237,41 @@ fn ThreadCount(threads: ThreadCounts) -> impl IntoView {
             {format!("{resolved}/{total}")}
         </span>
     }
+}
+
+/// GitHub's review decision on the PR: approved, changes requested, or a
+/// review still required. Nothing for a decision grenadine doesn't know.
+#[component]
+fn ReviewIcon(decision: ReviewDecision) -> impl IntoView {
+    // Unlike CI's check and the threads' speech bubble: a person with a
+    // check, a file with a diff's plus and minus, and an eye.
+    let path = match decision {
+        ReviewDecision::Approved => {
+            "M6 7.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM1.5 13.5c0-2.5 2-4.5 4.5-4.5 1 0 1.9.3 2.6.8M9.5 12l1.5 1.5 3.5-4"
+        }
+        ReviewDecision::ChangesRequested => "M3.5 1.5h6l3 3v10h-9zM8 4.5v4M6 6.5h4M6 11.5h4",
+        ReviewDecision::ReviewRequired => {
+            "M1.5 8s2.5-4.5 6.5-4.5 6.5 4.5 6.5 4.5-2.5 4.5-6.5 4.5S1.5 8 1.5 8zM8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"
+        }
+        ReviewDecision::Unknown => return None,
+    };
+    Some(view! {
+        <span class=format!("review {}", decision.class()) title=decision.label()>
+            <svg
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                <path d=path />
+            </svg>
+        </span>
+    })
 }
 
 /// Whether the checks on the PR's head pass, fail or are still running.

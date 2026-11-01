@@ -60,6 +60,10 @@ pub struct PrSummary {
     /// when it has none or when unknown.
     #[serde(default)]
     pub ci: Option<CiStatus>,
+    /// GitHub's review decision as of the PR's last sync, or of the last
+    /// inbox search before the first sync. `None` when there's none.
+    #[serde(default)]
+    pub review_decision: Option<ReviewDecision>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

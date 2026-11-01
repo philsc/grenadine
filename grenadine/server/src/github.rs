@@ -54,6 +54,8 @@ pub struct Hit {
     pub threads: ThreadCounts,
     /// `None` when the head has no checks.
     pub ci: Option<CiStatus>,
+    /// `None` when GitHub has no decision.
+    pub review_decision: Option<ReviewDecision>,
 }
 
 /// Everything about a PR that its sync needs from GraphQL.
@@ -186,8 +188,9 @@ pub fn search_query(filter: &str, repos: &[String]) -> String {
 pub const SEARCH_LIMIT: usize = 100;
 
 /// What a search's PR fields are, beyond the PR's metadata: its review
-/// threads and the checks on its head.
-const SEARCH_STATUS_FIELDS: &str = "reviewThreads(first: 100) { totalCount nodes { isResolved } }
+/// decision, its review threads and the checks on its head.
+const SEARCH_STATUS_FIELDS: &str = "reviewDecision
+    reviewThreads(first: 100) { totalCount nodes { isResolved } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
 
 /// Maps a check run's `CheckStatusState` and `CheckConclusionState`.
@@ -401,6 +404,36 @@ fn review_error(errors: &[Value]) -> Option<String> {
                 .unwrap_or("unknown error")
                 .to_owned()
         })
+}
+
+/// A search's PR node as a hit.
+fn hit_from_node(n: &Value) -> Hit {
+    Hit {
+        key: PrKey {
+            repo: str_at(n, "/repository/nameWithOwner").to_owned(),
+            number: n["number"].as_u64().unwrap_or_default(),
+        },
+        title: str_at(n, "/title").to_owned(),
+        author: author_login(n).to_owned(),
+        state: str_at(n, "/state").to_owned(),
+        is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+        url: str_at(n, "/url").to_owned(),
+        updated_at: str_at(n, "/updatedAt").to_owned(),
+        head_oid: str_at(n, "/headRefOid").to_owned(),
+        threads: ThreadCounts {
+            // Only the first 100 threads say whether they're resolved;
+            // that's plenty in practice.
+            resolved: nodes(n, "/reviewThreads/nodes")
+                .filter(|t| t["isResolved"].as_bool() == Some(true))
+                .count() as u32,
+            total: n
+                .pointer("/reviewThreads/totalCount")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as u32,
+        },
+        ci: ci_status(str_at(n, "/commits/nodes/0/commit/statusCheckRollup/state")),
+        review_decision: review_decision(str_at(n, "/reviewDecision")),
+    }
 }
 
 /// The reviews, the conversation, the checks and the merge state from a
@@ -1077,31 +1110,7 @@ impl GitHub {
                 Ok(found
                     .iter()
                     .filter(|n| n.get("number").is_some())
-                    .map(|n| Hit {
-                        key: PrKey {
-                            repo: str_at(n, "/repository/nameWithOwner").to_owned(),
-                            number: n["number"].as_u64().unwrap_or_default(),
-                        },
-                        title: str_at(n, "/title").to_owned(),
-                        author: author_login(n).to_owned(),
-                        state: str_at(n, "/state").to_owned(),
-                        is_draft: n["isDraft"].as_bool().unwrap_or_default(),
-                        url: str_at(n, "/url").to_owned(),
-                        updated_at: str_at(n, "/updatedAt").to_owned(),
-                        head_oid: str_at(n, "/headRefOid").to_owned(),
-                        threads: ThreadCounts {
-                            // Only the first 100 threads say whether
-                            // they're resolved; that's plenty in practice.
-                            resolved: nodes(n, "/reviewThreads/nodes")
-                                .filter(|t| t["isResolved"].as_bool() == Some(true))
-                                .count() as u32,
-                            total: n
-                                .pointer("/reviewThreads/totalCount")
-                                .and_then(Value::as_u64)
-                                .unwrap_or_default() as u32,
-                        },
-                        ci: ci_status(str_at(n, "/commits/nodes/0/commit/statusCheckRollup/state")),
-                    })
+                    .map(hit_from_node)
                     .collect())
             })
             .collect())
@@ -1669,6 +1678,53 @@ mod tests {
             Some(ReviewDecision::ReviewRequired)
         );
         assert_eq!(review_decision("NEW"), Some(ReviewDecision::Unknown));
+    }
+
+    #[test]
+    fn search_hits() {
+        let node = json!({
+            "number": 7,
+            "title": "Fix it",
+            "author": { "login": "alice" },
+            "state": "OPEN",
+            "isDraft": false,
+            "url": "https://github.com/o/r/pull/7",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "headRefOid": "abc",
+            "repository": { "nameWithOwner": "o/r" },
+            "reviewDecision": "CHANGES_REQUESTED",
+            "reviewThreads": {
+                "totalCount": 3,
+                "nodes": [{ "isResolved": true }, { "isResolved": false }, { "isResolved": true }]
+            },
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
+        });
+        let hit = hit_from_node(&node);
+        assert_eq!(
+            hit.key,
+            PrKey {
+                repo: "o/r".into(),
+                number: 7
+            }
+        );
+        assert_eq!(hit.author, "alice");
+        assert_eq!(
+            hit.threads,
+            ThreadCounts {
+                resolved: 2,
+                total: 3
+            }
+        );
+        assert_eq!(hit.ci, Some(CiStatus::Passing));
+        assert_eq!(hit.review_decision, Some(ReviewDecision::ChangesRequested));
+
+        // GitHub has no decision for a PR nobody needs to review.
+        let mut node = node;
+        node["reviewDecision"] = Value::Null;
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = Value::Null;
+        let hit = hit_from_node(&node);
+        assert_eq!(hit.review_decision, None);
+        assert_eq!(hit.ci, None);
     }
 
     #[test]
