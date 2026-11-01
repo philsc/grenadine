@@ -384,6 +384,7 @@ fn parse_line(line: &str) -> Parsed {
                     id: b["id"].as_str()?.to_owned(),
                     name: b["name"].as_str()?.to_owned(),
                     input: b["input"].to_string(),
+                    parent: None,
                 }),
                 _ => None,
             })
@@ -568,6 +569,7 @@ mod tests {
                     id: "toolu_1".into(),
                     name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    parent: None,
                 },
                 AgentEventKind::Usage {
                     tokens: Some(41_503),

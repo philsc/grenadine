@@ -766,7 +766,7 @@ pub fn test_state_with_agents(
     Arc::new(State {
         agents: crate::agent::Agents::new(
             &db,
-            (claude, devin),
+            (claude, (devin, "swe".into(), "swe".into())),
             worktrees,
             "http://127.0.0.1:9".into(),
             false,

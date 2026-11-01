@@ -53,14 +53,35 @@ pub struct Devin {
     exe: PathBuf,
     /// The models Devin offers.
     models: ModelList,
+    /// The model summaries and scans run on.
+    summary_model: String,
+    /// The model prunes run on.
+    prune_model: String,
 }
 
 impl Devin {
-    pub fn new(exe: PathBuf) -> Devin {
+    pub fn new(exe: PathBuf, summary_model: String, prune_model: String) -> Devin {
         Devin {
             exe,
             models: ModelList::default(),
+            summary_model,
+            prune_model,
         }
+    }
+
+    /// The `devin` executable.
+    pub fn exe(&self) -> &Path {
+        &self.exe
+    }
+
+    /// The model summaries and scans run on.
+    pub fn summary_model(&self) -> &str {
+        &self.summary_model
+    }
+
+    /// The model prunes run on.
+    pub fn prune_model(&self) -> &str {
+        &self.prune_model
     }
 }
 
@@ -714,14 +735,15 @@ impl Updates {
     }
 
     /// The events one `session/update` means; updates of subagents are
-    /// skipped.
+    /// skipped, except their tool calls, which name the subagent.
     fn update(&mut self, u: &SessionUpdate) -> Vec<AgentEventKind> {
         let parent = u
             .meta()
             .and_then(|m| extension(m, "subagent_context"))
             .and_then(|c| c.get("parentAgentId"))
-            .and_then(Value::as_str);
-        if parent.is_some_and(|p| p != "root") {
+            .and_then(Value::as_str)
+            .filter(|p| *p != "root");
+        if parent.is_some() && !matches!(u, SessionUpdate::ToolCall(_)) {
             return Vec::new();
         }
         match u {
@@ -742,21 +764,25 @@ impl Updates {
                 } else {
                     call.raw_input.clone()
                 };
-                self.tools.lock().unwrap().insert(
-                    call.tool_call_id.clone(),
-                    Tool {
-                        name: name.clone(),
-                        title: call.title.clone(),
-                        input: input.clone(),
-                        content: String::new(),
-                    },
-                );
+                // A subagent's calls never get updates.
+                if parent.is_none() {
+                    self.tools.lock().unwrap().insert(
+                        call.tool_call_id.clone(),
+                        Tool {
+                            name: name.clone(),
+                            title: call.title.clone(),
+                            input: input.clone(),
+                            content: String::new(),
+                        },
+                    );
+                }
                 self.flush()
                     .into_iter()
                     .chain([AgentEventKind::ToolUse {
                         id: call.tool_call_id.clone(),
                         name,
                         input: input.to_string(),
+                        parent: parent.map(str::to_owned),
                     }])
                     .collect()
             }
@@ -1251,6 +1277,232 @@ async fn elicitation(
     acp.respond(&rpc_id, answer);
 }
 
+/// A structured-output background job for Devin: what it answers, what it
+/// may do and spend, and where.
+pub struct DevinJob<'a> {
+    /// What it's called in errors.
+    pub name: &'a str,
+    /// The model, e.g. claude-haiku-5-5-medium.
+    pub model: &'a str,
+    /// The JSON schema the reply must match.
+    pub schema: &'a Value,
+    /// The prompt's text.
+    pub input: &'a str,
+    /// The permission mode, e.g. "ask".
+    pub mode: &'a str,
+    /// Which exec commands get allowed; everything else is rejected.
+    pub allow: &'a (dyn Fn(&str) -> bool + Send + Sync),
+    /// What it may spend, in ACU.
+    pub budget_acu: f64,
+    /// Where it runs.
+    pub cwd: &'a Path,
+    /// How long it may take before it's killed.
+    pub timeout: Duration,
+}
+
+/// The JSON object in `reply`: the last fenced block's contents, else the
+/// text from the first `{` to the last `}`.
+fn parse_reply(name: &str, reply: &str) -> Result<Value> {
+    let reply = reply.trim();
+    let json = reply
+        .rsplit("```")
+        .nth(1)
+        .map(|s| s.trim_start_matches(['j', 's', 'o', 'n', '\n']).trim())
+        .unwrap_or(reply);
+    let json = match (json.find('{'), json.rfind('}')) {
+        (Some(a), Some(b)) if a <= b => &json[a..=b],
+        _ => bail!(
+            "the {name} didn't reply with JSON: {}",
+            crate::cleanup::cut(reply, 300)
+        ),
+    };
+    serde_json::from_str(json).with_context(|| {
+        format!(
+            "the {name} didn't reply with JSON: {}",
+            crate::cleanup::cut(reply, 300)
+        )
+    })
+}
+
+/// Runs `job` as a `devin acp` session and returns its reply parsed as
+/// `job.schema`. The job's session is deleted, on every way out, so it
+/// doesn't stay in the user's Devin history.
+pub async fn structured(devin: &Path, job: &DevinJob<'_>) -> Result<Value> {
+    let mut cmd = tokio::process::Command::new(devin);
+    cmd.arg("acp").current_dir(job.cwd);
+    let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
+    let (result, session) = run_job(&mut rpc, job).await;
+    if let Some(session) = session {
+        // The session only existed for the job; it doesn't belong in the
+        // user's history. A hung delete doesn't keep the job.
+        let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
+        let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
+    }
+    rpc.kill().await;
+    result
+}
+
+/// What a job tracks while its prompt runs.
+struct JobRun<'a> {
+    job: &'a DevinJob<'a>,
+    /// Devin's session id.
+    session: String,
+    /// The root's text, reset when it starts a tool call.
+    text: String,
+    /// What it has spent, in ACU.
+    acu: f64,
+    /// The commands of the root's exec calls, by tool call id.
+    execs: HashMap<String, String>,
+}
+
+impl JobRun<'_> {
+    /// Takes what devin sent while the prompt ran; an error once the job
+    /// has gone over its budget.
+    fn handle(&mut self, acp: &Arc<Acp>, m: Incoming) -> Result<()> {
+        match m {
+            Incoming::Notification(n) if n.method == "session/update" => {
+                if let Ok(n) = serde_json::from_value::<SessionNotification>(n.params) {
+                    self.update(n.update);
+                }
+            }
+            Incoming::Request(r) => self.request(acp, r),
+            Incoming::Notification(_) | Incoming::Response(_) => {}
+        }
+        if self.acu > self.job.budget_acu {
+            acp.notify("session/cancel", json!({"sessionId": self.session}));
+            bail!(
+                "the {} went over its budget of {} ACU",
+                self.job.name,
+                self.job.budget_acu
+            );
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, u: SessionUpdate) {
+        let parent = u
+            .meta()
+            .and_then(|m| extension(m, "subagent_context"))
+            .and_then(|c| c.get("parentAgentId"))
+            .and_then(Value::as_str);
+        if parent.is_some_and(|p| p != "root") {
+            return;
+        }
+        match u {
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text },
+                ..
+            } => self.text += &text,
+            SessionUpdate::ToolCall(call) => {
+                // Whatever came before wasn't the final answer.
+                self.text.clear();
+                if extension(&call.meta, "inferenceToolName").and_then(Value::as_str)
+                    == Some("exec")
+                {
+                    let command = call.raw_input["command"].as_str().unwrap_or_default();
+                    self.execs.insert(call.tool_call_id, command.to_owned());
+                }
+            }
+            SessionUpdate::UsageUpdate(usage) => {
+                if let Some(total) = extension(&usage.meta, "totalAcuCost").and_then(Value::as_f64)
+                {
+                    self.acu = total;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Allows an exec whose command the job allows, rejects every other
+    /// permission request, and declines questions.
+    fn request(&mut self, acp: &Arc<Acp>, r: Request) {
+        match r.method.as_str() {
+            "session/request_permission" => match parse::<PermissionRequest>(r.params) {
+                Ok(p) => {
+                    let call = &p.tool_call.tool_call_id;
+                    let command = extension(&p.tool_call.meta, "editableCommand")
+                        .and_then(Value::as_str)
+                        .or(self.execs.get(call).map(String::as_str));
+                    let kind = match command {
+                        Some(c) if self.execs.contains_key(call) && (self.job.allow)(c) => {
+                            ApprovalKind::AllowOnce
+                        }
+                        _ => ApprovalKind::RejectOnce,
+                    };
+                    let option = first_option(&permission_options(&p), kind);
+                    acp.respond(&r.id, permission_outcome(option));
+                }
+                Err(e) => acp.respond_error(&r.id, -32602, &format!("{e}")),
+            },
+            "elicitation/create" => acp.respond(&r.id, json!({"action": "decline"})),
+            _ => acp.respond_error(&r.id, -32601, "unknown method"),
+        }
+    }
+}
+
+/// The job's outcome, beside the session id it got to.
+async fn run_job(rpc: &mut Rpc, job: &DevinJob<'_>) -> (Result<Value>, Option<String>) {
+    let mut session = None;
+    let result = tokio::time::timeout(job.timeout, async {
+        rpc.call("initialize", initialize_params(), |_, _| Ok(()))
+            .await?;
+        let result = rpc
+            .call(
+                "session/new",
+                json!({"cwd": job.cwd, "mcpServers": []}),
+                |_, _| Ok(()),
+            )
+            .await?;
+        let created: NewSessionResponse = parse(result)?;
+        session = Some(created.session_id.clone());
+        let id = created.session_id;
+        rpc.call(
+            "session/set_config_option",
+            json!({"sessionId": id, "configId": "model", "value": job.model}),
+            |_, _| Ok(()),
+        )
+        .await?;
+        rpc.call(
+            "session/set_mode",
+            json!({"sessionId": id, "modeId": job.mode}),
+            |_, _| Ok(()),
+        )
+        .await?;
+        let mut run = JobRun {
+            job,
+            session: id.clone(),
+            text: String::new(),
+            acu: 0.0,
+            execs: HashMap::new(),
+        };
+        let prompt = format!(
+            "{}\n\nReply with only a JSON object, no other text, that matches this JSON schema:\n{}",
+            job.input,
+            serde_json::to_string_pretty(job.schema).unwrap_or_default()
+        );
+        let result = rpc
+            .call(
+                "session/prompt",
+                json!({"sessionId": id, "prompt": [{"type": "text", "text": prompt}]}),
+                |acp, m| run.handle(acp, m),
+            )
+            .await?;
+        match parse::<PromptResponse>(result)?.stop_reason.as_str() {
+            "end_turn" => parse_reply(job.name, &run.text),
+            r => bail!("the {} stopped: {r}", job.name),
+        }
+    })
+    .await;
+    let result = result.unwrap_or_else(|_| {
+        Err(anyhow!(
+            "the {} took longer than {}s",
+            job.name,
+            job.timeout.as_secs()
+        ))
+    });
+    (result, session)
+}
+
 /// The fake `devin acp` in //grenadine/testing, set up in `dir` to play
 /// `scenario` (see fake_devin.py); what the client sends goes to
 /// `dir/devin_log`. Returns the executable to run as devin.
@@ -1330,6 +1582,7 @@ mod tests {
                     id: "exec:0#abc".into(),
                     name: "Bash".into(),
                     input: r#"{"command":"echo hi"}"#.into(),
+                    parent: None,
                 },
                 AgentEventKind::ToolResult {
                     id: "exec:0#abc".into(),
@@ -1549,6 +1802,7 @@ mod tests {
                 id: "exit_plan_mode:0#f".into(),
                 name: "ExitPlanMode".into(),
                 input: r##"{"plan":"# The plan\n\nDo the thing.\n"}"##.into(),
+                parent: None,
             }
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1563,6 +1817,7 @@ mod tests {
                 id: "exit_plan_mode:0#g".into(),
                 name: "ExitPlanMode".into(),
                 input: r#"{"plan":"summary"}"#.into(),
+                parent: None,
             }
         );
     }
@@ -1774,5 +2029,205 @@ mod tests {
         assert_eq!(devin.default_mode(), "accept-edits");
         assert_eq!(devin.after_plan(), ["accept-edits", "bypass"]);
         assert_eq!(devin.cost_unit(), grenadine_core::api::CostUnit::Acu);
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    /// A session/update step with a chunk of the answer.
+    fn chunk(text: &str) -> Value {
+        json!({"update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }})
+    }
+
+    /// The steps that start an exec of `command` as `call` and ask
+    /// permission for it.
+    fn exec_asking(call: &str, command: &str) -> [Value; 2] {
+        [
+            json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": call,
+                "rawInput": {"command": command},
+                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+            }}),
+            json!({
+                "request": "session/request_permission",
+                "params": {
+                    "sessionId": "job-s",
+                    "toolCall": {"toolCallId": call},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            }),
+        ]
+    }
+
+    /// A fake devin whose prompts take `steps`.
+    fn fake_job(dir: &Path, steps: Vec<Value>) -> PathBuf {
+        fake(
+            dir,
+            json!({"session_id": "job-s", "prompts": [{"steps": steps}]}),
+        )
+    }
+
+    fn job(dir: &Path) -> DevinJob<'_> {
+        static SCHEMA: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({"type": "object"}));
+        DevinJob {
+            name: "job",
+            model: "swe-2-high",
+            schema: &SCHEMA,
+            input: "do it",
+            mode: "ask",
+            allow: &|c| c.starts_with("ls"),
+            budget_acu: 1.0,
+            cwd: dir,
+            timeout: Duration::from_secs(20),
+        }
+    }
+
+    /// The methods the client sent the fake devin in `dir`, in order.
+    fn methods(dir: &Path) -> Vec<String> {
+        fake_log(dir)
+            .iter()
+            .filter_map(|m| m["method"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A job: the session id rides on every call, the reply is parsed,
+    /// and the session is deleted afterwards.
+    #[tokio::test]
+    async fn a_job_runs_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(
+            dir.path(),
+            vec![chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})],
+        );
+        let out = structured(&exe, &job(dir.path())).await.unwrap();
+        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(
+            methods(dir.path()),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_mode",
+                "session/prompt",
+                "session/delete",
+            ]
+        );
+        let log = fake_log(dir.path());
+        for m in &log[2..] {
+            assert_eq!(m["params"]["sessionId"], "job-s", "{m}");
+        }
+        assert_eq!(log[2]["params"]["value"], "swe-2-high");
+        assert_eq!(log[3]["params"]["modeId"], "ask");
+    }
+
+    /// Over budget: session/cancel goes out and the error says so.
+    #[tokio::test]
+    async fn over_budget_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(
+            dir.path(),
+            vec![
+                json!({"update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 1,
+                    "size": 2,
+                    "_meta": {"cognition.ai/totalAcuCost": 2.5},
+                }}),
+                json!({"end": "end_turn"}),
+            ],
+        );
+        let e = structured(&exe, &job(dir.path())).await.unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
+        let methods = methods(dir.path());
+        assert!(
+            methods.contains(&"session/cancel".to_owned()),
+            "{methods:?}"
+        );
+        assert_eq!(methods.last().unwrap(), "session/delete");
+    }
+
+    /// An exec the allowlist passes gets allow_once, one it doesn't gets
+    /// reject_once, and an elicitation is declined.
+    #[tokio::test]
+    async fn answers_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut steps = Vec::new();
+        steps.extend(exec_asking("t1", "ls -la"));
+        steps.extend(exec_asking("t2", "rm -rf /"));
+        steps.push(json!({
+            "request": "elicitation/create",
+            "params": {"sessionId": "job-s", "message": "pick"},
+        }));
+        steps.push(chunk(r#"{"a": 1}"#));
+        steps.push(json!({"end": "end_turn"}));
+        let exe = fake_job(dir.path(), steps);
+        let out = structured(&exe, &job(dir.path())).await.unwrap();
+        assert_eq!(out, json!({"a": 1}));
+        let log = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
+        assert!(log.contains("allow_once"), "{log}");
+        assert!(log.contains("reject_once"), "{log}");
+        assert!(log.contains("decline"), "{log}");
+    }
+
+    /// A devin that never answers the prompt: timeout, and the session's
+    /// delete is still attempted.
+    #[tokio::test]
+    async fn times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), Vec::new());
+        let mut job = job(dir.path());
+        job.timeout = Duration::from_millis(500);
+        let e = structured(&exe, &job).await.unwrap_err();
+        assert!(format!("{e:#}").contains("took longer"), "{e:#}");
+        assert_eq!(methods(dir.path()).last().unwrap(), "session/delete");
+    }
+
+    /// A subagent's tool call becomes a ToolUse with its parent, and isn't
+    /// remembered for results.
+    #[test]
+    fn a_subagents_call_names_its_parent() {
+        let mut u = Updates::new();
+        let events = u.update(&serde_json::from_str(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"exec:0#a6e9","rawInput":{"command":"ls"},"_meta":{"cognition.ai/inferenceToolName":"exec","cognition.ai/subagent_context":{"parentAgentId":"a6e974a3"}}}"#,
+        ).unwrap());
+        assert_eq!(
+            events,
+            [AgentEventKind::ToolUse {
+                id: "exec:0#a6e9".into(),
+                name: "Bash".into(),
+                input: r#"{"command":"ls"}"#.into(),
+                parent: Some("a6e974a3".into()),
+            }]
+        );
+        assert!(u.update(&serde_json::from_str(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#a6e9","status":"completed","content":[{"type":"content","content":{"type":"text","text":"x"}}],"_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a6e974a3"}}}"#,
+        ).unwrap()).is_empty());
+    }
+
+    /// The reply parser takes the last fenced block, a bare object, or
+    /// the object in prose, and fails on garbage.
+    #[test]
+    fn extracts_the_json_reply() {
+        let fenced = "Here you go.\n```json\n{\"a\": 1}\n```\nDone.";
+        assert_eq!(parse_reply("t", fenced).unwrap(), json!({"a": 1}));
+        assert_eq!(
+            parse_reply("t", "the answer\n{\"a\": 2}\n").unwrap(),
+            json!({"a": 2})
+        );
+        assert_eq!(
+            parse_reply("t", "sure {\"a\": 3} cheers").unwrap(),
+            json!({"a": 3})
+        );
+        assert!(parse_reply("t", "no json here").is_err());
     }
 }

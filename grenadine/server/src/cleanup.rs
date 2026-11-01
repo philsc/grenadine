@@ -27,7 +27,25 @@ use crate::sync::State;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What a scan may spend, in USD.
+/// `s` with its `{}` placeholders filled, in order.
+trait Format {
+    fn format(&self, args: &[&str]) -> String;
+}
+
+impl Format for str {
+    fn format(&self, args: &[&str]) -> String {
+        let mut out = self.to_owned();
+        for arg in args {
+            out = out.replacen("{}", arg, 1);
+        }
+        out
+    }
+}
+
 const SCAN_BUDGET_USD: &str = "2.00";
+
+/// What a Devin scan may spend, in ACU.
+const SCAN_BUDGET_ACU: f64 = 1.0;
 
 /// How often the cleanup items are checked for stale ones.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -37,6 +55,9 @@ const PRUNE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What a check for stale items may spend, in USD.
 const PRUNE_BUDGET_USD: &str = "1.00";
+
+/// What a Devin prune may spend, in ACU.
+const PRUNE_BUDGET_ACU: f64 = 0.5;
 
 /// About how much of the transcript a scan gets, in bytes. Its beginning
 /// and end are kept, and the full transcript is there to read.
@@ -93,12 +114,10 @@ outside the worktree (in /tmp, the home directory, caches); other git \
 worktrees or clones; branches or tags pushed to remotes; installed packages \
 or tools; systemd units, cron jobs or background services.
 
-Work from the transcript digest below. Use tools only to read the full \
-transcript, when the digest is cut short or leaves out what subagents did, \
-or to check whether something still exists. You can only look; never try \
+Work from the transcript digest below. {} You can only look; never try \
 to change or remove anything.
 
-Leave out things inside the worktree, Bazel's shared caches, Claude Code's \
+Leave out things inside the worktree, Bazel's shared caches, {}'s \
 own files, and things the session removed again itself. Report each finding \
 with a one-line title and a markdown detail that names exactly what it is \
 and where, quotes the evidence from the transcript, and says how to remove \
@@ -121,14 +140,31 @@ fn where_note(repo: &str, clone: Option<&Path>) -> String {
     }
 }
 
+/// Whether `cmd` is one of the read-only commands the cleanup jobs may
+/// run, from `ALLOWED_TOOLS`' `Bash(prefix:*)` entries.
+pub(crate) fn allowed_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd
+        .chars()
+        .any(|c| matches!(c, '|' | '&' | ';' | '>' | '<' | '`' | '\n'))
+        || cmd.contains("$(")
+    {
+        return false;
+    }
+    ALLOWED_TOOLS
+        .iter()
+        .filter_map(|t| t.strip_prefix("Bash(").and_then(|t| t.strip_suffix(":*)")))
+        .any(|prefix| cmd == prefix || cmd.starts_with(&format!("{prefix} ")))
+}
+
 const PRUNE_INSTRUCTIONS: &str = "\
 Scans of deleted coding agent sessions reported the cleanup items below as \
 things the sessions may have left behind on this machine or on remotes. \
 Some of them may be stale: the thing no longer exists, it was cleaned up \
 already (for example by the cleanup session an item was handed off to), or \
 it isn't something to clean up after all (for example it was inside the \
-session's worktree, which is removed, or it's a shared cache, or Claude \
-Code's own files).
+session's worktree, which is removed, or it's a shared cache, or {}'s \
+own files).
 
 Find the items that can be deleted from the list. Check with the tools \
 whether each thing still exists rather than guessing from its description. \
@@ -256,17 +292,32 @@ async fn run(
     } else {
         format!("on {} in the worktree {}", session.repo, session.worktree)
     };
+    let (instructions, tool_note) = match session.backend {
+        AgentBackend::Claude => (
+            INSTRUCTIONS.format(&[
+                "Use tools only to read the full transcript, when the digest is cut short or leaves out what subagents did, or to check whether something still exists.",
+                "Claude Code",
+            ]),
+            where_note(&session.repo, clone.as_deref()),
+        ),
+        AgentBackend::Devin => (
+            INSTRUCTIONS.format(&[
+                "Use tools only to check whether something still exists.",
+                "Devin",
+            ]),
+            where_note(&session.repo, clone.as_deref()),
+        ),
+    };
     let mut input = format!(
-        "{INSTRUCTIONS}\n\n{TOOL_NOTES} {}\n\n\
+        "{instructions}\n\n{TOOL_NOTES} {tool_note}\n\n\
          The session \u{201c}{}\u{201d} worked {place}.\n",
-        where_note(&session.repo, clone.as_deref()),
         session.title,
     );
-    if transcript.exists() {
+    if session.backend == AgentBackend::Claude && transcript.exists() {
         input += &format!("Its full transcript is {}.\n", transcript.display());
     }
     input += "\n# Transcript digest\n\n";
-    input += &digest(events);
+    input += &digest(events, session.backend.agent_name());
 
     let schema = json!({
         "type": "object",
@@ -286,16 +337,43 @@ async fn run(
         "required": ["items"],
     });
     let projects = transcript.parent().filter(|_| transcript.exists());
-    let output = ask(
-        state,
-        &SCAN,
-        &session.id,
-        &schema,
-        &input,
-        clone.as_deref(),
-        projects,
-    )
-    .await?;
+    let output = match session.backend {
+        AgentBackend::Claude => {
+            ask(
+                state,
+                &SCAN,
+                &session.id,
+                &schema,
+                &input,
+                clone.as_deref(),
+                projects,
+            )
+            .await?
+        }
+        AgentBackend::Devin => {
+            // A scan in the clone loads that repo's Devin rules and
+            // hooks; Devin has no `setting-sources` to switch off.
+            let cwd = clone.as_deref().map(|c| c.to_path_buf());
+            let dir = scan_dir(&session.id)?;
+            let result = crate::devin::structured(
+                state.agents.devin(),
+                &crate::devin::DevinJob {
+                    name: "scan",
+                    model: state.agents.devin_summary_model(),
+                    schema: &schema,
+                    input: &input,
+                    mode: "ask",
+                    allow: &allowed_command,
+                    budget_acu: SCAN_BUDGET_ACU,
+                    cwd: cwd.as_deref().unwrap_or(&dir),
+                    timeout: SCAN_TIMEOUT,
+                },
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&dir);
+            result?
+        }
+    };
     parse_items(&output)
 }
 
@@ -403,15 +481,24 @@ pub async fn prune_loop(state: Arc<State>) {
 /// repo in its clone, and doesn't run Sonnet when there are no items.
 pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     let items = state.db.cleanup_items()?;
-    let mut by_clone: BTreeMap<Option<PathBuf>, Vec<&CleanupItem>> = BTreeMap::new();
+    let mut by_group: BTreeMap<(&'static str, Option<PathBuf>), Vec<&CleanupItem>> =
+        BTreeMap::new();
     for item in &items {
         let clone = state.repo(&item.repo).map(|r| r.path);
-        by_clone.entry(clone).or_default().push(item);
+        by_group
+            .entry((item.backend.as_str(), clone))
+            .or_default()
+            .push(item);
     }
     let mut deleted = 0;
     let mut failed = None;
-    for (clone, items) in by_clone {
-        match prune_in(state, clone.as_deref(), &items).await {
+    for ((backend_key, clone), items) in by_group {
+        let backend = AgentBackend::parse(backend_key).unwrap_or_default();
+        if backend == AgentBackend::Devin && !state.agents.offers(AgentBackend::Devin, None).await {
+            tracing::warn!("Devin isn't offered, skipping its cleanup items");
+            continue;
+        }
+        match prune_in(state, backend, clone.as_deref(), &items).await {
             Ok(n) => deleted += n,
             Err(e) => failed = Some(e),
         }
@@ -427,10 +514,16 @@ pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
 
 /// Asks Sonnet, in `clone`, which of `items` are stale, deletes those and
 /// returns how many it deleted.
-async fn prune_in(state: &State, clone: Option<&Path>, items: &[&CleanupItem]) -> Result<usize> {
+async fn prune_in(
+    state: &State,
+    backend: AgentBackend,
+    clone: Option<&Path>,
+    items: &[&CleanupItem],
+) -> Result<usize> {
     let now = crate::agent::now();
     let mut input = format!(
-        "{PRUNE_INSTRUCTIONS}\n\n{TOOL_NOTES} {}\n\n# Items\n",
+        "{}\n\n{TOOL_NOTES} {}\n\n# Items\n",
+        PRUNE_INSTRUCTIONS.format(&[backend.label()]),
         where_note(&items[0].repo, clone)
     );
     for item in items {
@@ -465,7 +558,30 @@ async fn prune_in(state: &State, clone: Option<&Path>, items: &[&CleanupItem]) -
         },
         "required": ["stale"],
     });
-    let output = ask(state, &PRUNE, "prune", &schema, &input, clone, None).await?;
+    let output = match backend {
+        AgentBackend::Claude => ask(state, &PRUNE, "prune", &schema, &input, clone, None).await?,
+        AgentBackend::Devin => {
+            let dir = scan_dir("prune")?;
+            let cwd = clone.map(|c| c.to_path_buf());
+            let result = crate::devin::structured(
+                state.agents.devin(),
+                &crate::devin::DevinJob {
+                    name: "prune",
+                    model: state.agents.devin_prune_model(),
+                    schema: &schema,
+                    input: &input,
+                    mode: "ask",
+                    allow: &allowed_command,
+                    budget_acu: PRUNE_BUDGET_ACU,
+                    cwd: cwd.as_deref().unwrap_or(&dir),
+                    timeout: PRUNE_TIMEOUT,
+                },
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&dir);
+            result?
+        }
+    };
     let mut deleted = 0;
     for (id, reason) in parse_stale(&output, items) {
         if state.db.delete_cleanup_item(id)? {
@@ -510,7 +626,7 @@ pub(crate) fn cut(s: &str, n: usize) -> String {
 /// A compact transcript: the prompts, Claude's text, and each tool call
 /// that could create something with the start of its result. Reads and
 /// searches are left out.
-fn digest(events: &[AgentEvent]) -> String {
+fn digest(events: &[AgentEvent], agent: &str) -> String {
     let results: HashMap<&str, (&str, bool)> = events
         .iter()
         .filter_map(|e| match &e.kind {
@@ -529,11 +645,18 @@ fn digest(events: &[AgentEvent]) -> String {
             AgentEventKind::Prompt(p) => {
                 out += &format!("\n## Prompt\n\n{}\n\n", cut(p, PROMPT_LIMIT));
             }
-            AgentEventKind::Text(t) => out += &format!("Claude: {}\n", cut(t, TEXT_LIMIT)),
-            AgentEventKind::ToolUse { id, name, input } => {
+            AgentEventKind::Text(t) => out += &format!("{agent}: {}\n", cut(t, TEXT_LIMIT)),
+            AgentEventKind::ToolUse {
+                id,
+                name,
+                input,
+                parent,
+            } => {
                 let input: Value = serde_json::from_str(input).unwrap_or(Value::Null);
+                let sub = if parent.is_some() { "(subagent) " } else { "" };
                 let call = match name.as_str() {
-                    "Read" | "Glob" | "Grep" | "LS" | "TodoWrite" => continue,
+                    "Read" | "Glob" | "Grep" | "LS" | "TodoWrite" | "find_file_by_name"
+                    | "read" | "grep" => continue,
                     "Bash" => format!("$ {}", input["command"].as_str().unwrap_or_default()),
                     "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => format!(
                         "{name} {}",
@@ -544,7 +667,7 @@ fn digest(events: &[AgentEvent]) -> String {
                     ),
                     _ => format!("{name} {}", cut(&input.to_string(), TEXT_LIMIT)),
                 };
-                out += &call;
+                out += &format!("{sub}{call}");
                 out += "\n";
                 if let Some((content, is_error)) = results.get(id.as_str()) {
                     let content = cut(content, RESULT_LIMIT);
@@ -641,6 +764,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             input: input.to_string(),
+            parent: None,
         })
     }
 
@@ -678,7 +802,7 @@ mod tests {
             tool("5", "WebFetch", json!({"url": "https://example.com"})),
         ];
         assert_eq!(
-            digest(&events),
+            digest(&events, "Claude"),
             "\n## Prompt\n\nRun the e2e tests\n\n\
              Claude: Starting a container.\n\
              $ docker run -d --name e2e pg\n  → abc123\n\
@@ -693,7 +817,7 @@ mod tests {
         let events: Vec<_> = (0..20_000)
             .map(|i| tool("x", "Bash", json!({"command": format!("touch /tmp/f{i}")})))
             .collect();
-        let d = digest(&events);
+        let d = digest(&events, "Claude");
         assert!(d.len() < DIGEST_LIMIT + 200, "{}", d.len());
         assert!(d.starts_with("$ touch /tmp/f0\n"));
         assert!(d.ends_with("$ touch /tmp/f19999\n"));
@@ -727,6 +851,7 @@ mod tests {
             title: "x".into(),
             detail: "d".into(),
             created_at: 0,
+            backend: AgentBackend::Claude,
             handed_off_to: None,
         };
         let output = json!({"stale": [
@@ -751,5 +876,34 @@ mod tests {
         assert!(
             transcript_path(&session).ends_with("projects/-home-u--local-share-w-o-n-id/id.jsonl")
         );
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    /// The read-only commands the allowlist lets through, and what it
+    /// keeps out.
+    #[test]
+    fn allows_read_only_commands() {
+        for cmd in [
+            "ls -la /tmp",
+            "git log -1",
+            "docker ps -a",
+            "gh pr view 5 --json state",
+        ] {
+            assert!(allowed_command(cmd), "{cmd}");
+        }
+        for cmd in [
+            "rm -rf /tmp/x",
+            "ls; rm x",
+            "git branch -D x",
+            "lsblk",
+            "ls $(pwd)",
+            "gh pr view 1 && rm x",
+        ] {
+            assert!(!allowed_command(cmd), "{cmd}");
+        }
     }
 }

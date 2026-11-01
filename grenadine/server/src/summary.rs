@@ -19,6 +19,9 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// What writing a summary may spend, in USD.
 const BUDGET_USD: &str = "0.05";
 
+/// What a Devin summary may spend, in ACU.
+const SUMMARY_BUDGET_ACU: f64 = 0.02;
+
 /// How much of the prompt Haiku gets, in bytes.
 const PROMPT_LIMIT: usize = 8_000;
 
@@ -33,7 +36,7 @@ asks; only summarize it.";
 
 /// Starts writing a summary of the session's first `prompt`. Doesn't wait
 /// for it.
-pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
+pub fn start(state: &Arc<State>, id: &str, backend: AgentBackend, prompt: &str) {
     if !state.agents.summaries.load(Ordering::Relaxed) {
         return;
     }
@@ -43,7 +46,7 @@ pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
         crate::cleanup::cut(prompt, PROMPT_LIMIT)
     );
     tokio::spawn(async move {
-        let summary = match run(&state, &input).await {
+        let summary = match run(&state, backend, &input).await {
             Ok(summary) => summary,
             Err(e) => {
                 tracing::warn!("summarizing agent {id}: {e:#}");
@@ -57,12 +60,34 @@ pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
     });
 }
 
-async fn run(state: &State, input: &str) -> Result<String> {
+async fn run(state: &State, backend: AgentBackend, input: &str) -> Result<String> {
     let schema = json!({
         "type": "object",
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"],
     });
+    if backend == AgentBackend::Devin {
+        if !state.agents.offers(backend, None).await {
+            bail!("Devin isn't offered");
+        }
+        let dir = std::env::temp_dir();
+        let output = crate::devin::structured(
+            state.agents.devin(),
+            &crate::devin::DevinJob {
+                name: "summary",
+                model: state.agents.devin_summary_model(),
+                schema: &schema,
+                input,
+                mode: "ask",
+                allow: &|_| false,
+                budget_acu: SUMMARY_BUDGET_ACU,
+                cwd: &dir,
+                timeout: TIMEOUT,
+            },
+        )
+        .await?;
+        return parse_result(&output);
+    }
     // The model is one of Claude Code's.
     let output = state
         .agents

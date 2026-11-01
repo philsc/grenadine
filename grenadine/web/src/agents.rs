@@ -1806,7 +1806,8 @@ fn Transcript(
                         AgentEventKind::Text(t) => view! {
                             <div class="turn-text markdown" inner_html=markdown::to_html(&t, &repo)></div>
                         }.into_any(),
-                        AgentEventKind::ToolUse { id: tool, name, input } => {
+                        AgentEventKind::ToolUse { parent: Some(_), .. } => ().into_any(),
+                        AgentEventKind::ToolUse { id: tool, name, input, .. } => {
                             let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
                             let summary = tool_summary(&name, &value);
                             let result = Signal::derive(move || results.with(|r| r.get(&tool).cloned()));

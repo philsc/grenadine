@@ -77,6 +77,14 @@ struct Args {
     #[arg(long, default_value = "devin")]
     devin: PathBuf,
 
+    /// The model Devin's summaries and scans run on.
+    #[arg(long, default_value = "claude-haiku-5-5-medium")]
+    devin_summary_model: String,
+
+    /// The model Devin's prunes run on.
+    #[arg(long, default_value = "claude-sonnet-5-5-medium")]
+    devin_prune_model: String,
+
     /// The shell that terminals in agent sessions run, as a login shell.
     /// Defaults to the user's login shell.
     #[arg(long)]
@@ -199,7 +207,10 @@ async fn main() -> Result<()> {
     });
     let mut agents = agent::Agents::new(
         &db,
-        (args.claude, args.devin),
+        (
+            args.claude,
+            (args.devin, args.devin_summary_model, args.devin_prune_model),
+        ),
         worktrees,
         local_url(addr),
         slices,

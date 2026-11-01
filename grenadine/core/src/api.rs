@@ -673,6 +673,9 @@ pub struct CleanupItem {
     pub detail: String,
     /// Unix seconds.
     pub created_at: i64,
+    /// The backend of the session it was found in.
+    #[serde(default)]
+    pub backend: AgentBackend,
     /// The agent session the item was handed off to for cleaning up.
     pub handed_off_to: Option<String>,
 }
@@ -1220,6 +1223,10 @@ pub enum AgentEventKind {
         name: String,
         /// The tool's input as JSON.
         input: String,
+        /// The subagent that made the call, when it wasn't the session's
+        /// own agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
     },
     ToolResult {
         id: String,

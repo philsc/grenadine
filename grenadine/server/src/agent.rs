@@ -760,8 +760,8 @@ impl Agents {
     /// summarizes each new session's first prompt.
     pub fn new(
         db: &crate::db::Db,
-        // The claude and devin executables the backends run.
-        exes: (PathBuf, PathBuf),
+        // The claude executable, and devin's with its job models.
+        exes: (PathBuf, (PathBuf, String, String)),
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
@@ -774,7 +774,7 @@ impl Agents {
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
             claude: claude::Claude::new(exes.0),
-            devin: devin::Devin::new(exes.1),
+            devin: devin::Devin::new(exes.1.0, exes.1.1, exes.1.2),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
@@ -835,6 +835,21 @@ impl Agents {
 
     pub fn subscribe(&self, id: &str) -> broadcast::Receiver<AgentEvent> {
         self.with_live(id, |l| l.events.subscribe())
+    }
+
+    /// The `devin` executable.
+    pub fn devin(&self) -> &Path {
+        self.devin.exe()
+    }
+
+    /// The model Devin's summaries and scans run on.
+    pub fn devin_summary_model(&self) -> &str {
+        self.devin.summary_model()
+    }
+
+    /// The model Devin's prunes run on.
+    pub fn devin_prune_model(&self) -> &str {
+        self.devin.prune_model()
     }
 
     /// The backends sessions can pick, with their models: the default
@@ -941,7 +956,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
-    crate::summary::start(state, &id, &req.prompt);
+    crate::summary::start(state, &id, session.backend, &req.prompt);
     send_with_images(
         state,
         &id,
@@ -1975,7 +1990,9 @@ impl OpenedPrs {
     /// The PRs that `kind` shows were opened in a session in `repo`.
     pub fn see(&mut self, repo: &str, kind: &AgentEventKind) -> Vec<PrKey> {
         match kind {
-            AgentEventKind::ToolUse { id, name, input } if name == "Bash" => {
+            AgentEventKind::ToolUse {
+                id, name, input, ..
+            } if name == "Bash" => {
                 let command = serde_json::from_str::<Value>(input)
                     .ok()
                     .and_then(|v| v["command"].as_str().map(str::to_owned))
@@ -3084,6 +3101,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             id: id.into(),
             name: "Bash".into(),
             input: json!({ "command": command }).to_string(),
+            parent: None,
         };
         let result = |id: &str, content: &str, is_error| AgentEventKind::ToolResult {
             id: id.into(),
@@ -3511,7 +3529,11 @@ mod devin_tests {
     use crate::devin::{fake, fake_log};
 
     /// A state whose agents run `devin` as devin.
-    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, devin: PathBuf) -> Arc<State> {
+    pub(crate) fn state_with_devin(
+        fx: &crate::git::tests::Fixture,
+        dir: &Path,
+        devin: PathBuf,
+    ) -> Arc<State> {
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
@@ -3597,7 +3619,7 @@ mod devin_tests {
     }
 
     /// Waits until the session has finished `turns` turns.
-    async fn wait_for_turns(state: &State, id: &str, turns: usize) {
+    pub(crate) async fn wait_for_turns(state: &State, id: &str, turns: usize) {
         for _ in 0..200 {
             let ended = state
                 .db
@@ -3887,5 +3909,147 @@ mod devin_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the request outlived the turn");
+    }
+}
+
+#[cfg(test)]
+mod devin_job_tests {
+    use super::devin_tests::{state_with_devin, wait_for_turns};
+    use super::*;
+    use crate::devin::{fake, fake_log};
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A fake devin whose prompts that contain `matching` reply with
+    /// `answer` as JSON; other prompts just end.
+    fn devin_job_fake(dir: &Path, matching: &str, answer: Value) -> PathBuf {
+        fake(
+            dir,
+            json!({"prompts": [{"match": matching, "steps": [
+                {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": answer.to_string()},
+                }},
+                {"end": "end_turn"},
+            ]}]}),
+        )
+    }
+
+    /// A Devin session's summary comes from a `devin acp` job.
+    #[tokio::test]
+    async fn a_devin_summary_goes_through_devin() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = devin_job_fake(
+            dir.path(),
+            "Summarize it as a title",
+            json!({"summary": "Write a note"}),
+        );
+        let state = state_with_devin(&fx, dir.path(), devin);
+        state
+            .agents
+            .summaries
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "please write a note".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut summary = None;
+        for _ in 0..100 {
+            summary = state.db.agent(&session.id).unwrap().unwrap().summary;
+            if summary.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(summary.as_deref(), Some("Write a note"));
+        wait_for_turns(&state, &session.id, 1).await;
+    }
+
+    /// Prune groups items by backend: each backend runs once with only
+    /// its own item.
+    #[tokio::test]
+    async fn prunes_by_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = crate::git::tests::fixture();
+        let claude_script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {dir}/prune_args
+cat >> {dir}/prune_input
+cat {dir}/answer
+"#,
+            dir = dir.path().display()
+        );
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, &claude_script).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let devin = devin_job_fake(dir.path(), "", json!({"stale": []}));
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with_agents(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+            claude,
+            devin,
+            dir.path().join("worktrees"),
+        );
+        let session = |id: &str, backend: AgentBackend| AgentSession {
+            backend,
+            ..AgentSession::fixture(id, &fx.clone.slug)
+        };
+        state
+            .db
+            .add_cleanup_items(
+                &session("claude-s", AgentBackend::Claude),
+                &[("Claude leftover".into(), "d".into())],
+                now(),
+            )
+            .unwrap();
+        state
+            .db
+            .add_cleanup_items(
+                &session("devin-s", AgentBackend::Devin),
+                &[("Devin leftover".into(), "d".into())],
+                now(),
+            )
+            .unwrap();
+        let items = crate::cleanup::cleanup_state(&state).unwrap().items;
+        let claude_item = items.iter().find(|i| i.title == "Claude leftover").unwrap();
+        std::fs::write(
+            dir.path().join("answer"),
+            json!({
+                "type": "result",
+                "is_error": false,
+                "structured_output": {"stale": [{"id": claude_item.id, "reason": "gone"}]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 1);
+        let input = std::fs::read_to_string(dir.path().join("prune_input")).unwrap();
+        assert!(input.contains("Claude leftover"), "{input}");
+        assert!(!input.contains("Devin leftover"), "{input}");
+        let prompts: Vec<_> = fake_log(dir.path())
+            .into_iter()
+            .filter(|m| m["method"] == "session/prompt")
+            .map(|m| m["params"].to_string())
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("Devin leftover"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("Claude leftover"), "{}", prompts[0]);
+        let left = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "Devin leftover");
     }
 }
