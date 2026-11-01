@@ -17,6 +17,7 @@ from grenadine.testing.fake_github import (
     TOKEN,
     CheckRun,
     FakeGitHub,
+    PullRequest,
     SearchError,
     matches,
     search_prs,
@@ -492,6 +493,75 @@ class FakeGitHubTest(unittest.TestCase):
             threads["reviews"]["nodes"],
             [{"viewerDidAuthor": True, "comments": {"totalCount": 1}}],
         )
+
+    def test_merging(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id headRef {{ id }} }} }} }}"
+        )["data"]["repository"]["pullRequest"]
+        merge = (
+            "mutation($p: ID!, $h: GitObjectID!) { mergePullRequest(input: {"
+            " pullRequestId: $p, mergeMethod: SQUASH, expectedHeadOid: $h,"
+            ' commitHeadline: "Title"}) { clientMutationId } }'
+        )
+        out = self.query(merge, p=pr_id["id"], h="0" * 40)
+        self.assertIn("Head branch was modified", out["errors"][0]["message"])
+        self.assertEqual(pr.state, "OPEN")
+
+        out = self.query(merge, p=pr_id["id"], h=pr.head_oid)
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.state, "MERGED")
+        self.assertEqual(pr.merged_with, ("SQUASH", "Title", None))
+
+        out = self.query(
+            "mutation($r: ID!) { deleteRef(input: {refId: $r}) { clientMutationId } }",
+            r=pr_id["headRef"]["id"],
+        )
+        self.assertNotIn("errors", out)
+        self.assertIn(pr.head, self.repo.deleted_branches)
+
+    def test_merging_needs_a_mergeable_pr(self) -> None:
+        def merge(pr: PullRequest) -> dict:
+            pr_id = self.query(
+                'query { repository(owner: "test", name: "test") {'
+                f" pullRequest(number: {pr.number}) {{ id }} }} }}"
+            )["data"]["repository"]["pullRequest"]["id"]
+            return self.query(
+                "mutation($p: ID!) { mergePullRequest(input: {pullRequestId: $p})"
+                " { clientMutationId } }",
+                p=pr_id,
+            )
+
+        draft = self.inboxes.prs["Stay a draft"]
+        self.assertIn("still a draft", merge(draft)["errors"][0]["message"])
+        draft.can_merge_as_admin = True
+        self.assertIn("still a draft", merge(draft)["errors"][0]["message"])
+
+        # Blocked and out-of-date PRs only merge for those who may bypass
+        # the rules.
+        pr = self.inboxes.prs["Wait for reviewers"]
+        for state in ("BLOCKED", "BEHIND"):
+            pr.merge_state = state
+            pr.can_merge_as_admin = False
+            self.assertIn("not mergeable", merge(pr)["errors"][0]["message"])
+        pr.can_merge_as_admin = True
+        self.assertNotIn("errors", merge(pr))
+        self.assertEqual(pr.state, "MERGED")
+
+    def test_deleting_a_branch_can_fail(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.undeletable_branches.add(pr.head)
+        ref = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ headRef {{ id }} }} }} }}"
+        )["data"]["repository"]["pullRequest"]["headRef"]["id"]
+        out = self.query(
+            "mutation($r: ID!) { deleteRef(input: {refId: $r}) { clientMutationId } }",
+            r=ref,
+        )
+        self.assertIn("Cannot delete", out["errors"][0]["message"])
+        self.assertNotIn(pr.head, self.repo.deleted_branches)
 
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')

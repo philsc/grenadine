@@ -163,7 +163,12 @@ class PullRequest:
     issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
     # GitHub's MergeStateStatus; None works it out from the PR.
     merge_state: str | None = None
+    # The viewer may merge it bypassing the branch's rules.
+    can_merge_as_admin: bool = False
     pending: PendingReview | None = None
+    # How it was merged through the API: the method, the commit's title and
+    # body.
+    merged_with: tuple[str, str | None, str | None] | None = None
 
     @property
     def url(self) -> str:
@@ -217,6 +222,10 @@ class FakeRepo:
         # being the viewer's default.
         self.merge_methods = ["MERGE", "SQUASH", "REBASE"]
         self.delete_branch_on_merge = False
+        # Branches deleted through the API, and ones that deleting fails
+        # for.
+        self.deleted_branches: set[str] = set()
+        self.undeletable_branches: set[str] = set()
         self.bare.parent.mkdir(parents=True, exist_ok=True)
         self.work.parent.mkdir(parents=True, exist_ok=True)
         gh.git("init", "--quiet", "--bare", "--initial-branch=main", str(self.bare))
@@ -798,6 +807,46 @@ class FakeGitHub:
             pr.touch()
             return {"clientMutationId": None}
 
+        def merge_pr(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            if pr.state != OPEN:
+                raise ValueError("Pull Request is not open")
+            expected = input.get("expectedHeadOid")
+            if expected and expected != pr.head_oid:
+                raise ValueError(
+                    "Head branch was modified. Review and try the merge again."
+                )
+            if pr.draft:
+                raise ValueError("Pull Request is still a draft")
+            state = pr.merge_state_status()
+            bypass = ("BLOCKED", "BEHIND") if pr.can_merge_as_admin else ()
+            if state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE", *bypass):
+                raise ValueError("Pull Request is not mergeable")
+            method = input.get("mergeMethod") or "MERGE"
+            if method not in pr.repo.merge_methods:
+                raise ValueError(f"{method} merges are not allowed on this repository")
+            pr.merged_with = (
+                method,
+                input.get("commitHeadline"),
+                input.get("commitBody"),
+            )
+            pr.repo.merge(pr)
+            return {"clientMutationId": None}
+
+        def delete_ref(info: Any, input: dict[str, Any]) -> Any:
+            for repo in self.repos.values():
+                for branch in repo.pushes:
+                    if _ref_id(repo, branch) == input["refId"]:
+                        if branch in repo.undeletable_branches:
+                            raise PermissionError(
+                                f"Cannot delete protected branch {branch}"
+                            )
+                        repo.deleted_branches.add(branch)
+                        return {"clientMutationId": None}
+            raise LookupError(
+                f"Could not resolve to a node with the global id of '{input['refId']}'"
+            )
+
         def submit_review(info: Any, input: dict[str, Any]) -> Any:
             pr, review = self._pending(input["pullRequestReviewId"])
             self._submit(pr, input["event"], input.get("body") or "", review.comments)
@@ -836,6 +885,8 @@ class FakeGitHub:
             "deletePullRequestReviewComment": mutation(delete_comment),
             "submitPullRequestReview": mutation(submit_review),
             "deletePullRequestReview": mutation(delete_review),
+            "mergePullRequest": mutation(merge_pr),
+            "deleteRef": mutation(delete_ref),
         }
 
     def _pending(self, node_id: str) -> tuple[PullRequest, PendingReview]:
@@ -1150,6 +1201,11 @@ class FakeGitHub:
             "baseRefName": pr.base,
             "headRefName": pr.head,
             "headRefOid": pr.head_oid,
+            "headRef": (
+                None
+                if pr.head in repo.deleted_branches
+                else {"id": _ref_id(repo, pr.head), "name": pr.head}
+            ),
             "headRepository": lambda info: self._repo_node(repo),
             "isCrossRepository": False,
             "timelineItems": timeline,
@@ -1157,7 +1213,7 @@ class FakeGitHub:
             "reviewThreads": review_threads,
             "reviewDecision": pr.review_decision(),
             "mergeStateStatus": pr.merge_state_status(),
-            "viewerCanMergeAsAdmin": False,
+            "viewerCanMergeAsAdmin": pr.can_merge_as_admin,
             "reviews": reviews,
             "reviewRequests": lambda info, **_: {
                 "nodes": [
@@ -1172,6 +1228,10 @@ class FakeGitHub:
             },
             "comments": comments,
         }
+
+
+def _ref_id(repo: FakeRepo, branch: str) -> str:
+    return f"REF_{repo.slug}:{branch}"
 
 
 def _pr_id(pr: PullRequest) -> str:

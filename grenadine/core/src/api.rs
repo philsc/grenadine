@@ -325,6 +325,27 @@ pub struct NewThread {
     pub body: String,
 }
 
+/// The body of a request that merges a PR.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeRequest {
+    pub method: MergeMethod,
+    /// The head the viewer reviewed. GitHub refuses the merge when the PR's
+    /// head has moved on since.
+    pub head_oid: String,
+    /// The merge commit's title and body; `None` leaves them to GitHub.
+    pub title: Option<String>,
+    pub body: Option<String>,
+    /// Delete the head branch once merged.
+    pub delete_branch: bool,
+}
+
+/// The response to a merge that went through.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Merged {
+    /// What went wrong after merging, e.g. deleting the branch.
+    pub warning: Option<String>,
+}
+
 /// What submitting a review says about the PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewEvent {
@@ -435,6 +456,27 @@ pub enum MergeMethod {
     Merge,
     Squash,
     Rebase,
+}
+
+impl MergeMethod {
+    /// The method as GitHub's `PullRequestMergeMethod` names it.
+    pub fn as_github(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "MERGE",
+            MergeMethod::Squash => "SQUASH",
+            MergeMethod::Rebase => "REBASE",
+        }
+    }
+
+    /// The method GitHub names `s`, if any.
+    pub fn from_github(s: &str) -> Option<MergeMethod> {
+        match s {
+            "MERGE" => Some(MergeMethod::Merge),
+            "SQUASH" => Some(MergeMethod::Squash),
+            "REBASE" => Some(MergeMethod::Rebase),
+            _ => None,
+        }
+    }
 }
 
 /// Whether and how the PR can be merged.
@@ -1046,5 +1088,14 @@ mod tests {
             assert_eq!(Side::from_github(side.as_github()), side);
         }
         assert_eq!(Side::from_github(""), Side::Right);
+    }
+
+    #[test]
+    fn merge_methods_on_github() {
+        use MergeMethod::*;
+        for m in [Merge, Squash, Rebase] {
+            assert_eq!(MergeMethod::from_github(m.as_github()), Some(m));
+        }
+        assert_eq!(MergeMethod::from_github(""), None);
     }
 }

@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, ClassVar
 
-from playwright.sync_api import Locator, expect, sync_playwright
+from playwright.sync_api import Dialog, Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import COMMENTED, TEAM, TOKEN, FakeGitHub
@@ -893,6 +893,162 @@ class ReviewTest(ServerTestCase):
         self.assertIsNone(pr.pending)
         self.assertEqual((pr.reviews[-1].state, pr.reviews[-1].body), (COMMENTED, ""))
         self.assertEqual(pr.comments[-1].body, "One thing.")
+
+    def merge_box(self) -> Locator:
+        return self.page.locator(".merge-box")
+
+    def merge(self) -> list[str]:
+        """Clicks Merge, accepting the dialog. Returns what it said."""
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        self.merge_box().get_by_role("button", name=re.compile("^Merge")).click()
+        return messages
+
+    def resync(self, title: str) -> None:
+        """Comments on the PR from outside the page, which resyncs it, and
+        waits for the page to show the comment."""
+        pr = self.prs[title]
+        resp = self.page.request.post(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
+            headers={"Origin": self.url.rstrip("/")},
+            data={"body": "Ping"},
+        )
+        self.assertEqual(resp.status, 204, resp.text())
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            f"{len(pr.issue_comments)} comment"
+            + ("" if len(pr.issue_comments) == 1 else "s")
+        )
+
+    def test_squash_and_merge(self) -> None:
+        pr = self.prs[scenarios.SQUASH]
+        self.open(scenarios.SQUASH)
+        box = self.merge_box()
+        method = box.get_by_label("Merge method")
+        # GitHub's default for the viewer comes first.
+        expect(method).to_have_value("MERGE")
+        method.select_option(label="Squash and merge")
+        box.get_by_role("button", name="Edit the commit message").click()
+        title = box.get_by_label("Commit title")
+        expect(title).to_have_value(f"{pr.title} (#{pr.number})")
+        title.fill("Squash it all")
+        expect(box.get_by_label("Delete the branch")).to_be_checked()
+
+        messages = self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        expect(self.merge_box()).to_have_count(0)
+        self.assertEqual(messages, [f"Squash and merge #{pr.number} into main?"])
+        self.assertEqual(pr.merged_with, ("SQUASH", "Squash it all", pr.body))
+        self.assertIn(pr.head, pr.repo.deleted_branches)
+
+    def test_merge_refuses_a_head_it_did_not_show(self) -> None:
+        pr = self.prs[scenarios.STALE_HEAD]
+        self.open(scenarios.STALE_HEAD)
+        expect(self.merge_box().get_by_role("button", name="Merge")).to_be_enabled()
+        # Someone pushes; the page doesn't know yet.
+        pr.repo.checkout(pr.head)
+        pr.repo.commit(
+            "Sneak in", {"review/sneaky.md": "boo\n"}, author=scenarios.OTHER
+        )
+        pr.repo.push(pr.head, actor=scenarios.OTHER)
+
+        self.merge()
+        expect(self.merge_box().locator(".error")).to_contain_text(
+            "Head branch was modified"
+        )
+        self.assertEqual(pr.state, "OPEN")
+        # The refusal resyncs the PR, so the page shows the push, and
+        # merging that goes through.
+        expect(self.page.locator("details.picker summary")).to_have_text(
+            f"Base → v2 ({pr.head_oid[:8]})"
+        )
+        self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        self.assertEqual(pr.state, "MERGED")
+
+    def test_blocked_prs_cannot_be_merged(self) -> None:
+        self.open(scenarios.BLOCKED)
+        box = self.merge_box()
+        expect(box.locator(".merge-blocked")).to_have_text(
+            "The branch's rules block merging."
+        )
+        expect(box.get_by_role("button", name="Merge")).to_be_disabled()
+
+    def test_merge_bypassing_the_rules(self) -> None:
+        pr = self.prs[scenarios.BYPASS]
+        self.open(scenarios.BYPASS)
+        box = self.merge_box()
+        expect(box.locator(".merge-blocked")).to_have_count(0)
+        button = box.get_by_role("button", name="Merge, bypassing rules")
+        expect(button).to_be_enabled()
+        expect(button).to_have_class("danger")
+        messages = self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        dialog = (
+            f"Create a merge commit #{pr.number} into main, bypassing the"
+            " branch's rules?\n\nMerging is blocked: it needs an approving review."
+        )
+        self.assertEqual(messages, [dialog])
+        self.assertEqual(pr.state, "MERGED")
+
+    def test_merged_but_the_branch_stays(self) -> None:
+        pr = self.prs[scenarios.KEEP_BRANCH]
+        self.open(scenarios.KEEP_BRANCH)
+        expect(self.merge_box().get_by_label("Delete the branch")).to_be_checked()
+        self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        # The warning outlasts the merge box.
+        expect(self.merge_box()).to_have_count(0)
+        warning = self.page.locator(".banner.merge-warning")
+        expect(warning).to_contain_text("Merged, but the branch wasn't deleted:")
+        expect(warning).to_contain_text("Cannot delete protected branch")
+        self.assertEqual(pr.state, "MERGED")
+        self.assertNotIn(pr.head, pr.repo.deleted_branches)
+
+    def test_no_branch_to_delete_when_github_deletes_it(self) -> None:
+        pr = self.prs[scenarios.AUTO_DELETE]
+        self.open(scenarios.AUTO_DELETE)
+        delete = self.merge_box().get_by_label("Delete the branch")
+        expect(delete).to_have_count(1)
+        pr.repo.delete_branch_on_merge = True
+        self.addCleanup(setattr, pr.repo, "delete_branch_on_merge", False)
+        self.resync(scenarios.AUTO_DELETE)
+        expect(delete).to_have_count(0)
+
+    def test_merging_a_stacked_pr(self) -> None:
+        parent = self.prs[scenarios.STACK_PARENT]
+        self.open(scenarios.STACK_CHILD)
+        warning = self.merge_box().locator(".banner.warn")
+        expect(warning).to_have_text(
+            f"This PR targets the branch of #{parent.number}, so merging it puts"
+            " its changes there, not into main."
+        )
+        # Deleting the parent's branch would close the child.
+        self.open(scenarios.STACK_PARENT)
+        box = self.merge_box()
+        expect(box.locator(".banner.warn")).to_have_count(0)
+        expect(box.get_by_label("Delete the branch")).not_to_be_checked()
+
+    def test_merge_waits_for_github_to_decide(self) -> None:
+        pr = self.prs[scenarios.SETTLE]
+        self.open(scenarios.SETTLE)
+        button = self.merge_box().get_by_role("button", name="Merge")
+        expect(button).to_be_enabled()
+        # Something makes GitHub work out the merge state again.
+        pr.merge_state = "UNKNOWN"
+        self.resync(scenarios.SETTLE)
+        expect(self.merge_box().locator(".merge-blocked")).to_have_text(
+            "GitHub hasn't worked out yet whether this can be merged."
+        )
+        expect(button).to_be_disabled()
+        # Once it has, nothing about the PR changes, but the server syncs
+        # it again a little later anyway.
+        pr.merge_state = None
+        expect(button).to_be_enabled(timeout=30_000)
 
     def test_reply_to_a_thread(self) -> None:
         self.open(scenarios.REPLY)

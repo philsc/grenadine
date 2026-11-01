@@ -660,3 +660,45 @@ sync must keep the ones stored before and show the error as the PR's sync
 error.
 _Why:_ GitHub leaves such fields `null`, which would otherwise read as no
 reviews or no checks.
+
+**REVIEW-MERGE-6.** The merge box must offer the merge methods the
+repository allows, labelled "Create a merge commit", "Squash and merge"
+and "Rebase and merge". The first one picked must be GitHub's default for
+the viewer, else the first allowed one.
+_Why:_ GitHub's default follows the method the viewer last merged with,
+wherever they merged.
+
+**REVIEW-MERGE-7.** Merge must be disabled, with the reason shown, when
+the PR is a draft, conflicts with its base, isn't known to be mergeable
+yet, or the branch's rules block it or require it to be up to date. When
+GitHub says the viewer may bypass the rules, the button must instead read
+"Merge, bypassing rules" and look dangerous. Conflicts can't be bypassed.
+REVIEW-MERGE-4's follow-up syncs make a merge state that isn't known yet
+settle.
+
+**REVIEW-MERGE-8.** Merge must ask first, naming the method, the PR and
+the branch it goes into. When it bypasses the branch's rules, the
+question must say so and give REVIEW-MERGE-3's text for why they block
+it. Once the merge went through, Merge must stay disabled.
+
+**REVIEW-MERGE-9.** The merge must only go through when the PR's head is
+still the latest version the page shows. Otherwise GitHub's refusal must
+be shown and the PR left open. Either way, the PR must be synced
+afterwards.
+_Why:_ a push after the viewer looked must not be merged unseen, and the
+page must then show that push so the viewer can merge it.
+
+**REVIEW-MERGE-10.** Squash merges must offer to edit the commit message,
+starting from "_title_ (#_number_)" and the description. Without edits,
+GitHub's default message must be used.
+
+**REVIEW-MERGE-11.** Unless the repository deletes merged branches
+itself, the merge box must offer to delete the head branch, checked
+unless other open PRs target it. A merge whose branch couldn't be deleted
+must still count as merged, with a warning that stays on the page after
+the merge box goes away.
+_Why:_ deleting a branch that other PRs target closes them.
+
+**REVIEW-MERGE-12.** When the PR targets another open PR's branch, the
+merge box must warn that merging puts its changes there, not into the
+branch the bottom of the stack targets.

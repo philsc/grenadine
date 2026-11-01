@@ -1810,6 +1810,39 @@ textarea {
 .merge-status.bad {
   color: var(--del-fg);
 }
+.merge-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.merge-controls .banner,
+.merge-controls .error,
+.merge-blocked {
+  margin: 0;
+}
+.merge-controls .form-buttons {
+  align-items: center;
+  flex-wrap: wrap;
+}
+/* The bypass button stays next to the method it merges with. */
+.merge-controls .form-buttons .danger {
+  margin-left: 0;
+}
+.merge-message {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.merge-message input,
+.merge-message textarea {
+  box-sizing: border-box;
+  width: 100%;
+  font: inherit;
+}
+.merge-warning {
+  margin: 16px 0;
+}
 
 /* Writing comments. */
 

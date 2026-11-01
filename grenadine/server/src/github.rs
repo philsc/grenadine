@@ -7,9 +7,9 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeState, NewThread, Person, PrKey,
-    Review, ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr,
-    SubmitReview, ThreadCounts,
+    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeRequest, MergeState, NewThread,
+    Person, PrKey, Review, ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState,
+    Side, StackPr, SubmitReview, ThreadCounts,
 };
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
@@ -202,15 +202,6 @@ fn check_run_status(status: &str, conclusion: &str) -> Option<CiStatus> {
         "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => {
             Some(CiStatus::Failing)
         }
-        _ => None,
-    }
-}
-
-fn merge_method(s: &str) -> Option<MergeMethod> {
-    match s {
-        "MERGE" => Some(MergeMethod::Merge),
-        "SQUASH" => Some(MergeMethod::Squash),
-        "REBASE" => Some(MergeMethod::Rebase),
         _ => None,
     }
 }
@@ -504,7 +495,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             },
             state: merge_state(str_at(pr, "/mergeStateStatus")),
             methods,
-            default_method: merge_method(str_at(repo, "/viewerDefaultMergeMethod")),
+            default_method: MergeMethod::from_github(str_at(repo, "/viewerDefaultMergeMethod")),
             delete_branch_on_merge: repo["deleteBranchOnMerge"].as_bool().unwrap_or(false),
             can_merge_as_admin: pr["viewerCanMergeAsAdmin"].as_bool().unwrap_or(false),
         },
@@ -939,6 +930,44 @@ impl GitHub {
             }
         };
         Ok(())
+    }
+
+    /// Merges the PR. Returns a warning when it merged but its head branch
+    /// couldn't be deleted.
+    pub async fn merge(&self, key: &PrKey, m: &MergeRequest) -> Result<Option<String>> {
+        let pr = self.pr_node(key, "headRef { id }").await?;
+        self.mutate(
+            "mutation($pr: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!,
+                      $title: String, $body: String) {
+               mergePullRequest(input: {
+                 pullRequestId: $pr, mergeMethod: $method, expectedHeadOid: $head,
+                 commitHeadline: $title, commitBody: $body
+               }) {
+                 clientMutationId
+               }
+             }",
+            json!({
+                "pr": str_at(&pr, "/id"),
+                "method": m.method.as_github(),
+                "head": m.head_oid,
+                "title": m.title,
+                "body": m.body,
+            }),
+        )
+        .await?;
+        let head_ref = str_at(&pr, "/headRef/id");
+        if !m.delete_branch || head_ref.is_empty() {
+            return Ok(None);
+        }
+        let deleted = self
+            .mutate(
+                "mutation($ref: ID!) { deleteRef(input: { refId: $ref }) { clientMutationId } }",
+                json!({ "ref": head_ref }),
+            )
+            .await;
+        Ok(deleted
+            .err()
+            .map(|e| format!("Merged, but the branch wasn't deleted: {e:#}")))
     }
 
     /// Discards the viewer's pending review and its comments.
