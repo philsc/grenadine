@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, NewThread, PrKey, Side, WorktreeFile};
@@ -14,7 +15,7 @@ use leptos::prelude::*;
 
 use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
-use crate::highlight::{highlight_lines, mark};
+use crate::highlight::{self, Highlighted, highlight_lines, mark, plain_lines};
 use crate::inboxes::load_flag;
 use crate::pr::{Anchor, Placed, ThreadView};
 
@@ -220,6 +221,8 @@ pub fn DiffView(
     #[prop(optional_no_strip)] commenting: Option<Commenting>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
+    // What the last diff still had queued can wait for this one's files.
+    highlight::demote();
     let files = LocalResource::new(move || {
         load(repo.clone(), left.clone(), right.clone(), upstream.clone())
     });
@@ -279,12 +282,9 @@ fn scroll_to(path: &str) {
 
 /// Everything needed to draw a file's diff.
 struct Layout {
+    shape: Arc<Shape>,
     old_html: Vec<String>,
     new_html: Vec<String>,
-    hunks: Vec<Hunk>,
-    skipped_after: usize,
-    /// Per change block: whether upstream made the same change.
-    upstream: Vec<bool>,
     /// The file lines that the first old and new line are, when the texts
     /// are only part of the file.
     old_start: usize,
@@ -295,29 +295,40 @@ fn text(b: &Option<Arc<Blob>>) -> Option<&str> {
     b.as_ref().and_then(|b| b.text.as_deref())
 }
 
-fn layout(file: &FileData) -> Layout {
+/// What a diff looks like apart from its lines' HTML, so that it is worked
+/// out once whether the lines are highlighted yet or not.
+struct Shape {
+    hunks: Vec<Hunk>,
+    skipped_after: usize,
+    /// Per change block: whether upstream made the same change.
+    upstream: Vec<bool>,
+    marks: Vec<Mark>,
+}
+
+/// A paired line's old and new indexes and the char ranges that changed on
+/// each side.
+struct Mark {
+    old: usize,
+    new: usize,
+    dels: Vec<Range<usize>>,
+    inss: Vec<Range<usize>>,
+}
+
+fn shape(file: &FileData) -> Shape {
     let upstream = file
         .upstream
         .as_ref()
         .map(|(a, b)| (text(a).unwrap_or_default(), text(b).unwrap_or_default()));
-    layout_texts(
-        file.change.old_path.as_deref().unwrap_or_default(),
-        file.change.path(),
+    shape_texts(
         text(&file.old).unwrap_or_default(),
         text(&file.new).unwrap_or_default(),
         upstream,
     )
 }
 
-/// Lays out the diff from `old` to `new`, which are named by their paths
-/// for highlighting. `upstream` is the same file's upstream change.
-fn layout_texts(
-    old_path: &str,
-    new_path: &str,
-    old: &str,
-    new: &str,
-    upstream: Option<(&str, &str)>,
-) -> Layout {
+/// Works out the diff from `old` to `new`. `upstream` is the same file's
+/// upstream change.
+fn shape_texts(old: &str, new: &str, upstream: Option<(&str, &str)>) -> Shape {
     let (old_lines, new_lines) = (rebase::lines(old), rebase::lines(new));
     let blocks = rebase::change_blocks(&old_lines, &new_lines);
     let upstream = match upstream {
@@ -335,28 +346,44 @@ fn layout_texts(
         .map(|b| inline::align(&old_lines, &new_lines, b))
         .collect();
     let hunks = diff::hunks(&blocks, &aligned, old_lines.len(), new_lines.len(), CONTEXT);
-    let mut old_html = highlight_lines(old_path, old);
-    let mut new_html = highlight_lines(new_path, new);
-    for rows in &aligned {
-        for r in rows {
-            let (true, Some(o), Some(n)) = (r.paired, r.old, r.new) else {
-                continue;
-            };
-            let (dels, inss) = inline::changed_ranges(old_lines[o], new_lines[n]);
-            if let Some(h) = old_html.get_mut(o) {
-                *h = mark(h, &dels, "word-del");
+    let marks = aligned
+        .iter()
+        .flatten()
+        .filter_map(|r| match (r.paired, r.old, r.new) {
+            (true, Some(o), Some(n)) => {
+                let (dels, inss) = inline::changed_ranges(old_lines[o], new_lines[n]);
+                Some(Mark {
+                    old: o,
+                    new: n,
+                    dels,
+                    inss,
+                })
             }
-            if let Some(h) = new_html.get_mut(n) {
-                *h = mark(h, &inss, "word-add");
-            }
-        }
-    }
-    Layout {
-        old_html,
-        new_html,
+            _ => None,
+        })
+        .collect();
+    Shape {
         skipped_after: diff::skipped_after(&hunks, old_lines.len()),
         hunks,
         upstream,
+        marks,
+    }
+}
+
+/// Lays out `shape` with the given lines' HTML, highlighted or plain.
+fn layout(shape: Arc<Shape>, mut old_html: Vec<String>, mut new_html: Vec<String>) -> Layout {
+    for m in &shape.marks {
+        if let Some(h) = old_html.get_mut(m.old) {
+            *h = mark(h, &m.dels, "word-del");
+        }
+        if let Some(h) = new_html.get_mut(m.new) {
+            *h = mark(h, &m.inss, "word-add");
+        }
+    }
+    Layout {
+        shape,
+        old_html,
+        new_html,
         old_start: 0,
         new_start: 0,
     }
@@ -398,6 +425,68 @@ fn stats(file: &FileData) -> (usize, usize, bool) {
     (added, removed, all_upstream)
 }
 
+/// One side of a file, highlighted in the background.
+struct SideLines {
+    path: String,
+    /// The blob ID, or a hash of the contents when there is none.
+    id: String,
+    /// `None` for a missing or binary side.
+    blob: Option<Arc<Blob>>,
+    lines: RwSignal<Option<Highlighted>>,
+}
+
+impl SideLines {
+    /// Queues the highlighting right away if `expanded`; otherwise it waits
+    /// until the file is.
+    fn new(path: &str, id: &Option<String>, blob: &Option<Arc<Blob>>, expanded: bool) -> Self {
+        let blob = blob.clone().filter(|b| b.text.is_some());
+        let id = id.clone().unwrap_or_else(|| {
+            let mut h = DefaultHasher::new();
+            text(&blob).hash(&mut h);
+            format!("{:016x}", h.finish())
+        });
+        let lines = match &blob {
+            None => Some(Arc::new(Vec::new())),
+            Some(_) => highlight::cached(path, &id),
+        };
+        let side = SideLines {
+            path: path.to_owned(),
+            id,
+            blob,
+            lines: RwSignal::new(lines),
+        };
+        if expanded {
+            side.request(true);
+        }
+        side
+    }
+
+    /// Whether the highlighted lines are in; tracked.
+    fn ready(&self) -> bool {
+        self.lines.with(Option::is_some)
+    }
+
+    /// Queues the highlighting, unless it's done.
+    fn request(&self, urgent: bool) {
+        let Some(blob) = &self.blob else { return };
+        if self.lines.with_untracked(Option::is_some) {
+            return;
+        }
+        let lines = self.lines;
+        highlight::request(&self.path, &self.id, blob.clone(), urgent, move |h| {
+            lines.try_set(Some(h));
+        });
+    }
+
+    /// The lines' HTML: highlighted if ready, plain otherwise.
+    fn html(&self) -> Vec<String> {
+        match self.lines.get_untracked() {
+            Some(h) => (*h).clone(),
+            None => plain_lines(text(&self.blob).unwrap_or_default()),
+        }
+    }
+}
+
 #[component]
 fn FileView(
     file: Arc<FileData>,
@@ -417,6 +506,9 @@ fn FileView(
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
     let (added, removed, all_upstream) = if binary { (0, 0, false) } else { stats(&file) };
     let expanded = RwSignal::new(!all_upstream && added + removed <= BIG_FILE);
+    let old_path = c.old_path.as_deref().unwrap_or(c.path());
+    let old_lines = SideLines::new(old_path, &c.old_blob, &file.old, expanded.get_untracked());
+    let new_lines = SideLines::new(c.path(), &c.new_blob, &file.new, expanded.get_untracked());
     let title = match (c.status, &c.old_path, &c.new_path) {
         (ChangeStatus::Renamed | ChangeStatus::Copied, Some(o), Some(n)) => format!("{o} → {n}"),
         _ => c.path().to_owned(),
@@ -431,8 +523,10 @@ fn FileView(
         let file = file.clone();
         let comments = comments.clone();
         let fc = fc.clone();
-        // Computed once, on first expansion.
-        let cache = StoredValue::new_local(None::<Arc<Layout>>);
+        // Laid out plain on first expansion, and again once both sides are
+        // highlighted; the flag says which.
+        let cache = StoredValue::new_local(None::<(bool, Arc<Layout>)>);
+        let shape_cache = StoredValue::new_local(None::<Arc<Shape>>);
         move || {
             if !expanded.get() {
                 return ().into_any();
@@ -445,9 +539,24 @@ fn FileView(
                 };
                 return view! { <p class="binary muted">{format!("Binary file: {} → {} bytes", size(&file.old), size(&file.new))}</p> }.into_any();
             }
-            let l = cache.with_value(|l| l.clone()).unwrap_or_else(|| {
-                let l = Arc::new(layout(&file));
-                cache.set_value(Some(l.clone()));
+            let highlighted = old_lines.ready() && new_lines.ready();
+            if !highlighted {
+                old_lines.request(true);
+                new_lines.request(true);
+            }
+            let cached = cache.with_value(|c| {
+                c.as_ref()
+                    .filter(|(h, _)| *h == highlighted)
+                    .map(|(_, l)| l.clone())
+            });
+            let l = cached.unwrap_or_else(|| {
+                let shape = shape_cache.with_value(Clone::clone).unwrap_or_else(|| {
+                    let s = Arc::new(shape(&file));
+                    shape_cache.set_value(Some(s.clone()));
+                    s
+                });
+                let l = Arc::new(layout(shape, old_lines.html(), new_lines.html()));
+                cache.set_value(Some((highlighted, l.clone())));
                 l
             });
             if side_by_side.get() {
@@ -526,7 +635,11 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
                 let l = Layout {
                     old_start: f.old_start,
                     new_start: f.new_start,
-                    ..layout_texts(&path, &path, &f.old, &f.new, None)
+                    ..layout(
+                        Arc::new(shape_texts(&f.old, &f.new, None)),
+                        highlight_lines(&path, &f.old),
+                        highlight_lines(&path, &f.new),
+                    )
                 };
                 unified_view(&l, &[], inline_changes, None)
             }).collect_view()}
@@ -620,7 +733,7 @@ fn unified_view(
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
-    for h in &l.hunks {
+    for h in &l.shape.hunks {
         rows.extend(skip_row(h.skipped_before, 4));
         for line in &h.lines {
             let (old, new, kind, block, code) = match *line {
@@ -646,7 +759,7 @@ fn unified_view(
                     html(&l.new_html, Some(new)),
                 ),
             };
-            let upstream = block.is_some_and(|b| l.upstream[b]);
+            let upstream = block.is_some_and(|b| l.shape.upstream[b]);
             let marker = match kind {
                 "del" => "−",
                 "add" => "+",
@@ -673,7 +786,7 @@ fn unified_view(
             ));
         }
     }
-    rows.extend(skip_row(l.skipped_after, 4));
+    rows.extend(skip_row(l.shape.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
         <table class="diff unified" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>
@@ -689,10 +802,10 @@ fn split_view(
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows: Vec<AnyView> = Vec::new();
-    for h in &l.hunks {
+    for h in &l.shape.hunks {
         rows.extend(skip_row(h.skipped_before, 4));
         for r in &h.rows {
-            let upstream = r.block.is_some_and(|b| l.upstream[b]);
+            let upstream = r.block.is_some_and(|b| l.shape.upstream[b]);
             let (lk, rk) = match (r.block, r.old, r.new) {
                 (None, _, _) => ("ctx", "ctx"),
                 (Some(_), o, n) => (
@@ -721,7 +834,7 @@ fn split_view(
             ));
         }
     }
-    rows.extend(skip_row(l.skipped_after, 4));
+    rows.extend(skip_row(l.shape.skipped_after, 4));
     let outside = outside_comments(lc.rest());
     view! {
         <table class="diff split" class:inline-changes=move || inline_changes.get()><tbody>{rows}</tbody></table>

@@ -18,7 +18,7 @@ use crate::review::{
     MergeChoice, MergeTarget, ReviewChoice, ReviewPanel, conversation, merge_box, merge_warning,
     review_summary,
 };
-use crate::{Updates, api, hash_for, markdown};
+use crate::{Updates, api, hash_for, highlight, markdown};
 
 /// A review comment and its replies.
 #[derive(Clone, Debug, PartialEq)]
@@ -261,7 +261,8 @@ pub(crate) fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
     }
 }
 
-/// Warms the caches for the diffs most likely to be looked at next.
+/// Warms the caches for the diffs most likely to be looked at next, down
+/// to their highlighting.
 fn prefetch(pr: &PrDetail) {
     let v = &pr.versions;
     let mut pairs = Vec::new();
@@ -283,6 +284,17 @@ fn prefetch(pr: &PrDetail) {
                     .flat_map(|f| f.old_blob.iter().chain(&f.new_blob))
                     .cloned();
                 let _ = api::load_blobs(&repo, ids.collect::<Vec<_>>()).await;
+                for f in &changes.files {
+                    let old_path = f.old_path.as_deref().unwrap_or(f.path());
+                    for (path, id) in [(old_path, &f.old_blob), (f.path(), &f.new_blob)] {
+                        if let Some((id, blob)) =
+                            id.as_deref().and_then(|id| Some((id, api::blob(id)?)))
+                            && blob.text.is_some()
+                        {
+                            highlight::request(path, id, blob, false, |_| {});
+                        }
+                    }
+                }
             }
         }
     });
