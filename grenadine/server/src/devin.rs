@@ -224,6 +224,16 @@ impl SessionUpdate {
             SessionUpdate::Other => None,
         }
     }
+
+    /// The subagent the update is about, by its id; `None` for the
+    /// session's own agent, whose id is "root".
+    fn subagent(&self) -> Option<&str> {
+        self.meta()
+            .and_then(|m| extension(m, "subagent_context"))
+            .and_then(|c| c.get("parentAgentId"))
+            .and_then(Value::as_str)
+            .filter(|p| *p != "root")
+    }
 }
 
 /// A piece of content; only text is shown.
@@ -740,12 +750,7 @@ impl Updates {
     /// The events one `session/update` means; updates of subagents are
     /// skipped, except their tool calls, which name the subagent.
     fn update(&mut self, u: &SessionUpdate) -> Vec<AgentEventKind> {
-        let parent = u
-            .meta()
-            .and_then(|m| extension(m, "subagent_context"))
-            .and_then(|c| c.get("parentAgentId"))
-            .and_then(Value::as_str)
-            .filter(|p| *p != "root");
+        let parent = u.subagent();
         if parent.is_some() && !matches!(u, SessionUpdate::ToolCall(_)) {
             return Vec::new();
         }
@@ -779,8 +784,13 @@ impl Updates {
                         },
                     );
                 }
-                self.flush()
-                    .into_iter()
+                // A subagent's call doesn't end the root's answer.
+                let text = if parent.is_none() {
+                    self.flush()
+                } else {
+                    Vec::new()
+                };
+                text.into_iter()
                     .chain([AgentEventKind::ToolUse {
                         id: call.tool_call_id.clone(),
                         name,
@@ -1368,12 +1378,7 @@ impl JobRun<'_> {
     }
 
     fn update(&mut self, u: SessionUpdate) {
-        let parent = u
-            .meta()
-            .and_then(|m| extension(m, "subagent_context"))
-            .and_then(|c| c.get("parentAgentId"))
-            .and_then(Value::as_str);
-        if parent.is_some_and(|p| p != "root") {
+        if u.subagent().is_some() {
             return;
         }
         match u {
@@ -2238,6 +2243,30 @@ mod job_tests {
         assert!(u.update(&serde_json::from_str(
             r#"{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#a6e9","status":"completed","content":[{"type":"content","content":{"type":"text","text":"x"}}],"_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a6e974a3"}}}"#,
         ).unwrap()).is_empty());
+    }
+
+    /// A subagent's tool call while the root writes its answer doesn't
+    /// cut the answer in two.
+    #[test]
+    fn a_subagents_call_keeps_the_roots_text_whole() {
+        let mut u = Updates::new();
+        let mut events = Vec::new();
+        for body in [
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Half"}}"#,
+            r#"{"sessionUpdate":"tool_call","toolCallId":"exec:0#s","rawInput":{"command":"ls"},"_meta":{"cognition.ai/inferenceToolName":"exec","cognition.ai/subagent_context":{"parentAgentId":"sub-1"}}}"#,
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" whole"}}"#,
+        ] {
+            events.extend(u.update(&serde_json::from_str(body).unwrap()));
+        }
+        events.extend(u.flush());
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEventKind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Half whole"]);
     }
 
     /// The reply parser takes the last fenced block, a bare object, or
