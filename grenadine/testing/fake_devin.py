@@ -8,6 +8,8 @@ does, and plays the scenario `--scenario` names, a JSON file:
   options, as `{"value", "name"}`.
 - `load`: the updates session/load replays before it answers.
 - `gate`: session/new waits until this file exists, for up to 10 s.
+- `ask_on_new`: a request method that session/new sends before it
+  answers; it answers once the client has replied.
 - `plan_file`: `{"path", "text"}`, written at the start.
 - `prompts`: what a session/prompt does: the first entry whose `mode`
   (if any) is the mode set last and whose `match` (if any) is in the
@@ -142,6 +144,12 @@ for line in sys.stdin:
             if time.monotonic() > deadline:
                 sys.exit(1)
             time.sleep(0.01)
+        if "ask_on_new" in scenario:
+            send({"jsonrpc": "2.0", "id": "new-1", "method": scenario["ask_on_new"]})
+            for reply in sys.stdin:
+                log(reply)
+                if json.loads(reply).get("id") == "new-1":
+                    break
         answer(
             id,
             {

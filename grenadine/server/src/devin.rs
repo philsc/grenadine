@@ -536,9 +536,15 @@ impl Rpc {
         })
     }
 
+    /// Sends `method` and returns its result. Requests devin makes
+    /// meanwhile are declined, and anything else is dropped.
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_with(method, params, decline).await
+    }
+
     /// Sends `method` and returns its result; whatever else arrives
     /// meanwhile goes to `other`.
-    async fn call(
+    async fn call_with(
         &mut self,
         method: &str,
         params: Value,
@@ -581,7 +587,7 @@ impl Rpc {
     }
 }
 
-/// Declines whatever the agent asks a client that runs no turn.
+/// Declines whatever the agent asks while nothing else answers it.
 fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
     if let Incoming::Request(r) = m {
         acp.respond_error(&r.id, -32601, "unknown method");
@@ -614,13 +620,9 @@ async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentMo
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("running {}", exe.display()))?;
     let mut session = None;
     let listed = tokio::time::timeout(timeout, async {
-        rpc.call("initialize", initialize_params(), decline).await?;
+        rpc.call("initialize", initialize_params()).await?;
         let result = rpc
-            .call(
-                "session/new",
-                json!({"cwd": dir.path(), "mcpServers": []}),
-                decline,
-            )
+            .call("session/new", json!({"cwd": dir.path(), "mcpServers": []}))
             .await?;
         let created: NewSessionResponse = parse(result)?;
         session = Some(created.session_id);
@@ -631,7 +633,7 @@ async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentMo
     // history, whether or not the listing worked. An error here doesn't
     // fail the listing.
     if let Some(session) = session {
-        let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
+        let delete = rpc.call("session/delete", json!({"sessionId": session}));
         let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
     }
     let listed = listed
@@ -972,7 +974,7 @@ async fn run_turn(
 ) -> Result<Prompted> {
     let state = ctx.state.clone();
     let id = &session.id;
-    rpc.call("initialize", initialize_params(), |acp, m| {
+    rpc.call_with("initialize", initialize_params(), |acp, m| {
         ctx.handle(acp, m)
     })
     .await?;
@@ -987,7 +989,7 @@ async fn run_turn(
         // transcript already has them.
         ctx.loading = true;
         let result = rpc
-            .call(
+            .call_with(
                 "session/load",
                 json!({"sessionId": backend, "cwd": session.worktree, "mcpServers": mcp}),
                 |acp, m| ctx.handle(acp, m),
@@ -998,7 +1000,7 @@ async fn run_turn(
         (backend, current_model(&loaded.config_options))
     } else {
         let result = rpc
-            .call(
+            .call_with(
                 "session/new",
                 json!({"cwd": session.worktree, "mcpServers": mcp}),
                 |acp, m| ctx.handle(acp, m),
@@ -1028,7 +1030,7 @@ async fn run_turn(
     if stopped() {
         return Ok(Prompted::No);
     }
-    rpc.call(
+    rpc.call_with(
         "session/set_mode",
         json!({"sessionId": backend_session, "modeId": t.mode.as_str()}),
         |acp, m| ctx.handle(acp, m),
@@ -1036,7 +1038,7 @@ async fn run_turn(
     .await?;
     if let Some(m) = t.model.as_deref().filter(|m| *m != "default") {
         let result = rpc
-            .call(
+            .call_with(
                 "session/set_config_option",
                 json!({"sessionId": backend_session, "configId": "model", "value": m}),
                 |acp, m| ctx.handle(acp, m),
@@ -1070,7 +1072,7 @@ async fn run_turn(
         blocks.push(json!({"type": "text", "text": t.prompt}));
     }
     let result = rpc
-        .call(
+        .call_with(
             "session/prompt",
             json!({"sessionId": backend_session, "prompt": blocks}),
             |acp, m| ctx.handle(acp, m),
@@ -1314,7 +1316,7 @@ async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) ->
     if let Some(session) = session {
         // The session only existed for the job; it doesn't belong in the
         // user's history. A hung delete doesn't keep the job.
-        let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
+        let delete = rpc.call("session/delete", json!({"sessionId": session}));
         let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
     }
     rpc.kill().await;
@@ -1432,14 +1434,9 @@ async fn run_job(
 ) -> (Result<Value>, Option<String>) {
     let mut session = None;
     let result = tokio::time::timeout(job.timeout, async {
-        rpc.call("initialize", initialize_params(), |_, _| Ok(()))
-            .await?;
+        rpc.call("initialize", initialize_params()).await?;
         let result = rpc
-            .call(
-                "session/new",
-                json!({"cwd": cwd, "mcpServers": []}),
-                |_, _| Ok(()),
-            )
+            .call("session/new", json!({"cwd": cwd, "mcpServers": []}))
             .await?;
         let created: NewSessionResponse = parse(result)?;
         session = Some(created.session_id.clone());
@@ -1447,13 +1444,11 @@ async fn run_job(
         rpc.call(
             "session/set_config_option",
             json!({"sessionId": id, "configId": "model", "value": model}),
-            |_, _| Ok(()),
         )
         .await?;
         rpc.call(
             "session/set_mode",
             json!({"sessionId": id, "modeId": "ask"}),
-            |_, _| Ok(()),
         )
         .await?;
         let mut run = JobRun {
@@ -1469,7 +1464,7 @@ async fn run_job(
             serde_json::to_string_pretty(job.schema).unwrap_or_default()
         );
         let result = rpc
-            .call(
+            .call_with(
                 "session/prompt",
                 json!({"sessionId": id, "prompt": [{"type": "text", "text": prompt}]}),
                 |acp, m| run.handle(acp, m),
@@ -2117,6 +2112,32 @@ mod job_tests {
         }
         assert_eq!(log[2]["params"]["value"], "swe-2-high");
         assert_eq!(log[3]["params"]["modeId"], "ask");
+    }
+
+    /// A request devin makes while the job sets up is declined rather
+    /// than left to stall the job.
+    #[tokio::test]
+    async fn declines_requests_while_setting_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake(
+            dir.path(),
+            json!({
+                "session_id": "job-s",
+                "ask_on_new": "fs/read_text_file",
+                "prompts": [{"steps": [chunk(r#"{"ok": true}"#), {"end": "end_turn"}]}],
+            }),
+        );
+        let mut job = job();
+        job.timeout = Duration::from_secs(5);
+        let out = structured(&exe, "swe-2-high", &job, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"ok": true}));
+        let reply = fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["id"] == "new-1")
+            .unwrap();
+        assert_eq!(reply["error"]["code"], -32601, "{reply}");
     }
 
     /// Over budget: session/cancel goes out and the error says so.
