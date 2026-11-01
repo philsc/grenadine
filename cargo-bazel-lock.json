@@ -1,5 +1,5 @@
 {
-  "checksum": "6359e329fb3cb1f591d4e56df23d43d12f2e8e59e39f9c94d1d11ac7338d36b3",
+  "checksum": "310f97ca254d251e85dff7b26af80eac5e318582cda18013e97be5269efe7230",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4746,6 +4746,10 @@
             "target": "serde_json"
           },
           {
+            "id": "tempfile 3.27.0",
+            "target": "tempfile"
+          },
+          {
             "id": "tokio 1.54.1",
             "target": "tokio"
           },
@@ -4768,12 +4772,6 @@
           {
             "id": "vt100 0.18.1",
             "target": "vt100"
-          }
-        ],
-        "deps_dev": [
-          {
-            "id": "tempfile 3.27.0",
-            "target": "tempfile"
           }
         ],
         "edition": "2024"
@@ -18318,6 +18316,7 @@
     "serde_json 1.0.151",
     "similar 3.2.0",
     "syntect 5.3.0",
+    "tempfile 3.27.0",
     "tokio 1.54.1",
     "tokio-stream 0.1.19",
     "tokio-util 0.7.19",
@@ -18328,9 +18327,7 @@
     "wasm-bindgen-futures 0.4.71",
     "web-sys 0.3.98"
   ],
-  "direct_dev_deps": [
-    "tempfile 3.27.0"
-  ],
+  "direct_dev_deps": [],
   "workspace_members": {
     "grenadine_core 0.0.0": "grenadine/core",
     "grenadine_server 0.0.0": "grenadine/server",

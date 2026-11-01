@@ -24,12 +24,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::agent::{
-    Backend, Decision, Stopper, StructuredJob, Turn, TurnSink, backend_command, queue_next,
-    request_approval, stderr_tail,
+    Backend, Decision, ModelList, Stopper, StructuredJob, Turn, TurnSink, backend_command,
+    queue_next, request_approval, stderr_tail,
 };
 use crate::sync::State;
 
@@ -50,33 +50,22 @@ fn initialize_params() -> Value {
 pub struct Devin {
     /// The `devin` executable.
     exe: PathBuf,
-    /// The models Devin offers, once it has listed them.
-    models: OnceCell<Vec<AgentModelInfo>>,
+    /// The models Devin offers.
+    models: ModelList,
 }
 
 impl Devin {
     pub fn new(exe: PathBuf) -> Devin {
         Devin {
             exe,
-            models: OnceCell::new(),
+            models: ModelList::default(),
         }
     }
 }
 
 impl Backend for Devin {
-    /// The models Devin offers, listed once and kept; none while it
-    /// can't list them.
-    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>> {
-        async move {
-            match self.models.get_or_try_init(|| list_models(&self.exe)).await {
-                Ok(models) => models.clone(),
-                Err(e) => {
-                    tracing::warn!("listing Devin's models: {e:#}");
-                    Vec::new()
-                }
-            }
-        }
-        .boxed()
+    fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>> {
+        self.models.get("Devin", || list_models(&self.exe)).boxed()
     }
 
     fn turn<'a>(
@@ -541,42 +530,52 @@ fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
     Ok(())
 }
 
+/// How long listing the models may take.
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the listing's session gets to be deleted.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The models Devin offers, from a throwaway `devin acp` session's model
 /// config option; the session is deleted again so it doesn't stay in the
 /// user's Devin history.
 async fn list_models(exe: &Path) -> Result<Vec<AgentModelInfo>> {
-    let dir = std::env::temp_dir().join(format!("grenadine-models-{}", crate::agent::uuid()));
-    std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
+    list_models_within(exe, LIST_TIMEOUT).await
+}
+
+/// `list_models`, giving up after `timeout`.
+async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentModelInfo>> {
+    // It goes away with the listing, however that ends.
+    let dir = tempfile::Builder::new()
+        .prefix("grenadine-models-")
+        .tempdir()
+        .context("can't create a directory for listing Devin's models")?;
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("acp").current_dir(&dir);
+    cmd.arg("acp").current_dir(dir.path());
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("running {}", exe.display()))?;
-    let models = async {
+    let mut session = None;
+    let listed = tokio::time::timeout(timeout, async {
         rpc.call("initialize", initialize_params(), decline).await?;
-        let session: NewSessionResponse = parse(
-            rpc.call(
-                "session/new",
-                json!({"cwd": dir, "mcpServers": []}),
-                decline,
-            )
-            .await?,
-        )?;
-        // The session only existed to ask; it doesn't belong in the
-        // user's history. An error here doesn't fail the listing.
-        let _ = rpc
+        let result = rpc
             .call(
-                "session/delete",
-                json!({"sessionId": session.session_id}),
+                "session/new",
+                json!({"cwd": dir.path(), "mcpServers": []}),
                 decline,
             )
-            .await;
-        Ok(models(&session.config_options))
-    };
-    let models = tokio::time::timeout(Duration::from_secs(30), models)
-        .await
-        .context("devin didn't list its models in time")?;
-    drop(rpc);
-    let _ = std::fs::remove_dir_all(&dir);
-    models
+            .await?;
+        let created: NewSessionResponse = parse(result)?;
+        session = Some(created.session_id);
+        Ok(models(&created.config_options))
+    })
+    .await;
+    // The session only existed to ask; it doesn't belong in the user's
+    // history, whether or not the listing worked. An error here doesn't
+    // fail the listing.
+    if let Some(session) = session {
+        let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
+        let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
+    }
+    listed.context("devin didn't list its models in time")?
 }
 
 /// What the turn remembers of a tool call: the transcript's name and

@@ -13,9 +13,8 @@ use futures::future::BoxFuture;
 use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::OnceCell;
 
-use crate::agent::{Backend, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
+use crate::agent::{Backend, ModelList, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
 use crate::sync::State;
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
@@ -46,33 +45,24 @@ const INITIALIZE: &str =
 pub struct Claude {
     /// The `claude` executable.
     exe: PathBuf,
-    /// The models Claude Code offers, once it has listed them.
-    models: OnceCell<Vec<AgentModelInfo>>,
+    /// The models Claude Code offers.
+    models: ModelList,
 }
 
 impl Claude {
     pub fn new(exe: PathBuf) -> Claude {
         Claude {
             exe,
-            models: OnceCell::new(),
+            models: ModelList::default(),
         }
     }
 }
 
 impl Backend for Claude {
-    /// The models Claude Code offers, listed once and kept; none while it
-    /// can't list them.
-    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>> {
-        async move {
-            match self.models.get_or_try_init(|| list_models(&self.exe)).await {
-                Ok(models) => models.clone(),
-                Err(e) => {
-                    tracing::warn!("listing Claude Code's models: {e:#}");
-                    Vec::new()
-                }
-            }
-        }
-        .boxed()
+    fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>> {
+        self.models
+            .get("Claude Code", || list_models(&self.exe))
+            .boxed()
     }
 
     fn turn<'a>(

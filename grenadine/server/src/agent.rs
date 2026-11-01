@@ -52,6 +52,10 @@ const IMAGE_TYPES: [(&str, &str); 4] = [
 /// killed.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a backend that couldn't list its models goes before it's
+/// asked again, so that one that hangs doesn't hold up every request.
+const LISTING_RETRY: Duration = Duration::from_secs(5 * 60);
+
 /// How much of a backend's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
 
@@ -113,8 +117,8 @@ pub struct Decision {
 /// it offers that never changes, like its permission modes, is on
 /// `AgentBackend`.
 pub trait Backend: Send + Sync {
-    /// The models it offers; none while they can't be listed.
-    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>>;
+    /// The models it offers; an error while they can't be listed.
+    fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>>;
 
     /// Runs `turn` of `session` and returns the status the session ends
     /// up in; `sink` gets what the turn's output means for the transcript.
@@ -165,6 +169,50 @@ pub struct StructuredJob<'a> {
     pub cwd: &'a Path,
     /// How long it may take before it's killed.
     pub timeout: Duration,
+}
+
+/// A backend's models: listed once and kept, or the listing's failure
+/// kept for `LISTING_RETRY`. Whoever asks while it lists waits for that
+/// listing.
+#[derive(Default)]
+pub struct ModelList(tokio::sync::Mutex<Option<Listing>>);
+
+enum Listing {
+    Listed(Vec<AgentModelInfo>),
+    Failed { at: Instant, error: String },
+}
+
+impl ModelList {
+    /// The models, from `list` unless they're known; `name` is the
+    /// backend's, for the log.
+    pub async fn get<F>(&self, name: &str, list: impl FnOnce() -> F) -> Result<Vec<AgentModelInfo>>
+    where
+        F: Future<Output = Result<Vec<AgentModelInfo>>>,
+    {
+        let mut listing = self.0.lock().await;
+        match &*listing {
+            Some(Listing::Listed(models)) => return Ok(models.clone()),
+            Some(Listing::Failed { at, error }) if at.elapsed() < LISTING_RETRY => {
+                bail!("{error}")
+            }
+            _ => {}
+        }
+        match list().await {
+            Ok(models) => {
+                *listing = Some(Listing::Listed(models.clone()));
+                Ok(models)
+            }
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::warn!("listing {name}'s models: {error}");
+                *listing = Some(Listing::Failed {
+                    at: Instant::now(),
+                    error: error.clone(),
+                });
+                bail!("{error}")
+            }
+        }
+    }
 }
 
 /// Stops a turn the way Ctrl-C would. Interrupting a turn again stops it
@@ -783,29 +831,34 @@ impl Agents {
 
     /// The backends sessions can pick, with their models: the default
     /// one always, its models empty when they can't be listed, and the
-    /// others once they list theirs.
+    /// others when they can list theirs.
     pub async fn backends(&self) -> Vec<AgentBackendInfo> {
-        let mut infos = Vec::new();
-        for backend in AgentBackend::ALL {
-            let models = self.backend(backend).models().await;
-            if backend == AgentBackend::default() || !models.is_empty() {
-                infos.push(backend.info(models));
-            }
-        }
-        infos
+        let listed =
+            futures::future::join_all(AgentBackend::ALL.map(|b| self.backend(b).models())).await;
+        AgentBackend::ALL
+            .into_iter()
+            .zip(listed)
+            .filter_map(|(backend, listed)| match listed {
+                Ok(models) => Some(backend.info(models)),
+                Err(_) if backend == AgentBackend::default() => Some(backend.info(Vec::new())),
+                Err(_) => None,
+            })
+            .collect()
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
     /// one it lists. While it can't list them, there's no telling, so any
     /// that can't pass for a flag goes and the backend itself rejects one
     /// it doesn't have.
+    ///
+    /// Only `backend` is asked, and a backend that can't list its models
+    /// still takes prompts that keep its default.
     pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
         let Some(m) = model else { return true };
-        let models = self.backend(backend).models().await;
-        if models.is_empty() {
-            return !m.is_empty() && !m.starts_with('-');
+        match self.backend(backend).models().await {
+            Ok(models) if !models.is_empty() => models.iter().any(|i| i.value == m),
+            _ => !m.is_empty() && !m.starts_with('-'),
         }
-        models.iter().any(|i| i.value == m)
     }
 }
 
@@ -3480,6 +3533,40 @@ done
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("{id} never waited for approval");
+    }
+
+    /// A devin that can't list its models leaves Devin out of the
+    /// backends, but prompts with its default or any model that can't
+    /// pass for a flag still go, and devin isn't asked again for a while.
+    #[tokio::test]
+    async fn a_failed_listing_is_kept() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let script = format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display());
+        let state = state_with_devin(&fx, dir.path(), &script);
+        let backends: Vec<_> = state
+            .agents
+            .backends()
+            .await
+            .into_iter()
+            .map(|i| i.backend)
+            .collect();
+        assert_eq!(backends, [AgentBackend::Claude]);
+        assert!(state.agents.offers(AgentBackend::Devin, None).await);
+        assert!(
+            state
+                .agents
+                .offers(AgentBackend::Devin, Some("swe-2"))
+                .await
+        );
+        assert!(
+            !state
+                .agents
+                .offers(AgentBackend::Devin, Some("--help"))
+                .await
+        );
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
     }
 
     /// A Devin session's turn goes over ACP: the session id is stored,
