@@ -3798,6 +3798,43 @@ mod devin_tests {
         assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
     }
 
+    /// A turn with a subagent costs what `agent_stopped` reports, which
+    /// counts the subagent, rather than the root's total, whether it comes
+    /// before the prompt's answer or after it, and it isn't billed twice.
+    #[tokio::test]
+    async fn a_devin_turn_costs_what_agent_stopped_reports() {
+        let stopped = json!({
+            "notify": "_cognition.ai/agent_stopped",
+            "params": {"stats": {"acuCost": 0.4}},
+        });
+        let mut sub = usage(0.1);
+        sub["update"]["_meta"]["cognition.ai/subagent_context"] = json!({"parentAgentId": "sub-1"});
+        let end = json!({"end": "end_turn"});
+        for steps in [
+            vec![usage(0.25), sub.clone(), stopped.clone(), end.clone()],
+            vec![usage(0.25), sub.clone(), end.clone(), stopped.clone()],
+        ] {
+            let fx = crate::git::tests::fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let devin = fake(dir.path(), scenario("turn-stopped", steps));
+            let state = state_with_devin(&fx, dir.path(), devin);
+            let session = start(&state, &fx).await;
+            wait_for_turns(&state, &session.id, 1).await;
+            let ended: Vec<_> = state
+                .db
+                .agent_events(&session.id)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    AgentEventKind::TurnEnded { cost, .. } => Some(cost),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ended, [Some(0.4)]);
+            assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, 0.4);
+        }
+    }
+
     /// A Devin session's turn goes over ACP: the session id is stored,
     /// its permission request waits on the page, and the turn's cost is
     /// in ACUs. The next turn resumes the session without the answers

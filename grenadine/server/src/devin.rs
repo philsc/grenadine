@@ -307,6 +307,22 @@ fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
     meta.get(format!("cognition.ai/{key}"))
 }
 
+/// The params of `_cognition.ai/agent_stopped`, which Devin sends when a
+/// turn's agent stops.
+#[derive(Debug, Default, Deserialize)]
+struct AgentStopped {
+    #[serde(default)]
+    stats: StopStats,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopStats {
+    /// What the turn cost, in ACU, subagents included.
+    #[serde(default)]
+    acu_cost: Option<f64>,
+}
+
 /// The answer to `session/new`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -576,6 +592,11 @@ impl Rpc {
         bail!("devin closed its stdout")
     }
 
+    /// The next message devin sends; `None` once its stdout closed.
+    async fn next(&mut self) -> Option<Incoming> {
+        self.incoming.recv().await
+    }
+
     /// Kills devin; returns its stderr's tail.
     async fn kill(mut self) -> String {
         let _ = self.child.kill().await;
@@ -604,6 +625,10 @@ fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
     }
     Ok(())
 }
+
+/// How long a turn with subagents waits for `agent_stopped` after the
+/// prompt's answer.
+const STOPPED_WAIT: Duration = Duration::from_millis(500);
 
 /// How long listing the models may take.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -725,8 +750,14 @@ struct Updates {
     /// happens.
     text: String,
     tools: Tools,
-    /// The turn process's running ACU total, from the latest usage.
+    /// The turn process's running ACU total, from the root's latest
+    /// usage; it leaves out what subagents spent.
     acu: Option<f64>,
+    /// The turn's ACU total from `agent_stopped`, which counts the
+    /// subagents too.
+    stopped: Option<f64>,
+    /// Whether a subagent has reported anything.
+    subagents: bool,
 }
 
 impl Updates {
@@ -735,7 +766,15 @@ impl Updates {
             text: String::new(),
             tools: Tools::default(),
             acu: None,
+            stopped: None,
+            subagents: false,
         }
+    }
+
+    /// What the turn has cost so far, in ACU: `agent_stopped`'s total
+    /// once it came, else the root's.
+    fn total(&self) -> Option<f64> {
+        self.stopped.or(self.acu)
     }
 
     /// Ends the answer in progress; the `Text` event if it says anything.
@@ -751,6 +790,7 @@ impl Updates {
     /// skipped, except their tool calls, which name the subagent.
     fn update(&mut self, u: &SessionUpdate) -> Vec<AgentEventKind> {
         let parent = u.subagent();
+        self.subagents |= parent.is_some();
         if parent.is_some() && !matches!(u, SessionUpdate::ToolCall(_)) {
             return Vec::new();
         }
@@ -877,17 +917,32 @@ impl TurnCtx<'_, '_> {
                     for e in self.updates.update(&n.update) {
                         self.sink.event(e)?;
                     }
-                    // ACUs are billed as they're spent, so a turn that
-                    // never ends pays for what it used too.
-                    if let Some(total) = self.updates.acu {
-                        self.sink.bill(total)?;
+                    self.bill()?;
+                }
+            }
+            Incoming::Notification(n) if n.method == "_cognition.ai/agent_stopped" => {
+                if !self.loading {
+                    let stopped = parse::<AgentStopped>(n.params).unwrap_or_default();
+                    if let Some(acu) = stopped.stats.acu_cost {
+                        self.updates.stopped = Some(acu);
                     }
+                    self.bill()?;
                 }
             }
             Incoming::Request(r) => self.request(acp, r),
             Incoming::Notification(_) | Incoming::Response(_) => {}
         }
         Ok(())
+    }
+
+    /// Bills what the turn has cost so far. ACUs are billed as they're
+    /// spent, so a turn that never ends pays for what it used too, and
+    /// `agent_stopped`'s total only adds what the subagents spent.
+    fn bill(&mut self) -> Result<()> {
+        match self.updates.total() {
+            Some(total) => self.sink.bill(total),
+            None => Ok(()),
+        }
     }
 
     /// Answers the request `r` the agent made, on a task of its own.
@@ -940,7 +995,7 @@ async fn turn(
             loading: false,
         };
         let result = run_turn(&mut rpc, session, &t, &mut ctx).await;
-        (result, ctx.updates.acu)
+        (result, ctx.updates.total())
     };
     // The turn is over; stdin closing lets devin go on its own.
     let (exit, stderr) = rpc.close().await?;
@@ -1088,6 +1143,24 @@ async fn run_turn(
             |acp, m| ctx.handle(acp, m),
         )
         .await;
+    // With subagents, only agent_stopped has the turn's whole cost, and it
+    // may come after the prompt's answer.
+    if result.is_ok() && ctx.updates.subagents && ctx.updates.stopped.is_none() {
+        let acp = rpc.acp.clone();
+        let drained = tokio::time::timeout(STOPPED_WAIT, async {
+            while ctx.updates.stopped.is_none() {
+                match rpc.next().await {
+                    Some(m) => ctx.handle(&acp, m)?,
+                    None => break,
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await;
+        if let Ok(drained) = drained {
+            drained?;
+        }
+    }
     for e in ctx.updates.flush() {
         ctx.sink.event(e)?;
     }

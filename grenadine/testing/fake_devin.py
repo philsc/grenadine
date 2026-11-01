@@ -15,10 +15,12 @@ does, and plays the scenario `--scenario` names, a JSON file:
   (if any) is the mode set last and whose `match` (if any) is in the
   prompt's JSON. Its `steps` run in order:
   - `{"update": U}` sends a session/update with U.
+  - `{"notify": METHOD, "params": P}` sends a notification.
   - `{"request": METHOD, "params": P}` sends a request and waits for the
     client's reply; with `"wait": false`, the steps go on without it and
     the reply is only logged.
-  - `{"end": REASON}` answers the prompt with that stop reason.
+  - `{"end": REASON}` answers the prompt with that stop reason; the
+    steps after it still run.
   - `{"stderr": TEXT}` writes TEXT to stderr.
   - `{"exit": true}` exits without answering.
 
@@ -94,11 +96,14 @@ waiting = None
 
 
 def run_steps():
-    global prompt, steps, waiting, requests
-    while prompt is not None and steps and waiting is None:
+    global prompt, waiting, requests
+    while steps and waiting is None:
         step = steps.pop(0)
         if "update" in step:
             update(step["update"])
+        elif "notify" in step:
+            params = step.get("params", {})
+            send({"jsonrpc": "2.0", "method": step["notify"], "params": params})
         elif "request" in step:
             requests += 1
             id = f"{step['request']}-{requests}"
@@ -108,7 +113,7 @@ def run_steps():
                 waiting = id
         elif "end" in step:
             answer(prompt, {"stopReason": step["end"]})
-            prompt, steps = None, []
+            prompt = None
         elif "stderr" in step:
             sys.stderr.write(step["stderr"] + "\n")
             sys.stderr.flush()
