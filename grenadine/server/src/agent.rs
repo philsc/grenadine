@@ -2017,9 +2017,10 @@ impl<'a> TurnSink<'a> {
     }
 
     /// Adds what the turn's process has cost since it was last billed to
-    /// the session's cost; `total` is the process's total so far.
+    /// the session's cost; `total` is the process's total so far. A total
+    /// below what's billed already takes nothing back.
     pub fn bill(&mut self, total: f64) -> Result<()> {
-        if total != self.billed {
+        if total > self.billed {
             self.state.db.add_agent_cost(self.id, total - self.billed)?;
             self.billed = total;
         }
@@ -3886,10 +3887,40 @@ mod devin_tests {
         });
         let mut sub = usage(0.1);
         sub["update"]["_meta"]["cognition.ai/subagent_context"] = json!({"parentAgentId": "sub-1"});
+        // A subagent's own agent_stopped doesn't count, and the wait goes
+        // on for the root's.
+        let sub_stopped = json!({
+            "notify": "_cognition.ai/agent_stopped",
+            "params": {
+                "stats": {"acuCost": 0.9},
+                "_meta": {"cognition.ai/subagent_context": {"parentAgentId": "sub-1"}},
+            },
+        });
         let end = json!({"end": "end_turn"});
-        for steps in [
-            vec![usage(0.25), sub.clone(), stopped.clone(), end.clone()],
-            vec![usage(0.25), sub.clone(), end.clone(), stopped.clone()],
+        for (steps, cost) in [
+            (
+                vec![usage(0.25), sub.clone(), stopped.clone(), end.clone()],
+                0.4,
+            ),
+            (
+                vec![usage(0.25), sub.clone(), end.clone(), stopped.clone()],
+                0.4,
+            ),
+            (
+                vec![
+                    usage(0.25),
+                    sub.clone(),
+                    sub_stopped,
+                    end.clone(),
+                    stopped.clone(),
+                ],
+                0.4,
+            ),
+            // What's billed never goes down.
+            (
+                vec![usage(0.5), sub.clone(), stopped.clone(), end.clone()],
+                0.5,
+            ),
         ] {
             let fx = crate::git::tests::fixture();
             let dir = tempfile::tempdir().unwrap();
@@ -3907,8 +3938,8 @@ mod devin_tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(ended, [Some(0.4)]);
-            assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, 0.4);
+            assert_eq!(ended, [Some(cost)]);
+            assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, cost);
         }
     }
 

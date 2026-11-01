@@ -226,13 +226,9 @@ impl SessionUpdate {
     }
 
     /// The subagent the update is about, by its id; `None` for the
-    /// session's own agent, whose id is "root".
+    /// session's own agent.
     fn subagent(&self) -> Option<&str> {
-        self.meta()
-            .and_then(|m| extension(m, "subagent_context"))
-            .and_then(|c| c.get("parentAgentId"))
-            .and_then(Value::as_str)
-            .filter(|p| *p != "root")
+        self.meta().and_then(subagent_of)
     }
 }
 
@@ -302,6 +298,15 @@ struct UsageUpdate {
     meta: Value,
 }
 
+/// The subagent a message's `_meta` says it's about, by its id; `None`
+/// for the session's own agent, whose id is "root".
+fn subagent_of(meta: &Value) -> Option<&str> {
+    extension(meta, "subagent_context")
+        .and_then(|c| c.get("parentAgentId"))
+        .and_then(Value::as_str)
+        .filter(|p| *p != "root")
+}
+
 /// The `cognition.ai/<key>` extension in a `_meta`.
 fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
     meta.get(format!("cognition.ai/{key}"))
@@ -313,6 +318,9 @@ fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
 struct AgentStopped {
     #[serde(default)]
     stats: StopStats,
+    /// Says which subagent stopped, if it wasn't the root.
+    #[serde(rename = "_meta", default)]
+    meta: Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -770,9 +778,12 @@ impl Updates {
     }
 
     /// What the turn has cost so far, in ACU: `agent_stopped`'s total
-    /// once it came, else the root's.
+    /// once it came, else the root's, and never less than the root's.
     fn total(&self) -> Option<f64> {
-        self.stopped.or(self.acu)
+        match (self.stopped, self.acu) {
+            (Some(s), Some(a)) => Some(s.max(a)),
+            (s, a) => s.or(a),
+        }
     }
 
     /// Ends the answer in progress; the `Text` event if it says anything.
@@ -921,7 +932,10 @@ impl TurnCtx<'_, '_> {
             Incoming::Notification(n) if n.method == "_cognition.ai/agent_stopped" => {
                 if !self.loading {
                     let stopped = parse::<AgentStopped>(n.params).unwrap_or_default();
-                    if let Some(acu) = stopped.stats.acu_cost {
+                    // Only the root's counts the whole turn.
+                    if subagent_of(&stopped.meta).is_none()
+                        && let Some(acu) = stopped.stats.acu_cost
+                    {
                         self.updates.stopped = Some(acu);
                     }
                     self.bill()?;
