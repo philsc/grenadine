@@ -1219,9 +1219,50 @@ pub fn queue_next(state: &State, id: &str, prompt: String, plan: bool) {
     });
 }
 
-/// Forgets a permission request that Claude Code stopped waiting for.
-pub fn drop_approval(state: &State, id: &str, tool_use: &str) {
-    state.agents.with_live(id, |l| l.pending.remove(tool_use));
+/// Forgets a permission request when its waiter stops waiting.
+struct PendingGuard<'a> {
+    state: &'a State,
+    id: &'a str,
+    tool_use: &'a str,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .agents
+            .with_live(self.id, |l| l.pending.remove(self.tool_use));
+    }
+}
+
+/// Asks the user about the tool use `tool_use`, as `request_approval`
+/// does, and waits for the answer; `None` when the request couldn't be
+/// made or the server shuts down first. However the wait ends, including
+/// when it's dropped with the turn or the connection that waits, the
+/// request is forgotten, so it no longer counts as pending.
+pub async fn await_approval(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    tool_name: &str,
+    input: &Value,
+    options: Vec<ApprovalOption>,
+) -> Option<Decision> {
+    let rx = match request_approval(state, id, tool_use, tool_name, input, options) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!("agent {id}: {e:#}");
+            return None;
+        }
+    };
+    let _guard = PendingGuard {
+        state,
+        id,
+        tool_use,
+    };
+    tokio::select! {
+        d = rx => d.ok(),
+        _ = state.shutdown.cancelled() => None,
+    }
 }
 
 /// Passes the user's answer on to the waiting permission request. Returns

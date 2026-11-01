@@ -28,14 +28,6 @@ const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
 /// page. 0 turns the check off.
 const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
-/// The grenadine MCP server's tools that Claude may use without asking.
-const ALLOWED_TOOLS: [&str; 4] = [
-    "mcp__grenadine__list_terminals",
-    "mcp__grenadine__read_terminal",
-    "mcp__grenadine__wait_for_terminal",
-    "mcp__grenadine__show_image",
-];
-
 /// The `initialize` control request the Agent SDK starts with. Claude Code
 /// answers it without calling a model.
 const INITIALIZE: &str =
@@ -217,7 +209,7 @@ async fn turn(
         "mcp__grenadine__approve",
     ])
     .arg("--allowedTools")
-    .args(ALLOWED_TOOLS)
+    .args(crate::mcp::ALLOWED_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
     .args(

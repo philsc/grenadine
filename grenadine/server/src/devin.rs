@@ -28,9 +28,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::agent::{
-    Backend, Decision, ModelList, Stopper, StructuredJob, Turn, TurnSink, backend_command,
-    queue_next, request_approval, stderr_tail,
+    Backend, Decision, ModelList, Stopper, StructuredJob, Turn, TurnSink, await_approval,
+    backend_command, queue_next, stderr_tail,
 };
+use crate::mcp::ALLOWED_TOOLS;
 use crate::sync::State;
 
 /// The `initialize` params: the ACP version and that the client can't
@@ -1006,12 +1007,13 @@ fn first_option(options: &[ApprovalOption], kind: ApprovalKind) -> Option<String
 }
 
 /// The `optionId` the user's decision picks: their explicit choice, a
-/// plan approval's `plan_<mode>` option, the first allow, or the first
-/// reject.
+/// plan approval's `plan_<mode>` option, an allow or a reject as the
+/// decision says, or else the first option.
 fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<String> {
     if let Some(o) = &d.option {
         return Some(o.clone());
     }
+    let first = |kinds: &[ApprovalKind]| kinds.iter().find_map(|&k| first_option(options, k));
     if d.allow {
         if tool.name == "ExitPlanMode"
             && let Some(m) = &d.mode
@@ -1021,14 +1023,25 @@ fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<Strin
                 return Some(want);
             }
         }
-        first_option(options, ApprovalKind::AllowOnce)
+        first(&[ApprovalKind::AllowOnce, ApprovalKind::AllowAlways])
     } else {
-        first_option(options, ApprovalKind::RejectOnce)
+        first(&[ApprovalKind::RejectOnce, ApprovalKind::RejectAlways])
     }
     .or_else(|| options.first().map(|o| o.id.clone()))
 }
 
-/// Answers a `session/request_permission` request.
+/// The answer to a `session/request_permission` request that picks
+/// `option`; without one, it's cancelled.
+fn permission_outcome(option: Option<String>) -> Value {
+    match option {
+        Some(o) => json!({"outcome": {"outcome": "selected", "optionId": o}}),
+        None => json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
+
+/// Answers a `session/request_permission` request. It runs on a task the
+/// turn owns, so a request still waiting when the turn ends is dropped,
+/// and with it the card's pending request.
 async fn permission(
     acp: Arc<Acp>,
     state: Arc<State>,
@@ -1037,59 +1050,53 @@ async fn permission(
     rpc_id: RequestId,
     request: PermissionRequest,
 ) {
-    let tool_call = request.tool_call.tool_call_id.clone();
+    let tool_call = &request.tool_call.tool_call_id;
     let options = permission_options(&request);
-    // Grenadine's own MCP tools never ask the user.
-    let grenadine = extension(&request.tool_call.meta, "permissionRule")
-        .and_then(Value::as_str)
-        .is_some_and(|r| r.starts_with("mcp__grenadine__"));
-    let outcome = if grenadine {
-        json!({"outcome": "selected", "optionId": first_option(&options, ApprovalKind::AllowOnce)})
+    let tool = tools
+        .lock()
+        .unwrap()
+        .get(tool_call)
+        .cloned()
+        .unwrap_or_default();
+    // The grenadine tools Claude may use without asking don't ask here
+    // either; Devin names them in the request's permission rule.
+    let rule = extension(&request.tool_call.meta, "permissionRule").and_then(Value::as_str);
+    let allowed = [Some(tool.name.as_str()), rule]
+        .into_iter()
+        .flatten()
+        .any(|name| ALLOWED_TOOLS.contains(&name));
+    let decision = if allowed {
+        Some(Decision {
+            allow: true,
+            ..Decision::default()
+        })
     } else {
-        let tool = tools
-            .lock()
-            .unwrap()
-            .get(&tool_call)
-            .cloned()
-            .unwrap_or_default();
-        let rx = match request_approval(
+        await_approval(
             &state,
             &id,
-            &tool_call,
+            tool_call,
             &tool.name,
             &tool.input,
             options.clone(),
-        ) {
-            Ok(rx) => rx,
-            Err(e) => {
-                tracing::warn!("agent {id}: {e:#}");
-                acp.respond(&rpc_id, json!({"outcome": {"outcome": "cancelled"}}));
-                return;
-            }
-        };
-        let decision = tokio::select! {
-            d = rx => d.ok(),
-            _ = state.shutdown.cancelled() => None,
-        };
-        match decision {
-            None => json!({"outcome": {"outcome": "cancelled"}}),
-            Some(d) => {
-                if !d.allow
-                    && let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty())
-                {
-                    // The feedback becomes the next prompt; a rejected
-                    // plan keeps planning.
-                    queue_next(&state, &id, message, tool.name == "ExitPlanMode");
-                }
-                json!({"outcome": {"outcome": "selected", "optionId": decide(&d, &tool, &options)}})
-            }
-        }
+        )
+        .await
     };
-    acp.respond(&rpc_id, outcome);
+    let option = decision.and_then(|d| {
+        if !d.allow
+            && let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty())
+        {
+            // The feedback becomes the next prompt; a rejected plan keeps
+            // planning.
+            queue_next(&state, &id, message, tool.name == "ExitPlanMode");
+        }
+        decide(&d, &tool, &options)
+    });
+    acp.respond(&rpc_id, permission_outcome(option));
 }
 
 /// Answers an `elicitation/create` request, the questions of a
-/// `ask_user_question` tool call.
+/// `ask_user_question` tool call. Like `permission`, it runs on a task
+/// the turn owns.
 async fn elicitation(
     acp: Arc<Acp>,
     state: Arc<State>,
@@ -1109,25 +1116,15 @@ async fn elicitation(
         .get(&tool_call)
         .map(|t| t.input.clone())
         .unwrap_or(Value::Null);
-    let rx = match request_approval(
+    let decision = await_approval(
         &state,
         &id,
         &tool_call,
         "AskUserQuestion",
         &input,
         Vec::new(),
-    ) {
-        Ok(rx) => rx,
-        Err(e) => {
-            tracing::warn!("agent {id}: {e:#}");
-            acp.respond(&rpc_id, json!({"action": "decline"}));
-            return;
-        }
-    };
-    let decision = tokio::select! {
-        d = rx => d.ok(),
-        _ = state.shutdown.cancelled() => None,
-    };
+    )
+    .await;
     let answer = match decision {
         Some(d) if d.allow => {
             let answers = d.answers.unwrap_or_default();
@@ -1436,6 +1433,19 @@ mod tests {
             ),
             Some("reject_once".into())
         );
+        // Without an allow_once, an allow picks another allow, and with no
+        // options at all there's nothing to pick.
+        let always = [
+            option("reject_once", "No", ApprovalKind::RejectOnce),
+            option("allow_always", "Always", ApprovalKind::AllowAlways),
+        ];
+        let allow = Decision {
+            allow: true,
+            ..Default::default()
+        };
+        let tool = Tool::default();
+        assert_eq!(decide(&allow, &tool, &always), Some("allow_always".into()));
+        assert_eq!(decide(&allow, &tool, &[]), None);
     }
 
     /// A fake `devin acp` for the listing: it answers the handshake and
