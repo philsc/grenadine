@@ -400,7 +400,7 @@ pub struct Agents {
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
-    /// Whether Haiku summarizes each new session's first prompt.
+    /// Whether each new session's first prompt is summarized.
     pub summaries: std::sync::atomic::AtomicBool,
     /// The shells opened from the sessions' pages.
     pub terminals: crate::terminal::Terminals,
@@ -4155,5 +4155,147 @@ cat {dir}/answer
         let left = crate::cleanup::cleanup_state(&state).unwrap().items;
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].title, "Devin leftover");
+    }
+
+    /// A deleted Devin session is scanned by Devin, from the digest
+    /// alone, in the clone, in ask mode, and its items are Devin's. A scan
+    /// that fails points at no Claude transcript.
+    #[tokio::test]
+    async fn a_devin_scan_goes_through_devin() {
+        let marker = "A coding agent session was just deleted";
+        for (reply, items) in [
+            (
+                json!({"items": [{"title": "Container e2e", "detail": "`docker rm -f e2e`"}]})
+                    .to_string(),
+                "Container e2e",
+            ),
+            ("no JSON".to_owned(), "Couldn't scan \u{201c}hi\u{201d}"),
+        ] {
+            let fx = crate::git::tests::fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let devin = fake(
+                dir.path(),
+                json!({
+                    "models": [{"value": "swe", "name": "SWE"}],
+                    "prompts": [
+                        {"match": marker, "steps": [
+                            {"update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": reply},
+                            }},
+                            {"end": "end_turn"},
+                        ]},
+                        {"steps": [
+                            {"update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": "exec:0#d",
+                                "rawInput": {"command": "docker run -d --name e2e pg"},
+                                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+                            }},
+                            {"end": "end_turn"},
+                        ]},
+                    ],
+                }),
+            );
+            let state = state_with_devin(&fx, dir.path(), devin);
+            state
+                .agents
+                .scans
+                .enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let session = create(
+                &state,
+                NewAgent {
+                    backend: AgentBackend::Devin,
+                    repo: fx.clone.slug.clone(),
+                    pr: None,
+                    prompt: "hi".into(),
+                    permission_mode: "accept-edits".into(),
+                    model: None,
+                    images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            wait_for_turns(&state, &session.id, 1).await;
+            assert!(delete(&state, &session.id).await.unwrap());
+            let mut found = Vec::new();
+            for _ in 0..200 {
+                let c = crate::cleanup::cleanup_state(&state).unwrap();
+                if c.scanning.is_empty() {
+                    found = c.items;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].title, items);
+            assert_eq!(found[0].backend, AgentBackend::Devin);
+            assert!(
+                !found[0].detail.contains("transcript"),
+                "{}",
+                found[0].detail
+            );
+
+            let log = fake_log(dir.path());
+            let prompt = log
+                .iter()
+                .find(|m| m["method"] == "session/prompt" && m.to_string().contains(marker))
+                .unwrap()
+                .to_string();
+            assert!(prompt.contains("$ docker run -d --name e2e pg"), "{prompt}");
+            assert!(!prompt.contains("full transcript is"), "{prompt}");
+            assert!(!prompt.contains("ls-remote"), "{prompt}");
+            // The job's session runs in the clone, in ask mode, and is gone
+            // again.
+            let job = log
+                .iter()
+                .rposition(|m| m["method"] == "session/new")
+                .unwrap();
+            assert_eq!(
+                std::fs::canonicalize(log[job]["params"]["cwd"].as_str().unwrap()).unwrap(),
+                std::fs::canonicalize(&fx.clone.path).unwrap()
+            );
+            let methods: Vec<_> = log[job..]
+                .iter()
+                .filter_map(|m| m["method"].as_str())
+                .collect();
+            assert!(methods.contains(&"session/delete"), "{methods:?}");
+            assert!(
+                log[job..]
+                    .iter()
+                    .any(|m| m["method"] == "session/set_mode" && m["params"]["modeId"] == "ask")
+            );
+        }
+    }
+
+    /// While Devin isn't offered, prune leaves its items alone and doesn't
+    /// ask it anything beyond its models.
+    #[tokio::test]
+    async fn prune_skips_devin_while_it_isnt_offered() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let devin = dir.path().join("devin");
+        std::fs::write(
+            &devin,
+            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 1\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = AgentSession {
+            backend: AgentBackend::Devin,
+            ..AgentSession::fixture("devin-s", &fx.clone.slug)
+        };
+        state
+            .db
+            .add_cleanup_items(&session, &[("Devin leftover".into(), "d".into())], now())
+            .unwrap();
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 0);
+        let left = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(left.len(), 1);
+        // Only the one listing, which failed.
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "acp\n");
     }
 }

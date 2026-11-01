@@ -2347,10 +2347,25 @@ mod job_tests {
             .await
             .unwrap();
         assert_eq!(out, json!({"a": 1}));
-        let log = std::fs::read_to_string(dir.path().join("devin_log")).unwrap();
-        assert!(log.contains("allow_once"), "{log}");
-        assert!(log.contains("reject_once"), "{log}");
-        assert!(log.contains("decline"), "{log}");
+        // The fake numbers its requests in the order it sends them.
+        let reply = |id: &str| {
+            fake_log(dir.path())
+                .into_iter()
+                .find(|m| m["id"] == id && m["method"].is_null())
+                .unwrap_or_else(|| panic!("no reply to {id}"))
+        };
+        assert_eq!(
+            reply("session/request_permission-1")["result"],
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}})
+        );
+        assert_eq!(
+            reply("session/request_permission-2")["result"],
+            json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}})
+        );
+        assert_eq!(
+            reply("elicitation/create-3")["result"],
+            json!({"action": "decline"})
+        );
     }
 
     /// A devin that never answers the prompt: timeout, and the prompt is

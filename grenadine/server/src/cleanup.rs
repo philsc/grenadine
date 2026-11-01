@@ -1,11 +1,11 @@
 //! What deleted agent sessions left behind. Deleting a session stops its
 //! processes and removes its worktree and Bazel output bases, but a
 //! session can also leave containers, files elsewhere, pushed branches
-//! and the like. A Haiku run reads the deleted session's transcript in the
-//! background and reports those as cleanup items, which the user can
-//! delete or hand off to a new session that cleans them up. Every five
-//! minutes, a Sonnet run checks the items and deletes the ones that are
-//! gone or taken care of already.
+//! and the like. A background job on the session's backend reads the
+//! deleted session's transcript and reports those as cleanup items, which
+//! the user can delete or hand off to a new session that cleans them up.
+//! Every five minutes, a job on each backend checks its items and deletes
+//! the ones that are gone or taken care of already.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -26,22 +26,7 @@ use crate::sync::State;
 /// How long a scan may take before it's killed.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// What a scan may spend, in USD.
-/// `s` with its `{}` placeholders filled, in order.
-trait Format {
-    fn format(&self, args: &[&str]) -> String;
-}
-
-impl Format for str {
-    fn format(&self, args: &[&str]) -> String {
-        let mut out = self.to_owned();
-        for arg in args {
-            out = out.replacen("{}", arg, 1);
-        }
-        out
-    }
-}
-
+/// What a scan may spend.
 const SCAN_BUDGET: Budget = Budget { usd: 2.0, acu: 1.0 };
 
 /// How often the cleanup items are checked for stale ones.
@@ -90,7 +75,20 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "Bash(gh repo view:*)",
 ];
 
-const INSTRUCTIONS: &str = "\
+/// What a scan on `backend` is asked to do.
+fn instructions(backend: AgentBackend) -> String {
+    // Devin keeps its sessions where a scan can't read them.
+    let tools = match backend {
+        AgentBackend::Claude => {
+            "Use tools only to read the full transcript, when the digest is cut short \
+             or leaves out what subagents did, or to check whether something still \
+             exists."
+        }
+        AgentBackend::Devin => "Use tools only to check whether something still exists.",
+    };
+    let agent = backend.label();
+    format!(
+        "\
 A coding agent session was just deleted. Its git worktree has been removed, \
 its processes stopped, and the Bazel output bases of the workspaces in the \
 worktree deleted. Find anything else the session created that may still \
@@ -100,14 +98,16 @@ outside the worktree (in /tmp, the home directory, caches); other git \
 worktrees or clones; branches or tags pushed to remotes; installed packages \
 or tools; systemd units, cron jobs or background services.
 
-Work from the transcript digest below. {} You can only look; never try \
+Work from the transcript digest below. {tools} You can only look; never try \
 to change or remove anything.
 
-Leave out things inside the worktree, Bazel's shared caches, {}'s \
+Leave out things inside the worktree, Bazel's shared caches, {agent}'s \
 own files, and things the session removed again itself. Report each finding \
 with a one-line title and a markdown detail that names exactly what it is \
 and where, quotes the evidence from the transcript, and says how to remove \
-it. If there's nothing, report no items.";
+it. If there's nothing, report no items."
+    )
+}
 
 /// How to use the tools on `backend`, for both scans and checks for stale
 /// items, and where the job runs, for `repo`: its clone, or a directory of
@@ -355,13 +355,17 @@ pub(crate) fn allowed_command(cmd: &str) -> bool {
     READ_ONLY_COMMANDS.iter().any(|c| c.allows(&words))
 }
 
-const PRUNE_INSTRUCTIONS: &str = "\
+/// What a check on `backend` for stale items is asked to do.
+fn prune_instructions(backend: AgentBackend) -> String {
+    let agent = backend.label();
+    format!(
+        "\
 Scans of deleted coding agent sessions reported the cleanup items below as \
 things the sessions may have left behind on this machine or on remotes. \
 Some of them may be stale: the thing no longer exists, it was cleaned up \
 already (for example by the cleanup session an item was handed off to), or \
 it isn't something to clean up after all (for example it was inside the \
-session's worktree, which is removed, or it's a shared cache, or {}'s \
+session's worktree, which is removed, or it's a shared cache, or {agent}'s \
 own files).
 
 Find the items that can be deleted from the list. Check with the tools \
@@ -373,7 +377,9 @@ reason. If none can be deleted, report none.
 A pull request that's merged or closed needs no cleaning up, and neither \
 does its branch once the branch is gone from the remote. A commit that \
 was never pushed needs none once `git cat-file -t` can't find it, or once \
-a branch on the remote contains it.";
+a branch on the remote contains it."
+    )
+}
 
 /// The scans: whether deleting a session starts one, and the ones running.
 pub struct Scans {
@@ -427,13 +433,19 @@ pub fn scan(state: &Arc<State>, session: AgentSession, events: Vec<AgentEvent>) 
             Ok(found) => found,
             Err(e) => {
                 tracing::warn!("scanning {} for cleanup: {e:#}", session.id);
+                let mut detail = format!(
+                    "Looking for what the session left behind failed:\n\n```\n{e:#}\n```\n"
+                );
+                // Devin keeps its transcripts where only Devin reads them.
+                if session.backend == AgentBackend::Claude {
+                    detail += &format!(
+                        "\nIts full transcript may still be at `{}`.",
+                        transcript_path(&session).display()
+                    );
+                }
                 vec![(
                     format!("Couldn't scan \u{201c}{}\u{201d}", session.title),
-                    format!(
-                        "Looking for what the session left behind failed:\n\n```\n{e:#}\n```\n\n\
-                         Its full transcript may still be at `{}`.",
-                        transcript_path(&session).display()
-                    ),
+                    detail,
                 )]
             }
         };
@@ -474,7 +486,8 @@ fn transcript_path(session: &AgentSession) -> PathBuf {
         .join(format!("{}.jsonl", session.id))
 }
 
-/// Asks Haiku what the session left behind, as `(title, detail)` pairs.
+/// Asks the session's backend what the session left behind, as `(title,
+/// detail)` pairs.
 async fn run(
     state: &State,
     session: &AgentSession,
@@ -490,19 +503,10 @@ async fn run(
     } else {
         format!("on {} in the worktree {}", session.repo, session.worktree)
     };
-    let instructions = match session.backend {
-        AgentBackend::Claude => INSTRUCTIONS.format(&[
-            "Use tools only to read the full transcript, when the digest is cut short or leaves out what subagents did, or to check whether something still exists.",
-            "Claude Code",
-        ]),
-        AgentBackend::Devin => INSTRUCTIONS.format(&[
-            "Use tools only to check whether something still exists.",
-            "Devin",
-        ]),
-    };
     let mut input = format!(
-        "{instructions}\n\n{}\n\n\
+        "{}\n\n{}\n\n\
          The session \u{201c}{}\u{201d} worked {place}.\n",
+        instructions(session.backend),
         tool_notes(session.backend, &session.repo, clone.as_deref()),
         session.title,
     );
@@ -626,24 +630,24 @@ pub async fn prune_loop(state: Arc<State>) {
     }
 }
 
-/// Asks Sonnet which cleanup items are gone or taken care of already,
-/// deletes those and returns how many it deleted. Checks the items of each
-/// repo in its clone, and doesn't run Sonnet when there are no items.
+/// Asks which cleanup items are gone or taken care of already, deletes
+/// those and returns how many it deleted. Checks the items of each backend
+/// with that backend, unless it isn't offered, and those of each repo in
+/// its clone; doesn't run a job when there are no items.
 pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     let items = state.db.cleanup_items()?;
-    let mut by_group: BTreeMap<(&'static str, Option<PathBuf>), Vec<&CleanupItem>> =
+    let mut by_group: BTreeMap<(AgentBackend, Option<PathBuf>), Vec<&CleanupItem>> =
         BTreeMap::new();
     for item in &items {
         let clone = state.repo(&item.repo).map(|r| r.path);
         by_group
-            .entry((item.backend.as_str(), clone))
+            .entry((item.backend, clone))
             .or_default()
             .push(item);
     }
     let mut deleted = 0;
     let mut failed = None;
-    for ((backend_key, clone), items) in by_group {
-        let backend = AgentBackend::parse(backend_key).unwrap_or_default();
+    for ((backend, clone), items) in by_group {
         if !state.agents.offered(backend).await {
             tracing::warn!(
                 "{} isn't offered, skipping its cleanup items",
@@ -665,8 +669,8 @@ pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     }
 }
 
-/// Asks Sonnet, in `clone`, which of `items` are stale, deletes those and
-/// returns how many it deleted.
+/// Asks `backend`, in `clone`, which of `items` are stale, deletes those
+/// and returns how many it deleted.
 async fn prune_in(
     state: &State,
     backend: AgentBackend,
@@ -676,7 +680,7 @@ async fn prune_in(
     let now = crate::agent::now();
     let mut input = format!(
         "{}\n\n{}\n\n# Items\n",
-        PRUNE_INSTRUCTIONS.format(&[backend.label()]),
+        prune_instructions(backend),
         tool_notes(backend, &items[0].repo, clone)
     );
     for item in items {
@@ -785,8 +789,7 @@ fn digest(events: &[AgentEvent], agent: &str) -> String {
                 let input: Value = serde_json::from_str(input).unwrap_or(Value::Null);
                 let sub = if parent.is_some() { "(subagent) " } else { "" };
                 let call = match name.as_str() {
-                    "Read" | "Glob" | "Grep" | "LS" | "TodoWrite" | "find_file_by_name"
-                    | "read" | "grep" => continue,
+                    "Read" | "Glob" | "Grep" | "LS" | "TodoWrite" | "find_file_by_name" => continue,
                     "Bash" => format!("$ {}", input["command"].as_str().unwrap_or_default()),
                     "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => format!(
                         "{name} {}",
