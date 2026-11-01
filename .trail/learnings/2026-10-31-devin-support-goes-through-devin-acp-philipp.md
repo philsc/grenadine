@@ -39,7 +39,7 @@ touches:
 - Devin's accept-edits mode auto-runs commands it judges read-only (echo, ls, cat) without a permission request.
 - Unverified: whether "allow for this session" survives a new process plus session/load, and how Devin subagent events show up over ACP.
 - Unverified: whether `cognition.ai/totalAcuCost` is a total per `devin acp` process or for the whole session. Billing assumes per process, as it starts from 0 every turn; if it's session-wide, each resumed turn bills the earlier ones again. Check with a real two-turn run.
-- Unverified: what `cognition.ai/permissionRule` holds for an MCP tool. The auto-allow matches it, or the tool's inference name, against `mcp::ALLOWED_TOOLS` exactly; if neither is the bare tool name, those tools get asked about.
+- The probed `cognition.ai/permissionRule` for grenadine's MCP tools is `mcp__grenadine__*`, which doesn't say which tool. The auto-allow takes a grenadine request (by rule or name prefix) and allows it when the tool's inference name, its title or the rule name one of `mcp::ALLOWED_TOOLS` (full name, bare name, or ending in either); it asks for `approve` and for a tool it can't tell. Unverified: which of those fields names the tool in practice.
 - ACP loads the user's global Devin MCP servers, rules, skills and plugins.
 
 In the code: grenadine/server/src/agent.rs (Backend, Agents::backend, backend_command, Stopper, TurnSink), claude.rs (turn, parse_line, list_models, structured), mcp.rs (approve), summary.rs, cleanup.rs (ask, digest, transcript_path), core/src/api.rs (AgentBackend, PermissionMode, AgentSession.cost and cost_unit). Probe scripts and recorded ACP traces: /tmp/acp-probe/ (not in the repo).
