@@ -6,6 +6,7 @@ reviews can refer to it.
 
 - [Stacked PRs](#stacked-prs)
 - [Version picker](#version-picker)
+- [Reviews and merge state](#reviews-and-merge-state)
 
 # Stacked PRs
 
@@ -453,3 +454,99 @@ the merge-base row.
 panel. Clicking it must expand it.
 _Why:_ the picker counts resolved threads, so the diff must show which
 ones they are, without them taking up space.
+
+# Reviews and merge state
+
+These requirements cover how the PR page shows who reviewed a PR, the
+conversation on it, its checks and whether it can be merged.
+
+## Terms
+
+- **Verdict**: an approval, a change request or a dismissed review.
+- **Conversation**: the comments on the PR itself and the summaries of
+  its reviews, as opposed to review comments on its code.
+- **Viewer**: the GitHub user whose token grenadine uses.
+
+## Review summary
+
+**REVIEW-SUM-1.** The PR header must show GitHub's review decision as
+"Approved", "Changes requested" or "Review required". When GitHub
+reports no decision, none must be shown.
+
+**REVIEW-SUM-2.** Next to the decision, the header must show every
+reviewer once, in the order they first reviewed, marked with their latest
+verdict. A reviewer without a verdict must be marked as having commented.
+_Why:_ a comment after an approval doesn't take the approval back on
+GitHub either.
+
+**REVIEW-SUM-3.** The PR's author must not be listed as a reviewer.
+_Why:_ replying to a review thread creates a comment review by the author.
+
+**REVIEW-SUM-4.** Users, teams and bots asked to review who haven't yet
+must be listed as "Waiting on …".
+
+**REVIEW-SUM-5.** Pending reviews must not count as reviews.
+_Why:_ only their author can see them, and they may never be submitted.
+
+## Conversation
+
+**REVIEW-CONV-1.** Below the description, the page must list the
+comments on the PR and the reviews, oldest first, in a section titled
+"N comments" that starts out unfolded. The section must be hidden when
+the list is empty.
+
+**REVIEW-CONV-2.** Each review must show its author, its verdict
+("approved", "requested changes", "reviewed") and its summary. Comment
+reviews without a summary must be left out.
+_Why:_ their comments are already shown in the diff.
+
+**REVIEW-CONV-3.** Each entry must link its time to the entry on GitHub
+and render its body like the description.
+
+## Merge box
+
+**REVIEW-MERGE-1.** Below the conversation, open PRs must show a merge
+box. Merged and closed PRs must not.
+
+**REVIEW-MERGE-2.** The merge box must list the checks on the PR's head
+under a summary with their combined state and how many failed, are
+running, passed and were skipped, e.g. "Checks: 1 failing, 2 passing".
+The list must start out unfolded when the combined state is failing, and
+folded otherwise. Each check must link to its details when GitHub has a
+link. The list must be hidden when the head has no checks.
+
+**REVIEW-MERGE-3.** The merge box must say whether the PR can be merged,
+from GitHub's merge state:
+
+| Merge state                 | Text                                                    |
+| --------------------------- | ------------------------------------------------------- |
+| conflicts (or DIRTY)        | This branch has conflicts that must be resolved.        |
+| CLEAN, HAS_HOOKS            | Ready to merge.                                         |
+| UNSTABLE                    | Can be merged, but not every check passed.              |
+| BEHIND                      | This branch is out of date with its base.               |
+| DRAFT                       | This PR is a draft.                                     |
+| BLOCKED                     | Merging is blocked: _reason_.                           |
+| anything else, e.g. UNKNOWN | GitHub is still working out whether this can be merged. |
+
+The reason for BLOCKED must be "it needs an approving review" when a
+review is required, "changes were requested" when changes were requested,
+and "required checks or rules aren't satisfied" otherwise.
+
+**REVIEW-MERGE-4.** Reviews, the conversation, checks and the merge state
+must be fetched with each sync of the PR, in the same GraphQL request as
+its other metadata. The poller must also sync a PR when the combined state
+of its head's checks, as the inbox search reports it, differs from the one
+at its last sync. While a sync reads the merge state as UNKNOWN or the
+checks as running, the PR must be synced again up to three times, with
+growing delays.
+_Why:_ reviews and comments change the PR's `updatedAt`, which triggers a
+sync, but checks finishing and GitHub working out whether the PR can be
+merged don't. A base branch that moves on, making the PR BEHIND, still
+goes unnoticed until the PR changes.
+
+**REVIEW-MERGE-5.** When GitHub returns the PR but reports an error in a
+field of the reviews, the conversation, the checks or the merge state, the
+sync must keep the ones stored before and show the error as the PR's sync
+error.
+_Why:_ GitHub leaves such fields `null`, which would otherwise read as no
+reviews or no checks.

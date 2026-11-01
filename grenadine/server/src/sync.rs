@@ -11,18 +11,29 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use grenadine_core::api::{
-    Person, PrKey, ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
+    CiStatus, MergeState, Person, PrKey, ReviewComment, ReviewInfo, ServerEvent, StackPr,
+    SyncPhase, SyncStatus, SyncingPr, Version,
 };
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use crate::db::{Db, PrMeta, SyncMark};
 use crate::git::{REF_PREFIX, Repo};
-use crate::github::{self, GitHub, PrData};
+use crate::github::{self, GitHub, PrData, ThreadState};
 use crate::stack;
 
 /// How many PRs sync at the same time.
 const CONCURRENCY: usize = 4;
+
+/// How long to wait before each extra sync of a PR whose merge state or
+/// checks GitHub was still working out. Neither changes the PR's
+/// `updatedAt`, and the search doesn't report the merge state, so the
+/// poller alone wouldn't notice.
+const FOLLOW_UPS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(90),
+];
 
 /// A configured clone and the lock that serializes sync's writes to it.
 pub struct ClonedRepo {
@@ -49,6 +60,8 @@ pub struct State {
     /// PRs a page requested a sync for that are being synced on demand
     /// right now, so a second request doesn't start the same sync again.
     pub on_demand: std::sync::Mutex<BTreeSet<PrKey>>,
+    /// PRs that `follow_up` will sync again.
+    pub following_up: std::sync::Mutex<BTreeSet<PrKey>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
     /// The Claude Code sessions started from the UI.
@@ -126,11 +139,64 @@ impl State {
         tokio::spawn(async move {
             let result = sync_pr(&state, &key).await;
             state.on_demand.lock().unwrap().remove(&key);
-            if let Err(e) = result {
-                tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
-                let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
-            }
+            state.synced(&key, result);
             state.send(ServerEvent::PrChanged(key));
+        });
+    }
+
+    /// Records the outcome of a sync of `key`, and has it synced again
+    /// later while GitHub is still working out its merge state or checks.
+    fn synced(self: &Arc<State>, key: &PrKey, result: Result<bool>) {
+        match result {
+            Ok(true) => self.follow_up(key.clone()),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
+                let _ = self.db.store_sync_error(key, &format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Syncs `key` again after each of `FOLLOW_UPS` until GitHub has
+    /// settled its merge state and checks. A PR has at most one series of
+    /// follow-ups at a time, and attempts that would overlap another sync
+    /// of it are skipped.
+    fn follow_up(self: &Arc<State>, key: PrKey) {
+        if !self.following_up.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            for delay in FOLLOW_UPS {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = state.shutdown.cancelled() => break,
+                }
+                let busy = state
+                    .sync_status
+                    .lock()
+                    .unwrap()
+                    .in_flight
+                    .iter()
+                    .any(|p| p.key == key)
+                    || state.on_demand.lock().unwrap().contains(&key);
+                if busy {
+                    continue;
+                }
+                let result = sync_pr(&state, &key).await;
+                state.send(ServerEvent::PrChanged(key.clone()));
+                state.send(ServerEvent::InboxesChanged);
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
+                        let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
+                        break;
+                    }
+                }
+            }
+            state.following_up.lock().unwrap().remove(&key);
         });
     }
 
@@ -212,6 +278,7 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                     != Some(SyncMark {
                         updated_at: h.updated_at.clone(),
                         head_oid: h.head_oid.clone(),
+                        ci: h.ci,
                     })
         })
         .map(|h| h.key)
@@ -226,10 +293,7 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
             state.status_started(&key);
             let result = sync_pr(state, &key).await;
             state.status_finished(&key);
-            if let Err(e) = result {
-                tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
-                let _ = state.db.store_sync_error(&key, &format!("{e:#}"));
-            }
+            state.synced(&key, result);
             state.send(ServerEvent::PrChanged(key));
             // A synced or failed PR shows up differently in the inboxes.
             state.send(ServerEvent::InboxesChanged);
@@ -275,7 +339,27 @@ fn short(versions: &[Version]) -> String {
         .join(", ")
 }
 
-async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
+/// Whether GitHub was still working out the merge state or checks of a PR
+/// when it reported `review`.
+fn settling(review: &ReviewInfo) -> bool {
+    review.merge.state == MergeState::Unknown || review.ci == Some(CiStatus::Running)
+}
+
+/// Marks each review comment that starts a thread with the thread's ID
+/// and whether it's resolved.
+fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadState>) {
+    for c in comments {
+        if let Some(t) = threads.get(&c.id) {
+            c.resolved = t.resolved;
+            c.resolved_by = t.resolved_by.clone();
+            c.thread_id = Some(t.id.clone());
+        }
+    }
+}
+
+/// Syncs one PR. Returns whether GitHub was still working out its merge
+/// state or checks, so that it's worth syncing again soon.
+async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
     let repo = state
         .repos
         .get(&key.repo)
@@ -287,13 +371,8 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         None => Vec::new(),
     };
     let mut comments = state.github.review_comments(key).await?;
-    let resolved = state.github.resolved_threads(key).await?;
-    for c in &mut comments {
-        if let Some(by) = resolved.get(&c.id) {
-            c.resolved = true;
-            c.resolved_by = by.clone();
-        }
-    }
+    let threads = state.github.review_threads(key).await?;
+    apply_threads(&mut comments, &threads);
 
     let created_at = github::unix(&data.created_at)?;
     let history = History {
@@ -373,7 +452,13 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         base_ref: data.base_ref,
         head_ref: data.head_ref,
         head_oid: data.head_oid,
+        ci: data.ci,
+        review: data.review,
+        review_error: data
+            .review_error
+            .map(|e| format!("can't read the reviews and merge state: {e}")),
     };
+    let unsettled = meta.review.as_ref().is_some_and(settling);
     state.db.store_sync(
         &meta,
         &versions,
@@ -382,7 +467,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<()> {
         computed.approximate,
         drifted.then_some((old_text.as_str(), new_text.as_str())),
     )?;
-    Ok(())
+    Ok(unsettled)
 }
 
 /// How long a cached user's name and avatar are used before they're
@@ -591,6 +676,7 @@ pub fn test_state_with_agents(
         sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
+        following_up: std::sync::Mutex::new(BTreeSet::new()),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }
@@ -609,6 +695,122 @@ mod tests {
         )
         .await
         .expect("run did not stop after shutdown");
+    }
+
+    #[tokio::test]
+    async fn follow_ups_stop_on_shutdown() {
+        let state = test_state();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 1,
+        };
+        state.follow_up(key.clone());
+        // A second series for the same PR doesn't start.
+        state.follow_up(key.clone());
+        assert_eq!(state.following_up.lock().unwrap().len(), 1);
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.following_up.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the follow-ups did not stop after shutdown");
+        // It stopped before syncing, which would have failed.
+        assert_eq!(state.db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn unknown_merge_states_and_running_checks_are_settling() {
+        use grenadine_core::api::MergeInfo;
+        let mut review = ReviewInfo {
+            viewer: "me".into(),
+            decision: None,
+            reviews: vec![],
+            requested: vec![],
+            comments: vec![],
+            checks: vec![],
+            ci: Some(CiStatus::Passing),
+            merge: MergeInfo {
+                conflicting: Some(false),
+                state: MergeState::Clean,
+                methods: vec![],
+                default_method: None,
+                delete_branch_on_merge: false,
+                can_merge_as_admin: false,
+            },
+        };
+        assert!(!settling(&review));
+        review.ci = Some(CiStatus::Running);
+        assert!(settling(&review));
+        review.ci = None;
+        review.merge.state = MergeState::Unknown;
+        assert!(settling(&review));
+    }
+
+    #[test]
+    fn threads_mark_their_root_comments() {
+        let comment = |id| ReviewComment {
+            id,
+            in_reply_to: None,
+            author: "a".into(),
+            body: String::new(),
+            path: "p".into(),
+            original_commit: "c".into(),
+            original_line: Some(1),
+            original_start_line: None,
+            line: Some(1),
+            start_line: None,
+            side: grenadine_core::api::Side::Right,
+            on_file: false,
+            created_at: String::new(),
+            url: String::new(),
+            resolved: false,
+            resolved_by: None,
+            thread_id: None,
+        };
+        let mut comments = vec![comment(1), comment(2), comment(3)];
+        comments[2].in_reply_to = Some(1);
+        let threads = BTreeMap::from([
+            (
+                1,
+                ThreadState {
+                    id: "T1".into(),
+                    resolved: false,
+                    resolved_by: None,
+                },
+            ),
+            (
+                2,
+                ThreadState {
+                    id: "T2".into(),
+                    resolved: true,
+                    resolved_by: Some(Person {
+                        login: Some("o".into()),
+                        ..Person::default()
+                    }),
+                },
+            ),
+        ]);
+        apply_threads(&mut comments, &threads);
+        let marks: Vec<_> = comments
+            .iter()
+            .map(|c| {
+                (
+                    c.thread_id.as_deref(),
+                    c.resolved,
+                    c.resolved_by.as_ref().and_then(|p| p.login.as_deref()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (Some("T1"), false, None),
+                (Some("T2"), true, Some("o")),
+                (None, false, None),
+            ]
+        );
     }
 
     fn status(state: &State) -> SyncStatus {

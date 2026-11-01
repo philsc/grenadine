@@ -8,8 +8,8 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result};
 use grenadine_core::api::{
     AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus, CleanupItem, Inbox,
-    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, Stack, ThreadCounts,
-    Version, VersionKind,
+    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, ReviewComment, ReviewInfo, Stack,
+    ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -271,6 +271,16 @@ const MIGRATIONS: &[Migration] = &[
     );
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The PR's reviews, conversation, checks and merge state, the JSON of
+    -- an api::ReviewInfo; NULL until a sync fetched them.
+    ALTER TABLE prs ADD COLUMN review TEXT;
+    -- The state of the checks on the head at the last successful sync;
+    -- NULL when it had none.
+    ALTER TABLE prs ADD COLUMN synced_ci TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -354,6 +364,12 @@ pub struct PrMeta {
     pub base_ref: String,
     pub head_ref: String,
     pub head_oid: String,
+    /// The combined state of the checks on the head.
+    pub ci: Option<CiStatus>,
+    /// `None` keeps the stored one.
+    pub review: Option<ReviewInfo>,
+    /// Why `review` is `None` although the sync succeeded.
+    pub review_error: Option<String>,
 }
 
 /// What was true at a PR's last successful sync.
@@ -361,6 +377,8 @@ pub struct PrMeta {
 pub struct SyncMark {
     pub updated_at: String,
     pub head_oid: String,
+    /// Checks finishing don't change `updated_at`.
+    pub ci: Option<CiStatus>,
 }
 
 fn kind_str(k: VersionKind) -> &'static str {
@@ -608,18 +626,20 @@ impl Db {
     }
 
     pub fn sync_mark(&self, key: &PrKey) -> Result<Option<SyncMark>> {
-        let row: Option<(Option<String>, Option<String>)> = self
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT synced_updated_at, synced_head_oid FROM prs WHERE repo = ? AND number = ?",
+                "SELECT synced_updated_at, synced_head_oid, synced_ci FROM prs
+                 WHERE repo = ? AND number = ?",
                 params![key.repo, key.number],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         Ok(match row {
-            Some((Some(updated_at), Some(head_oid))) => Some(SyncMark {
+            Some((Some(updated_at), Some(head_oid), ci)) => Some(SyncMark {
                 updated_at,
                 head_oid,
+                ci: ci.as_deref().and_then(parse_ci),
             }),
             _ => None,
         })
@@ -708,7 +728,8 @@ impl Db {
     }
 
     /// Stores the result of a successful sync. A `stack` of `None` keeps
-    /// the stored stack.
+    /// the stored stack, and so does a `meta.review` of `None` the stored
+    /// review; `meta.review_error` becomes the PR's sync error.
     pub fn store_sync(
         &self,
         meta: &PrMeta,
@@ -724,16 +745,22 @@ impl Db {
         let drift_text = drift
             .map(|(old, new)| format!("Versions changed on recomputation: was {old}, now {new}"));
         let stack_json = stack.map(serde_json::to_string).transpose()?;
+        let review_json = meta
+            .review
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         tx.execute(
             "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url, created_at, updated_at,
                               base_ref, head_ref, head_oid, approximate, drift, sync_error,
-                              synced_updated_at, synced_head_oid, stack)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?10, ?13, ?16)
+                              synced_updated_at, synced_head_oid, stack, review, synced_ci)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?19, ?10, ?13, ?16, ?17, ?18)
              ON CONFLICT (repo, number) DO UPDATE SET
                 title = ?3, body = ?4, author = ?5, state = ?6, is_draft = ?7, url = ?8, created_at = ?9,
                 updated_at = ?10, base_ref = ?11, head_ref = ?12, head_oid = ?13, approximate = ?14,
-                drift = COALESCE(?15, drift), sync_error = NULL,
-                synced_updated_at = ?10, synced_head_oid = ?13, stack = COALESCE(?16, stack)",
+                drift = COALESCE(?15, drift), sync_error = ?19,
+                synced_updated_at = ?10, synced_head_oid = ?13, stack = COALESCE(?16, stack),
+                review = COALESCE(?17, review), synced_ci = ?18",
             params![
                 key.repo,
                 key.number,
@@ -751,6 +778,9 @@ impl Db {
                 approximate,
                 drift_text,
                 stack_json,
+                review_json,
+                meta.ci.map(ci_str),
+                meta.review_error,
             ],
         )?;
         // The error a not-yet-synced listing carried is now obsolete.
@@ -877,7 +907,8 @@ impl Db {
             conn.query_row(
                 "SELECT p.repo, p.number, p.title, p.author, p.state, p.is_draft, p.updated_at, p.url,
                         (SELECT COUNT(*) FROM versions v WHERE v.repo = p.repo AND v.number = p.number),
-                        p.body, p.base_ref, p.head_ref, p.approximate, p.drift, p.sync_error, p.stack
+                        p.body, p.base_ref, p.head_ref, p.approximate, p.drift, p.sync_error, p.stack,
+                        p.review
                  FROM prs p WHERE p.repo = ? AND p.number = ?",
                 params![key.repo, key.number],
                 |r| {
@@ -891,12 +922,24 @@ impl Db {
                         r.get::<_, Option<String>>(13)?,
                         r.get::<_, Option<String>>(14)?,
                         stack,
+                        r.get::<_, Option<String>>(16)?
+                            .and_then(|j| serde_json::from_str(&j).ok()),
                     ))
                 },
             )
             .optional()?
         };
-        let Some((summary, body, base_ref, head_ref, approximate, drift, sync_error, stack)) = row
+        let Some((
+            summary,
+            body,
+            base_ref,
+            head_ref,
+            approximate,
+            drift,
+            sync_error,
+            stack,
+            review,
+        )) = row
         else {
             return Ok(None);
         };
@@ -911,6 +954,7 @@ impl Db {
             approximate,
             drift,
             sync_error,
+            review,
         }))
     }
 
@@ -1323,7 +1367,9 @@ fn summary_from_row(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use grenadine_core::api::Side;
+    use grenadine_core::api::{
+        Check, MergeInfo, MergeMethod, MergeState, Review, ReviewDecision, ReviewState, Side,
+    };
 
     use super::*;
 
@@ -1376,6 +1422,9 @@ mod tests {
             base_ref: "main".into(),
             head_ref: "pr".into(),
             head_oid: "h".into(),
+            ci: None,
+            review: None,
+            review_error: None,
         }
     }
 
@@ -1494,12 +1543,48 @@ mod tests {
                 name: None,
                 avatar_url: None,
             }),
+            thread_id: Some("T3".into()),
         }];
-        db.store_sync(&meta(&key), &versions, &comments, None, false, None)
+        let review = ReviewInfo {
+            viewer: "me".into(),
+            decision: Some(ReviewDecision::Approved),
+            reviews: vec![Review {
+                author: Person {
+                    login: Some("o".into()),
+                    name: None,
+                    avatar_url: None,
+                },
+                state: ReviewState::Approved,
+                body: String::new(),
+                submitted_at: "s".into(),
+                url: "u".into(),
+            }],
+            requested: vec!["team".into()],
+            comments: vec![],
+            checks: vec![Check {
+                name: "test".into(),
+                status: Some(CiStatus::Passing),
+                url: None,
+            }],
+            ci: Some(CiStatus::Passing),
+            merge: MergeInfo {
+                conflicting: Some(false),
+                state: MergeState::Clean,
+                methods: vec![MergeMethod::Squash],
+                default_method: Some(MergeMethod::Squash),
+                delete_branch_on_merge: true,
+                can_merge_as_admin: false,
+            },
+        };
+        let mut with_review = meta(&key);
+        with_review.review = Some(review.clone());
+        with_review.ci = Some(CiStatus::Running);
+        db.store_sync(&with_review, &versions, &comments, None, false, None)
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert_eq!(pr.versions, versions);
         assert_eq!(pr.comments, comments);
+        assert_eq!(pr.review.as_ref(), Some(&review));
         assert_eq!(pr.summary.version_count, 2);
         assert_eq!(db.pr_title(&key).unwrap().as_deref(), Some("t"));
         assert!(db.inbox_prs(1).unwrap()[0].synced);
@@ -1507,15 +1592,23 @@ mod tests {
             db.sync_mark(&key).unwrap(),
             Some(SyncMark {
                 updated_at: "2026-01-02T00:00:00Z".into(),
-                head_oid: "h".into()
+                head_oid: "h".into(),
+                ci: Some(CiStatus::Running),
             })
         );
 
-        db.store_sync(&meta(&key), &versions, &[], None, false, Some(("a", "b")))
+        // A sync that couldn't read the reviews keeps the stored ones and
+        // says why.
+        let mut failed = meta(&key);
+        failed.review_error = Some("FORBIDDEN".into());
+        db.store_sync(&failed, &versions, &[], None, false, Some(("a", "b")))
             .unwrap();
         let pr = db.pr(&key).unwrap().unwrap();
         assert!(pr.drift.is_some());
         assert!(pr.comments.is_empty());
+        assert_eq!(pr.review, Some(review));
+        assert_eq!(pr.sync_error.as_deref(), Some("FORBIDDEN"));
+        assert_eq!(db.sync_mark(&key).unwrap().unwrap().ci, None);
 
         db.store_sync_error(&key, "boom").unwrap();
         assert_eq!(
