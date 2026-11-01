@@ -261,6 +261,9 @@ struct ToolCallUpdate {
     tool_call_id: String,
     #[serde(default)]
     status: Option<ToolCallStatus>,
+    /// The call's input, when the update changes it.
+    #[serde(default)]
+    raw_input: Value,
     #[serde(default, deserialize_with = "null_default")]
     content: Vec<ToolCallContent>,
     #[serde(rename = "_meta", default)]
@@ -423,6 +426,8 @@ struct PermissionToolCall {
     tool_call_id: String,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    raw_input: Value,
     #[serde(rename = "_meta", default)]
     meta: Value,
 }
@@ -1471,8 +1476,15 @@ struct JobRun<'a> {
     /// Each reports its own running total; the root's leaves out the
     /// subagents'.
     spent: HashMap<String, f64>,
-    /// The commands of the root's exec calls, by tool call id.
-    execs: HashMap<String, String>,
+    /// The commands the root's exec calls have shown, by tool call id: the
+    /// call's own and those of its updates.
+    execs: HashMap<String, Vec<String>>,
+}
+
+/// The command in an exec's `rawInput`: `None` without an input, and an
+/// empty one, which no check passes, for an input without a command.
+fn exec_command(raw_input: &Value) -> Option<String> {
+    (!raw_input.is_null()).then(|| raw_input["command"].as_str().unwrap_or_default().to_owned())
 }
 
 impl JobRun<'_> {
@@ -1523,7 +1535,16 @@ impl JobRun<'_> {
                     == Some("exec")
                 {
                     let command = call.raw_input["command"].as_str().unwrap_or_default();
-                    self.execs.insert(call.tool_call_id, command.to_owned());
+                    self.execs
+                        .insert(call.tool_call_id, vec![command.to_owned()]);
+                }
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                if let (Some(commands), Some(command)) = (
+                    self.execs.get_mut(&update.tool_call_id),
+                    exec_command(&update.raw_input),
+                ) {
+                    commands.push(command);
                 }
             }
             _ => {}
@@ -1536,19 +1557,25 @@ impl JobRun<'_> {
         match r.method.as_str() {
             "session/request_permission" => match parse::<PermissionRequest>(r.params) {
                 Ok(p) => {
-                    let call = &p.tool_call.tool_call_id;
-                    let command = extension(&p.tool_call.meta, "editableCommand")
-                        .and_then(Value::as_str)
-                        .or(self.execs.get(call).map(String::as_str));
-                    let kind = match command {
-                        Some(c)
-                            if self.job.tools == JobTools::ReadOnly
-                                && self.execs.contains_key(call)
-                                && crate::cleanup::allowed_command(c) =>
-                        {
-                            ApprovalKind::AllowOnce
-                        }
-                        _ => ApprovalKind::RejectOnce,
+                    // Every account of the command has to pass, since
+                    // there's no telling which one runs.
+                    let allowed = self.job.tools == JobTools::ReadOnly
+                        && self
+                            .execs
+                            .get(&p.tool_call.tool_call_id)
+                            .is_some_and(|seen| {
+                                let editable = extension(&p.tool_call.meta, "editableCommand")
+                                    .map(|c| c.as_str().unwrap_or_default().to_owned());
+                                seen.iter()
+                                    .cloned()
+                                    .chain(editable)
+                                    .chain(exec_command(&p.tool_call.raw_input))
+                                    .all(|c| crate::cleanup::allowed_command(&c))
+                            });
+                    let kind = if allowed {
+                        ApprovalKind::AllowOnce
+                    } else {
+                        ApprovalKind::RejectOnce
                     };
                     let option = first_option(&permission_options(&p), kind);
                     acp.respond(&r.id, permission_outcome(option));
@@ -2348,6 +2375,24 @@ mod job_tests {
         let mut steps = Vec::new();
         steps.extend(exec_asking("t1", "ls -la"));
         steps.extend(exec_asking("t2", "rm -rf /"));
+        // An exec whose update or permission request says something else
+        // than its call.
+        let [call, mut ask] = exec_asking("t3", "ls");
+        ask["params"]["toolCall"]["_meta"] = json!({"cognition.ai/editableCommand": "rm -rf /"});
+        steps.extend([call, ask]);
+        let [call, ask] = exec_asking("t4", "ls");
+        steps.extend([
+            call,
+            json!({"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t4",
+                "rawInput": {"command": "rm -rf /"},
+            }}),
+            ask,
+        ]);
+        let [call, mut ask] = exec_asking("t5", "ls");
+        ask["params"]["toolCall"]["rawInput"] = json!({"command": "rm -rf /"});
+        steps.extend([call, ask]);
         steps.push(json!({
             "request": "elicitation/create",
             "params": {"sessionId": "job-s", "message": "pick"},
@@ -2374,8 +2419,15 @@ mod job_tests {
             reply("session/request_permission-2")["result"],
             json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}})
         );
+        for id in 3..=5 {
+            assert_eq!(
+                reply(&format!("session/request_permission-{id}"))["result"],
+                json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}}),
+                "{id}"
+            );
+        }
         assert_eq!(
-            reply("elicitation/create-3")["result"],
+            reply("elicitation/create-6")["result"],
             json!({"action": "decline"})
         );
     }
