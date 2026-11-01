@@ -3,6 +3,9 @@
 Each test class starts the real server against a fake GitHub (see
 fake_github.py) that it loads with PRs first. A stub `gh` hands the server
 the fake's token, and a fake `claude` plays the agent.
+
+pytest runs the tests, spread across Bazel's shards. A shard starts the
+server only for the classes it has tests from.
 """
 
 import base64
@@ -21,6 +24,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, ClassVar
 
+import pytest_bazel
 from playwright.sync_api import Dialog, Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
@@ -2425,4 +2429,4 @@ class CleanupTest(ServerTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest_bazel.main([__file__, *sys.argv[1:]]))

@@ -44,8 +44,13 @@ py_test(
         "CHROME": "$(rootpath @chrome_headless_shell//:chrome-headless-shell)",
         "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
     },
+    # Each class's setup takes about a second, but its tests take over 75s
+    # in all, so they spread well across shards.
+    shard_count = 6,
     deps = [
         ":fake_github",
         "@grenadine_pypi//playwright",
+        "@grenadine_pypi//pytest_bazel",
+        "@grenadine_pypi//pytest_shard",
     ],
 )
