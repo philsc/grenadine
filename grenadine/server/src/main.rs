@@ -235,6 +235,14 @@ async fn main() -> Result<()> {
     ));
     // Shutting down doesn't wait for it; dropping it kills its claude.
     tokio::spawn(cleanup::prune_loop(state.clone()));
+    // Listing the backends' models can take a while, so it starts now
+    // rather than with the first page or prompt.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            state.agents.backends().await;
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

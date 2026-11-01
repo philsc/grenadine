@@ -124,9 +124,11 @@ struct Request {
     params: Value,
 }
 
+/// A response; its id is matched against the client's requests, whatever
+/// its shape.
 #[derive(Debug, Deserialize)]
 struct Response {
-    id: u64,
+    id: RequestId,
     #[serde(default)]
     result: Value,
     #[serde(default)]
@@ -142,7 +144,22 @@ struct Notification {
 
 #[derive(Debug, Deserialize)]
 struct RpcError {
+    #[serde(default)]
     message: String,
+}
+
+/// `T`, or its default for `null`.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A count that may come as any JSON number.
+fn count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.map(|n| n as u64))
 }
 
 /// `T` from a result or params.
@@ -203,6 +220,8 @@ enum ContentBlock {
 struct ToolCall {
     tool_call_id: String,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     raw_input: Value,
     #[serde(rename = "_meta", default)]
     meta: Value,
@@ -214,7 +233,7 @@ struct ToolCallUpdate {
     tool_call_id: String,
     #[serde(default)]
     status: Option<ToolCallStatus>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     content: Vec<ToolCallContent>,
     #[serde(rename = "_meta", default)]
     meta: Value,
@@ -243,9 +262,9 @@ enum ToolCallContent {
 
 #[derive(Debug, Deserialize)]
 struct UsageUpdate {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "count")]
     used: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "count")]
     size: Option<u64>,
     #[serde(rename = "_meta", default)]
     meta: Value,
@@ -261,8 +280,10 @@ fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
 #[serde(rename_all = "camelCase")]
 struct NewSessionResponse {
     session_id: String,
-    #[serde(default)]
-    config_options: Vec<ConfigOption>,
+    /// Read leniently: only the model option matters, and the others may
+    /// come in shapes this doesn't know.
+    #[serde(default, deserialize_with = "null_default")]
+    config_options: Vec<Value>,
 }
 
 /// The answer to `session/load` and the requests that set the mode or a
@@ -270,21 +291,11 @@ struct NewSessionResponse {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigResponse {
-    #[serde(default)]
-    config_options: Vec<ConfigOption>,
+    #[serde(default, deserialize_with = "null_default")]
+    config_options: Vec<Value>,
 }
 
-/// A session config option, such as the model.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigOption {
-    id: String,
-    #[serde(default)]
-    current_value: Option<String>,
-    #[serde(default)]
-    options: Vec<ConfigValue>,
-}
-
+/// A model the `model` config option offers.
 #[derive(Debug, Deserialize)]
 struct ConfigValue {
     value: String,
@@ -294,29 +305,45 @@ struct ConfigValue {
 }
 
 /// The `model` config option among a session answer's.
-fn model_option(options: &[ConfigOption]) -> Option<&ConfigOption> {
-    options.iter().find(|o| o.id == "model")
+fn model_option(options: &[Value]) -> Option<&Value> {
+    options
+        .iter()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
 }
 
-/// The models the session's `model` config option offers.
-fn models(options: &[ConfigOption]) -> Vec<AgentModelInfo> {
-    model_option(options)
-        .map(|o| {
-            o.options
-                .iter()
-                .map(|m| AgentModelInfo {
-                    value: m.value.clone(),
-                    display_name: m.name.clone(),
-                    description: m.description.clone().unwrap_or_default(),
-                })
-                .collect()
+/// The models the session's `model` config option offers; entries that
+/// aren't models are skipped, and grouped ones are taken out of their
+/// groups.
+fn models(options: &[Value]) -> Vec<AgentModelInfo> {
+    fn entries<'a>(options: &'a Value, out: &mut Vec<&'a Value>) {
+        for o in options.as_array().into_iter().flatten() {
+            match o.get("options") {
+                Some(group) => entries(group, out),
+                None => out.push(o),
+            }
+        }
+    }
+    let mut found = Vec::new();
+    if let Some(o) = model_option(options).and_then(|o| o.get("options")) {
+        entries(o, &mut found);
+    }
+    found
+        .into_iter()
+        .filter_map(|m| serde_json::from_value::<ConfigValue>(m.clone()).ok())
+        .map(|m| AgentModelInfo {
+            value: m.value,
+            display_name: m.name,
+            description: m.description.unwrap_or_default(),
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The model the session's `model` config option is set to.
-fn current_model(options: &[ConfigOption]) -> Option<String> {
-    model_option(options)?.current_value.clone()
+fn current_model(options: &[Value]) -> Option<String> {
+    model_option(options)?
+        .get("currentValue")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// The answer to `session/prompt`.
@@ -338,6 +365,8 @@ struct PermissionRequest {
 #[serde(rename_all = "camelCase")]
 struct PermissionToolCall {
     tool_call_id: String,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(rename = "_meta", default)]
     meta: Value,
 }
@@ -468,7 +497,7 @@ impl Rpc {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("devin wrote a line that isn't JSON-RPC ({e}): {line}")
+                        tracing::warn!("devin wrote a line that isn't JSON-RPC ({e}): {line}")
                     }
                 }
             }
@@ -496,8 +525,9 @@ impl Rpc {
         let id = self.acp.request(method, params);
         while let Some(m) = self.incoming.recv().await {
             match m {
-                Incoming::Response(r) if r.id == id => {
+                Incoming::Response(r) if r.id == RequestId::Number(id) => {
                     return match r.error {
+                        Some(e) if e.message.is_empty() => Err(anyhow!("{method} failed")),
                         Some(e) => Err(anyhow!("{method}: {}", e.message)),
                         None => Ok(r.result),
                     };
@@ -506,6 +536,12 @@ impl Rpc {
             }
         }
         bail!("devin closed its stdout")
+    }
+
+    /// Kills devin; returns its stderr's tail.
+    async fn kill(mut self) -> String {
+        let _ = self.child.kill().await;
+        self.stderr.await.unwrap_or_default()
     }
 
     /// Closes stdin, which lets devin exit on its own, and kills it if it
@@ -576,7 +612,21 @@ async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentMo
         let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
         let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
     }
-    listed.context("devin didn't list its models in time")?
+    let listed = listed
+        .map_err(|_| anyhow!("devin didn't list its models in time"))
+        .and_then(|r| r);
+    match listed {
+        Ok(models) => Ok(models),
+        // What devin said explains it, e.g. that the user isn't logged in.
+        Err(e) => {
+            let stderr = rpc.kill().await;
+            if stderr.is_empty() {
+                Err(e)
+            } else {
+                Err(anyhow!("{e:#}:\n{stderr}"))
+            }
+        }
+    }
 }
 
 /// What the turn remembers of a tool call: the transcript's name and
@@ -584,6 +634,8 @@ async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentMo
 #[derive(Clone, Default)]
 struct Tool {
     name: String,
+    /// What Devin calls the call, e.g. "Ran echo".
+    title: Option<String>,
     input: Value,
     content: String,
 }
@@ -694,6 +746,7 @@ impl Updates {
                     call.tool_call_id.clone(),
                     Tool {
                         name: name.clone(),
+                        title: call.title.clone(),
                         input: input.clone(),
                         content: String::new(),
                     },
@@ -942,9 +995,10 @@ async fn run_turn(
             stopper.stop();
         }
     });
-    // An interrupt that came before the prompt started had nothing to
-    // cancel, so the prompt doesn't start.
-    if state.agents.interrupted(id) {
+    // An interrupt, or a shutdown, that came before the prompt started had
+    // nothing to cancel, so the prompt doesn't start.
+    let stopped = || state.agents.interrupted(id) || state.shutdown.is_cancelled();
+    if stopped() {
         return Ok(Prompted::No);
     }
     rpc.call(
@@ -965,7 +1019,7 @@ async fn run_turn(
         model = current_model(&set.config_options).or(model);
     }
     ctx.sink.started(&backend_session, model)?;
-    if state.agents.interrupted(id) {
+    if stopped() {
         return Ok(Prompted::No);
     }
 
@@ -1028,8 +1082,9 @@ fn first_option(options: &[ApprovalOption], kind: ApprovalKind) -> Option<String
 }
 
 /// The `optionId` the user's decision picks: their explicit choice, a
-/// plan approval's `plan_<mode>` option, an allow or a reject as the
-/// decision says, or else the first option.
+/// plan approval's `plan_<mode>` option, or an allow or a reject as the
+/// decision says. With none of the decision's kind there's nothing to
+/// pick, since another kind would do the opposite.
 fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<String> {
     if let Some(o) = &d.option {
         return Some(o.clone());
@@ -1048,7 +1103,36 @@ fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<Strin
     } else {
         first(&[ApprovalKind::RejectOnce, ApprovalKind::RejectAlways])
     }
-    .or_else(|| options.first().map(|o| o.id.clone()))
+}
+
+/// The prefix of grenadine's MCP tools, as Devin names them.
+const GRENADINE_TOOLS: &str = "mcp__grenadine__";
+
+/// Whether a permission request goes ahead without asking: one for
+/// grenadine's MCP server, by the request's permission rule (Devin's is
+/// `mcp__grenadine__*`) or the tool's name, whose tool `names` show to be
+/// among those Claude may use without asking, `ALLOWED_TOOLS`. One for a
+/// tool that can't be told, or for `approve`, asks.
+fn auto_allowed<'a>(rule: Option<&'a str>, names: impl Iterator<Item = &'a str> + Clone) -> bool {
+    let grenadine = rule
+        .into_iter()
+        .chain(names.clone())
+        .any(|n| n.starts_with(GRENADINE_TOOLS));
+    // Devin may call a tool by its full name, its bare one, or something
+    // ending in either.
+    let tools = ALLOWED_TOOLS
+        .iter()
+        .map(|t| t.trim_start_matches(GRENADINE_TOOLS))
+        .chain(["approve"]);
+    let named: Vec<_> = tools
+        .filter(|t| {
+            names.clone().any(|n| {
+                let bare = n.trim_start_matches(GRENADINE_TOOLS);
+                bare == *t || n.ends_with(&format!("__{t}")) || n.ends_with(&format!("/{t}"))
+            })
+        })
+        .collect();
+    grenadine && !named.is_empty() && !named.contains(&"approve")
 }
 
 /// The answer to a `session/request_permission` request that picks
@@ -1079,14 +1163,14 @@ async fn permission(
         .get(tool_call)
         .cloned()
         .unwrap_or_default();
-    // The grenadine tools Claude may use without asking don't ask here
-    // either; Devin names them in the request's permission rule.
     let rule = extension(&request.tool_call.meta, "permissionRule").and_then(Value::as_str);
-    let allowed = [Some(tool.name.as_str()), rule]
-        .into_iter()
-        .flatten()
-        .any(|name| ALLOWED_TOOLS.contains(&name));
-    let decision = if allowed {
+    let names = [
+        Some(tool.name.as_str()),
+        tool.title.as_deref(),
+        request.tool_call.title.as_deref(),
+        rule,
+    ];
+    let decision = if auto_allowed(rule, names.into_iter().flatten()) {
         Some(Decision {
             allow: true,
             ..Decision::default()
@@ -1275,7 +1359,16 @@ mod tests {
         assert!(matches!(
             incoming(r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"no"}}"#),
             Incoming::Response(Response {
-                id: 3,
+                id: RequestId::Number(3),
+                error: Some(_),
+                ..
+            })
+        ));
+        // An error without a message still answers its request.
+        assert!(matches!(
+            incoming(r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32603}}"#),
+            Incoming::Response(Response {
+                id: RequestId::Number(4),
                 error: Some(_),
                 ..
             })
@@ -1292,6 +1385,80 @@ mod tests {
             serde_json::from_str::<SessionUpdate>(r#"{"sessionUpdate":"tool_call","rawInput":{}}"#)
                 .is_err()
         );
+    }
+
+    /// Config options are read leniently: only the model matters, its
+    /// grouped options are found, and others of any shape don't break the
+    /// answer.
+    #[test]
+    fn config_options_are_lenient() {
+        let created: NewSessionResponse = parse(json!({
+            "sessionId": "s",
+            "configOptions": [
+                {"id": "effort", "currentValue": 3, "options": [{"group": "g", "name": "G", "options": []}]},
+                {"id": "model", "currentValue": "swe-2", "options": [
+                    {"value": "swe-2", "name": "SWE-2"},
+                    {"group": "more", "name": "More", "options": [
+                        {"value": "swe-2-high", "name": "SWE-2 High"},
+                    ]},
+                    {"name": "no value"},
+                ]},
+            ],
+        }))
+        .unwrap();
+        let values: Vec<_> = models(&created.config_options)
+            .into_iter()
+            .map(|m| m.value)
+            .collect();
+        assert_eq!(values, ["swe-2", "swe-2-high"]);
+        assert_eq!(
+            current_model(&created.config_options).as_deref(),
+            Some("swe-2")
+        );
+        let loaded = parse::<Option<ConfigResponse>>(json!({"configOptions": null})).unwrap();
+        assert_eq!(current_model(&loaded.unwrap().config_options), None);
+    }
+
+    /// A tool call update with `null` content and usage in floats still
+    /// count.
+    #[test]
+    fn updates_are_lenient() {
+        let events = events(&[
+            r#"{"sessionUpdate":"tool_call","toolCallId":"exec:0#n","rawInput":{},"_meta":{"cognition.ai/inferenceToolName":"exec"}}"#,
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#n","status":"completed","content":null}"#,
+            r#"{"sessionUpdate":"usage_update","used":12.0,"size":200000.0}"#,
+        ]);
+        assert!(matches!(
+            events[1],
+            AgentEventKind::ToolResult { ref id, .. } if id == "exec:0#n"
+        ));
+        assert_eq!(
+            events[2],
+            AgentEventKind::Usage {
+                tokens: Some(12),
+                window: Some(200000),
+            }
+        );
+    }
+
+    /// Grenadine's MCP tools that Claude may use without asking go ahead
+    /// under Devin's `mcp__grenadine__*` rule; `approve`, a tool that
+    /// isn't grenadine's, and one that can't be told apart ask.
+    #[test]
+    fn auto_allows_grenadine_tools() {
+        let rule = Some("mcp__grenadine__*");
+        let allowed = |names: &[&str]| auto_allowed(rule, names.iter().copied());
+        assert!(allowed(&["mcp__grenadine__read_terminal"]));
+        assert!(allowed(&["read_terminal", "grenadine/read_terminal"]));
+        assert!(!allowed(&["mcp__grenadine__approve"]));
+        assert!(!allowed(&["mcp__grenadine__read_terminal", "approve"]));
+        assert!(!allowed(&["mcp__grenadine__*"]));
+        assert!(!allowed(&[]));
+        assert!(!auto_allowed(Some("exec"), ["read_terminal"].into_iter()));
+        assert!(auto_allowed(
+            None,
+            ["mcp__grenadine__show_image"].into_iter()
+        ));
     }
 
     /// A tool's output repeats across updates, so the result keeps the
@@ -1439,6 +1606,7 @@ mod tests {
         ];
         let plan = Tool {
             name: "ExitPlanMode".into(),
+            title: None,
             input: json!({"plan": "p"}),
             content: String::new(),
         };
@@ -1502,6 +1670,10 @@ mod tests {
         let tool = Tool::default();
         assert_eq!(decide(&allow, &tool, &always), Some("allow_always".into()));
         assert_eq!(decide(&allow, &tool, &[]), None);
+        // A denial with only allows offered picks none of them.
+        let deny = Decision::default();
+        let allows = [option("allow_once", "Yes", ApprovalKind::AllowOnce)];
+        assert_eq!(decide(&deny, &tool, &allows), None);
     }
 
     /// The listing asks a throwaway session for its models and deletes
@@ -1545,6 +1717,18 @@ mod tests {
             fake_log(dir.path())[2]["params"],
             json!({"sessionId": "list-tulip"})
         );
+    }
+
+    /// A listing that fails says what devin printed.
+    #[tokio::test]
+    async fn a_failed_listing_has_the_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("devin");
+        std::fs::write(&exe, "#!/bin/sh\necho 'Not logged in' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = list_models(&exe).await.unwrap_err();
+        assert!(format!("{e:#}").contains("Not logged in"), "{e:#}");
     }
 
     /// A listing that runs out of time fails, without leaving its

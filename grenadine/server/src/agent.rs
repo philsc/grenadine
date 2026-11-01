@@ -172,7 +172,8 @@ pub struct StructuredJob<'a> {
 }
 
 /// A backend's models: listed once and kept, or the listing's failure
-/// kept for `LISTING_RETRY`. Whoever asks while it lists waits for that
+/// kept for `LISTING_RETRY`. A listing without any models counts as a
+/// failure, since there's nothing to keep. Whoever asks while it lists waits for that
 /// listing.
 #[derive(Default)]
 pub struct ModelList(tokio::sync::Mutex<Option<Listing>>);
@@ -197,7 +198,14 @@ impl ModelList {
             }
             _ => {}
         }
-        match list().await {
+        let listed = list().await.and_then(|m| {
+            if m.is_empty() {
+                bail!("it listed none")
+            } else {
+                Ok(m)
+            }
+        });
+        match listed {
             Ok(models) => {
                 *listing = Some(Listing::Listed(models.clone()));
                 Ok(models)
@@ -1166,7 +1174,7 @@ pub fn request_approval(
             },
         );
     });
-    emit(
+    let requested = emit(
         state,
         id,
         AgentEventKind::ApprovalRequested {
@@ -1175,7 +1183,12 @@ pub fn request_approval(
             input: input.to_string(),
             options,
         },
-    )?;
+    );
+    // A request the page never heard of can't be answered.
+    if let Err(e) = requested {
+        state.agents.with_live(id, |l| l.pending.remove(tool_use));
+        return Err(e);
+    }
     set_status(state, id, AgentStatus::AwaitingApproval);
     Ok(rx)
 }
@@ -3637,6 +3650,23 @@ mod devin_tests {
             ..Default::default()
         };
         assert!(approve(state, id, "exec:0#t", decision).unwrap());
+    }
+
+    /// A listing without models is kept like a failure, not for good.
+    #[tokio::test]
+    async fn an_empty_listing_is_a_failure() {
+        let list = ModelList::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let listed = list
+                .get("Fake", || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Vec::new())
+                })
+                .await;
+            assert!(listed.is_err());
+        }
+        assert_eq!(calls.into_inner(), 1);
     }
 
     /// A devin that can't list its models leaves Devin out of the
