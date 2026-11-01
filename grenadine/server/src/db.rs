@@ -1358,10 +1358,24 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p \
       WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting)";
 
+/// Column `i` of `r` as `parse` reads it. A value it doesn't know, e.g.
+/// one a newer grenadine wrote, fails the row rather than passing for
+/// another.
+fn parsed<T>(r: &rusqlite::Row, i: usize, parse: fn(&str) -> Option<T>) -> rusqlite::Result<T> {
+    let s: String = r.get(i)?;
+    parse(&s).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            i,
+            rusqlite::types::Type::Text,
+            format!("unknown value {s:?}").into(),
+        )
+    })
+}
+
 fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
     Ok(AgentSession {
         id: r.get(0)?,
-        backend: AgentBackend::parse(&r.get::<_, String>(1)?).unwrap_or_default(),
+        backend: parsed(r, 1, AgentBackend::parse)?,
         repo: r.get(2)?,
         pr: r.get(3)?,
         title: r.get(4)?,
@@ -1371,7 +1385,7 @@ fn agent_from_row(r: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         status: parse_status(&r.get::<_, String>(8)?),
         created_at: r.get(9)?,
         cost: r.get(10)?,
-        cost_unit: CostUnit::parse(&r.get::<_, String>(11)?).unwrap_or_default(),
+        cost_unit: parsed(r, 11, CostUnit::parse)?,
         context_tokens: r.get(12)?,
         context_window: r.get(13)?,
         landed: r
@@ -2003,25 +2017,33 @@ mod tests {
 
     fn agent(id: &str, status: AgentStatus) -> AgentSession {
         AgentSession {
-            id: id.into(),
-            backend: AgentBackend::Claude,
-            repo: "o/n".into(),
             pr: Some(7),
             title: "t".into(),
-            summary: None,
             branch: "b".into(),
             worktree: "/w".into(),
             base_sha: "s".into(),
             status,
             created_at: 1,
-            cost: 0.0,
-            cost_unit: CostUnit::Usd,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture(id, "o/n")
+        }
+    }
+
+    /// A row whose backend or cost unit this build doesn't know fails to
+    /// load instead of passing for Claude's or USD.
+    #[test]
+    fn unknown_backends_fail_to_load() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
+        db.conn()
+            .execute("UPDATE agents SET backend = 'devin' WHERE id = 'a'", [])
+            .unwrap();
+        db.conn()
+            .execute("UPDATE agents SET cost_unit = 'acu' WHERE id = 'b'", [])
+            .unwrap();
+        for id in ["a", "b"] {
+            let e = db.agent(id).unwrap_err();
+            assert!(format!("{e:#}").contains("unknown value"), "{e:#}");
         }
     }
 

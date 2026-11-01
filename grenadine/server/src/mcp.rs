@@ -427,25 +427,12 @@ mod tests {
         state
             .db
             .create_agent(&AgentSession {
-                id: ID.into(),
-                backend: grenadine_core::api::AgentBackend::Claude,
-                repo: "o/n".into(),
-                pr: None,
                 title: "t".into(),
-                summary: None,
                 branch: "b".into(),
                 worktree: "/w".into(),
                 base_sha: "s".into(),
                 status: AgentStatus::Running,
-                created_at: 0,
-                cost: 0.0,
-                cost_unit: grenadine_core::api::CostUnit::Usd,
-                context_tokens: None,
-                context_window: None,
-                model: None,
-                landed: None,
-                prs: None,
-                unstaged: 0,
+                ..AgentSession::fixture(ID, "o/n")
             })
             .unwrap();
         state

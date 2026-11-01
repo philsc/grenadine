@@ -1,5 +1,5 @@
 //! Agent sessions driven from the UI. Each session works in its own git
-//! worktree; every prompt runs one turn with the session's backend (the
+//! worktree; every prompt runs one turn with the session's `Backend` (the
 //! Claude Code backend is in `claude.rs`), and the turn's output becomes
 //! the session's transcript. Each prompt comes with a permission mode;
 //! the backend asks about the tool uses that the mode doesn't decide on
@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
+use futures::future::BoxFuture;
 use grenadine_core::api::{
-    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentSession, AgentStatus,
-    CostUnit, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage, ServerEvent,
-    WrapUp, WrapUpTarget,
+    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
+    AgentStatus, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage,
+    ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::claude;
@@ -48,6 +50,9 @@ const IMAGE_TYPES: [(&str, &str); 4] = [
 /// How long a deleted session's processes get to exit before they're
 /// killed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of a backend's stderr is kept to explain a crash.
+const STDERR_TAIL: usize = 4096;
 
 /// What Claude is asked when there's uncommitted work to wrap up.
 const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
@@ -99,6 +104,177 @@ pub struct Decision {
     pub answers: Option<BTreeMap<String, String>>,
 }
 
+/// An agent backend: what runs sessions' turns and background jobs.
+/// Adding one takes an impl of this and an arm in `Agents::backend`; what
+/// it offers that never changes, like its permission modes, is on
+/// `AgentBackend`.
+pub trait Backend: Send + Sync {
+    /// The models it offers; none while they can't be listed.
+    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>>;
+
+    /// Runs `turn` of `session` and returns the status the session ends
+    /// up in; `sink` gets what the turn's output means for the transcript.
+    fn turn<'a>(
+        &'a self,
+        state: &'a State,
+        session: &'a AgentSession,
+        turn: Turn<'a>,
+        sink: TurnSink<'a>,
+    ) -> BoxFuture<'a, Result<AgentStatus>>;
+
+    /// Runs `job` and returns its answer, in the shape of its schema.
+    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>>;
+}
+
+/// One prompt's turn: what it says and how it runs.
+pub struct Turn<'a> {
+    pub prompt: &'a str,
+    pub images: &'a [String],
+    pub mode: &'a PermissionMode,
+    /// `None` or `default` keeps the backend's default.
+    pub model: Option<String>,
+    /// The session's grenadine MCP endpoint.
+    pub mcp_url: &'a str,
+    /// Appended to the agent's system prompt.
+    pub notes: &'a [String],
+}
+
+/// A run that answers in a JSON schema's shape without a session, for the
+/// background jobs like summaries and cleanup scans.
+pub struct StructuredJob<'a> {
+    /// What it's called in errors.
+    pub name: &'a str,
+    pub model: &'a str,
+    pub schema: &'a Value,
+    pub input: &'a str,
+    /// The tools it has, comma-separated; `None` leaves the backend's.
+    pub tools: Option<&'a str>,
+    /// The tools it may use without asking.
+    pub allowed: &'a [&'a str],
+    /// What it may spend, in USD.
+    pub budget_usd: &'a str,
+    /// Whether to load only the user's settings, not a project's.
+    pub setting_sources_user: bool,
+    /// A directory it may read besides `cwd`.
+    pub add_dir: Option<&'a Path>,
+    pub cwd: &'a Path,
+    /// How long it may take before it's killed.
+    pub timeout: Duration,
+}
+
+/// Stops a turn the way Ctrl-C would. Interrupting a turn again stops it
+/// again.
+#[derive(Clone)]
+pub struct Stopper(Arc<dyn Fn() + Send + Sync>);
+
+impl Stopper {
+    pub fn new(stop: impl Fn() + Send + Sync + 'static) -> Stopper {
+        Stopper(Arc::new(stop))
+    }
+
+    /// Sends `child` SIGINT.
+    pub fn sigint(child: &tokio::process::Child) -> Stopper {
+        let pid = child.id();
+        Stopper::new(move || {
+            if let Some(pid) = pid {
+                interrupt_pid(pid);
+            }
+        })
+    }
+
+    pub fn stop(&self) {
+        (self.0)()
+    }
+}
+
+/// A command that runs a backend's `exe` for a turn of `session`: in its
+/// worktree, in its systemd slice if it has one, outside the server's
+/// process group, with its stdio piped, killed when it's dropped.
+pub fn backend_command(
+    state: &State,
+    session: &AgentSession,
+    exe: &Path,
+) -> tokio::process::Command {
+    // `systemd-run --scope` execs `exe`, so the PID stays its own.
+    let mut cmd = if let Some(slice) = state.agents.slice_of(&session.id) {
+        let mut cmd = tokio::process::Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--collect"])
+            .arg(format!("--slice={slice}"))
+            .arg("--")
+            .arg(exe);
+        cmd
+    } else {
+        tokio::process::Command::new(exe)
+    };
+    cmd.current_dir(&session.worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Keep it out of the terminal's process group, like git in
+    // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
+    // SAFETY: setsid is async-signal-safe and the closure touches no
+    // memory outside the call.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Reads all of a backend's `stderr`; the task returns its end, to
+/// explain a crash.
+pub fn stderr_tail(
+    mut stderr: impl AsyncRead + Unpin + Send + 'static,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).trim().to_owned();
+        let start = text.len().saturating_sub(STDERR_TAIL);
+        let start = (start..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        text[start..].to_owned()
+    })
+}
+
+/// A backend's output, line by line. When the server shuts down
+/// meanwhile, the turn is stopped once and the output read on until it
+/// ends.
+pub struct OutputLines<R> {
+    lines: tokio::io::Lines<BufReader<R>>,
+    stopper: Stopper,
+    stopping: bool,
+}
+
+impl<R: AsyncRead + Unpin> OutputLines<R> {
+    pub fn new(out: R, stopper: Stopper) -> OutputLines<R> {
+        OutputLines {
+            lines: BufReader::new(out).lines(),
+            stopper,
+            stopping: false,
+        }
+    }
+
+    /// The next line; `None` once the output ends.
+    pub async fn next(&mut self, state: &State) -> Result<Option<String>> {
+        loop {
+            tokio::select! {
+                line = self.lines.next_line() => return Ok(line?),
+                _ = state.shutdown.cancelled(), if !self.stopping => {
+                    self.stopping = true;
+                    self.stopper.stop();
+                }
+            }
+        }
+    }
+}
+
 pub struct Agents {
     /// The Claude Code backend.
     claude: claude::Claude,
@@ -131,8 +307,8 @@ struct Live {
     queue: VecDeque<Queued>,
     /// Whether a task is running the queued prompts.
     running: bool,
-    /// The current claude process.
-    pid: Option<u32>,
+    /// Stops the current turn.
+    stopper: Option<Stopper>,
     /// The user stopped the current turn.
     interrupted: bool,
     /// Permission requests by tool use ID.
@@ -157,7 +333,7 @@ impl Live {
             secret: random_hex(16),
             queue: VecDeque::new(),
             running: false,
-            pid: None,
+            stopper: None,
             interrupted: false,
             pending: HashMap::new(),
             wrap_up: None,
@@ -219,7 +395,7 @@ pub fn now() -> i64 {
 }
 
 /// Asks a process to stop the way Ctrl-C would.
-pub(crate) fn interrupt_pid(pid: u32) {
+fn interrupt_pid(pid: u32) {
     // SAFETY: kill has no memory-safety preconditions.
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGINT);
@@ -535,9 +711,11 @@ impl Agents {
         self.slices.then(|| slice(id))
     }
 
-    /// The `claude` executable.
-    pub fn claude(&self) -> &Path {
-        self.claude.exe()
+    /// What runs the turns and background jobs of `backend`.
+    pub fn backend(&self, backend: AgentBackend) -> &dyn Backend {
+        match backend {
+            AgentBackend::Claude => &self.claude,
+        }
     }
 
     /// Where the images sent with prompts go.
@@ -551,17 +729,20 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
-    /// Remembers the turn's process so it can be interrupted; returns
-    /// whether an interrupt came before the process existed.
-    pub(crate) fn set_pid(&self, id: &str, pid: u32) -> bool {
-        self.with_live(id, |l| {
-            l.pid = Some(pid);
+    /// Lets `interrupt` stop the current turn with `stopper`. An
+    /// interrupt that came before the turn's process existed stops it now.
+    pub fn set_stopper(&self, id: &str, stopper: Stopper) {
+        let interrupted = self.with_live(id, |l| {
+            l.stopper = Some(stopper.clone());
             l.interrupted
-        })
+        });
+        if interrupted {
+            stopper.stop();
+        }
     }
 
     /// Whether the user stopped the current turn.
-    pub(crate) fn interrupted(&self, id: &str) -> bool {
+    fn interrupted(&self, id: &str) -> bool {
         self.with_live(id, |l| l.interrupted)
     }
 
@@ -574,31 +755,28 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// What each backend offers sessions, for the pickers: Claude always,
-    /// its models empty when they can't be listed.
+    /// The models each backend offers, for the pickers: empty when they
+    /// can't be listed.
     pub async fn backends(&self) -> Vec<AgentBackendInfo> {
-        vec![self.claude.info().await]
+        let mut infos = Vec::new();
+        for backend in AgentBackend::ALL {
+            infos.push(backend.info(self.backend(backend).models().await));
+        }
+        infos
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
     /// one it lists.
     pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
-        let models = match backend {
-            AgentBackend::Claude => self.claude.models().await,
-        };
         match model {
             None => true,
-            Some(m) => models.iter().any(|i| i.value == m),
+            Some(m) => self
+                .backend(backend)
+                .models()
+                .await
+                .iter()
+                .any(|i| i.value == m),
         }
-    }
-
-    /// Whether `backend` has `mode` among its permission modes.
-    pub fn has_mode(&self, backend: AgentBackend, mode: &PermissionMode) -> bool {
-        backend
-            .info(Vec::new())
-            .modes
-            .iter()
-            .any(|m| m.value == mode.as_str())
     }
 }
 
@@ -662,7 +840,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         status: AgentStatus::Idle,
         created_at: now(),
         cost: 0.0,
-        cost_unit: CostUnit::Usd,
+        cost_unit: req.backend.cost_unit(),
         context_tokens: None,
         context_window: None,
         model: None,
@@ -857,14 +1035,14 @@ pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
 
 /// Stops the current turn and drops the queued prompts.
 pub fn interrupt(state: &State, id: &str) {
-    let pending = state.agents.with_live(id, |l| {
+    let (stopper, pending) = state.agents.with_live(id, |l| {
         l.queue.clear();
         l.interrupted = l.running;
-        if let Some(pid) = l.pid {
-            interrupt_pid(pid);
-        }
-        std::mem::take(&mut l.pending)
+        (l.stopper.clone(), std::mem::take(&mut l.pending))
     });
+    if let Some(stopper) = stopper {
+        stopper.stop();
+    }
     for (tool_use, tx) in pending {
         let _ = tx.send(Decision {
             allow: false,
@@ -1054,10 +1232,14 @@ async fn run(state: Arc<State>, id: String) {
             if last == AgentStatus::Idle {
                 continue_wrap_up(&state, &id).await;
             } else if state.agents.with_live(&id, |l| l.wrap_up.take()).is_some() {
+                let agent = match state.db.agent(&id) {
+                    Ok(Some(s)) => s.backend.agent_name(),
+                    _ => AgentBackend::default().agent_name(),
+                };
                 let _ = emit(
                     &state,
                     &id,
-                    AgentEventKind::WrapUpFailed("Claude's turn didn't finish".into()),
+                    AgentEventKind::WrapUpFailed(format!("{agent}'s turn didn't finish")),
                 );
             }
             return;
@@ -1071,7 +1253,7 @@ async fn run(state: Arc<State>, id: String) {
             }
         };
         let interrupted = state.agents.with_live(&id, |l| {
-            l.pid = None;
+            l.stopper = None;
             l.interrupted
         });
         let status = if interrupted {
@@ -1446,7 +1628,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         .flatten()
         .collect();
     let sink = TurnSink::new(state, id, &session.repo);
-    let turn = claude::Turn {
+    let turn = Turn {
         prompt: &prompt,
         images: &images,
         mode: &mode,
@@ -1454,9 +1636,11 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         mcp_url: &mcp_url,
         notes: &notes,
     };
-    match session.backend {
-        AgentBackend::Claude => claude::turn(state, &session, turn, sink).await,
-    }
+    state
+        .agents
+        .backend(session.backend)
+        .turn(state, &session, turn, sink)
+        .await
 }
 
 /// What a backend's turn feeds its output into: the session's transcript
@@ -1531,13 +1715,10 @@ impl<'a> TurnSink<'a> {
         record_prs(self.state, self.id, &opened)
     }
 
-    /// How the turn went, without the backend's output: `unfinished`
+    /// How the turn went once the backend's output is done: `unfinished`
     /// explains a turn that never reported an end.
-    pub fn finish(
-        self,
-        interrupted: bool,
-        unfinished: impl FnOnce() -> String,
-    ) -> Result<AgentStatus> {
+    pub fn finish(self, unfinished: impl FnOnce() -> String) -> Result<AgentStatus> {
+        let interrupted = self.state.agents.interrupted(self.id);
         Ok(match self.ended {
             Some(true) => AgentStatus::Idle,
             Some(false) => AgentStatus::Failed,
@@ -1671,7 +1852,7 @@ fn store_images(state: &State, id: &str, kind: &mut AgentEventKind) -> Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
@@ -1708,7 +1889,7 @@ mod tests {
 
     /// A state whose agents run `script` as claude, with the git fixture's
     /// clone configured.
-    fn state_with_claude(
+    pub(crate) fn state_with_claude(
         fx: &crate::git::tests::Fixture,
         dir: &std::path::Path,
         script: &str,
@@ -2289,25 +2470,11 @@ cat {dir}/answer
         assert!(!dir.path().join("prune_args").exists());
 
         let session = AgentSession {
-            id: "gone".into(),
-            backend: AgentBackend::Claude,
-            repo: "owner/name".into(),
-            pr: None,
             title: "Run the e2e tests".into(),
-            summary: None,
             branch: "b".into(),
             worktree: "/w".into(),
             base_sha: "s".into(),
-            status: AgentStatus::Idle,
-            created_at: 0,
-            cost: 0.0,
-            cost_unit: CostUnit::Usd,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture("gone", "owner/name")
         };
         state
             .db
@@ -2440,25 +2607,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     /// A session row with its worktree at `worktree`, never started.
     fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
         AgentSession {
-            id: id.into(),
-            backend: AgentBackend::Claude,
-            repo: repo.into(),
-            pr: None,
             title: "t".into(),
-            summary: None,
             branch: session_branch(id),
             worktree: worktree.to_string_lossy().into_owned(),
             base_sha: "0".repeat(40),
-            status: AgentStatus::Idle,
             created_at: now(),
-            cost: 0.0,
-            cost_unit: CostUnit::Usd,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture(id, repo)
         }
     }
 
@@ -2652,7 +2806,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             None,
         );
         for _ in 0..100 {
-            if state.agents.with_live(&session.id, |l| l.pid.is_some()) {
+            if state.agents.with_live(&session.id, |l| l.stopper.is_some()) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

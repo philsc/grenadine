@@ -6,18 +6,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use grenadine_core::api::{
-    AgentBackendInfo, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk,
-    PermissionMode,
-};
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
+use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::OnceCell;
 
-use crate::agent::TurnSink;
+use crate::agent::{Backend, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
 use crate::sync::State;
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
@@ -30,9 +28,6 @@ const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
 /// servers by default, which would cut off a person who's away from the
 /// page. 0 turns the check off.
 const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
-
-/// How much of claude's stderr is kept to explain a crash.
-const STDERR_TAIL: usize = 4096;
 
 /// The grenadine MCP server's tools that Claude may use without asking.
 const ALLOWED_TOOLS: [&str; 4] = [
@@ -62,27 +57,36 @@ impl Claude {
             models: OnceCell::new(),
         }
     }
+}
 
-    /// The `claude` executable.
-    pub fn exe(&self) -> &Path {
-        &self.exe
-    }
-
+impl Backend for Claude {
     /// The models Claude Code offers, listed once and kept; none while it
     /// can't list them.
-    pub async fn models(&self) -> Vec<AgentModelInfo> {
-        match self.models.get_or_try_init(|| list_models(&self.exe)).await {
-            Ok(models) => models.clone(),
-            Err(e) => {
-                tracing::warn!("listing Claude Code's models: {e:#}");
-                Vec::new()
+    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>> {
+        async move {
+            match self.models.get_or_try_init(|| list_models(&self.exe)).await {
+                Ok(models) => models.clone(),
+                Err(e) => {
+                    tracing::warn!("listing Claude Code's models: {e:#}");
+                    Vec::new()
+                }
             }
         }
+        .boxed()
     }
 
-    /// What Claude Code offers sessions, for the backends endpoint.
-    pub async fn info(&self) -> AgentBackendInfo {
-        grenadine_core::api::AgentBackend::Claude.info(self.models().await)
+    fn turn<'a>(
+        &'a self,
+        state: &'a State,
+        session: &'a AgentSession,
+        t: Turn<'a>,
+        sink: TurnSink<'a>,
+    ) -> BoxFuture<'a, Result<AgentStatus>> {
+        turn(&self.exe, state, session, t, sink).boxed()
+    }
+
+    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.exe, job).boxed()
     }
 }
 
@@ -175,22 +179,11 @@ async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<Str
     Ok(format!("{message}\n"))
 }
 
-/// One prompt's turn: what it says and how it runs.
-pub struct Turn<'a> {
-    pub prompt: &'a str,
-    pub images: &'a [String],
-    pub mode: &'a PermissionMode,
-    pub model: Option<String>,
-    /// The session's grenadine MCP endpoint.
-    pub mcp_url: &'a str,
-    /// Appended to Claude's system prompt.
-    pub notes: &'a [String],
-}
-
 /// Runs `t` as a `claude -p` turn of `session` and returns the status the
 /// session ends up in; `sink` gets what the turn's output means for the
 /// transcript.
-pub async fn turn(
+async fn turn(
+    claude: &Path,
     state: &State,
     session: &AgentSession,
     t: Turn<'_>,
@@ -213,17 +206,7 @@ pub async fn turn(
             }
         }
     });
-    // `systemd-run --scope` execs claude, so the PID stays claude's.
-    let mut cmd = if let Some(slice) = state.agents.slice_of(id) {
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "--collect"])
-            .arg(format!("--slice={slice}"))
-            .arg("--")
-            .arg(state.agents.claude());
-        cmd
-    } else {
-        tokio::process::Command::new(state.agents.claude())
-    };
+    let mut cmd = crate::agent::backend_command(state, session, claude);
     cmd.arg("-p");
     // Claude's session ID is grenadine's.
     if let Some(backend_session) = state.db.backend_session(id)? {
@@ -253,41 +236,20 @@ pub async fn turn(
             .into_iter()
             .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
     )
-    .current_dir(&session.worktree)
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
     .env(
         "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
         MCP_TOOL_IDLE_TIMEOUT_MS,
-    )
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
+    );
     if let Some(model) = model.filter(|m| m != "default") {
         cmd.arg("--model").arg(model);
     }
     let input = user_message(prompt, &state.agents.images().join(id), images).await?;
-    // Keep claude out of the terminal's process group, like git in
-    // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
-    // SAFETY: setsid is async-signal-safe and the closure touches no
-    // memory outside the call.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("can't run {}", state.agents.claude().display()))?;
-    if let Some(pid) = child.id() {
-        // An interrupt that came before the process existed applies now.
-        if state.agents.set_pid(id, pid) {
-            crate::agent::interrupt_pid(pid);
-        }
-    }
+        .with_context(|| format!("can't run {}", claude.display()))?;
+    let stopper = Stopper::sigint(&child);
+    state.agents.set_stopper(id, stopper.clone());
     // The prompt goes through stdin so that one starting with `-` isn't
     // taken for a flag. If claude exits without reading it, its exit status
     // and stderr below say why.
@@ -299,32 +261,9 @@ pub async fn turn(
     }
     drop(stdin);
 
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
-        let text = String::from_utf8_lossy(&buf).trim().to_owned();
-        let start = text.len().saturating_sub(STDERR_TAIL);
-        let start = (start..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        text[start..].to_owned()
-    });
-
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut stopping = false;
-    loop {
-        let line = tokio::select! {
-            line = lines.next_line() => line?,
-            _ = state.shutdown.cancelled(), if !stopping => {
-                stopping = true;
-                if let Some(pid) = child.id() {
-                    crate::agent::interrupt_pid(pid);
-                }
-                continue;
-            }
-        };
-        let Some(line) = line else { break };
+    let stderr = crate::agent::stderr_tail(child.stderr.take().unwrap());
+    let mut lines = OutputLines::new(child.stdout.take().unwrap(), stopper);
+    while let Some(line) = lines.next(state).await? {
         match parse_line(&line) {
             Parsed::Started { model } => sink.started(id, model)?,
             Parsed::Events(events) => {
@@ -335,8 +274,8 @@ pub async fn turn(
         }
     }
     let exit = child.wait().await?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    sink.finish(state.agents.interrupted(id), || {
+    let stderr = stderr.await.unwrap_or_default();
+    sink.finish(|| {
         let mut message = format!("claude exited without finishing the turn ({exit})");
         if !stderr.is_empty() {
             message += &format!(":\n{stderr}");
@@ -519,32 +458,9 @@ fn parse_line(line: &str) -> Parsed {
     Parsed::Events(events)
 }
 
-/// A `claude -p` run that answers in a JSON schema's shape, for the
-/// background jobs like summaries and cleanup scans.
-pub struct StructuredJob<'a> {
-    /// What it's called in errors.
-    pub name: &'a str,
-    pub model: &'a str,
-    pub schema: &'a Value,
-    pub input: &'a str,
-    /// The `--tools` value; `None` passes no `--tools`.
-    pub tools: Option<&'a str>,
-    /// The tools it may use without asking.
-    pub allowed: &'a [&'a str],
-    /// What it may spend, in USD.
-    pub budget_usd: &'a str,
-    /// Whether to load only the user's settings, not a project's.
-    pub setting_sources_user: bool,
-    /// A directory it may read besides `cwd`.
-    pub add_dir: Option<&'a Path>,
-    pub cwd: &'a Path,
-    /// How long it may take before it's killed.
-    pub timeout: Duration,
-}
-
 /// Runs `claude -p --output-format json --json-schema` for `job` on its
 /// input and returns its `structured_output`.
-pub async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
+async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
     let mut cmd = tokio::process::Command::new(claude);
     cmd.args(["-p", "--model", job.model, "--output-format", "json"])
         .arg("--json-schema")
@@ -613,11 +529,10 @@ pub fn structured_output(name: &str, stdout: &[u8]) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use grenadine_core::api::AgentBackend;
 
     use super::*;
+    use crate::agent::tests::state_with_claude;
 
     fn events(line: &str) -> Vec<AgentEventKind> {
         match parse_line(line) {
@@ -769,27 +684,8 @@ mod tests {
         );
     }
 
-    /// A state whose agents run `script` as claude, with the git fixture's
-    /// clone configured.
-    fn state_with_claude(fx: &crate::git::tests::Fixture, dir: &Path, script: &str) -> Arc<State> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let claude = dir.join("claude");
-        std::fs::write(&claude, script).unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cloned = Arc::new(crate::sync::ClonedRepo {
-            repo: fx.clone.clone(),
-            git_lock: tokio::sync::Mutex::new(()),
-        });
-        crate::sync::test_state_with_agents(
-            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
-            claude,
-            dir.join("worktrees"),
-        )
-    }
-
     /// Claude Code lists its models in its answer to `initialize`, as
-    /// 2.1 writes it, shortened. The backend it shows offers its modes
-    /// and the listed models.
+    /// 2.1 writes it, shortened. The backend it shows offers them.
     #[tokio::test]
     async fn lists_models() {
         let fx = crate::git::tests::fixture();
@@ -821,23 +717,6 @@ echo '{{"type":"control_response","response":{{"subtype":"success","request_id":
         assert_eq!(backends.len(), 1);
         let info = &backends[0];
         assert_eq!(info.backend, AgentBackend::Claude);
-        assert_eq!(info.label, "Claude Code");
-        let modes: Vec<_> = info
-            .modes
-            .iter()
-            .map(|m| (m.value.as_str(), m.label.as_str()))
-            .collect();
-        assert_eq!(
-            modes,
-            [
-                ("manual", "Ask for everything"),
-                ("acceptEdits", "Accept edits"),
-                ("auto", "Auto"),
-                ("plan", "Plan first"),
-            ]
-        );
-        assert_eq!(info.default_mode, "auto");
-        assert_eq!(info.after_plan, ["manual", "acceptEdits", "auto"]);
         assert_eq!(info.models, models);
         assert!(state.agents.offers(AgentBackend::Claude, None).await);
         assert!(
@@ -852,8 +731,6 @@ echo '{{"type":"control_response","response":{{"subtype":"success","request_id":
                 .offers(AgentBackend::Claude, Some("--help"))
                 .await
         );
-        assert!(state.agents.has_mode(AgentBackend::Claude, &"auto".into()));
-        assert!(!state.agents.has_mode(AgentBackend::Claude, &"nope".into()));
 
         // Claude Code is asked once, without a prompt or a session to keep.
         let log = std::fs::read_to_string(&log).unwrap();

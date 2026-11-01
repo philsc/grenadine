@@ -7,10 +7,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use grenadine_core::api::ServerEvent;
+use grenadine_core::api::{AgentBackend, ServerEvent};
 use serde_json::{Value, json};
 
-use crate::claude::{StructuredJob, structured};
+use crate::agent::StructuredJob;
 use crate::sync::State;
 
 /// How long writing a summary may take before it's killed.
@@ -63,9 +63,11 @@ async fn run(state: &State, input: &str) -> Result<String> {
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"],
     });
-    let output = structured(
-        state.agents.claude(),
-        &StructuredJob {
+    // The model is one of Claude Code's.
+    let output = state
+        .agents
+        .backend(AgentBackend::Claude)
+        .structured(&StructuredJob {
             name: "summary",
             model: "haiku",
             schema: &schema,
@@ -79,9 +81,8 @@ async fn run(state: &State, input: &str) -> Result<String> {
             // distract.
             cwd: &std::env::temp_dir(),
             timeout: TIMEOUT,
-        },
-    )
-    .await?;
+        })
+        .await?;
     parse_result(&output)
 }
 

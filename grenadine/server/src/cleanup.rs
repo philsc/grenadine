@@ -15,12 +15,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL, NewAgent,
-    NewCleanupSession, PermissionMode, ServerEvent,
+    AgentBackend, AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL,
+    NewAgent, NewCleanupSession, PermissionMode, ServerEvent,
 };
 use serde_json::{Value, json};
 
-use crate::claude::{StructuredJob, structured};
+use crate::agent::StructuredJob;
 use crate::sync::State;
 
 /// How long a scan may take before it's killed.
@@ -337,9 +337,11 @@ async fn ask(
     add_dir: Option<&Path>,
 ) -> Result<Value> {
     let dir = scan_dir(id)?;
-    let result = structured(
-        state.agents.claude(),
-        &StructuredJob {
+    // The models and tools are Claude Code's.
+    let result = state
+        .agents
+        .backend(AgentBackend::Claude)
+        .structured(&StructuredJob {
             name: job.name,
             model: job.model,
             schema,
@@ -351,9 +353,8 @@ async fn ask(
             add_dir,
             cwd: cwd.unwrap_or(&dir),
             timeout: job.timeout,
-        },
-    )
-    .await;
+        })
+        .await;
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
@@ -744,25 +745,8 @@ mod tests {
     #[test]
     fn transcript_path_follows_claude_code() {
         let session = AgentSession {
-            id: "id".into(),
-            backend: grenadine_core::api::AgentBackend::Claude,
-            repo: "o/n".into(),
-            pr: None,
-            title: "t".into(),
-            summary: None,
-            branch: "b".into(),
             worktree: "/home/u/.local/share/w/o/n/id".into(),
-            base_sha: "s".into(),
-            status: grenadine_core::api::AgentStatus::Idle,
-            created_at: 0,
-            cost: 0.0,
-            cost_unit: grenadine_core::api::CostUnit::Usd,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture("id", "o/n")
         };
         assert!(
             transcript_path(&session).ends_with("projects/-home-u--local-share-w-o-n-id/id.jsonl")

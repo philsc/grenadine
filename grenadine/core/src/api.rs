@@ -768,6 +768,35 @@ pub struct AgentSession {
     pub unstaged: u32,
 }
 
+impl AgentSession {
+    /// An idle Claude session `id` in `repo` that has done nothing yet,
+    /// for tests to change the fields they care about.
+    #[doc(hidden)]
+    pub fn fixture(id: &str, repo: &str) -> AgentSession {
+        AgentSession {
+            id: id.into(),
+            backend: AgentBackend::Claude,
+            repo: repo.into(),
+            pr: None,
+            title: String::new(),
+            summary: None,
+            branch: String::new(),
+            worktree: String::new(),
+            base_sha: String::new(),
+            status: AgentStatus::Idle,
+            created_at: 0,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
+            context_tokens: None,
+            context_window: None,
+            model: None,
+            landed: None,
+            prs: None,
+            unstaged: 0,
+        }
+    }
+}
+
 /// How far the PRs an agent session opened have come. PRs closed without
 /// merging count in neither number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,6 +818,9 @@ pub enum AgentBackend {
 }
 
 impl AgentBackend {
+    /// Every backend, in picker order.
+    pub const ALL: [AgentBackend; 1] = [AgentBackend::Claude];
+
     /// The value requests and the database name it with.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -798,10 +830,7 @@ impl AgentBackend {
 
     /// The backend `as_str` names, if any.
     pub fn parse(s: &str) -> Option<AgentBackend> {
-        match s {
-            "claude" => Some(AgentBackend::Claude),
-            _ => None,
-        }
+        AgentBackend::ALL.into_iter().find(|b| b.as_str() == s)
     }
 
     /// What the backend picker calls it.
@@ -811,37 +840,79 @@ impl AgentBackend {
         }
     }
 
-    /// What the backend offers sessions besides `models`, which are
-    /// listed at runtime and are empty when they can't be.
-    pub fn info(self, models: Vec<AgentModelInfo>) -> AgentBackendInfo {
-        let mode = |value: &str, label: &str| ModeInfo {
-            value: value.to_owned(),
-            label: label.to_owned(),
-        };
+    /// What the page calls the agent in prose, e.g. "What Claude may do".
+    pub fn agent_name(self) -> &'static str {
         match self {
-            AgentBackend::Claude => AgentBackendInfo {
-                backend: self,
-                label: self.label().to_owned(),
-                modes: vec![
-                    // Ask before every tool use.
-                    mode("manual", "Ask for everything"),
-                    // Allow file edits, ask for the rest.
-                    mode("acceptEdits", "Accept edits"),
-                    // A classifier allows routine tool uses and asks for
-                    // risky ones.
-                    mode("auto", "Auto"),
-                    // Research without changing anything, then ask the
-                    // user to approve a plan; the turn goes on in the
-                    // mode picked with the approval.
-                    mode("plan", "Plan first"),
-                ],
-                default_mode: "auto".to_owned(),
-                after_plan: ["manual", "acceptEdits", "auto"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                models,
-            },
+            AgentBackend::Claude => "Claude",
+        }
+    }
+
+    /// The unit the backend reports costs in.
+    pub fn cost_unit(self) -> CostUnit {
+        match self {
+            AgentBackend::Claude => CostUnit::Usd,
+        }
+    }
+
+    /// The permission modes as `(value, label)`, in picker order. Every
+    /// backend has one named "plan", `PermissionMode::plan`.
+    pub fn modes(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            AgentBackend::Claude => &[
+                // Ask before every tool use.
+                ("manual", "Ask for everything"),
+                // Allow file edits, ask for the rest.
+                ("acceptEdits", "Accept edits"),
+                // A classifier allows routine tool uses and asks for risky
+                // ones.
+                ("auto", "Auto"),
+                // Research without changing anything, then ask the user to
+                // approve a plan; the turn goes on in the mode picked with
+                // the approval.
+                ("plan", "Plan first"),
+            ],
+        }
+    }
+
+    /// The mode a session starts with until the user picks one.
+    pub fn default_mode(self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "auto",
+        }
+    }
+
+    /// The modes a turn can go on in once a plan is approved, in picker
+    /// order.
+    pub fn after_plan(self) -> &'static [&'static str] {
+        match self {
+            AgentBackend::Claude => &["manual", "acceptEdits", "auto"],
+        }
+    }
+
+    /// Whether `mode` is one of the backend's permission modes.
+    pub fn has_mode(self, mode: &str) -> bool {
+        self.modes().iter().any(|(m, _)| *m == mode)
+    }
+
+    /// Whether a turn can go on in `mode` once a plan is approved.
+    pub fn allows_after_plan(self, mode: &str) -> bool {
+        self.after_plan().contains(&mode)
+    }
+
+    /// What the picker calls `mode`, if the backend has it.
+    pub fn mode_label(self, mode: &str) -> Option<&'static str> {
+        self.modes()
+            .iter()
+            .find(|(m, _)| *m == mode)
+            .map(|(_, label)| *label)
+    }
+
+    /// What the backend offers sessions with `models`, which are listed
+    /// at runtime and are empty when they can't be.
+    pub fn info(self, models: Vec<AgentModelInfo>) -> AgentBackendInfo {
+        AgentBackendInfo {
+            backend: self,
+            models,
         }
     }
 }
@@ -872,29 +943,12 @@ impl CostUnit {
     }
 }
 
-/// A permission mode a backend offers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModeInfo {
-    /// The mode's value, as a `PermissionMode`.
-    pub value: String,
-    /// What the picker calls it.
-    pub label: String,
-}
-
-/// What a backend offers sessions: its permission modes and models.
+/// What a backend offers sessions that is only known at runtime: its
+/// models. Its permission modes are `AgentBackend::modes`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentBackendInfo {
     pub backend: AgentBackend,
-    /// What the backend picker calls it.
-    pub label: String,
-    /// The permission modes, in picker order.
-    pub modes: Vec<ModeInfo>,
-    /// The mode a session starts with until the user picks one.
-    pub default_mode: String,
-    /// The modes a turn can go on in once a plan is approved.
-    pub after_plan: Vec<String>,
     /// The models; empty when they can't be listed.
     pub models: Vec<AgentModelInfo>,
 }
@@ -902,7 +956,7 @@ pub struct AgentBackendInfo {
 /// How an agent decides about tool uses during a turn; the user picks it
 /// with every prompt. Whatever the mode doesn't decide on its own is
 /// asked on the page. The values are the backend's, in
-/// `AgentBackendInfo::modes`.
+/// `AgentBackend::modes`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PermissionMode(String);
@@ -957,7 +1011,7 @@ pub struct NewAgent {
     /// Start from this PR's head rather than from the trunk.
     pub pr: Option<u64>,
     pub prompt: String,
-    /// A `ModeInfo::value` of the backend.
+    /// One of the backend's `AgentBackend::modes`.
     pub permission_mode: PermissionMode,
     /// An `AgentModelInfo::value` of the backend; `None` keeps its
     /// default.
@@ -972,7 +1026,7 @@ pub struct NewAgent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMessage {
     pub prompt: String,
-    /// A `ModeInfo::value` of the session's backend.
+    /// One of the session's backend's `AgentBackend::modes`.
     pub permission_mode: PermissionMode,
     /// An `AgentModelInfo::value` of the backend; `None` keeps its
     /// default.
@@ -1010,7 +1064,7 @@ pub enum WrapUpTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapUp {
     pub target: WrapUpTarget,
-    /// A `ModeInfo::value` of the session's backend.
+    /// One of the session's backend's `AgentBackend::modes`.
     pub permission_mode: PermissionMode,
     /// An `AgentModelInfo::value` of the backend; `None` keeps its
     /// default.
@@ -1221,5 +1275,23 @@ mod tests {
             assert_eq!(MergeMethod::from_github(m.as_github()), Some(m));
         }
         assert_eq!(MergeMethod::from_github(""), None);
+    }
+
+    /// `PermissionMode::plan`, the pickers' starting values and plan
+    /// approvals rely on each backend's tables agreeing.
+    #[test]
+    fn backend_modes_agree() {
+        for backend in AgentBackend::ALL {
+            assert_eq!(AgentBackend::parse(backend.as_str()), Some(backend));
+            assert!(
+                backend.has_mode(PermissionMode::plan().as_str()),
+                "{backend:?}"
+            );
+            assert!(backend.has_mode(backend.default_mode()), "{backend:?}");
+            assert!(!backend.after_plan().is_empty(), "{backend:?}");
+            for mode in backend.after_plan() {
+                assert!(backend.has_mode(mode), "{backend:?} {mode}");
+            }
+        }
     }
 }

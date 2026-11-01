@@ -599,12 +599,11 @@ async fn with_unstaged(state: &State, sessions: Vec<AgentSession>) -> ApiResult<
     .await?)
 }
 
-/// The backends, with the permission modes and models each offers.
+/// The backends, with the models each offers.
 async fn agent_backends(AxState(state): St) -> Json<Vec<AgentBackendInfo>> {
     Json(state.agents.backends().await)
 }
 
-const UNKNOWN_MODEL: &str = "Claude Code doesn't offer that model";
 const UNKNOWN_MODE: &str = "the backend has no such permission mode";
 
 /// Whether `backend` offers `model` and `mode`; the response when not.
@@ -614,11 +613,12 @@ async fn offers(
     model: Option<&str>,
     mode: &PermissionMode,
 ) -> Option<Response> {
-    if !state.agents.has_mode(backend, mode) {
+    if !backend.has_mode(mode.as_str()) {
         return Some((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
     }
     if !state.agents.offers(backend, model).await {
-        return Some((StatusCode::BAD_REQUEST, UNKNOWN_MODEL).into_response());
+        let message = format!("{} doesn't offer that model", backend.label());
+        return Some((StatusCode::BAD_REQUEST, message).into_response());
     }
     None
 }
@@ -892,11 +892,10 @@ async fn approve(
     };
     // The mode a plan approval carries goes on the turn, so it has to be
     // one the backend offers there.
-    if let Some(mode) = &approval.mode {
-        let info = session.backend.info(Vec::new());
-        if !info.after_plan.iter().any(|m| m == mode.as_str()) {
-            return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
-        }
+    if let Some(mode) = &approval.mode
+        && !session.backend.allows_after_plan(mode.as_str())
+    {
+        return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
     }
     let decision = Decision {
         allow: approval.allow,
@@ -1086,25 +1085,11 @@ mod tests {
         state
             .db
             .create_agent(&AgentSession {
-                id: id.into(),
-                backend: grenadine_core::api::AgentBackend::Claude,
-                repo: fx.clone.slug.clone(),
-                pr: None,
                 title: "t".into(),
-                summary: None,
                 branch: "x".into(),
                 worktree: worktree.to_string_lossy().into_owned(),
                 base_sha: "s".into(),
-                status: grenadine_core::api::AgentStatus::Idle,
-                created_at: 0,
-                cost: 0.0,
-                cost_unit: grenadine_core::api::CostUnit::Usd,
-                context_tokens: None,
-                context_window: None,
-                model: None,
-                landed: None,
-                prs: None,
-                unstaged: 0,
+                ..AgentSession::fixture(id, &fx.clone.slug)
             })
             .unwrap();
         let get = |id: &str| agent_changes(AxState(state.clone()), Path(id.to_owned()));
@@ -1376,25 +1361,12 @@ mod tests {
         state
             .db
             .create_agent(&AgentSession {
-                id: id.into(),
-                backend: grenadine_core::api::AgentBackend::Claude,
-                repo: "o/n".into(),
-                pr: None,
                 title: "t".into(),
-                summary: None,
                 branch: "x".into(),
                 worktree: "/w".into(),
                 base_sha: "s".into(),
                 status: grenadine_core::api::AgentStatus::AwaitingApproval,
-                created_at: 0,
-                cost: 0.0,
-                cost_unit: grenadine_core::api::CostUnit::Usd,
-                context_tokens: None,
-                context_window: None,
-                model: None,
-                landed: None,
-                prs: None,
-                unstaged: 0,
+                ..AgentSession::fixture(id, "o/n")
             })
             .unwrap();
         let approval = |mode| Approval {
