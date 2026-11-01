@@ -90,15 +90,6 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "Bash(gh repo view:*)",
 ];
 
-/// How to use the tools, for both scans and checks for stale items.
-const TOOL_NOTES: &str = "\
-Run each shell command on its own, without pipes, `&&`, `;`, redirections \
-or `$(...)`: anything else is denied. The shell commands you can run are \
-`ls`, `stat`, `du`, `file`, `docker`/`podman` listings, `systemctl --user \
-list-units`, `git ls-remote`, `git cat-file`, `git log`, `git branch \
---contains`, `git branch --list`, `gh pr view`, `gh pr list` and `gh repo \
-view`.";
-
 const INSTRUCTIONS: &str = "\
 A coding agent session was just deleted. Its git worktree has been removed, \
 its processes stopped, and the Bazel output bases of the workspaces in the \
@@ -118,38 +109,250 @@ with a one-line title and a markdown detail that names exactly what it is \
 and where, quotes the evidence from the transcript, and says how to remove \
 it. If there's nothing, report no items.";
 
-/// Where a job runs, for `repo`: its clone, or an empty directory when the
-/// server has none.
-fn where_note(repo: &str, clone: Option<&Path>) -> String {
-    match clone {
+/// How to use the tools on `backend`, for both scans and checks for stale
+/// items, and where the job runs, for `repo`: its clone, or a directory of
+/// its own when the server has none. Devin's jobs can't run `git
+/// ls-remote`, since checking its options isn't worth it when `gh` can
+/// tell about remote branches too.
+fn tool_notes(backend: AgentBackend, repo: &str, clone: Option<&Path>) -> String {
+    let (ls_remote, origin, github) = match backend {
+        AgentBackend::Claude => (
+            " `git ls-remote`,",
+            "`git ls-remote origin` and ",
+            "`git ls-remote https://github.com/OWNER/NAME` and ",
+        ),
+        AgentBackend::Devin => ("", "", ""),
+    };
+    let place = match clone {
         Some(clone) => format!(
             "The working directory is the clone of {repo} at {}, with `origin` on \
-             GitHub, so `git ls-remote origin` and `gh pr view NUMBER --json \
-             state,headRefName` work as they are.",
+             GitHub, so {origin}`gh pr view NUMBER --json state,headRefName` work as \
+             they are.",
             clone.display()
         ),
-        None => "There is no clone here. The repos are on GitHub as `owner/name`: use \
-                 `git ls-remote https://github.com/OWNER/NAME` and `gh pr view NUMBER \
-                 --repo OWNER/NAME --json state,headRefName`."
-            .to_owned(),
+        None => format!(
+            "There is no clone here. The repos are on GitHub as `owner/name`: use \
+             {github}`gh pr view NUMBER --repo OWNER/NAME --json state,headRefName`."
+        ),
+    };
+    format!(
+        "Run each shell command on its own, without pipes, `&&`, `;`, redirections, \
+         `$` or globs: anything else is denied, and so are options that could change \
+         things. The shell commands you can run are `ls`, `stat`, `du`, `file`, \
+         `docker`/`podman` listings, `systemctl --user list-units`,{ls_remote} `git \
+         cat-file`, `git log`, `git branch --contains`, `git branch --list`, `gh pr \
+         view`, `gh pr list` and `gh repo view`. {place}"
+    )
+}
+
+/// A read-only command a Devin job may run: its leading words, and the
+/// options it may take after them. Any other option is refused, since
+/// some would run commands or write files, e.g. `git log --output=FILE`.
+struct ReadOnlyCommand {
+    words: &'static [&'static str],
+    /// The single-letter options, which may come grouped, as in `ls -la`.
+    short: &'static str,
+    /// The long options, with or without `=VALUE`.
+    long: &'static [&'static str],
+}
+
+impl ReadOnlyCommand {
+    /// Whether `words` run this command with only its options.
+    fn allows(&self, words: &[String]) -> bool {
+        if words.len() < self.words.len() || !words.iter().zip(self.words).all(|(w, c)| w == c) {
+            return false;
+        }
+        let mut options = true;
+        words[self.words.len()..].iter().all(|w| {
+            if !options || !w.starts_with('-') || w == "-" {
+                return true;
+            }
+            if w == "--" {
+                options = false;
+                return true;
+            }
+            match w.strip_prefix("--") {
+                Some(long) => self
+                    .long
+                    .contains(&long.split_once('=').map_or(long, |(name, _)| name)),
+                None => w[1..].chars().all(|c| self.short.contains(c)),
+            }
+        })
     }
 }
 
+/// The commands Devin's jobs may run, the read-only ones of
+/// `READ_ONLY_TOOLS` with the options that only read.
+const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
+    ReadOnlyCommand {
+        words: &["ls"],
+        short: "aAdFhilLnRrSt1",
+        long: &[
+            "all",
+            "almost-all",
+            "directory",
+            "human-readable",
+            "recursive",
+            "full-time",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["stat"],
+        short: "cLt",
+        long: &["format", "printf", "dereference", "terse"],
+    },
+    ReadOnlyCommand {
+        words: &["du"],
+        short: "achsLdx",
+        long: &[
+            "all",
+            "apparent-size",
+            "human-readable",
+            "max-depth",
+            "summarize",
+            "total",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["file"],
+        short: "bLiz",
+        long: &["brief", "mime", "mime-type", "dereference"],
+    },
+    ReadOnlyCommand {
+        words: &["docker", "ps"],
+        short: "aqsn",
+        long: &["all", "quiet", "size", "last", "filter", "no-trunc"],
+    },
+    ReadOnlyCommand {
+        words: &["docker", "images"],
+        short: "aqf",
+        long: &["all", "quiet", "filter", "no-trunc", "digests"],
+    },
+    ReadOnlyCommand {
+        words: &["docker", "volume", "ls"],
+        short: "qf",
+        long: &["quiet", "filter"],
+    },
+    ReadOnlyCommand {
+        words: &["docker", "network", "ls"],
+        short: "qf",
+        long: &["quiet", "filter", "no-trunc"],
+    },
+    ReadOnlyCommand {
+        words: &["podman", "ps"],
+        short: "aqsn",
+        long: &["all", "quiet", "size", "last", "filter", "no-trunc"],
+    },
+    ReadOnlyCommand {
+        words: &["podman", "images"],
+        short: "aqf",
+        long: &["all", "quiet", "filter", "no-trunc", "digests"],
+    },
+    ReadOnlyCommand {
+        words: &["systemctl", "--user", "list-units"],
+        short: "at",
+        long: &["all", "type", "state", "no-pager", "plain", "no-legend"],
+    },
+    ReadOnlyCommand {
+        words: &["git", "cat-file"],
+        short: "tesp",
+        long: &[],
+    },
+    // Not the options that show diffs, which can run diff drivers.
+    ReadOnlyCommand {
+        words: &["git", "log"],
+        short: "n0123456789",
+        long: &[
+            "all",
+            "author",
+            "branches",
+            "date",
+            "decorate",
+            "first-parent",
+            "format",
+            "graph",
+            "grep",
+            "max-count",
+            "no-walk",
+            "oneline",
+            "pretty",
+            "remotes",
+            "reverse",
+            "since",
+            "tags",
+            "until",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["git", "branch", "--contains"],
+        short: "arv",
+        long: &[
+            "all",
+            "contains",
+            "format",
+            "list",
+            "merged",
+            "no-merged",
+            "remotes",
+            "verbose",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["git", "branch", "--list"],
+        short: "arv",
+        long: &[
+            "all",
+            "contains",
+            "format",
+            "list",
+            "merged",
+            "no-merged",
+            "remotes",
+            "verbose",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["gh", "pr", "view"],
+        short: "cqR",
+        long: &["comments", "jq", "json", "repo"],
+    },
+    ReadOnlyCommand {
+        words: &["gh", "pr", "list"],
+        short: "ABHLlqRsS",
+        long: &[
+            "author", "base", "head", "jq", "json", "label", "limit", "repo", "search", "state",
+        ],
+    },
+    ReadOnlyCommand {
+        words: &["gh", "repo", "view"],
+        short: "q",
+        long: &["jq", "json"],
+    },
+];
+
 /// Whether `cmd` is one of the read-only commands the cleanup jobs may
-/// run, from `READ_ONLY_TOOLS`' `Bash(prefix:*)` entries.
+/// run, with only options that read. It's split into words the way a
+/// shell would; what a shell would expand or run besides, like `$`,
+/// substitutions, pipes and globs that could expand to options, is
+/// refused, and so is anything that doesn't split.
 pub(crate) fn allowed_command(cmd: &str) -> bool {
-    let cmd = cmd.trim();
-    if cmd
-        .chars()
-        .any(|c| matches!(c, '|' | '&' | ';' | '>' | '<' | '`' | '\n'))
-        || cmd.contains("$(")
-    {
+    if cmd.chars().any(|c| {
+        matches!(
+            c,
+            '|' | '&' | ';' | '<' | '>' | '`' | '$' | '(' | ')' | '\\' | '#' | '\n' | '\r'
+        )
+    }) {
         return false;
     }
-    READ_ONLY_TOOLS
-        .iter()
-        .filter_map(|t| t.strip_prefix("Bash(").and_then(|t| t.strip_suffix(":*)")))
-        .any(|prefix| cmd == prefix || cmd.starts_with(&format!("{prefix} ")))
+    let Some(words) = shlex::split(cmd) else {
+        return false;
+    };
+    // A glob or brace expansion at the start of a word could expand to
+    // file names that are options.
+    if words.iter().any(|w| w.starts_with(['*', '?', '[', '{'])) {
+        return false;
+    }
+    READ_ONLY_COMMANDS.iter().any(|c| c.allows(&words))
 }
 
 const PRUNE_INSTRUCTIONS: &str = "\
@@ -287,25 +490,20 @@ async fn run(
     } else {
         format!("on {} in the worktree {}", session.repo, session.worktree)
     };
-    let (instructions, tool_note) = match session.backend {
-        AgentBackend::Claude => (
-            INSTRUCTIONS.format(&[
-                "Use tools only to read the full transcript, when the digest is cut short or leaves out what subagents did, or to check whether something still exists.",
-                "Claude Code",
-            ]),
-            where_note(&session.repo, clone.as_deref()),
-        ),
-        AgentBackend::Devin => (
-            INSTRUCTIONS.format(&[
-                "Use tools only to check whether something still exists.",
-                "Devin",
-            ]),
-            where_note(&session.repo, clone.as_deref()),
-        ),
+    let instructions = match session.backend {
+        AgentBackend::Claude => INSTRUCTIONS.format(&[
+            "Use tools only to read the full transcript, when the digest is cut short or leaves out what subagents did, or to check whether something still exists.",
+            "Claude Code",
+        ]),
+        AgentBackend::Devin => INSTRUCTIONS.format(&[
+            "Use tools only to check whether something still exists.",
+            "Devin",
+        ]),
     };
     let mut input = format!(
-        "{instructions}\n\n{TOOL_NOTES} {tool_note}\n\n\
+        "{instructions}\n\n{}\n\n\
          The session \u{201c}{}\u{201d} worked {place}.\n",
+        tool_notes(session.backend, &session.repo, clone.as_deref()),
         session.title,
     );
     if session.backend == AgentBackend::Claude && transcript.exists() {
@@ -477,9 +675,9 @@ async fn prune_in(
 ) -> Result<usize> {
     let now = crate::agent::now();
     let mut input = format!(
-        "{}\n\n{TOOL_NOTES} {}\n\n# Items\n",
+        "{}\n\n{}\n\n# Items\n",
         PRUNE_INSTRUCTIONS.format(&[backend.label()]),
-        where_note(&items[0].repo, clone)
+        tool_notes(backend, &items[0].repo, clone)
     );
     for item in items {
         input += &format!(
@@ -816,24 +1014,78 @@ mod command_tests {
     use super::*;
 
     /// The read-only commands the allowlist lets through, and what it
-    /// keeps out.
+    /// keeps out: other commands, shell syntax, and options that run
+    /// commands, write files or change things.
     #[test]
     fn allows_read_only_commands() {
         for cmd in [
             "ls -la /tmp",
-            "git log -1",
+            "ls",
+            "stat /tmp/x",
+            "du -sh /tmp/grenadine-e2e",
+            "file /tmp/x",
             "docker ps -a",
+            "docker volume ls --filter name=e2e",
+            "systemctl --user list-units --all",
+            "git log -1",
+            "git log -n 5 --oneline origin/main",
+            "git log --format=%H -1 abc123 -- src",
+            "git cat-file -t abc123",
+            "git branch --contains abc123 -r",
+            "git branch --list 'dev/*'",
             "gh pr view 5 --json state",
+            "gh pr view 5 --repo o/n --json state,headRefName",
+            "gh pr list --head dev/x --state all",
+            "gh repo view o/n --json name",
         ] {
             assert!(allowed_command(cmd), "{cmd}");
         }
         for cmd in [
+            // Not on the list.
             "rm -rf /tmp/x",
-            "ls; rm x",
-            "git branch -D x",
             "lsblk",
+            "git branch -D x",
+            "git push origin :x",
+            "git ls-remote origin",
+            // Shell syntax.
+            "ls; rm x",
             "ls $(pwd)",
+            "ls `id`",
+            "ls $HOME",
             "gh pr view 1 && rm x",
+            "ls > /tmp/x",
+            "ls *",
+            "ls {--output=x,}",
+            "ls \"unterminated",
+            // Options that run commands or write files.
+            "git ls-remote --upload-pack=\"touch ~/pwned\" .",
+            "git ls-remote --upload-pack \"touch ~/pwned\" .",
+            "git ls-remote -u \"touch ~/pwned\" .",
+            "git ls-remote --receive-pack=x .",
+            "git ls-remote --exec=x .",
+            "git log --output=/home/me/.bashrc -1",
+            "git log --output /home/me/.bashrc -1",
+            "git log -1 --output=/tmp/x",
+            "git log -p --ext-diff",
+            "git log -p --textconv",
+            "git log -p",
+            "git cat-file --textconv HEAD:x",
+            "git cat-file --filters HEAD:x",
+            "git -c core.pager=sh log",
+            "git -c core.sshCommand=x log",
+            "git --config-env=core.pager=X log",
+            "git log --config=x",
+            "git -C /elsewhere log",
+            "git branch --list -D x",
+            "git branch --contains x --set-upstream-to=y",
+            "git branch --list -m x y",
+            "docker -H tcp://x ps",
+            "docker ps --host x",
+            "gh pr view 5 --web",
+            "gh pr list --config x",
+            "file -C -m x",
+            "du --files0-from=/etc/shadow",
+            "ls --output=x",
         ] {
             assert!(!allowed_command(cmd), "{cmd}");
         }

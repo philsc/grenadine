@@ -1007,6 +1007,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "tokio",
  "tokio-stream",
