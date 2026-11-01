@@ -51,7 +51,7 @@ def default_inboxes() -> list[tuple[str, str]]:
     """The `(name, filter)` pairs of the server's default inboxes, read from
     its source so that they can't drift."""
     src = (Path(__file__).parents[1] / "server/src/inboxes.rs").read_text()
-    return re.findall(r'\(\s*"([^"]*)",\s*"([^"]*)",\s*\)', src)
+    return re.findall(r'name:\s*"([^"]*)",\s*filter:\s*"([^"]*)"', src)
 
 
 def server_query(filter: str, repos: list[str]) -> str:

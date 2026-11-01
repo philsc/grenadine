@@ -43,7 +43,7 @@ pub fn Inboxes(
             {move || if adding.get() {
                 view! {
                     <InboxForm
-                        initial=InboxEdit { name: String::new(), filter: "state:open archived:false draft:false ".into(), position: None }
+                        initial=InboxEdit { name: String::new(), filter: "state:open archived:false draft:false ".into(), position: None, count_in_total: false }
                         on_done=Callback::new(move |_| adding.set(false))
                         id=None
                     />
@@ -70,6 +70,7 @@ async fn swap(a: Inbox, b: Inbox) -> api::Result<()> {
             name: a.name,
             filter: a.filter,
             position: Some(pa),
+            count_in_total: a.count_in_total,
         },
     )
     .await?;
@@ -79,6 +80,7 @@ async fn swap(a: Inbox, b: Inbox) -> api::Result<()> {
             name: b.name,
             filter: b.filter,
             position: Some(pb),
+            count_in_total: b.count_in_total,
         },
     )
     .await
@@ -144,7 +146,7 @@ fn InboxSection(
                 let i = inbox.clone();
                 view! {
                     <InboxForm
-                        initial=InboxEdit { name: i.name.clone(), filter: i.filter.clone(), position: Some(i.position) }
+                        initial=InboxEdit { name: i.name.clone(), filter: i.filter.clone(), position: Some(i.position), count_in_total: i.count_in_total }
                         on_done=Callback::new(move |_| editing.set(false))
                         id=Some(i.id)
                     />
@@ -316,6 +318,7 @@ pub(crate) fn CiIcon(ci: CiStatus) -> impl IntoView {
 fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl IntoView {
     let name = RwSignal::new(initial.name);
     let filter = RwSignal::new(initial.filter);
+    let count_in_total = RwSignal::new(initial.count_in_total);
     let error = RwSignal::new(None::<String>);
     let position = initial.position;
     let updates = expect_context::<Updates>();
@@ -326,6 +329,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             name: name.get_untracked(),
             filter: filter.get_untracked(),
             position,
+            count_in_total: count_in_total.get_untracked(),
         };
         spawn_local(async move {
             let result = match id {
@@ -367,6 +371,9 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             </label>
             <label>"GitHub filter"
                 <input type="text" class="mono" prop:value=move || filter.get() on:input=move |ev| filter.set(event_target_value(&ev)) />
+            </label>
+            <label class="checkbox">"Count in total"
+                <input type="checkbox" prop:checked=move || count_in_total.get() on:change=move |ev| count_in_total.set(event_target_checked(&ev)) />
             </label>
             <p class="hint muted">"is:pr and repo: qualifiers for the configured repositories are added automatically. gr: qualifiers, described in the README, are evaluated by grenadine."</p>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}

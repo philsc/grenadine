@@ -318,6 +318,15 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE inboxes ADD COLUMN search_found INTEGER;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Whether the inbox counts in the top bar's total. The flagged
+    -- defaults come earlier than this column, so they're set here.
+    ALTER TABLE inboxes ADD COLUMN count_in_total INTEGER NOT NULL DEFAULT 0;
+    UPDATE inboxes SET count_in_total = 1
+     WHERE name IN ('Needs your review', 'Returned to you', 'Approved');
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -335,12 +344,33 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::ResetInboxes => {
                 tx.execute("DELETE FROM inboxes", [])?;
-                for (position, (name, filter)) in crate::inboxes::DEFAULT_INBOXES.iter().enumerate()
-                {
-                    tx.execute(
-                        "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
-                        params![name, filter, position as i64],
-                    )?;
+                // count_in_total only exists once its migration has run;
+                // on a fresh database this runs at the older position
+                // where the column doesn't exist yet.
+                let has_count: bool = tx.query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('inboxes')
+                     WHERE name = 'count_in_total'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                for (position, inbox) in crate::inboxes::DEFAULT_INBOXES.iter().enumerate() {
+                    if has_count {
+                        tx.execute(
+                            "INSERT INTO inboxes (name, filter, position, count_in_total)
+                             VALUES (?, ?, ?, ?)",
+                            params![
+                                inbox.name,
+                                inbox.filter,
+                                position as i64,
+                                inbox.count_in_total
+                            ],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
+                            params![inbox.name, inbox.filter, position as i64],
+                        )?;
+                    }
                 }
             }
             Migration::BackfillAgentPrs => backfill_agent_prs(&tx)?,
@@ -522,14 +552,17 @@ impl Db {
 
     pub fn inboxes(&self) -> Result<Vec<Inbox>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id, name, filter, position FROM inboxes ORDER BY position, id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, filter, position, count_in_total FROM inboxes
+             ORDER BY position, id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(Inbox {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 filter: r.get(2)?,
                 position: r.get(3)?,
+                count_in_total: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -570,8 +603,8 @@ impl Db {
             )?,
         };
         conn.execute(
-            "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
-            params![edit.name, edit.filter, position],
+            "INSERT INTO inboxes (name, filter, position, count_in_total) VALUES (?, ?, ?, ?)",
+            params![edit.name, edit.filter, position, edit.count_in_total],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -579,8 +612,15 @@ impl Db {
     /// Returns false when there is no such inbox.
     pub fn update_inbox(&self, id: i64, edit: &InboxEdit) -> Result<bool> {
         let n = self.conn().execute(
-            "UPDATE inboxes SET name = ?, filter = ?, position = COALESCE(?, position), error = NULL WHERE id = ?",
-            params![edit.name, edit.filter, edit.position, id],
+            "UPDATE inboxes SET name = ?, filter = ?, position = COALESCE(?, position),
+                count_in_total = ?, error = NULL WHERE id = ?",
+            params![
+                edit.name,
+                edit.filter,
+                edit.position,
+                edit.count_in_total,
+                id
+            ],
         )?;
         Ok(n > 0)
     }
@@ -1624,14 +1664,18 @@ mod tests {
         let db = Db::in_memory();
         let inboxes = db.inboxes().unwrap();
         assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
-        for (position, (inbox, (name, filter))) in inboxes
+        for (position, (inbox, default)) in inboxes
             .iter()
             .zip(crate::inboxes::DEFAULT_INBOXES.iter())
             .enumerate()
         {
             assert_eq!(
-                (inbox.name.as_str(), inbox.filter.as_str()),
-                (*name, *filter)
+                (
+                    inbox.name.as_str(),
+                    inbox.filter.as_str(),
+                    inbox.count_in_total
+                ),
+                (default.name, default.filter, default.count_in_total)
             );
             assert_eq!(inbox.position, position as i64);
         }
@@ -1644,10 +1688,12 @@ mod tests {
             name: "Mine".into(),
             filter: "label:x".into(),
             position: None,
+            count_in_total: true,
         };
         let id = db.create_inbox(&edit).unwrap();
         let inbox = db.inboxes().unwrap().pop().unwrap();
         assert_eq!((inbox.id, inbox.position), (id, 9));
+        assert!(inbox.count_in_total);
         assert!(
             db.update_inbox(
                 id,
@@ -2072,10 +2118,14 @@ mod tests {
         let db = Db::init(conn, None).unwrap();
         let inboxes = db.inboxes().unwrap();
         assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
-        for (inbox, (name, filter)) in inboxes.iter().zip(crate::inboxes::DEFAULT_INBOXES.iter()) {
+        for (inbox, default) in inboxes.iter().zip(crate::inboxes::DEFAULT_INBOXES.iter()) {
             assert_eq!(
-                (inbox.name.as_str(), inbox.filter.as_str()),
-                (*name, *filter)
+                (
+                    inbox.name.as_str(),
+                    inbox.filter.as_str(),
+                    inbox.count_in_total
+                ),
+                (default.name, default.filter, default.count_in_total)
             );
         }
         let listed: i64 = db
