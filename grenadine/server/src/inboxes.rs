@@ -3,17 +3,19 @@
 /// One default inbox.
 pub struct DefaultInbox {
     pub name: &'static str,
-    /// The GitHub search filter as the user would write it.
+    /// The GitHub search filter as the user would write it; `gr:`
+    /// qualifiers are grenadine's own.
     pub filter: &'static str,
     /// Whether its PRs count in the top bar's total.
     pub count_in_total: bool,
 }
 
-/// The default inboxes, in display order.
+/// The default inboxes, in display order. The same list is in the
+/// README's "Default inboxes" table.
 pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
     DefaultInbox {
         name: "Needs your review",
-        filter: "state:open archived:false draft:false user-review-requested:@me sort:updated-desc",
+        filter: "state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc",
         count_in_total: true,
     },
     DefaultInbox {
@@ -23,17 +25,17 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
     },
     DefaultInbox {
         name: "Returned to you",
-        filter: "state:open archived:false draft:false author:@me -is:queued ((-review:approved -review:none) OR review:changes_requested) sort:updated-desc",
+        filter: "state:open archived:false draft:false author:@me -is:queued ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc",
         count_in_total: true,
     },
     DefaultInbox {
         name: "Approved",
-        filter: "state:open archived:false draft:false author:@me -is:queued review:approved sort:updated-desc",
+        filter: "state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed sort:updated-desc",
         count_in_total: true,
     },
     DefaultInbox {
-        name: "Waiting for reviewers",
-        filter: "state:open archived:false draft:false author:@me -is:queued review:none sort:updated-desc",
+        name: "Merging",
+        filter: "state:open archived:false draft:false author:@me is:queued sort:updated-desc",
         count_in_total: false,
     },
     DefaultInbox {
@@ -42,18 +44,43 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
         count_in_total: false,
     },
     DefaultInbox {
-        name: "Merging",
-        filter: "state:open archived:false draft:false author:@me is:queued sort:updated-desc",
+        name: "Drafts from others",
+        filter: "state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc",
         count_in_total: false,
     },
     DefaultInbox {
-        name: "Drafts needing your review",
-        filter: "state:open archived:false draft:true user-review-requested:@me sort:updated-desc",
+        name: "Waiting for reviewers",
+        filter: "state:open archived:false draft:false author:@me -is:queued -gr:review:active -review:approved sort:updated-desc",
         count_in_total: false,
     },
     DefaultInbox {
-        name: "Waiting for authors",
+        name: "All my open PRs",
+        filter: "state:open archived:false author:@me sort:updated-desc",
+        count_in_total: false,
+    },
+    DefaultInbox {
+        name: "Waiting for author",
         filter: "state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc",
+        count_in_total: false,
+    },
+    DefaultInbox {
+        name: "Merged by me",
+        filter: "state:closed archived:false author:@me sort:updated-desc",
+        count_in_total: false,
+    },
+    DefaultInbox {
+        name: "Merged by others",
+        filter: "state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc",
+        count_in_total: false,
+    },
+    DefaultInbox {
+        name: "All open PRs",
+        filter: "state:open archived:false -is:queued sort:updated-desc",
+        count_in_total: false,
+    },
+    DefaultInbox {
+        name: "Unmerged PRs on mine",
+        filter: "state:closed archived:false author:@me is:unmerged sort:updated-desc",
         count_in_total: false,
     },
 ];

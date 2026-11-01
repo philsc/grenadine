@@ -40,8 +40,13 @@ APPROVED = "Approved"
 WAITING_FOR_REVIEWERS = "Waiting for reviewers"
 DRAFTS = "Drafts"
 MERGING = "Merging"
-DRAFTS_NEEDING_REVIEW = "Drafts needing your review"
-WAITING_FOR_AUTHORS = "Waiting for authors"
+DRAFTS_FROM_OTHERS = "Drafts from others"
+WAITING_FOR_AUTHOR = "Waiting for author"
+ALL_MY_OPEN = "All my open PRs"
+ALL_OPEN = "All open PRs"
+MERGED_BY_ME = "Merged by me"
+MERGED_BY_OTHERS = "Merged by others"
+UNMERGED_ON_MINE = "Unmerged PRs on mine"
 
 TEAM_NAME = "grenadine-test-reviewers"
 # A required status check that nothing ever reports on merge groups. It keeps
@@ -668,7 +673,7 @@ def inbox_cases(fx: Fixture) -> None:
         "inbox-returned-commented",
         "Get a comment-only review",
         expected_inbox=RETURNED,
-        notes="Mine. The other account left a review that only comments.",
+        notes="Mine. The other account left a review that only comments, which is an active review.",
     )
     fx.review(pr, other, "COMMENT", "Some thoughts, but no verdict.")
 
@@ -724,7 +729,7 @@ def inbox_cases(fx: Fixture) -> None:
         "Ask me to look at a draft",
         author=other,
         draft=True,
-        expected_inbox=DRAFTS_NEEDING_REVIEW,
+        expected_inbox=DRAFTS_FROM_OTHERS,
         notes="A draft by the other account, with a review requested from me.",
     )
     fx.request_review(pr, users=(me,))
@@ -734,36 +739,38 @@ def inbox_cases(fx: Fixture) -> None:
         "inbox-waiting-authors",
         "Wait for the author after my review",
         author=other,
-        expected_inbox=WAITING_FOR_AUTHORS,
+        expected_inbox=WAITING_FOR_AUTHOR,
         notes="Opened by the other account. I reviewed it without being asked.",
     )
     fx.review(pr, me, "COMMENT", "Over to you.")
 
     pr = simple_pr(
         fx,
-        "inbox-none-closed",
+        "inbox-unmerged",
         "Get closed",
-        expected_inbox=None,
-        notes="Mine, and closed without merging. It belongs in no inbox.",
+        expected_inbox=UNMERGED_ON_MINE,
+        notes="Mine, and closed without merging. It's in Unmerged PRs on mine "
+        "and Merged by me.",
     )
     fx.repo_api("PATCH", f"pulls/{pr.number}", {"state": "closed"})
 
     pr = simple_pr(
         fx,
-        "inbox-none-merged",
+        "inbox-merged",
         "Get merged",
-        expected_inbox=None,
-        notes="Mine, and merged. It belongs in no inbox.",
+        expected_inbox=MERGED_BY_ME,
+        notes="Mine, and merged. It's in Merged by me.",
     )
     fx.repo_api("PUT", f"pulls/{pr.number}/merge", {"merge_method": "merge"})
 
     simple_pr(
         fx,
-        "inbox-none-uninvolved",
+        "inbox-all-open-uninvolved",
         "Leave me out of it",
         author=other,
-        expected_inbox=None,
-        notes="Opened by the other account, and I'm not involved. It belongs in no inbox.",
+        expected_inbox=ALL_OPEN,
+        notes="Opened by the other account, and I'm not involved. It's only in "
+        "All open PRs.",
     )
 
 
@@ -1356,11 +1363,16 @@ def write_manifest(fx: Fixture, path: Path) -> None:
             NEEDS_TEAM_REVIEW,
             RETURNED,
             APPROVED,
-            WAITING_FOR_REVIEWERS,
-            DRAFTS,
             MERGING,
-            DRAFTS_NEEDING_REVIEW,
-            WAITING_FOR_AUTHORS,
+            DRAFTS,
+            DRAFTS_FROM_OTHERS,
+            WAITING_FOR_REVIEWERS,
+            ALL_MY_OPEN,
+            WAITING_FOR_AUTHOR,
+            MERGED_BY_ME,
+            MERGED_BY_OTHERS,
+            ALL_OPEN,
+            UNMERGED_ON_MINE,
         ],
         "cases": [dataclasses.asdict(pr) for pr in fx.prs.values()],
     }
