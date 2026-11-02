@@ -815,16 +815,19 @@ pub enum AgentBackend {
     /// Claude Code.
     #[default]
     Claude,
+    /// Devin.
+    Devin,
 }
 
 impl AgentBackend {
     /// Every backend, in picker order.
-    pub const ALL: [AgentBackend; 1] = [AgentBackend::Claude];
+    pub const ALL: [AgentBackend; 2] = [AgentBackend::Claude, AgentBackend::Devin];
 
     /// The value requests and the database name it with.
     pub fn as_str(self) -> &'static str {
         match self {
             AgentBackend::Claude => "claude",
+            AgentBackend::Devin => "devin",
         }
     }
 
@@ -837,6 +840,7 @@ impl AgentBackend {
     pub fn label(self) -> &'static str {
         match self {
             AgentBackend::Claude => "Claude Code",
+            AgentBackend::Devin => "Devin",
         }
     }
 
@@ -844,6 +848,7 @@ impl AgentBackend {
     pub fn agent_name(self) -> &'static str {
         match self {
             AgentBackend::Claude => "Claude",
+            AgentBackend::Devin => "Devin",
         }
     }
 
@@ -851,6 +856,7 @@ impl AgentBackend {
     pub fn cost_unit(self) -> CostUnit {
         match self {
             AgentBackend::Claude => CostUnit::Usd,
+            AgentBackend::Devin => CostUnit::Acu,
         }
     }
 
@@ -871,6 +877,20 @@ impl AgentBackend {
                 // the approval.
                 ("plan", "Plan first"),
             ],
+            AgentBackend::Devin => &[
+                // Allow file edits, ask for the rest.
+                ("accept-edits", "Code"),
+                // Auto-approve actions the model judges safe.
+                ("smart", "Smart"),
+                // Answer questions without code changes.
+                ("ask", "Ask"),
+                // Plan changes before implementing, then ask the user to
+                // approve; the turn goes on in the mode picked with the
+                // approval.
+                ("plan", "Plan first"),
+                // Auto-approve all tool calls.
+                ("bypass", "Bypass permissions"),
+            ],
         }
     }
 
@@ -878,6 +898,7 @@ impl AgentBackend {
     pub fn default_mode(self) -> &'static str {
         match self {
             AgentBackend::Claude => "auto",
+            AgentBackend::Devin => "accept-edits",
         }
     }
 
@@ -886,6 +907,7 @@ impl AgentBackend {
     pub fn after_plan(self) -> &'static [&'static str] {
         match self {
             AgentBackend::Claude => &["manual", "acceptEdits", "auto"],
+            AgentBackend::Devin => &["accept-edits", "bypass"],
         }
     }
 
@@ -924,6 +946,8 @@ pub enum CostUnit {
     /// US dollars.
     #[default]
     Usd,
+    /// ACUs, Devin's usage unit.
+    Acu,
 }
 
 impl CostUnit {
@@ -931,6 +955,7 @@ impl CostUnit {
     pub fn as_str(self) -> &'static str {
         match self {
             CostUnit::Usd => "usd",
+            CostUnit::Acu => "acu",
         }
     }
 
@@ -938,6 +963,7 @@ impl CostUnit {
     pub fn parse(s: &str) -> Option<CostUnit> {
         match s {
             "usd" => Some(CostUnit::Usd),
+            "acu" => Some(CostUnit::Acu),
             _ => None,
         }
     }
@@ -1126,6 +1152,8 @@ impl Landed {
 pub struct Approval {
     /// The tool use's ID.
     pub id: String,
+    /// Whether the tool use may go ahead. When `option` is set, the
+    /// option's kind decides instead.
     pub allow: bool,
     /// Told to the agent when the tool call is denied.
     pub message: Option<String>,
@@ -1133,10 +1161,44 @@ pub struct Approval {
     /// approved.
     #[serde(default)]
     pub mode: Option<PermissionMode>,
+    /// Which of the request's `options` the user picked, an
+    /// `ApprovalOption::id`; `None` for a plain allow/deny.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
     /// For `AskUserQuestion`: the answer to each question, keyed by the
     /// question's text.
     #[serde(default)]
     pub answers: Option<BTreeMap<String, String>>,
+}
+
+/// An answer a backend's permission request offers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    /// Sent back as `Approval::option`.
+    pub id: String,
+    /// What the button says.
+    pub label: String,
+    pub kind: ApprovalKind,
+}
+
+/// What kind of answer an `ApprovalOption` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    /// A kind of the backend's own, which doesn't allow the tool use.
+    #[serde(other)]
+    Other,
+}
+
+impl ApprovalKind {
+    /// Whether picking it lets the tool use go ahead.
+    pub fn is_allow(self) -> bool {
+        matches!(self, ApprovalKind::AllowOnce | ApprovalKind::AllowAlways)
+    }
 }
 
 /// Something that happened in an agent session's transcript.
@@ -1184,6 +1246,10 @@ pub enum AgentEventKind {
         tool_name: String,
         /// The tool's input as JSON.
         input: String,
+        /// The answers the backend offers; empty when allow/deny are the
+        /// only choices.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<ApprovalOption>,
     },
     ApprovalResolved {
         id: String,

@@ -748,6 +748,7 @@ pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
     test_state_with_agents(
         repos,
         "claude".into(),
+        "devin".into(),
         std::env::temp_dir().join("grenadine-test-worktrees"),
     )
 }
@@ -757,6 +758,7 @@ pub fn test_state_with(repos: BTreeMap<String, Arc<ClonedRepo>>) -> Arc<State> {
 pub fn test_state_with_agents(
     repos: BTreeMap<String, Arc<ClonedRepo>>,
     claude: std::path::PathBuf,
+    devin: std::path::PathBuf,
     worktrees: std::path::PathBuf,
 ) -> Arc<State> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -764,7 +766,7 @@ pub fn test_state_with_agents(
     Arc::new(State {
         agents: crate::agent::Agents::new(
             &db,
-            claude,
+            (claude, devin),
             worktrees,
             "http://127.0.0.1:9".into(),
             false,

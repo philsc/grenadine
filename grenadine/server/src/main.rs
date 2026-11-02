@@ -6,6 +6,7 @@ mod assets;
 mod claude;
 mod cleanup;
 mod db;
+mod devin;
 mod git;
 mod github;
 mod inboxes;
@@ -71,6 +72,10 @@ struct Args {
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
+
+    /// The Devin executable that agent sessions run.
+    #[arg(long, default_value = "devin")]
+    devin: PathBuf,
 
     /// The shell that terminals in agent sessions run, as a login shell.
     /// Defaults to the user's login shell.
@@ -194,7 +199,7 @@ async fn main() -> Result<()> {
     });
     let mut agents = agent::Agents::new(
         &db,
-        args.claude,
+        (args.claude, args.devin),
         worktrees,
         local_url(addr),
         slices,
@@ -230,6 +235,14 @@ async fn main() -> Result<()> {
     ));
     // Shutting down doesn't wait for it; dropping it kills its claude.
     tokio::spawn(cleanup::prune_loop(state.clone()));
+    // Listing the backends' models can take a while, so it starts now
+    // rather than with the first page or prompt.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            state.agents.backends().await;
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

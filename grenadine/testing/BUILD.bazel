@@ -29,6 +29,14 @@ py_test(
     deps = [":fake_github"],
 )
 
+# Stands in for `devin acp` in the server's and the UI's tests, playing a
+# scenario file.
+py_binary(
+    name = "fake_devin",
+    srcs = ["fake_devin.py"],
+    visibility = ["//grenadine/server:__pkg__"],
+)
+
 # Loads the UI in a headless browser against a server backed by the fake
 # GitHub.
 py_test(
@@ -36,12 +44,14 @@ py_test(
     size = "medium",
     srcs = ["ui_test.py"],
     data = [
+        ":fake_devin",
         "//grenadine/server",
         "@chrome_headless_shell//:chrome-headless-shell",
         "@chrome_headless_shell//:files",
     ],
     env = {
         "CHROME": "$(rootpath @chrome_headless_shell//:chrome-headless-shell)",
+        "FAKE_DEVIN": "$(rootpath :fake_devin)",
         "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
     },
     # Each class's setup takes about a second, but its tests take over 75s

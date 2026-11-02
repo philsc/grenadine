@@ -46,5 +46,7 @@ rust_test(
     name = "server_test",
     size = "small",
     crate = ":server",
+    data = ["//grenadine/testing:fake_devin"],
+    env = {"FAKE_DEVIN": "$(rootpath //grenadine/testing:fake_devin)"},
     deps = all_crate_deps(normal_dev = True),
 )

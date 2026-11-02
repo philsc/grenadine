@@ -17,14 +17,15 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage,
-    ServerEvent, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey,
+    PromptImage, ServerEvent, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::claude;
+use crate::devin;
 use crate::git::Repo;
 use crate::reflow::reflow;
 use crate::sync::State;
@@ -49,7 +50,11 @@ const IMAGE_TYPES: [(&str, &str); 4] = [
 
 /// How long a deleted session's processes get to exit before they're
 /// killed.
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a backend that couldn't list its models goes before it's
+/// asked again, so that one that hangs doesn't hold up every request.
+const LISTING_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// How much of a backend's stderr is kept to explain a crash.
 const STDERR_TAIL: usize = 4096;
@@ -100,6 +105,9 @@ pub struct Decision {
     pub message: Option<String>,
     /// The mode an approved plan goes on in.
     pub mode: Option<PermissionMode>,
+    /// The id of the offered option the user picked, if the request
+    /// offered any.
+    pub option: Option<String>,
     /// The answers to `AskUserQuestion`, by question.
     pub answers: Option<BTreeMap<String, String>>,
 }
@@ -109,14 +117,14 @@ pub struct Decision {
 /// it offers that never changes, like its permission modes, is on
 /// `AgentBackend`.
 pub trait Backend: Send + Sync {
-    /// The models it offers; none while they can't be listed.
-    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>>;
+    /// The models it offers; an error while they can't be listed.
+    fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>>;
 
     /// Runs `turn` of `session` and returns the status the session ends
     /// up in; `sink` gets what the turn's output means for the transcript.
     fn turn<'a>(
         &'a self,
-        state: &'a State,
+        state: &'a Arc<State>,
         session: &'a AgentSession,
         turn: Turn<'a>,
         sink: TurnSink<'a>,
@@ -135,7 +143,8 @@ pub struct Turn<'a> {
     pub model: Option<String>,
     /// The session's grenadine MCP endpoint.
     pub mcp_url: &'a str,
-    /// Appended to the agent's system prompt.
+    /// What the agent is told beyond the prompt: Claude gets them
+    /// appended to its system prompt, Devin as the prompt's first block.
     pub notes: &'a [String],
 }
 
@@ -160,6 +169,58 @@ pub struct StructuredJob<'a> {
     pub cwd: &'a Path,
     /// How long it may take before it's killed.
     pub timeout: Duration,
+}
+
+/// A backend's models: listed once and kept, or the listing's failure
+/// kept for `LISTING_RETRY`. A listing without any models counts as a
+/// failure, since there's nothing to keep. Whoever asks while it lists waits for that
+/// listing.
+#[derive(Default)]
+pub struct ModelList(tokio::sync::Mutex<Option<Listing>>);
+
+enum Listing {
+    Listed(Vec<AgentModelInfo>),
+    Failed { at: Instant, error: String },
+}
+
+impl ModelList {
+    /// The models, from `list` unless they're known; `name` is the
+    /// backend's, for the log.
+    pub async fn get<F>(&self, name: &str, list: impl FnOnce() -> F) -> Result<Vec<AgentModelInfo>>
+    where
+        F: Future<Output = Result<Vec<AgentModelInfo>>>,
+    {
+        let mut listing = self.0.lock().await;
+        match &*listing {
+            Some(Listing::Listed(models)) => return Ok(models.clone()),
+            Some(Listing::Failed { at, error }) if at.elapsed() < LISTING_RETRY => {
+                bail!("{error}")
+            }
+            _ => {}
+        }
+        let listed = list().await.and_then(|m| {
+            if m.is_empty() {
+                bail!("it listed none")
+            } else {
+                Ok(m)
+            }
+        });
+        match listed {
+            Ok(models) => {
+                *listing = Some(Listing::Listed(models.clone()));
+                Ok(models)
+            }
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::warn!("listing {name}'s models: {error}");
+                *listing = Some(Listing::Failed {
+                    at: Instant::now(),
+                    error: error.clone(),
+                });
+                bail!("{error}")
+            }
+        }
+    }
 }
 
 /// Stops a turn the way Ctrl-C would. Interrupting a turn again stops it
@@ -278,6 +339,8 @@ impl<R: AsyncRead + Unpin> OutputLines<R> {
 pub struct Agents {
     /// The Claude Code backend.
     claude: claude::Claude,
+    /// The Devin backend.
+    devin: devin::Devin,
     /// Worktrees go to `<dir>/<owner>/<name>/<id>`.
     worktrees: PathBuf,
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
@@ -297,6 +360,14 @@ pub struct Agents {
     pub terminals: crate::terminal::Terminals,
 }
 
+/// A permission request waiting for the user's answer.
+struct PendingRequest {
+    /// Answers the request's waiter.
+    tx: oneshot::Sender<Decision>,
+    /// The answers the backend offers beyond allow/deny.
+    options: Vec<ApprovalOption>,
+}
+
 /// What only exists while the server runs: the event channel open pages
 /// listen to, queued prompts and the pending permission requests.
 struct Live {
@@ -312,7 +383,10 @@ struct Live {
     /// The user stopped the current turn.
     interrupted: bool,
     /// Permission requests by tool use ID.
-    pending: HashMap<String, oneshot::Sender<Decision>>,
+    pending: HashMap<String, PendingRequest>,
+    /// The mode and model the running turn goes with, for follow-ups a
+    /// denied request queues.
+    turn: Option<(PermissionMode, Option<String>)>,
     /// The wrap-up in progress, if any.
     wrap_up: Option<Pending>,
 }
@@ -336,6 +410,7 @@ impl Live {
             stopper: None,
             interrupted: false,
             pending: HashMap::new(),
+            turn: None,
             wrap_up: None,
         }
     }
@@ -358,7 +433,7 @@ fn random_hex(n: usize) -> String {
 }
 
 /// A random (version 4) UUID, the format Claude Code's session IDs need.
-fn uuid() -> String {
+pub fn uuid() -> String {
     let mut b = random_bytes::<16>();
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
@@ -685,7 +760,8 @@ impl Agents {
     /// summarizes each new session's first prompt.
     pub fn new(
         db: &crate::db::Db,
-        claude: PathBuf,
+        // The claude and devin executables the backends run.
+        exes: (PathBuf, PathBuf),
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
@@ -697,7 +773,8 @@ impl Agents {
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude: claude::Claude::new(claude),
+            claude: claude::Claude::new(exes.0),
+            devin: devin::Devin::new(exes.1),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
@@ -719,6 +796,7 @@ impl Agents {
     pub fn backend(&self, backend: AgentBackend) -> &dyn Backend {
         match backend {
             AgentBackend::Claude => &self.claude,
+            AgentBackend::Devin => &self.devin,
         }
     }
 
@@ -746,7 +824,7 @@ impl Agents {
     }
 
     /// Whether the user stopped the current turn.
-    fn interrupted(&self, id: &str) -> bool {
+    pub fn interrupted(&self, id: &str) -> bool {
         self.with_live(id, |l| l.interrupted)
     }
 
@@ -759,27 +837,36 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The models each backend offers, for the pickers: empty when they
-    /// can't be listed.
+    /// The backends sessions can pick, with their models: the default
+    /// one always, its models empty when they can't be listed, and the
+    /// others when they can list theirs.
     pub async fn backends(&self) -> Vec<AgentBackendInfo> {
-        let mut infos = Vec::new();
-        for backend in AgentBackend::ALL {
-            infos.push(backend.info(self.backend(backend).models().await));
-        }
-        infos
+        let listed =
+            futures::future::join_all(AgentBackend::ALL.map(|b| self.backend(b).models())).await;
+        AgentBackend::ALL
+            .into_iter()
+            .zip(listed)
+            .filter_map(|(backend, listed)| match listed {
+                Ok(models) => Some(backend.info(models)),
+                Err(_) if backend == AgentBackend::default() => Some(backend.info(Vec::new())),
+                Err(_) => None,
+            })
+            .collect()
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
     /// one it lists. While it can't list them, there's no telling, so any
     /// that can't pass for a flag goes and the backend itself rejects one
     /// it doesn't have.
+    ///
+    /// Only `backend` is asked, and a backend that can't list its models
+    /// still takes prompts that keep its default.
     pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
         let Some(m) = model else { return true };
-        let models = self.backend(backend).models().await;
-        if models.is_empty() {
-            return !m.is_empty() && !m.starts_with('-');
+        match self.backend(backend).models().await {
+            Ok(models) if !models.is_empty() => models.iter().any(|i| i.value == m),
+            _ => !m.is_empty() && !m.starts_with('-'),
         }
-        models.iter().any(|i| i.value == m)
     }
 }
 
@@ -1049,8 +1136,8 @@ pub fn interrupt(state: &State, id: &str) {
     if let Some(stopper) = stopper {
         stopper.stop();
     }
-    for (tool_use, tx) in pending {
-        let _ = tx.send(Decision {
+    for (tool_use, pending) in pending {
+        let _ = pending.tx.send(Decision {
             allow: false,
             message: Some("The user interrupted the turn.".into()),
             ..Decision::default()
@@ -1068,40 +1155,134 @@ pub fn interrupt(state: &State, id: &str) {
 }
 
 /// Registers a permission request; the receiver gets the user's answer.
+/// `options` are the answers the backend offers beyond allow/deny.
 pub fn request_approval(
     state: &State,
     id: &str,
     tool_use: &str,
     tool_name: &str,
     input: &Value,
+    options: Vec<ApprovalOption>,
 ) -> Result<oneshot::Receiver<Decision>> {
     let (tx, rx) = oneshot::channel();
     state.agents.with_live(id, |l| {
-        l.pending.insert(tool_use.to_owned(), tx);
+        l.pending.insert(
+            tool_use.to_owned(),
+            PendingRequest {
+                tx,
+                options: options.clone(),
+            },
+        );
     });
-    emit(
+    let requested = emit(
         state,
         id,
         AgentEventKind::ApprovalRequested {
             id: tool_use.to_owned(),
             tool_name: tool_name.to_owned(),
             input: input.to_string(),
+            options,
         },
-    )?;
+    );
+    // A request the page never heard of can't be answered.
+    if let Err(e) = requested {
+        state.agents.with_live(id, |l| l.pending.remove(tool_use));
+        return Err(e);
+    }
     set_status(state, id, AgentStatus::AwaitingApproval);
     Ok(rx)
 }
 
-/// Forgets a permission request that Claude Code stopped waiting for.
-pub fn drop_approval(state: &State, id: &str, tool_use: &str) {
-    state.agents.with_live(id, |l| l.pending.remove(tool_use));
+/// The answer with id `option` that the waiting permission request
+/// `tool_use` offers, if it offers one.
+pub fn offered_option(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    option: &str,
+) -> Option<ApprovalOption> {
+    state.agents.with_live(id, |l| {
+        l.pending
+            .get(tool_use)?
+            .options
+            .iter()
+            .find(|o| o.id == option)
+            .cloned()
+    })
+}
+
+/// Queues `prompt` next, before the ones already waiting, with the
+/// running turn's mode and model unless the follow-up plans again.
+pub fn queue_next(state: &State, id: &str, prompt: String, plan: bool) {
+    state.agents.with_live(id, |l| {
+        // An interrupted turn doesn't send the denial's feedback again.
+        if l.interrupted {
+            return;
+        }
+        let (mode, model) = l
+            .turn
+            .clone()
+            .unwrap_or_else(|| (PermissionMode::plan(), None));
+        l.queue.push_front(Queued {
+            prompt,
+            images: Vec::new(),
+            mode: if plan { PermissionMode::plan() } else { mode },
+            model,
+        });
+    });
+}
+
+/// Forgets a permission request when its waiter stops waiting.
+struct PendingGuard<'a> {
+    state: &'a State,
+    id: &'a str,
+    tool_use: &'a str,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .agents
+            .with_live(self.id, |l| l.pending.remove(self.tool_use));
+    }
+}
+
+/// Asks the user about the tool use `tool_use`, as `request_approval`
+/// does, and waits for the answer; `None` when the request couldn't be
+/// made or the server shuts down first. However the wait ends, including
+/// when it's dropped with the turn or the connection that waits, the
+/// request is forgotten, so it no longer counts as pending.
+pub async fn await_approval(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    tool_name: &str,
+    input: &Value,
+    options: Vec<ApprovalOption>,
+) -> Option<Decision> {
+    let rx = match request_approval(state, id, tool_use, tool_name, input, options) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!("agent {id}: {e:#}");
+            return None;
+        }
+    };
+    let _guard = PendingGuard {
+        state,
+        id,
+        tool_use,
+    };
+    tokio::select! {
+        d = rx => d.ok(),
+        _ = state.shutdown.cancelled() => None,
+    }
 }
 
 /// Passes the user's answer on to the waiting permission request. Returns
 /// false when no such request is waiting.
 pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> Result<bool> {
     let (tx, still_pending) = state.agents.with_live(id, |l| {
-        let tx = l.pending.remove(tool_use);
+        let tx = l.pending.remove(tool_use).map(|p| p.tx);
         (tx, !l.pending.is_empty())
     });
     let Some(tx) = tx else {
@@ -1232,6 +1413,7 @@ async fn run(state: Arc<State>, id: String) {
             let prompt = l.queue.pop_front();
             l.running = prompt.is_some();
             l.interrupted = false;
+            l.turn = prompt.as_ref().map(|q| (q.mode.clone(), q.model.clone()));
             (prompt, l.wrap_up.is_some())
         });
         let Some(queued) = prompt else {
@@ -1263,6 +1445,7 @@ async fn run(state: Arc<State>, id: String) {
         };
         let interrupted = state.agents.with_live(&id, |l| {
             l.stopper = None;
+            l.turn = None;
             l.interrupted
         });
         let status = if interrupted {
@@ -1705,12 +1888,10 @@ impl<'a> TurnSink<'a> {
             return record_usage(self.state, self.id, tokens, window);
         }
         if let AgentEventKind::TurnEnded { error, cost } = &kind {
-            // The cost is the process's total so far, and a process can
-            // report several results: one more for each background task
-            // that finishes after the answer.
+            // A process can report several results: one more for each
+            // background task that finishes after the answer.
             if let Some(cost) = cost {
-                self.state.db.add_agent_cost(self.id, cost - self.billed)?;
-                self.billed = *cost;
+                self.bill(*cost)?;
             }
             let repeat = self.ended == Some(true) && self.last_was_end && error.is_none();
             self.ended = Some(error.is_none());
@@ -1722,6 +1903,16 @@ impl<'a> TurnSink<'a> {
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
+    }
+
+    /// Adds what the turn's process has cost since it was last billed to
+    /// the session's cost; `total` is the process's total so far.
+    pub fn bill(&mut self, total: f64) -> Result<()> {
+        if total != self.billed {
+            self.state.db.add_agent_cost(self.id, total - self.billed)?;
+            self.billed = total;
+        }
+        Ok(())
     }
 
     /// How the turn went once the backend's output is done: `unfinished`
@@ -1914,6 +2105,7 @@ pub(crate) mod tests {
         crate::sync::test_state_with_agents(
             [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
             claude,
+            "devin".into(),
             dir.join("worktrees"),
         )
     }
@@ -3305,5 +3497,395 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             )),
             "{args}"
         );
+    }
+}
+
+#[cfg(test)]
+mod devin_tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use grenadine_core::api::NewAgent;
+    use serde_json::json;
+
+    use super::*;
+    use crate::devin::{fake, fake_log};
+
+    /// A state whose agents run `devin` as devin.
+    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, devin: PathBuf) -> Arc<State> {
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        crate::sync::test_state_with_agents(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+            "claude".into(),
+            devin,
+            dir.join("worktrees"),
+        )
+    }
+
+    /// A session/update with a chunk of the answer.
+    fn chunk(text: &str) -> Value {
+        json!({"update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }})
+    }
+
+    /// A session/update with the process's ACU total.
+    fn usage(acu: f64) -> Value {
+        json!({"update": {
+            "sessionUpdate": "usage_update",
+            "used": 100,
+            "size": 200000,
+            "_meta": {"cognition.ai/totalAcuCost": acu},
+        }})
+    }
+
+    /// The steps that start an `exec` call and ask permission for it,
+    /// waiting for the answer unless `wait` is false.
+    fn exec_asking(wait: bool) -> [Value; 2] {
+        [
+            json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec:0#t",
+                "rawInput": {"command": "touch f"},
+                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+            }}),
+            json!({
+                "request": "session/request_permission",
+                "params": {
+                    "sessionId": "s",
+                    "toolCall": {"toolCallId": "exec:0#t"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+                "wait": wait,
+            }),
+        ]
+    }
+
+    /// A scenario whose prompts take `steps`; resuming the session
+    /// replays an answer.
+    fn scenario(session: &str, steps: Vec<Value>) -> Value {
+        json!({
+            "session_id": session,
+            "model": "swe-2",
+            "load": [chunk("replayed")["update"]],
+            "prompts": [{"steps": steps}],
+        })
+    }
+
+    /// A Devin session that starts on `prompt`.
+    async fn start(state: &Arc<State>, fx: &crate::git::tests::Fixture) -> AgentSession {
+        create(
+            state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Waits until the session has finished `turns` turns.
+    async fn wait_for_turns(state: &State, id: &str, turns: usize) {
+        for _ in 0..200 {
+            let ended = state
+                .db
+                .agent_events(id)
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        AgentEventKind::TurnEnded { .. } | AgentEventKind::Error(_)
+                    )
+                })
+                .count();
+            let running = state.agents.with_live(id, |l| l.running);
+            if ended >= turns && !running {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{id} didn't finish its turns");
+    }
+
+    /// Waits until the session's status is `AwaitingApproval`.
+    async fn wait_for_approval(state: &State, id: &str) {
+        for _ in 0..500 {
+            if state.db.agent(id).unwrap().unwrap().status == AgentStatus::AwaitingApproval {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never waited for approval");
+    }
+
+    /// Waits until the fake devin in `dir` was sent `method`.
+    async fn wait_for_method(dir: &Path, method: &str) {
+        for _ in 0..500 {
+            if fake_log(dir).iter().any(|m| m["method"] == method) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("devin was never sent {method}");
+    }
+
+    /// Allows the `exec` call with its option.
+    fn allow(state: &State, id: &str) {
+        let decision = Decision {
+            allow: true,
+            option: Some("allow_once".into()),
+            ..Default::default()
+        };
+        assert!(approve(state, id, "exec:0#t", decision).unwrap());
+    }
+
+    /// A listing without models is kept like a failure, not for good.
+    #[tokio::test]
+    async fn an_empty_listing_is_a_failure() {
+        let list = ModelList::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..2 {
+            let listed = list
+                .get("Fake", || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Vec::new())
+                })
+                .await;
+            assert!(listed.is_err());
+        }
+        assert_eq!(calls.into_inner(), 1);
+    }
+
+    /// A devin that can't list its models leaves Devin out of the
+    /// backends, but prompts with its default or any model that can't
+    /// pass for a flag still go, and devin isn't asked again for a while.
+    #[tokio::test]
+    async fn a_failed_listing_is_kept() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let devin = dir.path().join("devin");
+        std::fs::write(
+            &devin,
+            format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let backends: Vec<_> = state
+            .agents
+            .backends()
+            .await
+            .into_iter()
+            .map(|i| i.backend)
+            .collect();
+        assert_eq!(backends, [AgentBackend::Claude]);
+        assert!(state.agents.offers(AgentBackend::Devin, None).await);
+        assert!(
+            state
+                .agents
+                .offers(AgentBackend::Devin, Some("swe-2"))
+                .await
+        );
+        assert!(
+            !state
+                .agents
+                .offers(AgentBackend::Devin, Some("--help"))
+                .await
+        );
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
+    }
+
+    /// A Devin session's turn goes over ACP: the session id is stored,
+    /// its permission request waits on the page, and the turn's cost is
+    /// in ACUs. The next turn resumes the session without the answers
+    /// session/load replays.
+    #[tokio::test]
+    async fn a_devin_turn_runs_and_resumes() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let [tool_call, ask] = exec_asking(true);
+        let steps = vec![
+            chunk("Hi"),
+            tool_call,
+            ask,
+            json!({"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec:0#t",
+                "status": "completed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "done"}}],
+            }}),
+            usage(0.25),
+            json!({"end": "end_turn"}),
+        ];
+        let devin = fake(dir.path(), scenario("turn-slate", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+
+        wait_for_approval(&state, &session.id).await;
+        allow(&state, &session.id);
+        wait_for_turns(&state, &session.id, 1).await;
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.cost, 0.25);
+        assert_eq!(stored.cost_unit, grenadine_core::api::CostUnit::Acu);
+        assert_eq!(stored.model.as_deref(), Some("swe-2"));
+        assert_eq!(
+            state.db.backend_session(&session.id).unwrap().as_deref(),
+            Some("turn-slate")
+        );
+
+        send(
+            &state,
+            &session.id,
+            "again".into(),
+            "accept-edits".into(),
+            None,
+        );
+        wait_for_approval(&state, &session.id).await;
+        allow(&state, &session.id);
+        wait_for_turns(&state, &session.id, 2).await;
+        let load = fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["method"] == "session/load")
+            .expect("the second turn resumed the session");
+        assert_eq!(load["params"]["sessionId"], "turn-slate");
+        let events = state.db.agent_events(&session.id).unwrap();
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                AgentEventKind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Hi", "Hi"], "no replayed answer");
+        // Each turn's process reports its own total.
+        assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, 0.5);
+    }
+
+    /// A prompt asked to stop before its turn got to running it never
+    /// reaches Devin: the interrupt that landed while the session was
+    /// being set up ends it as Interrupted without a `session/prompt`.
+    #[tokio::test]
+    async fn an_early_interrupt_skips_the_prompt() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let mut scenario = scenario("early-oak", vec![json!({"end": "end_turn"})]);
+        scenario["gate"] = gate.to_str().unwrap().into();
+        let devin = fake(dir.path(), scenario);
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        // Devin holds session/new until the interrupt is in.
+        wait_for_method(dir.path(), "session/new").await;
+        interrupt(&state, &session.id);
+        std::fs::write(&gate, "").unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Interrupted
+        );
+        let methods: Vec<_> = fake_log(dir.path())
+            .iter()
+            .filter_map(|m| m["method"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            !methods.iter().any(|m| m == "session/prompt"),
+            "fake devin received a prompt: {methods:?}"
+        );
+    }
+
+    /// An interrupt asks Devin to cancel, which ends the turn, and the
+    /// ACUs spent so far are billed.
+    #[tokio::test]
+    async fn an_interrupt_cancels() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // Devin ignores the answer to its permission request, so only
+        // session/cancel ends the turn.
+        let [tool_call, ask] = exec_asking(false);
+        let steps = vec![usage(0.125), tool_call, ask];
+        let devin = fake(dir.path(), scenario("stop-pine", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        wait_for_approval(&state, &session.id).await;
+        interrupt(&state, &session.id);
+        wait_for_turns(&state, &session.id, 1).await;
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.status, AgentStatus::Interrupted);
+        assert_eq!(stored.cost, 0.125);
+        assert!(
+            fake_log(dir.path())
+                .iter()
+                .any(|m| m["method"] == "session/cancel")
+        );
+        let ended: Vec<_> = state
+            .db
+            .agent_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::TurnEnded { error, .. } => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, [Some("interrupted".to_owned())]);
+    }
+
+    /// A devin that dies while a permission request waits takes the
+    /// request with it, and the error says what devin printed. The ACUs
+    /// it reported are billed.
+    #[tokio::test]
+    async fn a_dead_devin_drops_its_approvals() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let [tool_call, ask] = exec_asking(false);
+        let steps = vec![
+            usage(0.0625),
+            tool_call,
+            ask,
+            json!({"stderr": "Not logged in"}),
+            json!({"exit": true}),
+        ];
+        let devin = fake(dir.path(), scenario("gone-fern", steps));
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = start(&state, &fx).await;
+        wait_for_turns(&state, &session.id, 1).await;
+        let stored = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(stored.status, AgentStatus::Failed);
+        assert_eq!(stored.cost, 0.0625);
+        let error = state
+            .db
+            .agent_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                AgentEventKind::TurnEnded { error, .. } => error,
+                _ => None,
+            })
+            .unwrap();
+        assert!(error.contains("Not logged in"), "{error}");
+        for _ in 0..100 {
+            if state
+                .agents
+                .with_live(&session.id, |l| l.pending.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the request outlived the turn");
     }
 }

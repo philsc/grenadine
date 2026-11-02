@@ -33,6 +33,171 @@ from grenadine.testing.fake_github import COMMENTED, TEAM, TOKEN, FakeGitHub
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
 
+
+def devin_scenario(tmp: Path) -> dict:
+    """What the fake `devin acp` (//grenadine/testing:fake_devin) plays: a
+    turn that asks to run a command with Devin's options, a question when
+    the prompt asks for one, and in plan mode a plan from a plan file with
+    front matter. Resuming a session replays an answer, which the
+    transcript must not show again. It logs what grenadine sends to
+    `devin_acp.log` in `tmp`."""
+
+    def update(u: dict) -> dict:
+        return {"update": u}
+
+    def tool_call(kind: str, raw_input: dict, **meta: str) -> dict:
+        return update(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": f"{kind}:{{turn}}",
+                "rawInput": raw_input,
+                "_meta": {"cognition.ai/inferenceToolName": kind, **meta},
+            }
+        )
+
+    def done(kind: str, text: str) -> dict:
+        return update(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": f"{kind}:{{turn}}",
+                "status": "completed",
+                "content": [
+                    {"type": "content", "content": {"type": "text", "text": text}}
+                ],
+            }
+        )
+
+    def permission(kind: str, options: list[tuple[str, str, str]]) -> dict:
+        return {
+            "request": "session/request_permission",
+            "params": {
+                "sessionId": "devin-test",
+                "toolCall": {"toolCallId": f"{kind}:{{turn}}"},
+                "options": [
+                    {"optionId": id, "name": name, "kind": kind}
+                    for id, name, kind in options
+                ],
+            },
+        }
+
+    plan_file = str(tmp / "devin_plan.md")
+    question = {
+        "question": "Tea or coffee?",
+        "header": "Drink",
+        "options": [
+            {"label": "Tea", "description": "Tea"},
+            {"label": "Coffee", "description": "Coffee"},
+        ],
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "q0": {
+                "title": "Drink",
+                "description": "Tea or coffee?",
+                "oneOf": [
+                    {"const": "Tea", "title": "Tea"},
+                    {"const": "Coffee", "title": "Coffee"},
+                ],
+            }
+        },
+    }
+    end = {"end": "end_turn"}
+    return {
+        "log": str(tmp / "devin_acp.log"),
+        "session_id": "devin-test",
+        "model": "swe-2",
+        "models": [
+            {"value": "swe-2", "name": "SWE-2"},
+            {"value": "swe-2-high", "name": "SWE-2 High"},
+        ],
+        "load": [
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Replayed."},
+            }
+        ],
+        "plan_file": {
+            "path": plan_file,
+            "text": "---\nagent: devin\n---\n# The plan\n\nDo the thing.\n",
+        },
+        "prompts": [
+            {
+                "mode": "plan",
+                "steps": [
+                    tool_call(
+                        "exit_plan_mode",
+                        {"plan": "summary"},
+                        **{"cognition.ai/planFilePath": plan_file},
+                    ),
+                    permission(
+                        "exit_plan_mode",
+                        [
+                            (
+                                "plan_accept_edits",
+                                "Yes, implement and accept edits",
+                                "allow_once",
+                            ),
+                            ("plan_bypass", "Yes, implement and bypass", "allow_once"),
+                            ("reject_once", "No", "reject_once"),
+                        ],
+                    ),
+                    done("exit_plan_mode", "ok"),
+                    end,
+                ],
+            },
+            {
+                "match": "question",
+                "steps": [
+                    tool_call("ask_user_question", {"questions": [question]}),
+                    {
+                        "request": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "sessionId": "devin-test",
+                            "requestedSchema": schema,
+                            "message": "Tea or coffee?",
+                            "_meta": {
+                                "cognition.ai/toolCallId": "ask_user_question:{turn}"
+                            },
+                        },
+                    },
+                    done("ask_user_question", "Tea"),
+                    end,
+                ],
+            },
+            {
+                "steps": [
+                    update(
+                        {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "On it."},
+                        }
+                    ),
+                    tool_call("exec", {"command": "touch note.txt"}),
+                    permission(
+                        "exec",
+                        [
+                            ("allow_once", "Allow", "allow_once"),
+                            ("reject_once", "Reject", "reject_once"),
+                        ],
+                    ),
+                    done("exec", "done"),
+                    update(
+                        {
+                            "sessionUpdate": "usage_update",
+                            "used": 1000,
+                            "size": 200000,
+                            "_meta": {"cognition.ai/totalAcuCost": 0.5},
+                        }
+                    ),
+                    end,
+                ],
+            },
+        ],
+    }
+
+
 # Stands in for `claude -p`: it writes a short turn as stream-json and,
 # when the prompt asks it to write, asks grenadine for permission through
 # the MCP tool first, like Claude Code does. Permission modes other than
@@ -238,6 +403,12 @@ class ServerTestCase(unittest.TestCase):
         claude = bin_dir / "claude"
         claude.write_text(f"#!{sys.executable}\n{FAKE_CLAUDE}")
         claude.chmod(0o755)
+        scenario = tmp / "devin_scenario.json"
+        scenario.write_text(json.dumps(devin_scenario(tmp)))
+        devin = bin_dir / "devin"
+        fake_devin = Path(os.environ["FAKE_DEVIN"]).absolute()
+        devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
+        devin.chmod(0o755)
 
         env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
         repo_flags = []
@@ -263,6 +434,7 @@ class ServerTestCase(unittest.TestCase):
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
+        cls.devin_log = tmp / "devin_acp.log"
         cls.server_args = (
             [
                 os.environ["GRENADINE_SERVER"],
@@ -270,6 +442,7 @@ class ServerTestCase(unittest.TestCase):
                 f"--port={port}",
                 f"--db={tmp / 'grenadine.db'}",
                 f"--github-api={api}",
+                f"--devin={devin}",
                 f"--poll-interval={cls.POLL_INTERVAL}",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
@@ -1488,6 +1661,132 @@ class AgentTest(ServerTestCase):
         other.get_by_role("link", name="Start one").click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
+
+    def devin_saw(self, needle: str) -> None:
+        # Waits until the fake devin's client log holds `needle`.
+        for _ in range(200):
+            if needle in self.devin_log.read_text():
+                return
+            time.sleep(0.05)
+        self.fail(f"devin never saw {needle}: {self.devin_log.read_text()}")
+
+    def start_devin_session(self, permissions: str, prompt: str) -> Locator:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Backend").select_option(label="Devin")
+        self.page.get_by_label("Permissions").select_option(label=permissions)
+        self.page.get_by_label("Prompt").fill(prompt)
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        return self.page.locator(".transcript")
+
+    def delete_session(self, title: str) -> None:
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        # Deleting scans the worktree for leftovers, which may leave a
+        # cleanup entry; the session's own entry is gone.
+        sessions = self.section("General").locator(".agent-entry")
+        expect(sessions.filter(has_text=title)).to_have_count(0)
+
+    def test_backends_keep_their_own_models(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        backend = self.page.get_by_label("Backend")
+        model = self.page.get_by_label("Model")
+        model.select_option("sonnet")
+        backend.select_option(label="Devin")
+        # Devin doesn't offer Claude's pick, and resetting it doesn't
+        # count as a pick for Devin.
+        expect(model).to_have_value("default")
+        backend.select_option(label="Claude Code")
+        expect(model).to_have_value("sonnet")
+        backend.select_option(label="Devin")
+        model.select_option("swe-2-high")
+        backend.select_option(label="Claude Code")
+        expect(model).to_have_value("sonnet")
+        backend.select_option(label="Devin")
+        expect(model).to_have_value("swe-2-high")
+
+    def test_a_draft_leaves_a_backend_no_longer_offered(self) -> None:
+        # The last session was Devin's, but Devin can't list its models
+        # any more, so the server offers Claude Code alone.
+        self.page.add_init_script(
+            "localStorage.setItem('grenadine.agent-backend', 'devin')"
+        )
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(json=[{"backend": "claude", "models": []}]),
+        )
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.get_by_label("Prompt")).to_have_attribute(
+            "placeholder", re.compile(r"^What should Claude do\?")
+        )
+        # With nothing else to pick, there's no picker.
+        expect(self.page.get_by_label("Backend")).to_have_count(0)
+        # The draft keeps its pick, so once Devin is back, so is the draft's
+        # backend.
+        self.page.get_by_label("Prompt").fill("later")
+        self.page.unroute("**/api/agents/backends")
+        self.page.add_init_script(
+            "localStorage.setItem('grenadine.agent-backend', 'claude')"
+        )
+        self.page.reload()
+        expect(self.page.get_by_label("Prompt")).to_have_value("later")
+        expect(self.page.get_by_label("Backend")).to_have_value("devin")
+
+    def test_devin_session(self) -> None:
+        transcript = self.start_devin_session("Code", "write a note")
+        expect(transcript.locator(".turn-text")).to_contain_text("On it.")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Devin wants to use Bash")
+        # Devin's options render as a button each.
+        approval.get_by_role("button", name="Allow").click()
+        expect(approval).to_contain_text("Allowed Bash")
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.500 ACU"])
+        expect(self.page.locator(".composer .agent-model")).to_have_text("swe-2")
+        self.delete_session("write a note")
+
+    def test_devin_question(self) -> None:
+        transcript = self.start_devin_session("Code", "ask me a question")
+        question = transcript.locator(".approval")
+        expect(question).to_contain_text("Devin asks")
+        question.get_by_text("Tea", exact=True).click()
+        question.get_by_role("button", name="Answer").click()
+        # The answer goes back to Devin as the elicitation's q0.
+        self.devin_saw('"action":"accept"')
+        self.devin_saw('"q0":"Tea"')
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        self.delete_session("ask me a question")
+
+    def test_devin_plan(self) -> None:
+        transcript = self.start_devin_session("Plan first", "make a plan")
+        plan = transcript.locator(".approval.plan")
+        # The card shows the plan file's text, without its front matter.
+        expect(plan).to_contain_text("Devin's plan is waiting for your approval")
+        expect(plan.locator(".plan-text")).to_contain_text("Do the thing.")
+        expect(plan.locator(".plan-text")).not_to_contain_text("agent: devin")
+        # Devin's after-plan modes are Code and Bypass permissions.
+        expect(plan.get_by_label("After the plan")).to_have_value("accept-edits")
+        # Sent back with feedback, the plan's denial goes to Devin as
+        # reject_once and the feedback runs as the next prompt.
+        plan.get_by_label("Feedback").fill("more detail")
+        plan.get_by_role("button", name="Keep planning").click()
+        self.devin_saw('"optionId":"reject_once"')
+        expect(transcript.locator(".turn-prompt").last).to_have_text("more detail")
+        self.devin_saw("more detail")
+
+        # The next turn plans again; approving it picks the option that
+        # names the mode the turn goes on in.
+        revised = transcript.locator(".approval.plan").last
+        expect(revised).to_contain_text("Devin's plan is waiting for your approval")
+        revised.get_by_role("button", name="Approve plan").click()
+        self.devin_saw('"optionId":"plan_accept_edits"')
+        expect(revised).to_contain_text("Plan approved")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        # The second turn resumed the session, whose replayed answer the
+        # transcript already has.
+        self.devin_saw('"method":"session/load"')
+        expect(transcript).not_to_contain_text("Replayed.")
+        self.delete_session("make a plan")
 
     def test_general_session(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})

@@ -2074,8 +2074,8 @@ mod tests {
         let db = Db::in_memory();
         db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
         db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
-        db.set_agent_backend_raw("a", "devin", "usd");
-        db.set_agent_backend_raw("b", "claude", "acu");
+        db.set_agent_backend_raw("a", "hal", "usd");
+        db.set_agent_backend_raw("b", "claude", "gold");
         db.create_agent(&agent("c", AgentStatus::Idle)).unwrap();
         for id in ["a", "b"] {
             let e = db.agent(id).unwrap_err();

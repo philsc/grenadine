@@ -13,9 +13,8 @@ use futures::future::BoxFuture;
 use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::OnceCell;
 
-use crate::agent::{Backend, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
+use crate::agent::{Backend, ModelList, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
 use crate::sync::State;
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
@@ -29,14 +28,6 @@ const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
 /// page. 0 turns the check off.
 const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
-/// The grenadine MCP server's tools that Claude may use without asking.
-const ALLOWED_TOOLS: [&str; 4] = [
-    "mcp__grenadine__list_terminals",
-    "mcp__grenadine__read_terminal",
-    "mcp__grenadine__wait_for_terminal",
-    "mcp__grenadine__show_image",
-];
-
 /// The `initialize` control request the Agent SDK starts with. Claude Code
 /// answers it without calling a model.
 const INITIALIZE: &str =
@@ -46,38 +37,29 @@ const INITIALIZE: &str =
 pub struct Claude {
     /// The `claude` executable.
     exe: PathBuf,
-    /// The models Claude Code offers, once it has listed them.
-    models: OnceCell<Vec<AgentModelInfo>>,
+    /// The models Claude Code offers.
+    models: ModelList,
 }
 
 impl Claude {
     pub fn new(exe: PathBuf) -> Claude {
         Claude {
             exe,
-            models: OnceCell::new(),
+            models: ModelList::default(),
         }
     }
 }
 
 impl Backend for Claude {
-    /// The models Claude Code offers, listed once and kept; none while it
-    /// can't list them.
-    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>> {
-        async move {
-            match self.models.get_or_try_init(|| list_models(&self.exe)).await {
-                Ok(models) => models.clone(),
-                Err(e) => {
-                    tracing::warn!("listing Claude Code's models: {e:#}");
-                    Vec::new()
-                }
-            }
-        }
-        .boxed()
+    fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>> {
+        self.models
+            .get("Claude Code", || list_models(&self.exe))
+            .boxed()
     }
 
     fn turn<'a>(
         &'a self,
-        state: &'a State,
+        state: &'a std::sync::Arc<State>,
         session: &'a AgentSession,
         t: Turn<'a>,
         sink: TurnSink<'a>,
@@ -227,7 +209,7 @@ async fn turn(
         "mcp__grenadine__approve",
     ])
     .arg("--allowedTools")
-    .args(ALLOWED_TOOLS)
+    .args(crate::mcp::ALLOWED_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
     .args(

@@ -40,19 +40,14 @@ const IDLE: Duration = Duration::from_secs(3);
 /// The largest image `show_image` shows.
 const MAX_IMAGE: u64 = 20 << 20;
 
-/// Forgets the permission request when Claude Code hangs up without an
-/// answer, e.g. because the turn was interrupted.
-struct PendingGuard<'a> {
-    state: &'a State,
-    id: &'a str,
-    tool_use: &'a str,
-}
-
-impl Drop for PendingGuard<'_> {
-    fn drop(&mut self) {
-        agent::drop_approval(self.state, self.id, self.tool_use);
-    }
-}
+/// The tools agents may use without asking: all of this server's but
+/// `approve`, which answers for a permission request.
+pub const ALLOWED_TOOLS: [&str; 4] = [
+    "mcp__grenadine__list_terminals",
+    "mcp__grenadine__read_terminal",
+    "mcp__grenadine__wait_for_terminal",
+    "mcp__grenadine__show_image",
+];
 
 fn reply(id: &Value, result: Value) -> Response {
     Json(json!({"jsonrpc": "2.0", "id": id, "result": result})).into_response()
@@ -227,24 +222,17 @@ pub async fn handle(
                 Some(t) => t.to_owned(),
                 None => format!("request-{rpc_id}"),
             };
-            let decision =
-                match agent::request_approval(&state, &id, &tool_use, tool_name, &args["input"]) {
-                    Ok(rx) => {
-                        let _guard = PendingGuard {
-                            state: &state,
-                            id: &id,
-                            tool_use: &tool_use,
-                        };
-                        tokio::select! {
-                            d = rx => d.ok(),
-                            _ = state.shutdown.cancelled() => None,
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("agent {id}: {e:#}");
-                        None
-                    }
-                };
+            // Claude Code hanging up, e.g. because the turn was
+            // interrupted, drops the wait and so the request.
+            let decision = agent::await_approval(
+                &state,
+                &id,
+                &tool_use,
+                tool_name,
+                &args["input"],
+                Vec::new(),
+            )
+            .await;
             let answer = match decision {
                 Some(Decision {
                     allow: true,
@@ -580,6 +568,7 @@ mod tests {
                     id: "toolu_1".into(),
                     tool_name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    options: Vec::new(),
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_1".into(),
@@ -590,6 +579,7 @@ mod tests {
                     id: "toolu_2".into(),
                     tool_name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    options: Vec::new(),
                 },
                 AgentEventKind::ApprovalResolved {
                     id: "toolu_2".into(),

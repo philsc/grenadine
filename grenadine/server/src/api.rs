@@ -605,6 +605,7 @@ async fn agent_backends(AxState(state): St) -> Json<Vec<AgentBackendInfo>> {
 }
 
 const UNKNOWN_MODE: &str = "the backend has no such permission mode";
+const UNKNOWN_OPTION: &str = "unknown approval option";
 
 /// Whether `backend` offers `model` and `mode`; the response when not.
 async fn offers(
@@ -899,10 +900,19 @@ async fn approve(
     {
         return Ok((StatusCode::BAD_REQUEST, UNKNOWN_MODE).into_response());
     }
+    // A picked option says by its kind whether the tool use goes ahead.
+    let allow = match &approval.option {
+        None => approval.allow,
+        Some(option) => match agent::offered_option(&state, &id, &approval.id, option) {
+            Some(o) => o.kind.is_allow(),
+            None => return Ok((StatusCode::BAD_REQUEST, UNKNOWN_OPTION).into_response()),
+        },
+    };
     let decision = Decision {
-        allow: approval.allow,
+        allow,
         message: approval.message,
         mode: approval.mode,
+        option: approval.option,
         answers: approval.answers,
     };
     Ok(if agent::approve(&state, &id, &approval.id, decision)? {
@@ -1376,6 +1386,7 @@ mod tests {
             allow: true,
             message: None,
             mode,
+            option: None,
             answers: None,
         };
         let response = approve(
@@ -1402,6 +1413,72 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The option an answer picks decides whether the tool use goes
+    /// ahead, whatever its `allow` says; an option the request didn't
+    /// offer is a 400.
+    #[tokio::test]
+    async fn an_option_decides_the_answer() {
+        use grenadine_core::api::{ApprovalKind, ApprovalOption};
+        let state = crate::sync::test_state();
+        let id = "00000000-0000-0000-0000-000000000001";
+        state
+            .db
+            .create_agent(&AgentSession {
+                title: "t".into(),
+                branch: "x".into(),
+                worktree: "/w".into(),
+                base_sha: "s".into(),
+                ..AgentSession::fixture(id, "o/n")
+            })
+            .unwrap();
+        let option = |id: &str, kind| ApprovalOption {
+            id: id.into(),
+            label: id.into(),
+            kind,
+        };
+        let rx = agent::request_approval(
+            &state,
+            id,
+            "t",
+            "Bash",
+            &serde_json::json!({}),
+            vec![
+                option("allow_once", ApprovalKind::AllowOnce),
+                option("reject_once", ApprovalKind::RejectOnce),
+            ],
+        )
+        .unwrap();
+        let approval = |option: &str| Approval {
+            id: "t".into(),
+            allow: true,
+            message: None,
+            mode: None,
+            option: Some(option.into()),
+            answers: None,
+        };
+        let response = approve(
+            AxState(state.clone()),
+            Path(id.to_owned()),
+            Json(approval("allow_always")),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = approve(
+            AxState(state.clone()),
+            Path(id.to_owned()),
+            Json(approval("reject_once")),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let decision = rx.await.unwrap();
+        assert!(!decision.allow);
+        assert_eq!(decision.option.as_deref(), Some("reject_once"));
     }
 
     /// A permission mode the backend doesn't list is a 400, like an

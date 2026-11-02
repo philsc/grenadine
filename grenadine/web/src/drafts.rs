@@ -93,17 +93,18 @@ impl Drafts {
             now as u64,
             (js_sys::Math::random() * f64::from(u32::MAX)) as u32
         );
+        let backend = crate::agents::last_backend();
         self.0.update(|list| {
             list.push(Draft {
                 id: id.clone(),
                 repo: repo.unwrap_or_else(|| GENERAL.to_owned()),
                 pr: pr.map(|n| n.to_string()).unwrap_or_default(),
                 prompt: String::new(),
-                backend: AgentBackend::Claude,
+                backend,
                 // New sessions start out planning, whatever the others go
                 // on with.
                 mode: PermissionMode::plan(),
-                model: crate::agents::last_model(),
+                model: crate::agents::last_model(backend),
                 created_at: now,
             })
         });
@@ -119,14 +120,15 @@ impl Drafts {
         {
             return d;
         }
+        let backend = crate::agents::last_backend();
         let d = Draft {
             id: id.to_owned(),
             repo: GENERAL.to_owned(),
             pr: String::new(),
             prompt: String::new(),
-            backend: AgentBackend::Claude,
+            backend,
             mode: PermissionMode::plan(),
-            model: crate::agents::last_model(),
+            model: crate::agents::last_model(backend),
             created_at: js_sys::Date::now(),
         };
         self.0.update(|list| list.push(d.clone()));
