@@ -1,7 +1,8 @@
 //! The diff between two commits, computed in the browser from blobs the
 //! server sends, and the diffs of an agent's file edits and worktree.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -314,6 +315,39 @@ struct Mark {
     inss: Vec<Range<usize>>,
 }
 
+/// A shape's sides' blob IDs.
+type ShapeKey = (String, String);
+
+/// How many shapes are kept.
+const SHAPES: usize = 500;
+
+thread_local! {
+    /// Shapes by their sides' blob IDs, oldest first.
+    static SHAPE_CACHE: RefCell<VecDeque<(ShapeKey, Arc<Shape>)>> = RefCell::default();
+}
+
+/// The file's shape, kept for the life of the page when the file has no
+/// upstream change, so that coming back to a diff doesn't redo it.
+fn cached_shape(file: &FileData, old_id: &str, new_id: &str) -> Arc<Shape> {
+    if file.upstream.is_some() {
+        return Arc::new(shape(file));
+    }
+    let key = (old_id.to_owned(), new_id.to_owned());
+    if let Some(s) =
+        SHAPE_CACHE.with_borrow(|c| c.iter().find(|(k, _)| *k == key).map(|(_, s)| s.clone()))
+    {
+        return s;
+    }
+    let s = Arc::new(shape(file));
+    SHAPE_CACHE.with_borrow_mut(|c| {
+        if c.len() >= SHAPES {
+            c.pop_front();
+        }
+        c.push_back((key, s.clone()));
+    });
+    s
+}
+
 fn shape(file: &FileData) -> Shape {
     let upstream = file
         .upstream
@@ -526,7 +560,6 @@ fn FileView(
         // Laid out plain on first expansion, and again once both sides are
         // highlighted; the flag says which.
         let cache = StoredValue::new_local(None::<(bool, Arc<Layout>)>);
-        let shape_cache = StoredValue::new_local(None::<Arc<Shape>>);
         move || {
             if !expanded.get() {
                 return ().into_any();
@@ -550,11 +583,7 @@ fn FileView(
                     .map(|(_, l)| l.clone())
             });
             let l = cached.unwrap_or_else(|| {
-                let shape = shape_cache.with_value(Clone::clone).unwrap_or_else(|| {
-                    let s = Arc::new(shape(&file));
-                    shape_cache.set_value(Some(s.clone()));
-                    s
-                });
+                let shape = cached_shape(&file, &old_lines.id, &new_lines.id);
                 let l = Arc::new(layout(shape, old_lines.html(), new_lines.html()));
                 cache.set_value(Some((highlighted, l.clone())));
                 l
