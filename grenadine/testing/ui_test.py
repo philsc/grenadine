@@ -1435,6 +1435,20 @@ class VersionsTest(ServerTestCase):
             self.file("kinds/old_name.txt → kinds/new_name.txt").locator(".stats")
         ).to_have_text("+0 −0")
 
+    def test_big_diff_renders_every_file_highlighted(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        expect(self.page.locator(".diff-summary")).to_have_text(
+            f"{len(scenarios.BIG_FILES)} files changed"
+        )
+        # The later files render after the first ones, plain at first and
+        # highlighted once the background highlighter gets to them.
+        expect(self.page.locator(".diff-placeholder")).to_have_count(0)
+        for path in scenarios.BIG_FILES:
+            with self.subTest(path=path):
+                file = self.file(path)
+                expect(file.locator("tr.line td.code.add")).to_have_count(300)
+                expect(file.locator("td.code .sy-storage").first).to_have_text("def")
+
 
 # A new session's form; each is a draft of its own.
 DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"

@@ -310,7 +310,7 @@ async fn work() {
 }
 
 /// Resolves in a later task, after the page had a chance to paint.
-async fn next_task() {
+pub async fn next_task() {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         let _ = web_sys::window()
             .expect("no window")

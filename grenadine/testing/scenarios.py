@@ -219,6 +219,14 @@ GROW = "Grow one push at a time"
 REBASE = "Rebase onto a newer main"
 REBASE_AND_EDIT = "Rebase and edit in one push"
 FILE_KINDS = "Change every kind of file"
+BIG_DIFF = "Add more files than render at once"
+# Enough rows that the later files render after the first ones paint.
+BIG_FILES = [f"big/module_{i}.py" for i in range(6)]
+
+
+def big_module(i: int) -> str:
+    return "".join(f"def f{i}_{n}():\n    return {n}\n" for n in range(150))
+
 
 STEPS_PY = "versions/steps.py"
 
@@ -354,6 +362,14 @@ def versions_cases(gh: FakeGitHub) -> Versions:
     repo.push("case/file-kinds")
     prs[FILE_KINDS] = repo.open_pr(FILE_KINDS, head="case/file-kinds")
     shas[FILE_KINDS] = v
+
+    repo.checkout("case/big-diff", "main")
+    v = [
+        repo.commit(BIG_DIFF, {path: big_module(i) for i, path in enumerate(BIG_FILES)})
+    ]
+    repo.push("case/big-diff")
+    prs[BIG_DIFF] = repo.open_pr(BIG_DIFF, head="case/big-diff")
+    shas[BIG_DIFF] = v
 
     return Versions(prs, shas)
 
