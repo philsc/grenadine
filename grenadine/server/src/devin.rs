@@ -1740,7 +1740,9 @@ mod tests {
             dir.path(),
             json!({"gate": dir.path().join("never").to_str().unwrap()}),
         );
-        let e = list_models_within(&exe, Duration::from_millis(500))
+        // Long enough for the fake to start and reach the gate on a slow
+        // machine; a Python start-up alone can take most of a second.
+        let e = list_models_within(&exe, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("in time"), "{e:#}");
