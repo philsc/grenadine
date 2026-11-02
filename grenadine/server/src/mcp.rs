@@ -427,23 +427,12 @@ mod tests {
         state
             .db
             .create_agent(&AgentSession {
-                id: ID.into(),
-                repo: "o/n".into(),
-                pr: None,
                 title: "t".into(),
-                summary: None,
                 branch: "b".into(),
                 worktree: "/w".into(),
                 base_sha: "s".into(),
                 status: AgentStatus::Running,
-                created_at: 0,
-                cost_usd: 0.0,
-                context_tokens: None,
-                context_window: None,
-                model: None,
-                landed: None,
-                prs: None,
-                unstaged: 0,
+                ..AgentSession::fixture(ID, "o/n")
             })
             .unwrap();
         state
@@ -747,7 +736,7 @@ mod tests {
     fn allowed_answers() {
         let plan = json!({"plan": "# Plan", "planFilePath": "/p.md"});
         assert_eq!(
-            allowed(&plan, Some(PermissionMode::AcceptEdits), None),
+            allowed(&plan, Some("acceptEdits".into()), None),
             json!({
                 "behavior": "allow",
                 "updatedInput": plan,

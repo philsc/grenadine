@@ -1,9 +1,9 @@
-//! Claude Code sessions driven from the UI. Each session works in its own
-//! git worktree; every prompt runs one `claude -p` process that resumes
-//! the session and reads the prompt as a stream-json message, and its
-//! stream-json output becomes the session's transcript. Each prompt comes with a permission mode; Claude asks about
-//! the tool uses that the mode doesn't decide on its own through the MCP
-//! tool in `mcp.rs`, which waits for the user's answer from the page.
+//! Agent sessions driven from the UI. Each session works in its own git
+//! worktree; every prompt runs one turn with the session's `Backend` (the
+//! Claude Code backend is in `claude.rs`), and the turn's output becomes
+//! the session's transcript. Each prompt comes with a permission mode;
+//! the backend asks about the tool uses that the mode doesn't decide on
+//! its own, and the user answers on the page.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::ffi::OsStrExt as _;
@@ -14,35 +14,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
+use futures::future::BoxFuture;
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, GENERAL, Landed,
-    LandedPr, NewAgent, PatchHunk, PermissionMode, PrKey, PromptImage, ServerEvent, WrapUp,
-    WrapUpTarget,
+    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
+    AgentStatus, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey, PromptImage,
+    ServerEvent, WrapUp, WrapUpTarget,
 };
-use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{OnceCell, broadcast, oneshot};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
+use tokio::sync::{broadcast, oneshot};
 
+use crate::claude;
 use crate::git::Repo;
 use crate::reflow::reflow;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
 const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
-
-/// How long Claude Code waits for an MCP tool call, in milliseconds. The
-/// permission tool waits for a person, so make it the most Claude Code
-/// allows (about 24 days). 0 doesn't mean "never" here; it becomes 1s.
-const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
-
-/// How long Claude Code lets an MCP tool call go without a response or
-/// progress before it gives up, in milliseconds. It's 5 minutes for HTTP
-/// servers by default, which would cut off a person who's away from the
-/// page. 0 turns the check off.
-const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
-
-/// How much of claude's stderr is kept to explain a crash.
-const STDERR_TAIL: usize = 4096;
 
 /// The most images one prompt may come with.
 pub const MAX_IMAGES: usize = 20;
@@ -62,6 +50,9 @@ const IMAGE_TYPES: [(&str, &str); 4] = [
 /// How long a deleted session's processes get to exit before they're
 /// killed.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of a backend's stderr is kept to explain a crash.
+const STDERR_TAIL: usize = 4096;
 
 /// What Claude is asked when there's uncommitted work to wrap up.
 const COMMIT_PROMPT: &str = "Wrap up: commit all of your changes with descriptive commit \
@@ -113,9 +104,180 @@ pub struct Decision {
     pub answers: Option<BTreeMap<String, String>>,
 }
 
+/// An agent backend: what runs sessions' turns and background jobs.
+/// Adding one takes an impl of this and an arm in `Agents::backend`; what
+/// it offers that never changes, like its permission modes, is on
+/// `AgentBackend`.
+pub trait Backend: Send + Sync {
+    /// The models it offers; none while they can't be listed.
+    fn models(&self) -> BoxFuture<'_, Vec<AgentModelInfo>>;
+
+    /// Runs `turn` of `session` and returns the status the session ends
+    /// up in; `sink` gets what the turn's output means for the transcript.
+    fn turn<'a>(
+        &'a self,
+        state: &'a State,
+        session: &'a AgentSession,
+        turn: Turn<'a>,
+        sink: TurnSink<'a>,
+    ) -> BoxFuture<'a, Result<AgentStatus>>;
+
+    /// Runs `job` and returns its answer, in the shape of its schema.
+    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>>;
+}
+
+/// One prompt's turn: what it says and how it runs.
+pub struct Turn<'a> {
+    pub prompt: &'a str,
+    pub images: &'a [String],
+    pub mode: &'a PermissionMode,
+    /// `None` or `default` keeps the backend's default.
+    pub model: Option<String>,
+    /// The session's grenadine MCP endpoint.
+    pub mcp_url: &'a str,
+    /// Appended to the agent's system prompt.
+    pub notes: &'a [String],
+}
+
+/// A run that answers in a JSON schema's shape without a session, for the
+/// background jobs like summaries and cleanup scans.
+pub struct StructuredJob<'a> {
+    /// What it's called in errors.
+    pub name: &'a str,
+    pub model: &'a str,
+    pub schema: &'a Value,
+    pub input: &'a str,
+    /// The tools it has, comma-separated; `None` leaves the backend's.
+    pub tools: Option<&'a str>,
+    /// The tools it may use without asking.
+    pub allowed: &'a [&'a str],
+    /// What it may spend, in USD.
+    pub budget_usd: &'a str,
+    /// Whether to load only the user's settings, not a project's.
+    pub setting_sources_user: bool,
+    /// A directory it may read besides `cwd`.
+    pub add_dir: Option<&'a Path>,
+    pub cwd: &'a Path,
+    /// How long it may take before it's killed.
+    pub timeout: Duration,
+}
+
+/// Stops a turn the way Ctrl-C would. Interrupting a turn again stops it
+/// again.
+#[derive(Clone)]
+pub struct Stopper(Arc<dyn Fn() + Send + Sync>);
+
+impl Stopper {
+    pub fn new(stop: impl Fn() + Send + Sync + 'static) -> Stopper {
+        Stopper(Arc::new(stop))
+    }
+
+    /// Sends `child` SIGINT.
+    pub fn sigint(child: &tokio::process::Child) -> Stopper {
+        let pid = child.id();
+        Stopper::new(move || {
+            if let Some(pid) = pid {
+                interrupt_pid(pid);
+            }
+        })
+    }
+
+    pub fn stop(&self) {
+        (self.0)()
+    }
+}
+
+/// A command that runs a backend's `exe` for a turn of `session`: in its
+/// worktree, in its systemd slice if it has one, outside the server's
+/// process group, with its stdio piped, killed when it's dropped.
+pub fn backend_command(
+    state: &State,
+    session: &AgentSession,
+    exe: &Path,
+) -> tokio::process::Command {
+    // `systemd-run --scope` execs `exe`, so the PID stays its own.
+    let mut cmd = if let Some(slice) = state.agents.slice_of(&session.id) {
+        let mut cmd = tokio::process::Command::new("systemd-run");
+        cmd.args(["--user", "--scope", "--quiet", "--collect"])
+            .arg(format!("--slice={slice}"))
+            .arg("--")
+            .arg(exe);
+        cmd
+    } else {
+        tokio::process::Command::new(exe)
+    };
+    cmd.current_dir(&session.worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Keep it out of the terminal's process group, like git in
+    // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
+    // SAFETY: setsid is async-signal-safe and the closure touches no
+    // memory outside the call.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Reads all of a backend's `stderr`; the task returns its end, to
+/// explain a crash.
+pub fn stderr_tail(
+    mut stderr: impl AsyncRead + Unpin + Send + 'static,
+) -> tokio::task::JoinHandle<String> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).trim().to_owned();
+        let start = text.len().saturating_sub(STDERR_TAIL);
+        let start = (start..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        text[start..].to_owned()
+    })
+}
+
+/// A backend's output, line by line. When the server shuts down
+/// meanwhile, the turn is stopped once and the output read on until it
+/// ends.
+pub struct OutputLines<R> {
+    lines: tokio::io::Lines<BufReader<R>>,
+    stopper: Stopper,
+    stopping: bool,
+}
+
+impl<R: AsyncRead + Unpin> OutputLines<R> {
+    pub fn new(out: R, stopper: Stopper) -> OutputLines<R> {
+        OutputLines {
+            lines: BufReader::new(out).lines(),
+            stopper,
+            stopping: false,
+        }
+    }
+
+    /// The next line; `None` once the output ends.
+    pub async fn next(&mut self, state: &State) -> Result<Option<String>> {
+        loop {
+            tokio::select! {
+                line = self.lines.next_line() => return Ok(line?),
+                _ = state.shutdown.cancelled(), if !self.stopping => {
+                    self.stopping = true;
+                    self.stopper.stop();
+                }
+            }
+        }
+    }
+}
+
 pub struct Agents {
-    /// The `claude` executable.
-    claude: PathBuf,
+    /// The Claude Code backend.
+    claude: claude::Claude,
     /// Worktrees go to `<dir>/<owner>/<name>/<id>`.
     worktrees: PathBuf,
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
@@ -127,8 +289,6 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
-    /// The models Claude Code offers, once it has listed them.
-    models: OnceCell<Vec<AgentModelInfo>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether Haiku summarizes each new session's first prompt.
@@ -147,8 +307,8 @@ struct Live {
     queue: VecDeque<Queued>,
     /// Whether a task is running the queued prompts.
     running: bool,
-    /// The current claude process.
-    pid: Option<u32>,
+    /// Stops the current turn.
+    stopper: Option<Stopper>,
     /// The user stopped the current turn.
     interrupted: bool,
     /// Permission requests by tool use ID.
@@ -173,7 +333,7 @@ impl Live {
             secret: random_hex(16),
             queue: VecDeque::new(),
             running: false,
-            pid: None,
+            stopper: None,
             interrupted: false,
             pending: HashMap::new(),
             wrap_up: None,
@@ -435,8 +595,12 @@ pub fn remove_orphaned_worktrees(
     // Git keeps the path the worktree was added at, which needn't be the
     // canonical one.
     let added = std::path::absolute(worktrees)?;
-    let owned: std::collections::BTreeSet<String> =
-        db.agents()?.into_iter().map(|s| s.branch).collect();
+    // Even sessions this build can't run own what they own.
+    let owned: std::collections::BTreeSet<String> = db
+        .agents_unchecked()?
+        .into_iter()
+        .map(|(s, _)| s.branch)
+        .collect();
     for (slug, cloned) in repos {
         let repo = &cloned.repo;
         let dirs = [root.join(slug), added.join(slug)];
@@ -449,7 +613,7 @@ pub fn remove_orphaned_worktrees(
             }) else {
                 continue;
             };
-            if db.agent(id)?.is_some() {
+            if db.agent_unchecked(id)?.is_some() {
                 continue;
             }
             if let Err(e) = repo.worktree_remove_only(&path) {
@@ -486,7 +650,7 @@ pub fn remove_orphaned_worktrees(
         else {
             continue;
         };
-        if db.agent(id)?.is_some() {
+        if db.agent_unchecked(id)?.is_some() {
             continue;
         }
         match remove_tree(&path) {
@@ -529,17 +693,16 @@ impl Agents {
         summaries: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
-        // Claude Code runs in the worktrees, so a relative path would
+        // The backend runs in the worktrees, so a relative path would
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude,
+            claude: claude::Claude::new(claude),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
             slices,
             live: std::sync::Mutex::default(),
-            models: OnceCell::new(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
             terminals: crate::terminal::Terminals::default(),
@@ -552,9 +715,11 @@ impl Agents {
         self.slices.then(|| slice(id))
     }
 
-    /// The `claude` executable.
-    pub fn claude(&self) -> &Path {
-        &self.claude
+    /// What runs the turns and background jobs of `backend`.
+    pub fn backend(&self, backend: AgentBackend) -> &dyn Backend {
+        match backend {
+            AgentBackend::Claude => &self.claude,
+        }
     }
 
     /// Where the images sent with prompts go.
@@ -568,6 +733,23 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
+    /// Lets `interrupt` stop the current turn with `stopper`. An
+    /// interrupt that came before the turn's process existed stops it now.
+    pub fn set_stopper(&self, id: &str, stopper: Stopper) {
+        let interrupted = self.with_live(id, |l| {
+            l.stopper = Some(stopper.clone());
+            l.interrupted
+        });
+        if interrupted {
+            stopper.stop();
+        }
+    }
+
+    /// Whether the user stopped the current turn.
+    fn interrupted(&self, id: &str) -> bool {
+        self.with_live(id, |l| l.interrupted)
+    }
+
     /// The secret the session's MCP endpoint expects.
     pub fn secret(&self, id: &str) -> String {
         self.with_live(id, |l| l.secret.clone())
@@ -577,92 +759,28 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The models Claude Code offers, listed once and kept; none while it
-    /// can't list them.
-    pub async fn models(&self) -> Vec<AgentModelInfo> {
-        match self
-            .models
-            .get_or_try_init(|| list_models(&self.claude))
-            .await
-        {
-            Ok(models) => models.clone(),
-            Err(e) => {
-                tracing::warn!("listing Claude Code's models: {e:#}");
-                Vec::new()
-            }
+    /// The models each backend offers, for the pickers: empty when they
+    /// can't be listed.
+    pub async fn backends(&self) -> Vec<AgentBackendInfo> {
+        let mut infos = Vec::new();
+        for backend in AgentBackend::ALL {
+            infos.push(backend.info(self.backend(backend).models().await));
         }
+        infos
     }
 
-    /// Whether prompts may ask for `model`: Claude Code's default, or one
-    /// it lists.
-    pub async fn offers(&self, model: Option<&str>) -> bool {
-        match model {
-            None => true,
-            Some(m) => self.models().await.iter().any(|i| i.value == m),
+    /// Whether `backend` lets prompts ask for `model`: its default, or
+    /// one it lists. While it can't list them, there's no telling, so any
+    /// that can't pass for a flag goes and the backend itself rejects one
+    /// it doesn't have.
+    pub async fn offers(&self, backend: AgentBackend, model: Option<&str>) -> bool {
+        let Some(m) = model else { return true };
+        let models = self.backend(backend).models().await;
+        if models.is_empty() {
+            return !m.is_empty() && !m.starts_with('-');
         }
+        models.iter().any(|i| i.value == m)
     }
-}
-
-/// The `initialize` control request the Agent SDK starts with. Claude Code
-/// answers it without calling a model.
-const INITIALIZE: &str =
-    r#"{"type":"control_request","request_id":"models","request":{"subtype":"initialize"}}"#;
-
-/// Asks Claude Code for its models the way the Agent SDK does.
-async fn list_models(claude: &Path) -> Result<Vec<AgentModelInfo>> {
-    let mut child = tokio::process::Command::new(claude)
-        .args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--no-session-persistence",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("running {}", claude.display()))?;
-    // Stdin stays open until the answer is in, so claude waits for more.
-    let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(format!("{INITIALIZE}\n").as_bytes())
-        .await?;
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let read = async {
-        while let Some(line) = lines.next_line().await? {
-            if let Some(models) = parse_models(&line) {
-                return Ok(models);
-            }
-        }
-        bail!("claude exited without listing its models")
-    };
-    let models = tokio::time::timeout(std::time::Duration::from_secs(30), read)
-        .await
-        .context("claude didn't list its models in time")?;
-    drop(stdin);
-    let _ = child.kill().await;
-    models
-}
-
-/// The models in the answer to `INITIALIZE`, if `line` is that answer.
-/// Entries that don't parse are skipped.
-fn parse_models(line: &str) -> Option<Vec<AgentModelInfo>> {
-    let v = serde_json::from_str::<Value>(line).ok()?;
-    let response = &v["response"];
-    if v["type"] != "control_response" || response["request_id"] != "models" {
-        return None;
-    }
-    Some(
-        response["response"]["models"]
-            .as_array()?
-            .iter()
-            .filter_map(|m| serde_json::from_value(m.clone()).ok())
-            .collect(),
-    )
 }
 
 /// Stores an event (unless it's ephemeral) and sends it to open pages. The
@@ -714,6 +832,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
 
     let session = AgentSession {
         id: id.clone(),
+        backend: req.backend,
         repo: req.repo,
         pr: req.pr,
         title: title(&req.prompt),
@@ -723,7 +842,8 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         base_sha,
         status: AgentStatus::Idle,
         created_at: now(),
-        cost_usd: 0.0,
+        cost: 0.0,
+        cost_unit: req.backend.cost_unit(),
         context_tokens: None,
         context_window: None,
         model: None,
@@ -799,7 +919,7 @@ async fn add_worktree(
 }
 
 /// Queues a prompt; it runs once the turns before it are done, with
-/// `model` or else Claude Code's default.
+/// `model` or else the backend's default.
 pub fn send(
     state: &Arc<State>,
     id: &str,
@@ -833,7 +953,7 @@ pub fn send_with_images(
     }
 }
 
-/// Why Claude can't take `images`, if it can't.
+/// Why the agent can't take `images`, if it can't.
 pub fn check_images(images: &[PromptImage]) -> Option<String> {
     if images.len() > MAX_IMAGES {
         return Some(format!("a prompt can have at most {MAX_IMAGES} images"));
@@ -862,7 +982,7 @@ fn extension(media_type: &str) -> Option<&'static str> {
 }
 
 /// The media type of the image stored as `name`.
-fn media_type(name: &str) -> Option<&'static str> {
+pub(crate) fn media_type(name: &str) -> Option<&'static str> {
     let (_, ext) = name.rsplit_once('.')?;
     IMAGE_TYPES.iter().find(|(_, e)| *e == ext).map(|(t, _)| *t)
 }
@@ -905,8 +1025,11 @@ pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
     let Ok(dirs) = std::fs::read_dir(images) else {
         return Ok(());
     };
-    let owned: std::collections::BTreeSet<String> =
-        db.agents()?.into_iter().map(|s| s.id).collect();
+    let owned: std::collections::BTreeSet<String> = db
+        .agents_unchecked()?
+        .into_iter()
+        .map(|(s, _)| s.id)
+        .collect();
     for dir in dirs.flatten() {
         let name = dir.file_name().to_string_lossy().into_owned();
         if valid_id(&name) && !owned.contains(&name) {
@@ -916,45 +1039,16 @@ pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The stream-json user message that gives Claude `prompt` with the images
-/// in `dir` named `images`. The text goes last: Claude Code only takes a
-/// prompt for a slash command when its last block is the command.
-async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<String> {
-    let mut content = Vec::new();
-    for name in images {
-        let bytes = tokio::fs::read(dir.join(name))
-            .await
-            .with_context(|| format!("can't read the image {name}"))?;
-        content.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type(name).unwrap_or("image/png"),
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            },
-        }));
-    }
-    if !prompt.trim().is_empty() {
-        content.push(json!({"type": "text", "text": prompt}));
-    }
-    let message = json!({
-        "type": "user",
-        "message": {"role": "user", "content": content},
-        "parent_tool_use_id": null,
-    });
-    Ok(format!("{message}\n"))
-}
-
 /// Stops the current turn and drops the queued prompts.
 pub fn interrupt(state: &State, id: &str) {
-    let pending = state.agents.with_live(id, |l| {
+    let (stopper, pending) = state.agents.with_live(id, |l| {
         l.queue.clear();
         l.interrupted = l.running;
-        if let Some(pid) = l.pid {
-            interrupt_pid(pid);
-        }
-        std::mem::take(&mut l.pending)
+        (l.stopper.clone(), std::mem::take(&mut l.pending))
     });
+    if let Some(stopper) = stopper {
+        stopper.stop();
+    }
     for (tool_use, tx) in pending {
         let _ = tx.send(Decision {
             allow: false,
@@ -1039,9 +1133,10 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
 
 /// Stops the session and removes it along with its worktree and branch, or
 /// a general session's directory. Returns false when there is no such
-/// session.
+/// session. A session whose backend this build doesn't know goes too, but
+/// isn't scanned.
 pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
-    let Some(session) = state.db.agent(id)? else {
+    let Some((session, known)) = state.db.agent_unchecked(id)? else {
         return Ok(false);
     };
     // Without its clone the worktree and branch would stay behind with
@@ -1120,7 +1215,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     state.agents.live.lock().unwrap().remove(id);
     state.agents.terminals.forget(id);
     state.send(ServerEvent::AgentsChanged);
-    crate::cleanup::scan(state, scanned, events);
+    if known {
+        crate::cleanup::scan(state, scanned, events);
+    }
     Ok(true)
 }
 
@@ -1144,10 +1241,14 @@ async fn run(state: Arc<State>, id: String) {
             if last == AgentStatus::Idle {
                 continue_wrap_up(&state, &id).await;
             } else if state.agents.with_live(&id, |l| l.wrap_up.take()).is_some() {
+                let agent = match state.db.agent(&id) {
+                    Ok(Some(s)) => s.backend.agent_name(),
+                    _ => AgentBackend::default().agent_name(),
+                };
                 let _ = emit(
                     &state,
                     &id,
-                    AgentEventKind::WrapUpFailed("Claude's turn didn't finish".into()),
+                    AgentEventKind::WrapUpFailed(format!("{agent}'s turn didn't finish")),
                 );
             }
             return;
@@ -1161,7 +1262,7 @@ async fn run(state: Arc<State>, id: String) {
             }
         };
         let interrupted = state.agents.with_live(&id, |l| {
-            l.pid = None;
+            l.stopper = None;
             l.interrupted
         });
         let status = if interrupted {
@@ -1495,14 +1596,6 @@ fn terminals_note(state: &State, id: &str) -> Option<String> {
     ))
 }
 
-/// The grenadine MCP server's tools that Claude may use without asking.
-const ALLOWED_TOOLS: [&str; 4] = [
-    "mcp__grenadine__list_terminals",
-    "mcp__grenadine__read_terminal",
-    "mcp__grenadine__wait_for_terminal",
-    "mcp__grenadine__show_image",
-];
-
 /// A PR's title and body for a commit with `message`. The body is
 /// rewrapped at 72 columns so GitHub's squash merge doesn't wrap it again.
 fn pr_text(message: &str) -> (String, String) {
@@ -1510,7 +1603,8 @@ fn pr_text(message: &str) -> (String, String) {
     (subject.trim().to_owned(), reflow(body.trim(), 72))
 }
 
-/// Runs one prompt and returns the status the session ends up in.
+/// Runs one prompt with the session's backend and returns the status the
+/// session ends up in.
 async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatus> {
     let Queued {
         prompt,
@@ -1533,204 +1627,127 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         tokio::fs::create_dir_all(&session.worktree).await?;
     }
 
-    let mcp = json!({
-        "mcpServers": {
-            "grenadine": {
-                "type": "http",
-                "url": format!("{}/mcp/{id}/{}", state.agents.base_url, state.agents.secret(id)),
-            }
-        }
-    });
+    let mcp_url = format!(
+        "{}/mcp/{id}/{}",
+        state.agents.base_url,
+        state.agents.secret(id)
+    );
     let notes: Vec<_> = [landed_note(&session), terminals_note(state, id)]
         .into_iter()
         .flatten()
         .collect();
-    // `systemd-run --scope` execs claude, so the PID stays claude's.
-    let mut cmd = if state.agents.slices {
-        let mut cmd = tokio::process::Command::new("systemd-run");
-        cmd.args(["--user", "--scope", "--quiet", "--collect"])
-            .arg(format!("--slice={}", slice(id)))
-            .arg("--")
-            .arg(&state.agents.claude);
-        cmd
-    } else {
-        tokio::process::Command::new(&state.agents.claude)
+    let sink = TurnSink::new(state, id, &session.repo);
+    let turn = Turn {
+        prompt: &prompt,
+        images: &images,
+        mode: &mode,
+        model,
+        mcp_url: &mcp_url,
+        notes: &notes,
     };
-    cmd.arg("-p");
-    if state.db.agent_started(id)? {
-        cmd.args(["--resume", id]);
-    } else {
-        cmd.args(["--session-id", id]);
-    }
-    cmd.args([
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--permission-mode",
-        mode.as_str(),
-        "--permission-prompt-tool",
-        "mcp__grenadine__approve",
-    ])
-    .arg("--allowedTools")
-    .args(ALLOWED_TOOLS)
-    .arg("--mcp-config")
-    .arg(mcp.to_string())
-    .args(
-        (!notes.is_empty())
-            .then(|| notes.join("\n\n"))
-            .into_iter()
-            .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
-    )
-    .current_dir(&session.worktree)
-    .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
-    .env(
-        "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
-        MCP_TOOL_IDLE_TIMEOUT_MS,
-    )
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
-    if let Some(model) = model.filter(|m| m != "default") {
-        cmd.arg("--model").arg(model);
-    }
-    let input = user_message(&prompt, &state.agents.images.join(id), &images).await?;
-    // Keep claude out of the terminal's process group, like git in
-    // `Repo::command`, so Ctrl-C on the server doesn't reach it directly.
-    // SAFETY: setsid is async-signal-safe and the closure touches no
-    // memory outside the call.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("can't run {}", state.agents.claude.display()))?;
-    if let Some(pid) = child.id() {
-        // An interrupt that came before the process existed applies now.
-        if state.agents.with_live(id, |l| {
-            l.pid = Some(pid);
-            l.interrupted
-        }) {
-            interrupt_pid(pid);
-        }
-    }
-    // The prompt goes through stdin so that one starting with `-` isn't
-    // taken for a flag. If claude exits without reading it, its exit status
-    // and stderr below say why.
-    let mut stdin = child.stdin.take().unwrap();
-    if let Err(e) = stdin.write_all(input.as_bytes()).await
-        && e.kind() != std::io::ErrorKind::BrokenPipe
-    {
-        return Err(e.into());
-    }
-    drop(stdin);
+    state
+        .agents
+        .backend(session.backend)
+        .turn(state, &session, turn, sink)
+        .await
+}
 
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
-        let text = String::from_utf8_lossy(&buf).trim().to_owned();
-        let start = text.len().saturating_sub(STDERR_TAIL);
-        let start = (start..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(0);
-        text[start..].to_owned()
-    });
+/// What a backend's turn feeds its output into: the session's transcript
+/// and the bookkeeping that goes with it.
+pub struct TurnSink<'a> {
+    state: &'a State,
+    id: &'a str,
+    repo: &'a str,
+    /// Whether the turn ended, and successfully.
+    ended: Option<bool>,
+    /// The cost already added to the session's.
+    billed: f64,
+    /// Whether the last event shown ended the turn.
+    last_was_end: bool,
+    prs: OpenedPrs,
+}
 
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut ended = None;
-    // The cost already added to the session's, and whether the last event
-    // shown ended the turn.
-    let mut billed = 0.0;
-    let mut last_was_end = false;
-    let mut stopping = false;
-    let mut prs = OpenedPrs::default();
-    loop {
-        let line = tokio::select! {
-            line = lines.next_line() => line?,
-            _ = state.shutdown.cancelled(), if !stopping => {
-                stopping = true;
-                if let Some(pid) = child.id() {
-                    interrupt_pid(pid);
-                }
-                continue;
-            }
-        };
-        let Some(line) = line else { break };
-        match parse_line(&line) {
-            Parsed::Started { model } => {
-                state.db.set_agent_started(id)?;
-                // The window is only known once a turn's result reports it;
-                // the model's name doesn't tell, since Claude Code leaves
-                // `[1m]` off it.
-                if let Some(model) = model {
-                    state.db.set_agent_model(id, &model)?;
-                    emit(state, id, AgentEventKind::Model(model))?;
-                }
-            }
-            Parsed::Events(events) => {
-                for mut kind in events {
-                    store_images(state, id, &mut kind)?;
-                    if let AgentEventKind::Usage { tokens, window } = kind {
-                        record_usage(state, id, tokens, window)?;
-                        continue;
-                    }
-                    if let AgentEventKind::TurnEnded { error, cost_usd } = &kind {
-                        // The cost is the process's total so far, and a
-                        // process can report several results: one more for
-                        // each background task that finishes after the
-                        // answer.
-                        if let Some(cost) = cost_usd {
-                            state.db.add_agent_cost(id, cost - billed)?;
-                            billed = *cost;
-                        }
-                        let repeat = ended == Some(true) && last_was_end && error.is_none();
-                        ended = Some(error.is_none());
-                        if repeat {
-                            continue;
-                        }
-                    }
-                    last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
-                    let opened = prs.see(&session.repo, &kind);
-                    emit(state, id, kind)?;
-                    record_prs(state, id, &opened)?;
-                }
-            }
+impl<'a> TurnSink<'a> {
+    pub fn new(state: &'a State, id: &'a str, repo: &'a str) -> TurnSink<'a> {
+        TurnSink {
+            state,
+            id,
+            repo,
+            ended: None,
+            billed: 0.0,
+            last_was_end: false,
+            prs: OpenedPrs::default(),
         }
     }
-    let exit = child.wait().await?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    Ok(match ended {
-        Some(true) => AgentStatus::Idle,
-        Some(false) => AgentStatus::Failed,
-        None if state.agents.with_live(id, |l| l.interrupted) => {
-            emit(
-                state,
-                id,
-                AgentEventKind::TurnEnded {
-                    error: Some("interrupted".into()),
-                    cost_usd: None,
-                },
-            )?;
-            AgentStatus::Interrupted
+
+    /// The backend created (or resumed) its session, which later turns
+    /// resume by `backend_session_id`, with `model` if it's known.
+    pub fn started(&mut self, backend_session_id: &str, model: Option<String>) -> Result<()> {
+        self.state
+            .db
+            .set_backend_session(self.id, backend_session_id)?;
+        // The window is only known once a turn's result reports it; the
+        // model's name doesn't tell, since Claude Code leaves `[1m]` off
+        // it.
+        if let Some(model) = model {
+            self.state.db.set_agent_model(self.id, &model)?;
+            emit(self.state, self.id, AgentEventKind::Model(model))?;
         }
-        None => {
-            let mut message = format!("claude exited without finishing the turn ({exit})");
-            if !stderr.is_empty() {
-                message += &format!(":\n{stderr}");
+        Ok(())
+    }
+
+    /// Stores `kind` in the transcript the way a turn's events are kept:
+    /// images into the database, usage into the session's row, costs
+    /// billed and repeated turn ends suppressed.
+    pub fn event(&mut self, mut kind: AgentEventKind) -> Result<()> {
+        store_images(self.state, self.id, &mut kind)?;
+        if let AgentEventKind::Usage { tokens, window } = kind {
+            return record_usage(self.state, self.id, tokens, window);
+        }
+        if let AgentEventKind::TurnEnded { error, cost } = &kind {
+            // The cost is the process's total so far, and a process can
+            // report several results: one more for each background task
+            // that finishes after the answer.
+            if let Some(cost) = cost {
+                self.state.db.add_agent_cost(self.id, cost - self.billed)?;
+                self.billed = *cost;
             }
-            emit(state, id, AgentEventKind::Error(message))?;
-            AgentStatus::Failed
+            let repeat = self.ended == Some(true) && self.last_was_end && error.is_none();
+            self.ended = Some(error.is_none());
+            if repeat {
+                return Ok(());
+            }
         }
-    })
+        self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        let opened = self.prs.see(self.repo, &kind);
+        emit(self.state, self.id, kind)?;
+        record_prs(self.state, self.id, &opened)
+    }
+
+    /// How the turn went once the backend's output is done: `unfinished`
+    /// explains a turn that never reported an end.
+    pub fn finish(self, unfinished: impl FnOnce() -> String) -> Result<AgentStatus> {
+        let interrupted = self.state.agents.interrupted(self.id);
+        Ok(match self.ended {
+            Some(true) => AgentStatus::Idle,
+            Some(false) => AgentStatus::Failed,
+            None if interrupted => {
+                emit(
+                    self.state,
+                    self.id,
+                    AgentEventKind::TurnEnded {
+                        error: Some("interrupted".into()),
+                        cost: None,
+                    },
+                )?;
+                AgentStatus::Interrupted
+            }
+            None => {
+                emit(self.state, self.id, AgentEventKind::Error(unfinished()))?;
+                AgentStatus::Failed
+            }
+        })
+    }
 }
 
 /// The PRs that GitHub URLs in `text` point to.
@@ -1812,53 +1829,6 @@ fn record_prs(state: &State, id: &str, prs: &[PrKey]) -> Result<()> {
     Ok(())
 }
 
-/// What one line of `--output-format stream-json` means for the transcript.
-#[derive(Debug, PartialEq)]
-enum Parsed {
-    /// Claude Code created (or resumed) its session with `model`.
-    Started {
-        model: Option<String>,
-    },
-    Events(Vec<AgentEventKind>),
-}
-
-/// The text of a tool result, whose content is a string or a list of blocks.
-fn result_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|b| match b["type"].as_str() {
-                Some("text") => b["text"].as_str().unwrap_or_default().to_owned(),
-                Some(other) => format!("[{other}]"),
-                None => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
-/// The images in a tool result as `data:` URLs, which `store_images`
-/// replaces with ids before the result is stored.
-fn result_images(content: &Value) -> Vec<String> {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|b| b["type"] == "image" && b["source"]["type"] == "base64")
-        .filter_map(|b| {
-            let source = &b["source"];
-            Some(format!(
-                "data:{};base64,{}",
-                source["media_type"].as_str()?,
-                source["data"].as_str()?
-            ))
-        })
-        .collect()
-}
-
 /// Stores an image of session `id`'s transcript and returns its new id.
 pub fn store_image(state: &State, id: &str, mime: &str, data: &[u8]) -> Result<String> {
     let image = uuid();
@@ -1890,135 +1860,10 @@ fn store_images(state: &State, id: &str, kind: &mut AgentEventKind) -> Result<()
     Ok(())
 }
 
-/// The hunks of a file tool's `structuredPatch`, or none when the result
-/// has no patch.
-fn patch(result: &Value) -> Vec<PatchHunk> {
-    result["structuredPatch"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|h| {
-            Some(PatchHunk {
-                old_start: h["oldStart"].as_u64()? as usize,
-                new_start: h["newStart"].as_u64()? as usize,
-                lines: h["lines"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(|l| Some(l.as_str()?.to_owned()))
-                    .collect(),
-            })
-        })
-        .collect()
-}
-
-/// How many tokens the context holds after an assistant message.
-fn context_tokens(usage: &Value) -> Option<u64> {
-    if !usage.is_object() {
-        return None;
-    }
-    let fields = [
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    ];
-    Some(fields.iter().filter_map(|f| usage[f].as_u64()).sum())
-}
-
-/// Picks the parts of a stream-json line that the transcript shows. Lines
-/// of subagents (with a `parent_tool_use_id`) and unknown lines are
-/// skipped, so a newer Claude Code degrades to showing less.
-fn parse_line(line: &str) -> Parsed {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return Parsed::Events(Vec::new());
-    };
-    if !v["parent_tool_use_id"].is_null() {
-        return Parsed::Events(Vec::new());
-    }
-    let blocks = || v["message"]["content"].as_array().into_iter().flatten();
-    let events = match v["type"].as_str() {
-        Some("system") if v["subtype"] == "init" => {
-            let model = v["model"].as_str().unwrap_or_default();
-            return Parsed::Started {
-                model: (!model.is_empty()).then(|| model.to_owned()),
-            };
-        }
-        Some("stream_event") => {
-            let delta = &v["event"]["delta"];
-            match (v["event"]["type"].as_str(), delta["type"].as_str()) {
-                (Some("content_block_delta"), Some("text_delta")) => delta["text"]
-                    .as_str()
-                    .map(|t| AgentEventKind::TextDelta(t.to_owned()))
-                    .into_iter()
-                    .collect(),
-                _ => Vec::new(),
-            }
-        }
-        Some("assistant") => blocks()
-            .filter_map(|b| match b["type"].as_str()? {
-                "text" => Some(AgentEventKind::Text(b["text"].as_str()?.to_owned())),
-                "tool_use" => Some(AgentEventKind::ToolUse {
-                    id: b["id"].as_str()?.to_owned(),
-                    name: b["name"].as_str()?.to_owned(),
-                    input: b["input"].to_string(),
-                }),
-                _ => None,
-            })
-            .chain(
-                context_tokens(&v["message"]["usage"]).map(|tokens| AgentEventKind::Usage {
-                    tokens: Some(tokens),
-                    window: None,
-                }),
-            )
-            .collect(),
-        Some("user") => blocks()
-            .filter(|b| b["type"] == "tool_result")
-            .map(|b| AgentEventKind::ToolResult {
-                id: b["tool_use_id"].as_str().unwrap_or_default().to_owned(),
-                content: result_text(&b["content"]),
-                is_error: b["is_error"].as_bool().unwrap_or(false),
-                // A message carries one tool result, and its patch is
-                // beside it.
-                patch: patch(&v["tool_use_result"]),
-                images: result_images(&b["content"]),
-            })
-            .collect(),
-        Some("result") => {
-            let error = v["is_error"].as_bool().unwrap_or(false).then(|| {
-                v["result"]
-                    .as_str()
-                    .filter(|r| !r.is_empty())
-                    .or(v["subtype"].as_str())
-                    .unwrap_or("error")
-                    .to_owned()
-            });
-            // The main model has the largest window; subagents' may be
-            // smaller.
-            let window = v["modelUsage"]
-                .as_object()
-                .into_iter()
-                .flat_map(|m| m.values())
-                .filter_map(|m| m["contextWindow"].as_u64())
-                .max();
-            let usage = window.map(|w| AgentEventKind::Usage {
-                tokens: None,
-                window: Some(w),
-            });
-            usage
-                .into_iter()
-                .chain([AgentEventKind::TurnEnded {
-                    error,
-                    cost_usd: v["total_cost_usd"].as_f64(),
-                }])
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    Parsed::Events(events)
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -2030,17 +1875,18 @@ mod tests {
         assert!(!valid_id("../../etc"));
     }
 
-    /// The page sends permission modes as JSON; Claude Code gets them as
-    /// arguments. Both use its names.
+    /// Prompts carry the backend's mode names as strings; a message
+    /// without one is rejected.
     #[test]
     fn permission_modes() {
-        for mode in PermissionMode::ALL {
-            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
-            assert_eq!(PermissionMode::parse(mode.as_str()), Some(mode));
-        }
         let msg: grenadine_core::api::AgentMessage =
-            serde_json::from_str(r#"{"prompt":"hi"}"#).unwrap();
-        assert_eq!(msg.permission_mode, PermissionMode::Manual);
+            serde_json::from_str(r#"{"prompt":"hi","permission_mode":"auto"}"#).unwrap();
+        assert_eq!(msg.permission_mode.as_str(), "auto");
+        assert_eq!(serde_json::to_value(&msg.permission_mode).unwrap(), "auto");
+        assert!(
+            serde_json::from_str::<grenadine_core::api::AgentMessage>(r#"{"prompt":"hi"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2050,145 +1896,9 @@ mod tests {
         assert_eq!(title(""), "");
     }
 
-    fn events(line: &str) -> Vec<AgentEventKind> {
-        match parse_line(line) {
-            Parsed::Events(e) => e,
-            Parsed::Started { .. } => panic!("{line} started a session"),
-        }
-    }
-
-    /// Lines as Claude Code 2.1 writes them, shortened.
-    #[test]
-    fn parses_stream_json() {
-        assert_eq!(
-            parse_line(
-                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
-            ),
-            Parsed::Started {
-                model: Some("claude-opus-4-6".into())
-            }
-        );
-        assert_eq!(
-            parse_line(
-                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
-            ),
-            Parsed::Started {
-                model: Some("claude-opus-4-6[1m]".into())
-            }
-        );
-        assert_eq!(
-            events(r#"{"type":"system","subtype":"hook_started","session_id":"s"}"#),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::TextDelta("Hel".into())]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}},"parent_tool_use_id":null}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":""},{"type":"text","text":"Hello"},{"type":"tool_use","id":"toolu_1","name":"Write","input":{"file_path":"/w/b.txt","content":"hello\n"},"caller":{"type":"direct"}}],"usage":{"input_tokens":3,"cache_creation_input_tokens":1000,"cache_read_input_tokens":40000,"output_tokens":500,"service_tier":"standard"}},"parent_tool_use_id":null,"session_id":"s"}"#
-            ),
-            [
-                AgentEventKind::Text("Hello".into()),
-                AgentEventKind::ToolUse {
-                    id: "toolu_1".into(),
-                    name: "Write".into(),
-                    input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
-                },
-                AgentEventKind::Usage {
-                    tokens: Some(41_503),
-                    window: None,
-                },
-            ]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"No shell for you","is_error":true}]},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_1".into(),
-                content: "No shell for you".into(),
-                is_error: true,
-                patch: vec![],
-                images: vec![],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_2","type":"tool_result","content":[{"type":"text","text":"a"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBO"}}]}]},"parent_tool_use_id":null}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_2".into(),
-                content: "a\n[image]".into(),
-                is_error: false,
-                patch: vec![],
-                images: vec!["data:image/png;base64,iVBO".into()],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_3","type":"tool_result","content":"Updated"}]},"parent_tool_use_id":null,"tool_use_result":{"filePath":"/w/a.rs","structuredPatch":[{"oldStart":4,"oldLines":2,"newStart":4,"newLines":2,"lines":[" a","-b","+c"]}]}}"#
-            ),
-            [AgentEventKind::ToolResult {
-                id: "toolu_3".into(),
-                content: "Updated".into(),
-                is_error: false,
-                patch: vec![PatchHunk {
-                    old_start: 4,
-                    new_start: 4,
-                    lines: vec![" a".into(), "-b".into(), "+c".into()],
-                }],
-                images: vec![],
-            }]
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_9"}"#
-            ),
-            []
-        );
-        assert_eq!(
-            events(
-                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.5,"modelUsage":{"claude-haiku-4-5":{"contextWindow":200000},"claude-opus-4-6":{"inputTokens":3,"contextWindow":1000000}}}"#
-            ),
-            [
-                AgentEventKind::Usage {
-                    tokens: None,
-                    window: Some(1_000_000),
-                },
-                AgentEventKind::TurnEnded {
-                    error: None,
-                    cost_usd: Some(0.5)
-                },
-            ]
-        );
-        assert_eq!(
-            events(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
-            [AgentEventKind::TurnEnded {
-                error: Some("error_during_execution".into()),
-                cost_usd: None
-            }]
-        );
-        assert_eq!(events("not json"), []);
-    }
-
     /// A state whose agents run `script` as claude, with the git fixture's
     /// clone configured.
-    fn state_with_claude(
+    pub(crate) fn state_with_claude(
         fx: &crate::git::tests::Fixture,
         dir: &std::path::Path,
         script: &str,
@@ -2274,7 +1984,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             id,
             "what's this?".into(),
             names.clone(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         let events = wait_for_turns(&state, id, 2).await;
@@ -2306,65 +2016,6 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(!file.exists());
     }
 
-    /// Claude Code lists its models in its answer to `initialize`, as
-    /// 2.1 writes it, shortened.
-    #[tokio::test]
-    async fn lists_models() {
-        let fx = crate::git::tests::fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("log");
-        let script = format!(
-            r#"#!/bin/sh
-read -r request
-echo "$* | $request" >> {log}
-echo '{{"type":"system","subtype":"hook_started"}}'
-echo '{{"type":"control_response","response":{{"subtype":"success","request_id":"models","response":{{"commands":[],"models":[{{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)","description":"Opus 5.5"}},{{"value":"sonnet","displayName":"Sonnet 5.5","description":"Efficient","supportsEffort":true}},{{"displayName":"no value"}}]}}}}}}'
-"#,
-            log = log.display()
-        );
-        let state = state_with_claude(&fx, dir.path(), &script);
-        let models = state.agents.models().await;
-        assert_eq!(
-            models,
-            [
-                AgentModelInfo {
-                    value: "default".into(),
-                    display_name: "Default (recommended)".into(),
-                    description: "Opus 5.5".into(),
-                },
-                AgentModelInfo {
-                    value: "sonnet".into(),
-                    display_name: "Sonnet 5.5".into(),
-                    description: "Efficient".into(),
-                },
-            ]
-        );
-        assert!(state.agents.offers(None).await);
-        assert!(state.agents.offers(Some("sonnet")).await);
-        assert!(!state.agents.offers(Some("--help")).await);
-
-        // Claude Code is asked once, without a prompt or a session to keep.
-        let log = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            log,
-            format!(
-                "-p --input-format stream-json --output-format stream-json --verbose \
-                 --no-session-persistence | {INITIALIZE}\n"
-            )
-        );
-    }
-
-    /// Without a list, prompts can only go with Claude Code's default.
-    #[tokio::test]
-    async fn offers_only_the_default_without_models() {
-        let fx = crate::git::tests::fixture();
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
-        assert_eq!(state.agents.models().await, []);
-        assert!(state.agents.offers(None).await);
-        assert!(!state.agents.offers(Some("sonnet")).await);
-    }
-
     /// Reads the prompt's text from the stream-json message on stdin into
     /// `$prompt`, for fake claudes in shell. Only for text without quotes,
     /// backslashes or newlines, which JSON would escape.
@@ -2391,10 +2042,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "-first".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: Some("sonnet".into()),
                 images: Vec::new(),
             },
@@ -2412,7 +2064,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             &state,
             &session.id,
             "second".into(),
-            PermissionMode::Manual,
+            PermissionMode::from("manual"),
             None,
         );
         let transcript = wait_for_turns(&state, &session.id, 2).await;
@@ -2423,14 +2075,14 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 AgentEventKind::Text("Hi there".into()),
                 AgentEventKind::TurnEnded {
                     error: None,
-                    cost_usd: Some(0.25),
+                    cost: Some(0.25),
                 },
             ]
         };
         assert_eq!(transcript, [turn("-first"), turn("second")].concat());
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
-        assert_eq!(session.cost_usd, 0.5);
+        assert_eq!(session.cost, 0.5);
         assert_eq!(session.context_tokens, Some(15));
         assert_eq!(session.context_window, Some(200_000));
         assert_eq!(session.model.as_deref(), Some("claude-test"));
@@ -2512,10 +2164,11 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2526,7 +2179,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
 
         let ended = |cost| AgentEventKind::TurnEnded {
             error: None,
-            cost_usd: Some(cost),
+            cost: Some(cost),
         };
         assert_eq!(
             transcript,
@@ -2540,7 +2193,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         );
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
-        assert_eq!(session.cost_usd, 0.5);
+        assert_eq!(session.cost, 0.5);
     }
 
     /// A general session runs in an empty directory of its own, outside any
@@ -2560,10 +2213,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         );
         let state = state_with_claude(&fx, dir.path(), &script);
         let new = |pr| NewAgent {
+            backend: AgentBackend::Claude,
             repo: GENERAL.into(),
             pr,
             prompt: "what's a monad?".into(),
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
         };
@@ -2626,10 +2280,11 @@ esac
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "please write a note\nin notes.txt".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2693,10 +2348,11 @@ esac
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "Run the e2e tests".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2757,6 +2413,7 @@ esac
             grenadine_core::api::NewCleanupSession {
                 ids: vec![items[0].id],
                 repo: "owner/name".into(),
+                backend: AgentBackend::Claude,
                 model: None,
             },
         )
@@ -2791,6 +2448,7 @@ esac
             grenadine_core::api::NewCleanupSession {
                 ids: vec![items[0].id],
                 repo: "owner/name".into(),
+                backend: AgentBackend::Claude,
                 model: None,
             },
         )
@@ -2821,23 +2479,11 @@ cat {dir}/answer
         assert!(!dir.path().join("prune_args").exists());
 
         let session = AgentSession {
-            id: "gone".into(),
-            repo: "owner/name".into(),
-            pr: None,
             title: "Run the e2e tests".into(),
-            summary: None,
             branch: "b".into(),
             worktree: "/w".into(),
             base_sha: "s".into(),
-            status: AgentStatus::Idle,
-            created_at: 0,
-            cost_usd: 0.0,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture("gone", "owner/name")
         };
         state
             .db
@@ -2944,10 +2590,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "build".into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -2969,23 +2616,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     /// A session row with its worktree at `worktree`, never started.
     fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
         AgentSession {
-            id: id.into(),
-            repo: repo.into(),
-            pr: None,
             title: "t".into(),
-            summary: None,
             branch: session_branch(id),
             worktree: worktree.to_string_lossy().into_owned(),
             base_sha: "0".repeat(40),
-            status: AgentStatus::Idle,
             created_at: now(),
-            cost_usd: 0.0,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture(id, repo)
         }
     }
 
@@ -3011,6 +2647,16 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             .unwrap();
         assert!(delete(&state, &gone).await.unwrap());
         assert!(state.db.agent(&gone).unwrap().is_none());
+
+        // One of a backend this build doesn't know can be deleted too.
+        let unknown = uuid();
+        state
+            .db
+            .create_agent(&session_row(&unknown, GENERAL, &dir.path().join("u")))
+            .unwrap();
+        state.db.set_agent_backend_raw(&unknown, "devin", "acu");
+        assert!(delete(&state, &unknown).await.unwrap());
+        assert!(state.db.agent_unchecked(&unknown).unwrap().is_none());
     }
 
     /// Worktrees no session owns go at startup with their branches, even
@@ -3047,6 +2693,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(&repo_dir.join(&detached), &["checkout", "-q", "--detach"]);
         db.create_agent(&session_row(&owned, "owner/name", &repo_dir.join(&owned)))
             .unwrap();
+        // A session of a backend this build doesn't know still owns its
+        // worktree.
+        db.set_agent_backend_raw(&owned, "devin", "acu");
         let elsewhere = dir.path().join("elsewhere");
         fx.clone
             .worktree_add(&elsewhere, "grenadine/agent/other", "HEAD")
@@ -3125,10 +2774,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::default(),
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3143,7 +2793,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Failed);
         // Never started, so the next turn creates the session again.
-        assert!(!state.db.agent_started(&session.id).unwrap());
+        assert_eq!(state.db.backend_session(&session.id).unwrap(), None);
     }
 
     #[tokio::test]
@@ -3159,10 +2809,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             &state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: "go".into(),
-                permission_mode: PermissionMode::default(),
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3173,11 +2824,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             &session.id,
             "queued".into(),
-            PermissionMode::default(),
+            PermissionMode::from("auto"),
             None,
         );
         for _ in 0..100 {
-            if state.agents.with_live(&session.id, |l| l.pid.is_some()) {
+            if state.agents.with_live(&session.id, |l| l.stopper.is_some()) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3314,10 +2965,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = create(
             state,
             NewAgent {
+                backend: AgentBackend::Claude,
                 repo: "owner/name".into(),
                 pr: None,
                 prompt: prompt.into(),
-                permission_mode: PermissionMode::Auto,
+                permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
             },
@@ -3332,7 +2984,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     async fn wrap(state: &Arc<State>, id: &str, target: WrapUpTarget) -> AgentEventKind {
         let req = WrapUp {
             target,
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
         };
         assert!(wrap_up(state, id, req).await);
@@ -3368,12 +3020,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit b more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         let req = || WrapUp {
             target: WrapUpTarget::Checkout,
-            permission_mode: PermissionMode::Auto,
+            permission_mode: PermissionMode::from("auto"),
             model: None,
         };
         assert!(wrap_up(&state, id, req()).await);
@@ -3421,7 +3073,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit b more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         wait_for_turns(&state, id, 3).await;
@@ -3526,7 +3178,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "commit c more".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         // What's left uncommitted becomes a third commit.
@@ -3534,7 +3186,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &state,
             id,
             "write d last".into(),
-            PermissionMode::Auto,
+            PermissionMode::from("auto"),
             None,
         );
         wait_for_turns(&state, id, 3).await;
@@ -3633,7 +3285,13 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             url: "https://github.com/owner/name/pull/24".into(),
         };
         record_landed(&state, id, &landed).unwrap();
-        send(&state, id, "what PR?".into(), PermissionMode::Auto, None);
+        send(
+            &state,
+            id,
+            "what PR?".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
         wait_for_turns(&state, id, 2).await;
         let args = args();
         let last = args

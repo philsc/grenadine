@@ -9,19 +9,18 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use grenadine_core::api::{
-    AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL, NewAgent,
-    NewCleanupSession, PermissionMode, ServerEvent,
+    AgentBackend, AgentEvent, AgentEventKind, AgentSession, CleanupItem, CleanupState, GENERAL,
+    NewAgent, NewCleanupSession, PermissionMode, ServerEvent,
 };
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
 
+use crate::agent::StructuredJob;
 use crate::sync::State;
 
 /// How long a scan may take before it's killed.
@@ -338,57 +337,24 @@ async fn ask(
     add_dir: Option<&Path>,
 ) -> Result<Value> {
     let dir = scan_dir(id)?;
-    let mut cmd = tokio::process::Command::new(state.agents.claude());
-    cmd.args(["-p", "--model", job.model, "--output-format", "json"])
-        .arg("--json-schema")
-        .arg(schema.to_string())
-        .args([
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            // Not the project settings of a clone it runs in, which could
-            // allow more tools or add hooks.
-            "--setting-sources",
-            "user",
-            "--tools",
-            "Read,Glob,Grep,Bash",
-            "--permission-mode",
-            "dontAsk",
-            "--max-budget-usd",
-            job.budget_usd,
-        ]);
-    if let Some(add_dir) = add_dir {
-        cmd.arg("--add-dir").arg(add_dir);
-    }
-    // Last, since it takes every value up to the next flag.
-    cmd.arg("--allowedTools")
-        .args(ALLOWED_TOOLS)
-        .current_dir(cwd.unwrap_or(&dir))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let result = async {
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("can't run {}", state.agents.claude().display()))?;
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(input.as_bytes()).await?;
-        drop(stdin);
-        let out = tokio::time::timeout(job.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "the {} took longer than {}s",
-                    job.name,
-                    job.timeout.as_secs()
-                )
-            })??;
-        structured_output(job, &out.stdout).with_context(|| {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            format!("claude exited with {}: {}", out.status, stderr.trim())
+    // The models and tools are Claude Code's.
+    let result = state
+        .agents
+        .backend(AgentBackend::Claude)
+        .structured(&StructuredJob {
+            name: job.name,
+            model: job.model,
+            schema,
+            input,
+            tools: Some("Read,Glob,Grep,Bash"),
+            allowed: ALLOWED_TOOLS,
+            budget_usd: job.budget_usd,
+            setting_sources_user: true,
+            add_dir,
+            cwd: cwd.unwrap_or(&dir),
+            timeout: job.timeout,
         })
-    }
-    .await;
+        .await;
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
@@ -397,20 +363,6 @@ fn scan_dir(id: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("grenadine-cleanup-{id}"));
     std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
     Ok(dir)
-}
-
-/// The structured output in `claude -p --output-format json --json-schema`
-/// output.
-fn structured_output(job: &Job, stdout: &[u8]) -> Result<Value> {
-    let mut result: Value = serde_json::from_slice(stdout).context("no result")?;
-    if result["is_error"].as_bool() != Some(false) {
-        let why = result["result"]
-            .as_str()
-            .or(result["subtype"].as_str())
-            .unwrap_or("unknown error");
-        bail!("the {} failed: {why}", job.name);
-    }
-    Ok(result["structured_output"].take())
 }
 
 /// The `(title, detail)` pairs in a scan's output.
@@ -660,10 +612,11 @@ pub async fn hand_off(state: &Arc<State>, req: NewCleanupSession) -> Result<Opti
     let session = crate::agent::create(
         state,
         NewAgent {
+            backend: req.backend,
             repo: req.repo,
             pr: None,
             prompt: hand_off_prompt(&items),
-            permission_mode: PermissionMode::Plan,
+            permission_mode: PermissionMode::plan(),
             model: req.model,
             images: Vec::new(),
         },
@@ -756,16 +709,12 @@ mod tests {
                 {"title": "", "detail": "dropped"},
             ]},
         });
-        let output = structured_output(&SCAN, ok.to_string().as_bytes()).unwrap();
+        let output = crate::claude::structured_output("scan", ok.to_string().as_bytes()).unwrap();
         assert_eq!(
             parse_items(&output).unwrap(),
             [("Container e2e".to_owned(), "`docker rm -f e2e`".to_owned())]
         );
         assert!(parse_items(&json!({})).is_err());
-        let failed = json!({"is_error": true, "subtype": "error_max_budget_usd"});
-        let e = structured_output(&SCAN, failed.to_string().as_bytes()).unwrap_err();
-        assert!(format!("{e:#}").contains("error_max_budget_usd"), "{e:#}");
-        assert!(structured_output(&SCAN, b"").is_err());
     }
 
     #[test]
@@ -796,23 +745,8 @@ mod tests {
     #[test]
     fn transcript_path_follows_claude_code() {
         let session = AgentSession {
-            id: "id".into(),
-            repo: "o/n".into(),
-            pr: None,
-            title: "t".into(),
-            summary: None,
-            branch: "b".into(),
             worktree: "/home/u/.local/share/w/o/n/id".into(),
-            base_sha: "s".into(),
-            status: grenadine_core::api::AgentStatus::Idle,
-            created_at: 0,
-            cost_usd: 0.0,
-            context_tokens: None,
-            context_window: None,
-            model: None,
-            landed: None,
-            prs: None,
-            unstaged: 0,
+            ..AgentSession::fixture("id", "o/n")
         };
         assert!(
             transcript_path(&session).ends_with("projects/-home-u--local-share-w-o-n-id/id.jsonl")
