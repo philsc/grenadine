@@ -273,6 +273,7 @@ pub fn start() {
         }
     }
     leptos::mount::mount_to_body(App);
+    highlight::warm();
 }
 
 #[cfg(test)]
