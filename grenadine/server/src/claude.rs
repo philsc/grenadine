@@ -14,7 +14,9 @@ use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentSta
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::agent::{Backend, ModelList, OutputLines, Stopper, StructuredJob, Turn, TurnSink};
+use crate::agent::{
+    Backend, JobKind, JobSpec, JobTools, ModelList, OutputLines, Stopper, Turn, TurnSink,
+};
 use crate::sync::State;
 
 /// How long Claude Code waits for an MCP tool call, in milliseconds. The
@@ -67,8 +69,12 @@ impl Backend for Claude {
         turn(&self.exe, state, session, t, sink).boxed()
     }
 
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>> {
-        structured(&self.exe, job).boxed()
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.exe, job, cwd).boxed()
     }
 }
 
@@ -384,6 +390,7 @@ fn parse_line(line: &str) -> Parsed {
                     id: b["id"].as_str()?.to_owned(),
                     name: b["name"].as_str()?.to_owned(),
                     input: b["input"].to_string(),
+                    parent: None,
                 }),
                 _ => None,
             })
@@ -440,36 +447,65 @@ fn parse_line(line: &str) -> Parsed {
     Parsed::Events(events)
 }
 
+/// The settings that have this binary check each of a job's Bash commands
+/// as its PreToolUse hook, `cleanup::bash_hook`.
+fn bash_hook_settings() -> Result<Value> {
+    let exe = std::env::current_exe().context("can't find the server's executable")?;
+    let exe = exe
+        .to_str()
+        .and_then(|e| shlex::try_quote(e).ok())
+        .ok_or_else(|| anyhow!("can't quote {}", exe.display()))?;
+    let hook = format!("{exe} {}", crate::cleanup::BASH_HOOK_ARG);
+    Ok(json!({"hooks": {"PreToolUse": [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": hook}],
+    }]}}))
+}
+
+/// The model `kind` of job runs on.
+fn job_model(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Summary | JobKind::Scan => "haiku",
+        JobKind::Prune => "sonnet",
+    }
+}
+
 /// Runs `claude -p --output-format json --json-schema` for `job` on its
-/// input and returns its `structured_output`.
-async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
+/// input in `cwd` and returns its `structured_output`.
+async fn structured(claude: &Path, job: &JobSpec<'_>, cwd: &Path) -> Result<Value> {
+    let name = job.kind.name();
     let mut cmd = tokio::process::Command::new(claude);
-    cmd.args(["-p", "--model", job.model, "--output-format", "json"])
-        .arg("--json-schema")
-        .arg(job.schema.to_string())
-        .args(["--no-session-persistence", "--strict-mcp-config"]);
-    // Not the project settings of a clone it runs in, which could allow
-    // more tools or add hooks.
-    if job.setting_sources_user {
-        cmd.args(["--setting-sources", "user"]);
-    }
-    if let Some(tools) = job.tools {
-        cmd.arg("--tools").arg(tools);
-    }
     cmd.args([
-        "--permission-mode",
-        "dontAsk",
-        "--max-budget-usd",
-        job.budget_usd,
-    ]);
+        "-p",
+        "--model",
+        job_model(job.kind),
+        "--output-format",
+        "json",
+    ])
+    .arg("--json-schema")
+    .arg(job.schema.to_string())
+    .args(["--no-session-persistence", "--strict-mcp-config"])
+    // Not the project settings of a clone it runs in, which could
+    // allow more tools or add hooks.
+    .args(["--setting-sources", "user"]);
+    let (tools, allowed): (_, &[&str]) = match job.tools {
+        JobTools::None => ("", &[]),
+        JobTools::ReadOnly => {
+            cmd.arg("--settings").arg(bash_hook_settings()?.to_string());
+            ("Read,Glob,Grep,Bash", crate::cleanup::READ_ONLY_TOOLS)
+        }
+    };
+    cmd.arg("--tools").arg(tools);
+    cmd.args(["--permission-mode", "dontAsk", "--max-budget-usd"])
+        .arg(job.budget.usd.to_string());
     if let Some(add_dir) = job.add_dir {
         cmd.arg("--add-dir").arg(add_dir);
     }
     // Last, since it takes every value up to the next flag.
-    if !job.allowed.is_empty() {
-        cmd.arg("--allowedTools").args(job.allowed);
+    if !allowed.is_empty() {
+        cmd.arg("--allowedTools").args(allowed);
     }
-    cmd.current_dir(job.cwd)
+    cmd.current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -482,14 +518,8 @@ async fn structured(claude: &Path, job: &StructuredJob<'_>) -> Result<Value> {
     drop(stdin);
     let out = tokio::time::timeout(job.timeout, child.wait_with_output())
         .await
-        .map_err(|_| {
-            anyhow!(
-                "the {} took longer than {}s",
-                job.name,
-                job.timeout.as_secs()
-            )
-        })??;
-    structured_output(job.name, &out.stdout).with_context(|| {
+        .map_err(|_| anyhow!("the {name} took longer than {}s", job.timeout.as_secs()))??;
+    structured_output(name, &out.stdout).with_context(|| {
         let stderr = String::from_utf8_lossy(&out.stderr);
         format!("claude exited with {}: {}", out.status, stderr.trim())
     })
@@ -568,6 +598,7 @@ mod tests {
                     id: "toolu_1".into(),
                     name: "Write".into(),
                     input: r#"{"content":"hello\n","file_path":"/w/b.txt"}"#.into(),
+                    parent: None,
                 },
                 AgentEventKind::Usage {
                     tokens: Some(41_503),

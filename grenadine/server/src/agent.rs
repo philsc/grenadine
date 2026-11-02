@@ -130,8 +130,13 @@ pub trait Backend: Send + Sync {
         sink: TurnSink<'a>,
     ) -> BoxFuture<'a, Result<AgentStatus>>;
 
-    /// Runs `job` and returns its answer, in the shape of its schema.
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>>;
+    /// Runs `job` in `cwd`, on a model of its own for the job's kind, and
+    /// returns the answer, in the shape of the job's schema.
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>>;
 }
 
 /// One prompt's turn: what it says and how it runs.
@@ -148,27 +153,126 @@ pub struct Turn<'a> {
     pub notes: &'a [String],
 }
 
-/// A run that answers in a JSON schema's shape without a session, for the
-/// background jobs like summaries and cleanup scans.
-pub struct StructuredJob<'a> {
+/// What a background job is for. Each backend runs each kind on a model
+/// of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// A title for a new session's first prompt.
+    Summary,
+    /// What a deleted session left behind.
+    Scan,
+    /// Which cleanup items are stale.
+    Prune,
+}
+
+impl JobKind {
     /// What it's called in errors.
-    pub name: &'a str,
-    pub model: &'a str,
+    pub fn name(self) -> &'static str {
+        match self {
+            JobKind::Summary => "summary",
+            JobKind::Scan => "scan",
+            JobKind::Prune => "prune",
+        }
+    }
+}
+
+/// What a background job may use besides its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobTools {
+    /// Nothing.
+    None,
+    /// Reading files, and the read-only commands that `cleanup` lists.
+    ReadOnly,
+}
+
+/// What a background job may spend on each backend, in the backend's
+/// cost unit.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    /// On Claude Code, in USD.
+    pub usd: f64,
+    /// On Devin, in ACU.
+    pub acu: f64,
+}
+
+/// A background job, like a summary or a cleanup scan, that answers in a
+/// JSON schema's shape without a session: what it's for, what it may use
+/// and spend, and where it runs.
+pub struct JobSpec<'a> {
+    pub kind: JobKind,
     pub schema: &'a Value,
     pub input: &'a str,
-    /// The tools it has, comma-separated; `None` leaves the backend's.
-    pub tools: Option<&'a str>,
-    /// The tools it may use without asking.
-    pub allowed: &'a [&'a str],
-    /// What it may spend, in USD.
-    pub budget_usd: &'a str,
-    /// Whether to load only the user's settings, not a project's.
-    pub setting_sources_user: bool,
-    /// A directory it may read besides `cwd`.
+    pub tools: JobTools,
+    pub budget: Budget,
+    /// A directory it may read besides where it runs, on a backend that
+    /// can.
     pub add_dir: Option<&'a Path>,
-    pub cwd: &'a Path,
+    /// The clone it runs in, so that it can ask git about the repo; Devin,
+    /// which has no `--setting-sources user`, loads the clone's own rules
+    /// and hooks there. Without one, it runs in a private directory of its
+    /// own: the backends load instructions, settings and even hooks from
+    /// where they run, and a shared directory like /tmp could hold anyone's.
+    pub clone: Option<&'a Path>,
     /// How long it may take before it's killed.
     pub timeout: Duration,
+}
+
+/// The error of a job on a backend that isn't offered, e.g. because it
+/// can't list its models right now.
+#[derive(Debug)]
+pub struct NotOffered(pub AgentBackend);
+
+impl std::fmt::Display for NotOffered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} isn't offered", self.0.label())
+    }
+}
+
+impl std::error::Error for NotOffered {}
+
+/// A fresh directory, gone again once it's dropped, for a background
+/// process to run in. The backends load instructions, settings and hooks
+/// from where they run and from its parents, so it's in a parent only
+/// this user can write to, never in a shared one like /tmp.
+pub fn private_dir() -> Result<tempfile::TempDir> {
+    let parent = private_parent(
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    )?;
+    Ok(tempfile::Builder::new()
+        .prefix("grenadine-")
+        .tempdir_in(&parent)?)
+}
+
+/// Where `private_dir` makes its directories: the runtime directory if
+/// it's this user's alone, else `grenadine/jobs` in the cache directory,
+/// which only this user may use.
+fn private_parent(
+    runtime: Option<std::ffi::OsString>,
+    cache: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    // SAFETY: getuid can't fail and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    if let Some(runtime) = set(runtime)
+        && let Ok(m) = std::fs::metadata(&runtime)
+        && m.is_dir()
+        && m.uid() == uid
+        && m.mode() & 0o077 == 0
+    {
+        return Ok(runtime);
+    }
+    let cache = set(cache)
+        .or_else(|| set(home).map(|h| h.join(".cache")))
+        .context("neither XDG_RUNTIME_DIR nor HOME is set")?;
+    let dir = cache.join("grenadine").join("jobs");
+    std::fs::create_dir_all(&dir).with_context(|| format!("can't create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("can't make {} private", dir.display()))?;
+    Ok(dir)
 }
 
 /// A backend's models: listed once and kept, or the listing's failure
@@ -354,7 +458,7 @@ pub struct Agents {
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
-    /// Whether Haiku summarizes each new session's first prompt.
+    /// Whether each new session's first prompt is summarized.
     pub summaries: std::sync::atomic::AtomicBool,
     /// The shells opened from the sessions' pages.
     pub terminals: crate::terminal::Terminals,
@@ -754,14 +858,16 @@ pub fn remove_orphaned_worktrees(
 
 impl Agents {
     /// Marks the sessions that were running when the server last stopped as
-    /// interrupted. With `slices`, each session's processes go into their
-    /// own systemd user slice. With `scans`, deleting a session scans its
-    /// transcript for what it left behind. With `summaries`, Haiku
-    /// summarizes each new session's first prompt.
+    /// interrupted. `claude` is the executable Claude Code sessions run.
+    /// With `slices`, each session's processes go into their own systemd
+    /// user slice. With `scans`, deleting a session scans its transcript
+    /// for what it left behind. With `summaries`, each new session's first
+    /// prompt is summarized.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: &crate::db::Db,
-        // The claude and devin executables the backends run.
-        exes: (PathBuf, PathBuf),
+        claude: PathBuf,
+        devin: devin::DevinConfig,
         worktrees: PathBuf,
         base_url: String,
         slices: bool,
@@ -773,8 +879,8 @@ impl Agents {
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
         Ok(Agents {
-            claude: claude::Claude::new(exes.0),
-            devin: devin::Devin::new(exes.1),
+            claude: claude::Claude::new(claude),
+            devin: devin::Devin::new(devin),
             images: worktrees.with_file_name("images"),
             worktrees,
             base_url,
@@ -852,6 +958,24 @@ impl Agents {
                 Err(_) => None,
             })
             .collect()
+    }
+
+    /// Whether sessions can pick `backend`, as `backends` has it.
+    pub async fn offered(&self, backend: AgentBackend) -> bool {
+        backend == AgentBackend::default() || self.backend(backend).models().await.is_ok()
+    }
+
+    /// Runs `job` on `backend` and returns its answer, in the shape of its
+    /// schema. A backend that isn't offered doesn't run it.
+    pub async fn structured(&self, backend: AgentBackend, job: &JobSpec<'_>) -> Result<Value> {
+        if !self.offered(backend).await {
+            return Err(NotOffered(backend).into());
+        }
+        // It goes away with the job, however that ends.
+        let dir = private_dir()
+            .with_context(|| format!("can't create a directory for the {}", job.kind.name()))?;
+        let cwd = job.clone.unwrap_or(dir.path());
+        self.backend(backend).structured(job, cwd).await
     }
 
     /// Whether `backend` lets prompts ask for `model`: its default, or
@@ -941,7 +1065,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
-    crate::summary::start(state, &id, &req.prompt);
+    crate::summary::start(state, &id, session.backend, &req.prompt);
     send_with_images(
         state,
         &id,
@@ -1906,9 +2030,10 @@ impl<'a> TurnSink<'a> {
     }
 
     /// Adds what the turn's process has cost since it was last billed to
-    /// the session's cost; `total` is the process's total so far.
+    /// the session's cost; `total` is the process's total so far. A total
+    /// below what's billed already takes nothing back.
     pub fn bill(&mut self, total: f64) -> Result<()> {
-        if total != self.billed {
+        if total > self.billed {
             self.state.db.add_agent_cost(self.id, total - self.billed)?;
             self.billed = total;
         }
@@ -1975,7 +2100,9 @@ impl OpenedPrs {
     /// The PRs that `kind` shows were opened in a session in `repo`.
     pub fn see(&mut self, repo: &str, kind: &AgentEventKind) -> Vec<PrKey> {
         match kind {
-            AgentEventKind::ToolUse { id, name, input } if name == "Bash" => {
+            AgentEventKind::ToolUse {
+                id, name, input, ..
+            } if name == "Bash" => {
                 let command = serde_json::from_str::<Value>(input)
                     .ok()
                     .and_then(|v| v["command"].as_str().map(str::to_owned))
@@ -2442,6 +2569,35 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         assert_eq!(state.db.agent(&session.id).unwrap(), None);
     }
 
+    /// Jobs' directories go in the runtime directory if it's private,
+    /// else in a private one in the cache directory.
+    #[test]
+    fn private_dirs_have_private_parents() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("run");
+        std::fs::create_dir(&runtime).unwrap();
+        let home = dir.path().join("home");
+        let some = |p: &Path| Some(p.as_os_str().to_owned());
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            private_parent(some(&runtime), None, some(&home)).unwrap(),
+            runtime
+        );
+        // One that others may use doesn't count.
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let jobs = private_parent(some(&runtime), None, some(&home)).unwrap();
+        assert_eq!(jobs, home.join(".cache/grenadine/jobs"));
+        let mode = std::fs::metadata(&jobs).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let cache = dir.path().join("cache");
+        assert_eq!(
+            private_parent(None, some(&cache), some(&home)).unwrap(),
+            cache.join("grenadine/jobs")
+        );
+        assert!(private_parent(None, None, None).is_err());
+    }
+
     /// Haiku summarizes a new session's first prompt in the background,
     /// without tools.
     #[tokio::test]
@@ -2453,6 +2609,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
 case " $* " in
 *" --json-schema "*)
   echo "$*" > {dir}/summary_args
+  pwd > {dir}/summary_cwd
   cat > {dir}/summary_input
   echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
   ;;
@@ -2498,6 +2655,19 @@ esac
         let args = std::fs::read_to_string(dir.path().join("summary_args")).unwrap();
         assert!(args.contains("--model haiku"), "{args}");
         assert!(args.contains("--tools  --permission-mode"), "{args}");
+        // In a private directory of its own, which is gone again.
+        let cwd = std::fs::read_to_string(dir.path().join("summary_cwd")).unwrap();
+        let cwd = Path::new(cwd.trim());
+        assert!(
+            cwd.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("grenadine-"),
+            "{}",
+            cwd.display()
+        );
+        assert!(!cwd.exists(), "{} is left", cwd.display());
         let input = std::fs::read_to_string(dir.path().join("summary_input")).unwrap();
         assert!(
             input.ends_with("please write a note\nin notes.txt\n"),
@@ -2597,6 +2767,11 @@ esac
         assert!(args.starts_with("-p --model haiku "), "{args}");
         assert!(args.contains(" --permission-mode dontAsk "), "{args}");
         assert!(args.contains(" --allowedTools Read Glob Grep "), "{args}");
+        assert!(!args.contains("git log"), "{args}");
+        // Each Bash command goes through the hook, which checks its
+        // options.
+        assert!(args.contains("--settings {\"hooks\""), "{args}");
+        assert!(args.contains(crate::cleanup::BASH_HOOK_ARG), "{args}");
         let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
         assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
 
@@ -3084,6 +3259,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             id: id.into(),
             name: "Bash".into(),
             input: json!({ "command": command }).to_string(),
+            parent: None,
         };
         let result = |id: &str, content: &str, is_error| AgentEventKind::ToolResult {
             id: id.into(),
@@ -3511,7 +3687,11 @@ mod devin_tests {
     use crate::devin::{fake, fake_log};
 
     /// A state whose agents run `devin` as devin.
-    fn state_with_devin(fx: &crate::git::tests::Fixture, dir: &Path, devin: PathBuf) -> Arc<State> {
+    pub(crate) fn state_with_devin(
+        fx: &crate::git::tests::Fixture,
+        dir: &Path,
+        devin: PathBuf,
+    ) -> Arc<State> {
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
@@ -3597,7 +3777,7 @@ mod devin_tests {
     }
 
     /// Waits until the session has finished `turns` turns.
-    async fn wait_for_turns(state: &State, id: &str, turns: usize) {
+    pub(crate) async fn wait_for_turns(state: &State, id: &str, turns: usize) {
         for _ in 0..200 {
             let ended = state
                 .db
@@ -3707,6 +3887,73 @@ mod devin_tests {
                 .await
         );
         assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
+    }
+
+    /// A turn with a subagent costs what `agent_stopped` reports, which
+    /// counts the subagent, rather than the root's total, whether it comes
+    /// before the prompt's answer or after it, and it isn't billed twice.
+    #[tokio::test]
+    async fn a_devin_turn_costs_what_agent_stopped_reports() {
+        let stopped = json!({
+            "notify": "_cognition.ai/agent_stopped",
+            "params": {"stats": {"acuCost": 0.4}},
+        });
+        let mut sub = usage(0.1);
+        sub["update"]["_meta"]["cognition.ai/subagent_context"] = json!({"parentAgentId": "sub-1"});
+        // A subagent's own agent_stopped doesn't count, and the wait goes
+        // on for the root's.
+        let sub_stopped = json!({
+            "notify": "_cognition.ai/agent_stopped",
+            "params": {
+                "stats": {"acuCost": 0.9},
+                "_meta": {"cognition.ai/subagent_context": {"parentAgentId": "sub-1"}},
+            },
+        });
+        let end = json!({"end": "end_turn"});
+        for (steps, cost) in [
+            (
+                vec![usage(0.25), sub.clone(), stopped.clone(), end.clone()],
+                0.4,
+            ),
+            (
+                vec![usage(0.25), sub.clone(), end.clone(), stopped.clone()],
+                0.4,
+            ),
+            (
+                vec![
+                    usage(0.25),
+                    sub.clone(),
+                    sub_stopped,
+                    end.clone(),
+                    stopped.clone(),
+                ],
+                0.4,
+            ),
+            // What's billed never goes down.
+            (
+                vec![usage(0.5), sub.clone(), stopped.clone(), end.clone()],
+                0.5,
+            ),
+        ] {
+            let fx = crate::git::tests::fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let devin = fake(dir.path(), scenario("turn-stopped", steps));
+            let state = state_with_devin(&fx, dir.path(), devin);
+            let session = start(&state, &fx).await;
+            wait_for_turns(&state, &session.id, 1).await;
+            let ended: Vec<_> = state
+                .db
+                .agent_events(&session.id)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    AgentEventKind::TurnEnded { cost, .. } => Some(cost),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ended, [Some(cost)]);
+            assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, cost);
+        }
     }
 
     /// A Devin session's turn goes over ACP: the session id is stored,
@@ -3887,5 +4134,331 @@ mod devin_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the request outlived the turn");
+    }
+}
+
+#[cfg(test)]
+mod devin_job_tests {
+    use super::devin_tests::{state_with_devin, wait_for_turns};
+    use super::*;
+    use crate::devin::{fake, fake_log};
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A fake devin whose prompts that contain `matching` reply with
+    /// `answer` as JSON; other prompts just end.
+    fn devin_job_fake(dir: &Path, matching: &str, answer: Value) -> PathBuf {
+        fake(
+            dir,
+            json!({"models": [{"value": "swe", "name": "SWE"}], "prompts": [{"match": matching, "steps": [
+                {"update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": answer.to_string()},
+                }},
+                {"end": "end_turn"},
+            ]}]}),
+        )
+    }
+
+    /// A Devin session's summary comes from a `devin acp` job.
+    #[tokio::test]
+    async fn a_devin_summary_goes_through_devin() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = devin_job_fake(
+            dir.path(),
+            "Summarize it as a title",
+            json!({"summary": "Write a note"}),
+        );
+        let state = state_with_devin(&fx, dir.path(), devin);
+        state
+            .agents
+            .summaries
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "please write a note".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut summary = None;
+        for _ in 0..100 {
+            summary = state.db.agent(&session.id).unwrap().unwrap().summary;
+            if summary.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(summary.as_deref(), Some("Write a note"));
+        wait_for_turns(&state, &session.id, 1).await;
+    }
+
+    /// Prune groups items by backend: each backend runs once with only
+    /// its own item.
+    #[tokio::test]
+    async fn prunes_by_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = crate::git::tests::fixture();
+        let claude_script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {dir}/prune_args
+cat >> {dir}/prune_input
+cat {dir}/answer
+"#,
+            dir = dir.path().display()
+        );
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, &claude_script).unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let devin = devin_job_fake(dir.path(), "", json!({"stale": []}));
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with_agents(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+            claude,
+            devin,
+            dir.path().join("worktrees"),
+        );
+        let session = |id: &str, backend: AgentBackend| AgentSession {
+            backend,
+            ..AgentSession::fixture(id, &fx.clone.slug)
+        };
+        state
+            .db
+            .add_cleanup_items(
+                &session("claude-s", AgentBackend::Claude),
+                &[("Claude leftover".into(), "d".into())],
+                now(),
+            )
+            .unwrap();
+        state
+            .db
+            .add_cleanup_items(
+                &session("devin-s", AgentBackend::Devin),
+                &[("Devin leftover".into(), "d".into())],
+                now(),
+            )
+            .unwrap();
+        let items = crate::cleanup::cleanup_state(&state).unwrap().items;
+        let claude_item = items.iter().find(|i| i.title == "Claude leftover").unwrap();
+        std::fs::write(
+            dir.path().join("answer"),
+            json!({
+                "type": "result",
+                "is_error": false,
+                "structured_output": {"stale": [{"id": claude_item.id, "reason": "gone"}]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 1);
+        let input = std::fs::read_to_string(dir.path().join("prune_input")).unwrap();
+        assert!(input.contains("Claude leftover"), "{input}");
+        assert!(!input.contains("Devin leftover"), "{input}");
+        let prompts: Vec<_> = fake_log(dir.path())
+            .into_iter()
+            .filter(|m| m["method"] == "session/prompt")
+            .map(|m| m["params"].to_string())
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("Devin leftover"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("Claude leftover"), "{}", prompts[0]);
+        let left = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "Devin leftover");
+    }
+
+    /// A deleted Devin session is scanned by Devin, from the digest
+    /// alone, in the clone, in ask mode, and its items are Devin's. A scan
+    /// that fails points at no Claude transcript.
+    #[tokio::test]
+    async fn a_devin_scan_goes_through_devin() {
+        let marker = "A coding agent session was just deleted";
+        for (reply, items) in [
+            (
+                json!({"items": [{"title": "Container e2e", "detail": "`docker rm -f e2e`"}]})
+                    .to_string(),
+                "Container e2e",
+            ),
+            ("no JSON".to_owned(), "Couldn't scan \u{201c}hi\u{201d}"),
+        ] {
+            let fx = crate::git::tests::fixture();
+            let dir = tempfile::tempdir().unwrap();
+            let devin = fake(
+                dir.path(),
+                json!({
+                    "models": [{"value": "swe", "name": "SWE"}],
+                    "prompts": [
+                        {"match": marker, "steps": [
+                            {"update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": reply},
+                            }},
+                            {"end": "end_turn"},
+                        ]},
+                        {"steps": [
+                            {"update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": "exec:0#d",
+                                "rawInput": {"command": "docker run -d --name e2e pg"},
+                                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+                            }},
+                            {"end": "end_turn"},
+                        ]},
+                    ],
+                }),
+            );
+            let state = state_with_devin(&fx, dir.path(), devin);
+            state
+                .agents
+                .scans
+                .enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let session = create(
+                &state,
+                NewAgent {
+                    backend: AgentBackend::Devin,
+                    repo: fx.clone.slug.clone(),
+                    pr: None,
+                    prompt: "hi".into(),
+                    permission_mode: "accept-edits".into(),
+                    model: None,
+                    images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            wait_for_turns(&state, &session.id, 1).await;
+            assert!(delete(&state, &session.id).await.unwrap());
+            let mut found = Vec::new();
+            for _ in 0..200 {
+                let c = crate::cleanup::cleanup_state(&state).unwrap();
+                if c.scanning.is_empty() {
+                    found = c.items;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].title, items);
+            assert_eq!(found[0].backend, AgentBackend::Devin);
+            assert!(
+                !found[0].detail.contains("transcript"),
+                "{}",
+                found[0].detail
+            );
+
+            let log = fake_log(dir.path());
+            let prompt = log
+                .iter()
+                .find(|m| m["method"] == "session/prompt" && m.to_string().contains(marker))
+                .unwrap()
+                .to_string();
+            assert!(prompt.contains("$ docker run -d --name e2e pg"), "{prompt}");
+            assert!(!prompt.contains("full transcript is"), "{prompt}");
+            assert!(!prompt.contains("ls-remote"), "{prompt}");
+            // The job's session runs in the clone, in ask mode, and is gone
+            // again.
+            let job = log
+                .iter()
+                .rposition(|m| m["method"] == "session/new")
+                .unwrap();
+            assert_eq!(
+                std::fs::canonicalize(log[job]["params"]["cwd"].as_str().unwrap()).unwrap(),
+                std::fs::canonicalize(&fx.clone.path).unwrap()
+            );
+            let methods: Vec<_> = log[job..]
+                .iter()
+                .filter_map(|m| m["method"].as_str())
+                .collect();
+            assert!(methods.contains(&"session/delete"), "{methods:?}");
+            assert!(
+                log[job..]
+                    .iter()
+                    .any(|m| m["method"] == "session/set_mode" && m["params"]["modeId"] == "ask")
+            );
+        }
+    }
+
+    /// While Devin isn't offered, prune leaves its items alone and doesn't
+    /// ask it anything beyond its models.
+    #[tokio::test]
+    async fn prune_skips_devin_while_it_isnt_offered() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let devin = dir.path().join("devin");
+        std::fs::write(
+            &devin,
+            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 1\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let session = AgentSession {
+            backend: AgentBackend::Devin,
+            ..AgentSession::fixture("devin-s", &fx.clone.slug)
+        };
+        state
+            .db
+            .add_cleanup_items(&session, &[("Devin leftover".into(), "d".into())], now())
+            .unwrap();
+        assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 0);
+        let left = crate::cleanup::cleanup_state(&state).unwrap().items;
+        assert_eq!(left.len(), 1);
+        // Only the one listing, which failed.
+        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "acp\n");
+    }
+
+    /// A scan of a Devin session tries again while Devin isn't offered,
+    /// and then leaves an item that says what to do.
+    #[tokio::test]
+    async fn a_devin_scan_waits_for_devin() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = dir.path().join("devin");
+        std::fs::write(&devin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = state_with_devin(&fx, dir.path(), devin);
+        state
+            .agents
+            .scans
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = AgentSession {
+            backend: AgentBackend::Devin,
+            title: "Run the e2e tests".into(),
+            ..AgentSession::fixture("devin-s", &fx.clone.slug)
+        };
+        crate::cleanup::scan(&state, session, Vec::new());
+        let mut found = Vec::new();
+        for _ in 0..200 {
+            let c = crate::cleanup::cleanup_state(&state).unwrap();
+            if c.scanning.is_empty() {
+                found = c.items;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].title,
+            "Couldn't scan \u{201c}Run the e2e tests\u{201d}"
+        );
+        assert!(
+            found[0].detail.contains("Devin couldn't be reached"),
+            "{}",
+            found[0].detail
+        );
     }
 }

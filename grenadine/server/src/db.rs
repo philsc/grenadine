@@ -303,6 +303,12 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agents ADD COLUMN cost_unit TEXT NOT NULL DEFAULT 'usd';
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The backend of the session the item was found in.
+    ALTER TABLE cleanup_items ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1336,7 +1342,7 @@ impl Db {
     pub fn cleanup_items(&self) -> Result<Vec<CleanupItem>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, repo, session_id, session_title, title, detail, created_at, handed_off_to
+            "SELECT id, repo, session_id, session_title, title, detail, created_at, handed_off_to, backend
              FROM cleanup_items ORDER BY created_at DESC, id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1349,6 +1355,7 @@ impl Db {
                 detail: r.get(5)?,
                 created_at: r.get(6)?,
                 handed_off_to: r.get(7)?,
+                backend: AgentBackend::parse(&r.get::<_, String>(8)?).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1365,9 +1372,10 @@ impl Db {
         let tx = conn.transaction()?;
         for (title, detail) in found {
             tx.execute(
-                "INSERT INTO cleanup_items (repo, session_id, session_title, title, detail, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![session.repo, session.id, session.title, title, detail, created_at],
+                "INSERT INTO cleanup_items (repo, session_id, session_title, title, detail, created_at, backend)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![session.repo, session.id, session.title, title, detail, created_at,
+                        session.backend.as_str()],
             )?;
         }
         tx.commit()?;
@@ -2031,7 +2039,8 @@ mod tests {
     fn migrates_agents_to_backends() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        // Stop before the backends migration, which moves `started`.
+        migrate(&mut conn, MIGRATIONS.len() - 2).unwrap();
         for (id, started) in [("started", 1), ("fresh", 0)] {
             conn.execute(
                 "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status,
@@ -2041,7 +2050,14 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO cleanup_items (repo, session_id, session_title, title, detail, created_at)
+             VALUES ('o/n', 's', 't', 'x', 'd', 0)",
+            [],
+        )
+        .unwrap();
         let db = Db::init(conn, None).unwrap();
+        assert_eq!(db.cleanup_items().unwrap()[0].backend, AgentBackend::Claude);
         let started = db.agent("started").unwrap().unwrap();
         assert_eq!(started.backend, AgentBackend::Claude);
         assert_eq!(started.cost, 1.5);
@@ -2272,6 +2288,7 @@ mod tests {
                 id: "t".into(),
                 name: "Bash".into(),
                 input: r#"{"command":"gh pr create --fill"}"#.into(),
+                parent: None,
             },
             AgentEventKind::ToolResult {
                 id: "t".into(),
@@ -2320,6 +2337,7 @@ mod tests {
                 detail: "d1".into(),
                 created_at: 1,
                 handed_off_to: None,
+                backend: AgentBackend::Claude,
             }
         );
 

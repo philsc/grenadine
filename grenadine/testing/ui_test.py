@@ -39,8 +39,10 @@ def devin_scenario(tmp: Path) -> dict:
     turn that asks to run a command with Devin's options, a question when
     the prompt asks for one, and in plan mode a plan from a plan file with
     front matter. Resuming a session replays an answer, which the
-    transcript must not show again. It logs what grenadine sends to
-    `devin_acp.log` in `tmp`."""
+    transcript must not show again. A subagent's tool call comes with the
+    command, which the transcript doesn't show. The background jobs of a
+    Devin session get a summary, no cleanup items and no stale ones. It
+    logs what grenadine sends to `devin_acp.log` in `tmp`."""
 
     def update(u: dict) -> dict:
         return {"update": u}
@@ -103,6 +105,11 @@ def devin_scenario(tmp: Path) -> dict:
         },
     }
     end = {"end": "end_turn"}
+
+    def reply(answer: dict) -> list:
+        text = {"type": "text", "text": json.dumps(answer)}
+        return [update({"sessionUpdate": "agent_message_chunk", "content": text}), end]
+
     return {
         "log": str(tmp / "devin_acp.log"),
         "session_id": "devin-test",
@@ -122,6 +129,18 @@ def devin_scenario(tmp: Path) -> dict:
             "text": "---\nagent: devin\n---\n# The plan\n\nDo the thing.\n",
         },
         "prompts": [
+            {
+                "match": "Summarize it as a title",
+                "steps": reply({"summary": "A Devin task"}),
+            },
+            {
+                "match": "A coding agent session was just deleted",
+                "steps": reply({"items": []}),
+            },
+            {
+                "match": "Find the items that can be deleted",
+                "steps": reply({"stale": []}),
+            },
             {
                 "mode": "plan",
                 "steps": [
@@ -175,6 +194,19 @@ def devin_scenario(tmp: Path) -> dict:
                         }
                     ),
                     tool_call("exec", {"command": "touch note.txt"}),
+                    update(
+                        {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "exec:{turn}-sub",
+                            "rawInput": {"command": "echo subagent-marker"},
+                            "_meta": {
+                                "cognition.ai/inferenceToolName": "exec",
+                                "cognition.ai/subagent_context": {
+                                    "parentAgentId": "sub1"
+                                },
+                            },
+                        }
+                    ),
                     permission(
                         "exec",
                         [
@@ -1743,7 +1775,13 @@ class AgentTest(ServerTestCase):
         expect(approval).to_contain_text("Allowed Bash")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.500 ACU"])
         expect(self.page.locator(".composer .agent-model")).to_have_text("swe-2")
-        self.delete_session("write a note")
+        # The subagent's exec is recorded but its tool call doesn't render.
+        expect(transcript).to_contain_text("touch note.txt")
+        expect(transcript).not_to_contain_text("subagent-marker")
+        # Devin wrote the summary that labels the session.
+        sessions = self.section("General").locator(".agent-entry")
+        expect(sessions.filter(has_text="A Devin task")).to_have_count(1)
+        self.delete_session("A Devin task")
 
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")

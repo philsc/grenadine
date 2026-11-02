@@ -1,5 +1,5 @@
 {
-  "checksum": "310f97ca254d251e85dff7b26af80eac5e318582cda18013e97be5269efe7230",
+  "checksum": "2e5feeb8390939a7ff159416b37cbb6009428482ae76153320cbfa9dffddd729",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4744,6 +4744,10 @@
           {
             "id": "serde_json 1.0.151",
             "target": "serde_json"
+          },
+          {
+            "id": "shlex 2.0.1",
+            "target": "shlex"
           },
           {
             "id": "tempfile 3.27.0",
@@ -18314,6 +18318,7 @@
     "rustls 0.23.45",
     "serde 1.0.229",
     "serde_json 1.0.151",
+    "shlex 2.0.1",
     "similar 3.2.0",
     "syntect 5.3.0",
     "tempfile 3.27.0",

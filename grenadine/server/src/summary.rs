@@ -1,5 +1,5 @@
-//! Short summaries of what agent sessions were asked to do. Haiku writes
-//! one from a new session's first prompt in the background, and the
+//! Short summaries of what agent sessions were asked to do. The session's
+//! backend writes one from its first prompt in the background, and the
 //! sidebar shows it in place of the prompt's first line.
 
 use std::sync::Arc;
@@ -10,16 +10,19 @@ use anyhow::{Result, anyhow, bail};
 use grenadine_core::api::{AgentBackend, ServerEvent};
 use serde_json::{Value, json};
 
-use crate::agent::StructuredJob;
+use crate::agent::{Budget, JobKind, JobSpec, JobTools};
 use crate::sync::State;
 
 /// How long writing a summary may take before it's killed.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-/// What writing a summary may spend, in USD.
-const BUDGET_USD: &str = "0.05";
+/// What writing a summary may spend.
+const BUDGET: Budget = Budget {
+    usd: 0.05,
+    acu: 0.02,
+};
 
-/// How much of the prompt Haiku gets, in bytes.
+/// How much of the prompt the summary gets, in bytes.
 const PROMPT_LIMIT: usize = 8_000;
 
 /// The longest summary kept, in bytes.
@@ -33,7 +36,7 @@ asks; only summarize it.";
 
 /// Starts writing a summary of the session's first `prompt`. Doesn't wait
 /// for it.
-pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
+pub fn start(state: &Arc<State>, id: &str, backend: AgentBackend, prompt: &str) {
     if !state.agents.summaries.load(Ordering::Relaxed) {
         return;
     }
@@ -43,7 +46,7 @@ pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
         crate::cleanup::cut(prompt, PROMPT_LIMIT)
     );
     tokio::spawn(async move {
-        let summary = match run(&state, &input).await {
+        let summary = match run(&state, backend, &input).await {
             Ok(summary) => summary,
             Err(e) => {
                 tracing::warn!("summarizing agent {id}: {e:#}");
@@ -57,31 +60,29 @@ pub fn start(state: &Arc<State>, id: &str, prompt: &str) {
     });
 }
 
-async fn run(state: &State, input: &str) -> Result<String> {
+async fn run(state: &State, backend: AgentBackend, input: &str) -> Result<String> {
     let schema = json!({
         "type": "object",
         "properties": {"summary": {"type": "string"}},
         "required": ["summary"],
     });
-    // The model is one of Claude Code's.
     let output = state
         .agents
-        .backend(AgentBackend::Claude)
-        .structured(&StructuredJob {
-            name: "summary",
-            model: "haiku",
-            schema: &schema,
-            input,
-            tools: Some(""),
-            allowed: &[],
-            budget_usd: BUDGET_USD,
-            setting_sources_user: false,
-            add_dir: None,
-            // Away from any repository, whose CLAUDE.md would only
-            // distract.
-            cwd: &std::env::temp_dir(),
-            timeout: TIMEOUT,
-        })
+        .structured(
+            backend,
+            &JobSpec {
+                kind: JobKind::Summary,
+                schema: &schema,
+                input,
+                tools: JobTools::None,
+                budget: BUDGET,
+                add_dir: None,
+                // Away from any repository, whose instructions would only
+                // distract.
+                clone: None,
+                timeout: TIMEOUT,
+            },
+        )
         .await?;
     parse_result(&output)
 }

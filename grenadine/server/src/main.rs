@@ -77,6 +77,18 @@ struct Args {
     #[arg(long, default_value = "devin")]
     devin: PathBuf,
 
+    /// The model a Devin session's summary and its cleanup scan run on.
+    #[arg(
+        long,
+        alias = "devin-summary-model",
+        default_value = "claude-haiku-5-5-medium"
+    )]
+    devin_job_model: String,
+
+    /// The model the checks of Devin sessions' cleanup items run on.
+    #[arg(long, default_value = "claude-sonnet-5-5-medium")]
+    devin_prune_model: String,
+
     /// The shell that terminals in agent sessions run, as a login shell.
     /// Defaults to the user's login shell.
     #[arg(long)]
@@ -158,6 +170,10 @@ impl Signals {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Claude Code runs the server's binary as the cleanup jobs' hook.
+    if std::env::args().nth(1).as_deref() == Some(cleanup::BASH_HOOK_ARG) {
+        std::process::exit(cleanup::bash_hook());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -199,7 +215,12 @@ async fn main() -> Result<()> {
     });
     let mut agents = agent::Agents::new(
         &db,
-        (args.claude, args.devin),
+        args.claude,
+        devin::DevinConfig {
+            exe: args.devin,
+            job_model: args.devin_job_model,
+            prune_model: args.devin_prune_model,
+        },
         worktrees,
         local_url(addr),
         slices,

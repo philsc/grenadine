@@ -28,8 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::agent::{
-    Backend, Decision, ModelList, Stopper, StructuredJob, Turn, TurnSink, await_approval,
-    backend_command, queue_next, stderr_tail,
+    Backend, Decision, JobKind, JobSpec, JobTools, ModelList, Stopper, Turn, TurnSink,
+    await_approval, backend_command, queue_next, stderr_tail,
 };
 use crate::mcp::ALLOWED_TOOLS;
 use crate::sync::State;
@@ -47,26 +47,45 @@ fn initialize_params() -> Value {
     })
 }
 
-/// The Devin backend: the `devin` executable and what it offers.
-pub struct Devin {
+/// How Devin runs: its executable and the models of its background jobs.
+pub struct DevinConfig {
     /// The `devin` executable.
-    exe: PathBuf,
+    pub exe: PathBuf,
+    /// The model summaries and cleanup scans run on.
+    pub job_model: String,
+    /// The model checks for stale cleanup items run on.
+    pub prune_model: String,
+}
+
+/// The Devin backend: how it runs and what it offers.
+pub struct Devin {
+    config: DevinConfig,
     /// The models Devin offers.
     models: ModelList,
 }
 
 impl Devin {
-    pub fn new(exe: PathBuf) -> Devin {
+    pub fn new(config: DevinConfig) -> Devin {
         Devin {
-            exe,
+            config,
             models: ModelList::default(),
+        }
+    }
+
+    /// The model `kind` of job runs on.
+    fn job_model(&self, kind: JobKind) -> &str {
+        match kind {
+            JobKind::Summary | JobKind::Scan => &self.config.job_model,
+            JobKind::Prune => &self.config.prune_model,
         }
     }
 }
 
 impl Backend for Devin {
     fn models(&self) -> BoxFuture<'_, Result<Vec<AgentModelInfo>>> {
-        self.models.get("Devin", || list_models(&self.exe)).boxed()
+        self.models
+            .get("Devin", || list_models(&self.config.exe))
+            .boxed()
     }
 
     fn turn<'a>(
@@ -76,12 +95,15 @@ impl Backend for Devin {
         t: Turn<'a>,
         sink: TurnSink<'a>,
     ) -> BoxFuture<'a, Result<AgentStatus>> {
-        turn(&self.exe, state, session, t, sink).boxed()
+        turn(&self.config.exe, state, session, t, sink).boxed()
     }
 
-    /// Summaries and cleanup scans run on Claude Code.
-    fn structured<'a>(&'a self, job: &'a StructuredJob<'a>) -> BoxFuture<'a, Result<Value>> {
-        async move { bail!("{} can't run on Devin", job.name) }.boxed()
+    fn structured<'a>(
+        &'a self,
+        job: &'a JobSpec<'a>,
+        cwd: &'a Path,
+    ) -> BoxFuture<'a, Result<Value>> {
+        structured(&self.config.exe, self.job_model(job.kind), job, cwd).boxed()
     }
 }
 
@@ -202,6 +224,12 @@ impl SessionUpdate {
             SessionUpdate::Other => None,
         }
     }
+
+    /// The subagent the update is about, by its id; `None` for the
+    /// session's own agent.
+    fn subagent(&self) -> Option<&str> {
+        self.meta().and_then(subagent_of)
+    }
 }
 
 /// A piece of content; only text is shown.
@@ -233,6 +261,9 @@ struct ToolCallUpdate {
     tool_call_id: String,
     #[serde(default)]
     status: Option<ToolCallStatus>,
+    /// The call's input, when the update changes it.
+    #[serde(default)]
+    raw_input: Value,
     #[serde(default, deserialize_with = "null_default")]
     content: Vec<ToolCallContent>,
     #[serde(rename = "_meta", default)]
@@ -270,9 +301,37 @@ struct UsageUpdate {
     meta: Value,
 }
 
+/// The subagent a message's `_meta` says it's about, by its id; `None`
+/// for the session's own agent, whose id is "root".
+fn subagent_of(meta: &Value) -> Option<&str> {
+    extension(meta, "subagent_context")
+        .and_then(|c| c.get("parentAgentId"))
+        .and_then(Value::as_str)
+        .filter(|p| *p != "root")
+}
+
 /// The `cognition.ai/<key>` extension in a `_meta`.
 fn extension<'a>(meta: &'a Value, key: &str) -> Option<&'a Value> {
     meta.get(format!("cognition.ai/{key}"))
+}
+
+/// The params of `_cognition.ai/agent_stopped`, which Devin sends when a
+/// turn's agent stops.
+#[derive(Debug, Default, Deserialize)]
+struct AgentStopped {
+    #[serde(default)]
+    stats: StopStats,
+    /// Says which subagent stopped, if it wasn't the root.
+    #[serde(rename = "_meta", default)]
+    meta: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopStats {
+    /// What the turn cost, in ACU, subagents included.
+    #[serde(default)]
+    acu_cost: Option<f64>,
 }
 
 /// The answer to `session/new`.
@@ -367,6 +426,8 @@ struct PermissionToolCall {
     tool_call_id: String,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    raw_input: Value,
     #[serde(rename = "_meta", default)]
     meta: Value,
 }
@@ -514,9 +575,15 @@ impl Rpc {
         })
     }
 
+    /// Sends `method` and returns its result. Requests devin makes
+    /// meanwhile are declined, and anything else is dropped.
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_with(method, params, decline).await
+    }
+
     /// Sends `method` and returns its result; whatever else arrives
     /// meanwhile goes to `other`.
-    async fn call(
+    async fn call_with(
         &mut self,
         method: &str,
         params: Value,
@@ -536,6 +603,11 @@ impl Rpc {
             }
         }
         bail!("devin closed its stdout")
+    }
+
+    /// The next message devin sends; `None` once its stdout closed.
+    async fn next(&mut self) -> Option<Incoming> {
+        self.incoming.recv().await
     }
 
     /// Kills devin; returns its stderr's tail.
@@ -559,7 +631,7 @@ impl Rpc {
     }
 }
 
-/// Declines whatever the agent asks a client that runs no turn.
+/// Declines whatever the agent asks while nothing else answers it.
 fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
     if let Incoming::Request(r) = m {
         acp.respond_error(&r.id, -32601, "unknown method");
@@ -567,10 +639,14 @@ fn decline(acp: &Arc<Acp>, m: Incoming) -> Result<()> {
     Ok(())
 }
 
+/// How long a turn with subagents waits for `agent_stopped` after the
+/// prompt's answer.
+const STOPPED_WAIT: Duration = Duration::from_millis(500);
+
 /// How long listing the models may take.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the listing's session gets to be deleted.
+/// How long a throwaway session gets to be deleted.
 const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The models Devin offers, from a throwaway `devin acp` session's model
@@ -583,22 +659,16 @@ async fn list_models(exe: &Path) -> Result<Vec<AgentModelInfo>> {
 /// `list_models`, giving up after `timeout`.
 async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentModelInfo>> {
     // It goes away with the listing, however that ends.
-    let dir = tempfile::Builder::new()
-        .prefix("grenadine-models-")
-        .tempdir()
+    let dir = crate::agent::private_dir()
         .context("can't create a directory for listing Devin's models")?;
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("acp").current_dir(dir.path());
     let mut rpc = Rpc::spawn(cmd).with_context(|| format!("running {}", exe.display()))?;
     let mut session = None;
     let listed = tokio::time::timeout(timeout, async {
-        rpc.call("initialize", initialize_params(), decline).await?;
+        rpc.call("initialize", initialize_params()).await?;
         let result = rpc
-            .call(
-                "session/new",
-                json!({"cwd": dir.path(), "mcpServers": []}),
-                decline,
-            )
+            .call("session/new", json!({"cwd": dir.path(), "mcpServers": []}))
             .await?;
         let created: NewSessionResponse = parse(result)?;
         session = Some(created.session_id);
@@ -609,7 +679,7 @@ async fn list_models_within(exe: &Path, timeout: Duration) -> Result<Vec<AgentMo
     // history, whether or not the listing worked. An error here doesn't
     // fail the listing.
     if let Some(session) = session {
-        let delete = rpc.call("session/delete", json!({"sessionId": session}), decline);
+        let delete = rpc.call("session/delete", json!({"sessionId": session}));
         let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
     }
     let listed = listed
@@ -691,8 +761,14 @@ struct Updates {
     /// happens.
     text: String,
     tools: Tools,
-    /// The turn process's running ACU total, from the latest usage.
+    /// The turn process's running ACU total, from the root's latest
+    /// usage; it leaves out what subagents spent.
     acu: Option<f64>,
+    /// The turn's ACU total from `agent_stopped`, which counts the
+    /// subagents too.
+    stopped: Option<f64>,
+    /// Whether a subagent has reported anything.
+    subagents: bool,
 }
 
 impl Updates {
@@ -701,6 +777,17 @@ impl Updates {
             text: String::new(),
             tools: Tools::default(),
             acu: None,
+            stopped: None,
+            subagents: false,
+        }
+    }
+
+    /// What the turn has cost so far, in ACU: `agent_stopped`'s total
+    /// once it came, else the root's, and never less than the root's.
+    fn total(&self) -> Option<f64> {
+        match (self.stopped, self.acu) {
+            (Some(s), Some(a)) => Some(s.max(a)),
+            (s, a) => s.or(a),
         }
     }
 
@@ -714,14 +801,11 @@ impl Updates {
     }
 
     /// The events one `session/update` means; updates of subagents are
-    /// skipped.
+    /// skipped, except their tool calls, which name the subagent.
     fn update(&mut self, u: &SessionUpdate) -> Vec<AgentEventKind> {
-        let parent = u
-            .meta()
-            .and_then(|m| extension(m, "subagent_context"))
-            .and_then(|c| c.get("parentAgentId"))
-            .and_then(Value::as_str);
-        if parent.is_some_and(|p| p != "root") {
+        let parent = u.subagent();
+        self.subagents |= parent.is_some();
+        if parent.is_some() && !matches!(u, SessionUpdate::ToolCall(_)) {
             return Vec::new();
         }
         match u {
@@ -742,21 +826,30 @@ impl Updates {
                 } else {
                     call.raw_input.clone()
                 };
-                self.tools.lock().unwrap().insert(
-                    call.tool_call_id.clone(),
-                    Tool {
-                        name: name.clone(),
-                        title: call.title.clone(),
-                        input: input.clone(),
-                        content: String::new(),
-                    },
-                );
-                self.flush()
-                    .into_iter()
+                // A subagent's calls never get updates.
+                if parent.is_none() {
+                    self.tools.lock().unwrap().insert(
+                        call.tool_call_id.clone(),
+                        Tool {
+                            name: name.clone(),
+                            title: call.title.clone(),
+                            input: input.clone(),
+                            content: String::new(),
+                        },
+                    );
+                }
+                // A subagent's call doesn't end the root's answer.
+                let text = if parent.is_none() {
+                    self.flush()
+                } else {
+                    Vec::new()
+                };
+                text.into_iter()
                     .chain([AgentEventKind::ToolUse {
                         id: call.tool_call_id.clone(),
                         name,
                         input: input.to_string(),
+                        parent: parent.map(str::to_owned),
                     }])
                     .collect()
             }
@@ -838,17 +931,35 @@ impl TurnCtx<'_, '_> {
                     for e in self.updates.update(&n.update) {
                         self.sink.event(e)?;
                     }
-                    // ACUs are billed as they're spent, so a turn that
-                    // never ends pays for what it used too.
-                    if let Some(total) = self.updates.acu {
-                        self.sink.bill(total)?;
+                    self.bill()?;
+                }
+            }
+            Incoming::Notification(n) if n.method == "_cognition.ai/agent_stopped" => {
+                if !self.loading {
+                    let stopped = parse::<AgentStopped>(n.params).unwrap_or_default();
+                    // Only the root's counts the whole turn.
+                    if subagent_of(&stopped.meta).is_none()
+                        && let Some(acu) = stopped.stats.acu_cost
+                    {
+                        self.updates.stopped = Some(acu);
                     }
+                    self.bill()?;
                 }
             }
             Incoming::Request(r) => self.request(acp, r),
             Incoming::Notification(_) | Incoming::Response(_) => {}
         }
         Ok(())
+    }
+
+    /// Bills what the turn has cost so far. ACUs are billed as they're
+    /// spent, so a turn that never ends pays for what it used too, and
+    /// `agent_stopped`'s total only adds what the subagents spent.
+    fn bill(&mut self) -> Result<()> {
+        match self.updates.total() {
+            Some(total) => self.sink.bill(total),
+            None => Ok(()),
+        }
     }
 
     /// Answers the request `r` the agent made, on a task of its own.
@@ -901,7 +1012,7 @@ async fn turn(
             loading: false,
         };
         let result = run_turn(&mut rpc, session, &t, &mut ctx).await;
-        (result, ctx.updates.acu)
+        (result, ctx.updates.total())
     };
     // The turn is over; stdin closing lets devin go on its own.
     let (exit, stderr) = rpc.close().await?;
@@ -945,7 +1056,7 @@ async fn run_turn(
 ) -> Result<Prompted> {
     let state = ctx.state.clone();
     let id = &session.id;
-    rpc.call("initialize", initialize_params(), |acp, m| {
+    rpc.call_with("initialize", initialize_params(), |acp, m| {
         ctx.handle(acp, m)
     })
     .await?;
@@ -960,7 +1071,7 @@ async fn run_turn(
         // transcript already has them.
         ctx.loading = true;
         let result = rpc
-            .call(
+            .call_with(
                 "session/load",
                 json!({"sessionId": backend, "cwd": session.worktree, "mcpServers": mcp}),
                 |acp, m| ctx.handle(acp, m),
@@ -971,7 +1082,7 @@ async fn run_turn(
         (backend, current_model(&loaded.config_options))
     } else {
         let result = rpc
-            .call(
+            .call_with(
                 "session/new",
                 json!({"cwd": session.worktree, "mcpServers": mcp}),
                 |acp, m| ctx.handle(acp, m),
@@ -1001,7 +1112,7 @@ async fn run_turn(
     if stopped() {
         return Ok(Prompted::No);
     }
-    rpc.call(
+    rpc.call_with(
         "session/set_mode",
         json!({"sessionId": backend_session, "modeId": t.mode.as_str()}),
         |acp, m| ctx.handle(acp, m),
@@ -1009,7 +1120,7 @@ async fn run_turn(
     .await?;
     if let Some(m) = t.model.as_deref().filter(|m| *m != "default") {
         let result = rpc
-            .call(
+            .call_with(
                 "session/set_config_option",
                 json!({"sessionId": backend_session, "configId": "model", "value": m}),
                 |acp, m| ctx.handle(acp, m),
@@ -1043,12 +1154,30 @@ async fn run_turn(
         blocks.push(json!({"type": "text", "text": t.prompt}));
     }
     let result = rpc
-        .call(
+        .call_with(
             "session/prompt",
             json!({"sessionId": backend_session, "prompt": blocks}),
             |acp, m| ctx.handle(acp, m),
         )
         .await;
+    // With subagents, only agent_stopped has the turn's whole cost, and it
+    // may come after the prompt's answer.
+    if result.is_ok() && ctx.updates.subagents && ctx.updates.stopped.is_none() {
+        let acp = rpc.acp.clone();
+        let drained = tokio::time::timeout(STOPPED_WAIT, async {
+            while ctx.updates.stopped.is_none() {
+                match rpc.next().await {
+                    Some(m) => ctx.handle(&acp, m)?,
+                    None => break,
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await;
+        if let Ok(drained) = drained {
+            drained?;
+        }
+    }
     for e in ctx.updates.flush() {
         ctx.sink.event(e)?;
     }
@@ -1251,27 +1380,323 @@ async fn elicitation(
     acp.respond(&rpc_id, answer);
 }
 
+/// The JSON object in `reply`: all of it, else the last fenced block
+/// that holds one, else the last object in the text. A fence only counts
+/// at the start of a line, so one quoted inside a JSON string doesn't.
+fn parse_reply(name: &str, reply: &str) -> Result<Value> {
+    let object = |s: &str| {
+        serde_json::from_str::<Value>(s.trim())
+            .ok()
+            .filter(Value::is_object)
+    };
+    object(reply)
+        .or_else(|| fenced(reply).iter().rev().find_map(|b| object(b)))
+        .or_else(|| last_object(reply))
+        .ok_or_else(|| {
+            anyhow!(
+                "the {name} didn't reply with JSON: {}",
+                crate::cleanup::cut(reply, 300)
+            )
+        })
+}
+
+/// The contents of the fenced blocks in `text`, in order; an unclosed one
+/// runs to the end.
+fn fenced(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<String> = None;
+    for line in text.lines() {
+        match open.as_mut() {
+            None if line.starts_with("```") => open = Some(String::new()),
+            None => {}
+            Some(_) if line.starts_with("```") => blocks.extend(open.take()),
+            Some(block) => {
+                block.push_str(line);
+                block.push('\n');
+            }
+        }
+    }
+    blocks.extend(open);
+    blocks
+}
+
+/// The last JSON object in `text` that starts at a `{`, braces in prose
+/// and objects inside it aside.
+fn last_object(text: &str) -> Option<Value> {
+    let mut found = None;
+    let mut i = 0;
+    while let Some(at) = text[i..].find('{') {
+        let start = i + at;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(v)) if v.is_object() => {
+                found = Some(v);
+                i = start + stream.byte_offset();
+            }
+            _ => i = start + 1,
+        }
+    }
+    found
+}
+
+/// Runs `job` on `model` as a `devin acp` session in `cwd`, in ask mode, and returns
+/// its reply parsed as JSON; the schema is only in the prompt. The job's
+/// session is deleted, on every way out, so it doesn't stay in the user's
+/// Devin history.
+async fn structured(devin: &Path, model: &str, job: &JobSpec<'_>, cwd: &Path) -> Result<Value> {
+    let mut cmd = tokio::process::Command::new(devin);
+    cmd.arg("acp").current_dir(cwd);
+    let mut rpc = Rpc::spawn(cmd).with_context(|| format!("can't run {}", devin.display()))?;
+    let (result, session, cancelled) = run_job(&mut rpc, model, job, cwd).await;
+    if let Some(session) = session {
+        // A prompt may still be running, e.g. after a timeout, and Devin
+        // might not delete a session that's busy. It ignores a cancel with
+        // nothing running.
+        if result.is_err() && !cancelled {
+            rpc.acp
+                .notify("session/cancel", json!({"sessionId": session}));
+        }
+        // The session only existed for the job; it doesn't belong in the
+        // user's history. A hung delete doesn't keep the job.
+        let delete = rpc.call("session/delete", json!({"sessionId": session}));
+        let _ = tokio::time::timeout(DELETE_TIMEOUT, delete).await;
+    }
+    rpc.kill().await;
+    result
+}
+
+/// What a job tracks while its prompt runs.
+struct JobRun<'a, 'c> {
+    job: &'a JobSpec<'a>,
+    /// Set once the job has sent `session/cancel`.
+    cancelled: &'c mut bool,
+    /// The root's `agent_stopped` total, which counts the subagents too.
+    stopped: Option<f64>,
+    /// Devin's session id.
+    session: String,
+    /// The root's text, reset when it starts a tool call.
+    text: String,
+    /// What the root and each subagent have spent, in ACU, by agent id.
+    /// Each reports its own running total; the root's leaves out the
+    /// subagents'.
+    spent: HashMap<String, f64>,
+    /// The commands the root's exec calls have shown, by tool call id: the
+    /// call's own and those of its updates.
+    execs: HashMap<String, Vec<String>>,
+}
+
+/// The command in an exec's `rawInput`: `None` without an input, and an
+/// empty one, which no check passes, for an input without a command.
+fn exec_command(raw_input: &Value) -> Option<String> {
+    (!raw_input.is_null()).then(|| raw_input["command"].as_str().unwrap_or_default().to_owned())
+}
+
+impl JobRun<'_, '_> {
+    /// Takes what devin sent while the prompt ran; an error once the job
+    /// has gone over its budget.
+    fn handle(&mut self, acp: &Arc<Acp>, m: Incoming) -> Result<()> {
+        match m {
+            Incoming::Notification(n) if n.method == "session/update" => {
+                if let Ok(n) = serde_json::from_value::<SessionNotification>(n.params) {
+                    self.update(n.update);
+                }
+            }
+            Incoming::Notification(n) if n.method == "_cognition.ai/agent_stopped" => {
+                let stopped = parse::<AgentStopped>(n.params).unwrap_or_default();
+                if subagent_of(&stopped.meta).is_none() {
+                    self.stopped = stopped.stats.acu_cost.or(self.stopped);
+                }
+            }
+            Incoming::Request(r) => self.request(acp, r),
+            Incoming::Notification(_) | Incoming::Response(_) => {}
+        }
+        let spent = self.spent.values().sum::<f64>();
+        if spent.max(self.stopped.unwrap_or_default()) > self.job.budget.acu {
+            acp.notify("session/cancel", json!({"sessionId": self.session}));
+            *self.cancelled = true;
+            bail!(
+                "the {} went over its budget of {} ACU",
+                self.job.kind.name(),
+                self.job.budget.acu
+            );
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, u: SessionUpdate) {
+        if let SessionUpdate::UsageUpdate(usage) = &u {
+            if let Some(total) = extension(&usage.meta, "totalAcuCost").and_then(Value::as_f64) {
+                let agent = u.subagent().unwrap_or("root").to_owned();
+                let spent = self.spent.entry(agent).or_default();
+                *spent = spent.max(total);
+            }
+            return;
+        }
+        if u.subagent().is_some() {
+            return;
+        }
+        match u {
+            SessionUpdate::AgentMessageChunk {
+                content: ContentBlock::Text { text },
+                ..
+            } => self.text += &text,
+            SessionUpdate::ToolCall(call) => {
+                // Whatever came before wasn't the final answer.
+                self.text.clear();
+                if extension(&call.meta, "inferenceToolName").and_then(Value::as_str)
+                    == Some("exec")
+                {
+                    let command = call.raw_input["command"].as_str().unwrap_or_default();
+                    self.execs
+                        .insert(call.tool_call_id, vec![command.to_owned()]);
+                }
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                if let (Some(commands), Some(command)) = (
+                    self.execs.get_mut(&update.tool_call_id),
+                    exec_command(&update.raw_input),
+                ) {
+                    commands.push(command);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Allows an exec of a read-only command if the job may run those,
+    /// rejects every other permission request, and declines questions.
+    fn request(&mut self, acp: &Arc<Acp>, r: Request) {
+        match r.method.as_str() {
+            "session/request_permission" => match parse::<PermissionRequest>(r.params) {
+                Ok(p) => {
+                    // Every account of the command has to pass, since
+                    // there's no telling which one runs.
+                    let allowed = self.job.tools == JobTools::ReadOnly
+                        && self
+                            .execs
+                            .get(&p.tool_call.tool_call_id)
+                            .is_some_and(|seen| {
+                                let editable = extension(&p.tool_call.meta, "editableCommand")
+                                    .map(|c| c.as_str().unwrap_or_default().to_owned());
+                                seen.iter()
+                                    .cloned()
+                                    .chain(editable)
+                                    .chain(exec_command(&p.tool_call.raw_input))
+                                    .all(|c| crate::cleanup::allowed_command(&c))
+                            });
+                    let kind = if allowed {
+                        ApprovalKind::AllowOnce
+                    } else {
+                        ApprovalKind::RejectOnce
+                    };
+                    let option = first_option(&permission_options(&p), kind);
+                    acp.respond(&r.id, permission_outcome(option));
+                }
+                Err(e) => acp.respond_error(&r.id, -32602, &format!("{e}")),
+            },
+            "elicitation/create" => acp.respond(&r.id, json!({"action": "decline"})),
+            _ => acp.respond_error(&r.id, -32601, "unknown method"),
+        }
+    }
+}
+
+/// The job's outcome, beside the session id it got to and whether it
+/// cancelled its prompt already.
+async fn run_job(
+    rpc: &mut Rpc,
+    model: &str,
+    job: &JobSpec<'_>,
+    cwd: &Path,
+) -> (Result<Value>, Option<String>, bool) {
+    let mut session = None;
+    let mut cancelled = false;
+    let result = tokio::time::timeout(job.timeout, async {
+        rpc.call("initialize", initialize_params()).await?;
+        let result = rpc
+            .call("session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .await?;
+        let created: NewSessionResponse = parse(result)?;
+        session = Some(created.session_id.clone());
+        let id = created.session_id;
+        rpc.call(
+            "session/set_config_option",
+            json!({"sessionId": id, "configId": "model", "value": model}),
+        )
+        .await?;
+        rpc.call(
+            "session/set_mode",
+            json!({"sessionId": id, "modeId": "ask"}),
+        )
+        .await?;
+        let mut run = JobRun {
+            job,
+            cancelled: &mut cancelled,
+            stopped: None,
+            session: id.clone(),
+            text: String::new(),
+            spent: HashMap::new(),
+            execs: HashMap::new(),
+        };
+        let prompt = format!(
+            "{}\n\nReply with only a JSON object, no other text, that matches this JSON schema:\n{}",
+            job.input,
+            serde_json::to_string_pretty(job.schema).unwrap_or_default()
+        );
+        let result = rpc
+            .call_with(
+                "session/prompt",
+                json!({"sessionId": id, "prompt": [{"type": "text", "text": prompt}]}),
+                |acp, m| run.handle(acp, m),
+            )
+            .await?;
+        match parse::<PromptResponse>(result)?.stop_reason.as_str() {
+            "end_turn" => parse_reply(job.kind.name(), &run.text),
+            r => bail!("the {} stopped: {r}", job.kind.name()),
+        }
+    })
+    .await;
+    let result = result.unwrap_or_else(|_| {
+        Err(anyhow!(
+            "the {} took longer than {}s",
+            job.kind.name(),
+            job.timeout.as_secs()
+        ))
+    });
+    (result, session, cancelled)
+}
+
 /// The fake `devin acp` in //grenadine/testing, set up in `dir` to play
 /// `scenario` (see fake_devin.py); what the client sends goes to
 /// `dir/devin_log`. Returns the executable to run as devin.
 #[cfg(test)]
 pub fn fake(dir: &Path, mut scenario: Value) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::io::Write as _;
     let fake = std::path::absolute(std::env::var("FAKE_DEVIN").unwrap()).unwrap();
     scenario["log"] = dir.join("devin_log").to_str().unwrap().into();
     let path = dir.join("scenario.json");
     std::fs::write(&path, scenario.to_string()).unwrap();
     let exe = dir.join("devin");
-    std::fs::write(
-        &exe,
-        format!(
-            "#!/bin/sh\nexec {} --scenario={} \"$@\"\n",
-            fake.display(),
-            path.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Another process writes it: a test thread that forks while this one
+    // holds it open for writing would keep it open in the child, and
+    // running it would fail with "Text file busy".
+    let mut writer = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(&exe)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let script = format!(
+        "#!/bin/sh\nexec {} --scenario={} \"$@\"\n",
+        fake.display(),
+        path.display()
+    );
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
     exe
 }
 
@@ -1330,6 +1755,7 @@ mod tests {
                     id: "exec:0#abc".into(),
                     name: "Bash".into(),
                     input: r#"{"command":"echo hi"}"#.into(),
+                    parent: None,
                 },
                 AgentEventKind::ToolResult {
                     id: "exec:0#abc".into(),
@@ -1549,6 +1975,7 @@ mod tests {
                 id: "exit_plan_mode:0#f".into(),
                 name: "ExitPlanMode".into(),
                 input: r##"{"plan":"# The plan\n\nDo the thing.\n"}"##.into(),
+                parent: None,
             }
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1563,6 +1990,7 @@ mod tests {
                 id: "exit_plan_mode:0#g".into(),
                 name: "ExitPlanMode".into(),
                 input: r#"{"plan":"summary"}"#.into(),
+                parent: None,
             }
         );
     }
@@ -1774,5 +2202,394 @@ mod tests {
         assert_eq!(devin.default_mode(), "accept-edits");
         assert_eq!(devin.after_plan(), ["accept-edits", "bypass"]);
         assert_eq!(devin.cost_unit(), grenadine_core::api::CostUnit::Acu);
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    /// A session/update step with a chunk of the answer.
+    fn chunk(text: &str) -> Value {
+        json!({"update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        }})
+    }
+
+    /// The steps that start an exec of `command` as `call` and ask
+    /// permission for it.
+    fn exec_asking(call: &str, command: &str) -> [Value; 2] {
+        [
+            json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": call,
+                "rawInput": {"command": command},
+                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+            }}),
+            json!({
+                "request": "session/request_permission",
+                "params": {
+                    "sessionId": "job-s",
+                    "toolCall": {"toolCallId": call},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            }),
+        ]
+    }
+
+    /// A fake devin whose prompts take `steps`.
+    fn fake_job(dir: &Path, steps: Vec<Value>) -> PathBuf {
+        fake(
+            dir,
+            json!({"session_id": "job-s", "prompts": [{"steps": steps}]}),
+        )
+    }
+
+    fn job() -> JobSpec<'static> {
+        static SCHEMA: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({"type": "object"}));
+        JobSpec {
+            kind: JobKind::Scan,
+            schema: &SCHEMA,
+            input: "do it",
+            tools: JobTools::ReadOnly,
+            budget: crate::agent::Budget { usd: 1.0, acu: 1.0 },
+            add_dir: None,
+            clone: None,
+            timeout: Duration::from_secs(20),
+        }
+    }
+
+    /// The methods the client sent the fake devin in `dir`, in order.
+    fn methods(dir: &Path) -> Vec<String> {
+        fake_log(dir)
+            .iter()
+            .filter_map(|m| m["method"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// A job: the session id rides on every call, the reply is parsed,
+    /// and the session is deleted afterwards.
+    #[tokio::test]
+    async fn a_job_runs_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(
+            dir.path(),
+            vec![chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})],
+        );
+        let out = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(
+            methods(dir.path()),
+            [
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/set_mode",
+                "session/prompt",
+                "session/delete",
+            ]
+        );
+        let log = fake_log(dir.path());
+        for m in &log[2..] {
+            assert_eq!(m["params"]["sessionId"], "job-s", "{m}");
+        }
+        assert_eq!(log[2]["params"]["value"], "swe-2-high");
+        assert_eq!(log[3]["params"]["modeId"], "ask");
+    }
+
+    /// A request devin makes while the job sets up is declined rather
+    /// than left to stall the job.
+    #[tokio::test]
+    async fn declines_requests_while_setting_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake(
+            dir.path(),
+            json!({
+                "session_id": "job-s",
+                "ask_on_new": "fs/read_text_file",
+                "prompts": [{"steps": [chunk(r#"{"ok": true}"#), {"end": "end_turn"}]}],
+            }),
+        );
+        let mut job = job();
+        job.timeout = Duration::from_secs(5);
+        let out = structured(&exe, "swe-2-high", &job, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"ok": true}));
+        let reply = fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["id"] == "new-1")
+            .unwrap();
+        assert_eq!(reply["error"]["code"], -32601, "{reply}");
+    }
+
+    /// A usage update step: `agent`'s running ACU total.
+    fn usage(agent: &str, acu: f64) -> Value {
+        json!({"update": {
+            "sessionUpdate": "usage_update",
+            "used": 1,
+            "size": 2,
+            "_meta": {
+                "cognition.ai/totalAcuCost": acu,
+                "cognition.ai/subagent_context": {"parentAgentId": agent},
+            },
+        }})
+    }
+
+    /// The budget counts each agent's latest total once, and the
+    /// subagents' on top of the root's.
+    #[tokio::test]
+    async fn the_budget_counts_subagents() {
+        let steps = |sub: Option<f64>| {
+            let mut steps = vec![usage("root", 0.6), usage("root", 0.9)];
+            steps.extend(sub.map(|acu| usage("sub-1", acu)));
+            steps.extend([chunk(r#"{"ok": true}"#), json!({"end": "end_turn"})]);
+            steps
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(Some(0.05)));
+        let out = structured(&exe, "swe-2-high", &job(), dir.path()).await;
+        assert_eq!(out.unwrap(), json!({"ok": true}));
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(Some(0.2)));
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
+        assert!(methods(dir.path()).contains(&"session/cancel".to_owned()));
+    }
+
+    /// Over budget: session/cancel goes out and the error says so.
+    #[tokio::test]
+    async fn over_budget_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(
+            dir.path(),
+            vec![
+                json!({"update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 1,
+                    "size": 2,
+                    "_meta": {"cognition.ai/totalAcuCost": 2.5},
+                }}),
+                json!({"end": "end_turn"}),
+            ],
+        );
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
+        // Cancelled once, then deleted.
+        assert_eq!(
+            methods(dir.path())[4..],
+            ["session/prompt", "session/cancel", "session/delete"]
+        );
+    }
+
+    /// The root's `agent_stopped` total counts toward the budget; a
+    /// subagent's doesn't.
+    #[tokio::test]
+    async fn the_budget_counts_agent_stopped() {
+        let stopped = |meta: Value| {
+            json!({
+                "notify": "_cognition.ai/agent_stopped",
+                "params": {"stats": {"acuCost": 1.5}, "_meta": meta},
+            })
+        };
+        let steps = |meta| {
+            vec![
+                usage("root", 0.2),
+                stopped(meta),
+                chunk(r#"{"ok": true}"#),
+                json!({"end": "end_turn"}),
+            ]
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sub = json!({"cognition.ai/subagent_context": {"parentAgentId": "sub-1"}});
+        let exe = fake_job(dir.path(), steps(sub));
+        let out = structured(&exe, "swe-2-high", &job(), dir.path()).await;
+        assert_eq!(out.unwrap(), json!({"ok": true}));
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), steps(json!({})));
+        let e = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("budget"), "{e:#}");
+    }
+
+    /// An exec the allowlist passes gets allow_once, one it doesn't gets
+    /// reject_once, and an elicitation is declined.
+    #[tokio::test]
+    async fn answers_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut steps = Vec::new();
+        steps.extend(exec_asking("t1", "ls -la"));
+        steps.extend(exec_asking("t2", "rm -rf /"));
+        // An exec whose update or permission request says something else
+        // than its call.
+        let [call, mut ask] = exec_asking("t3", "ls");
+        ask["params"]["toolCall"]["_meta"] = json!({"cognition.ai/editableCommand": "rm -rf /"});
+        steps.extend([call, ask]);
+        let [call, ask] = exec_asking("t4", "ls");
+        steps.extend([
+            call,
+            json!({"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t4",
+                "rawInput": {"command": "rm -rf /"},
+            }}),
+            ask,
+        ]);
+        let [call, mut ask] = exec_asking("t5", "ls");
+        ask["params"]["toolCall"]["rawInput"] = json!({"command": "rm -rf /"});
+        steps.extend([call, ask]);
+        steps.push(json!({
+            "request": "elicitation/create",
+            "params": {"sessionId": "job-s", "message": "pick"},
+        }));
+        steps.push(chunk(r#"{"a": 1}"#));
+        steps.push(json!({"end": "end_turn"}));
+        let exe = fake_job(dir.path(), steps);
+        let out = structured(&exe, "swe-2-high", &job(), dir.path())
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"a": 1}));
+        // The fake numbers its requests in the order it sends them.
+        let reply = |id: &str| {
+            fake_log(dir.path())
+                .into_iter()
+                .find(|m| m["id"] == id && m["method"].is_null())
+                .unwrap_or_else(|| panic!("no reply to {id}"))
+        };
+        assert_eq!(
+            reply("session/request_permission-1")["result"],
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}})
+        );
+        assert_eq!(
+            reply("session/request_permission-2")["result"],
+            json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}})
+        );
+        for id in 3..=5 {
+            assert_eq!(
+                reply(&format!("session/request_permission-{id}"))["result"],
+                json!({"outcome": {"outcome": "selected", "optionId": "reject_once"}}),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            reply("elicitation/create-6")["result"],
+            json!({"action": "decline"})
+        );
+    }
+
+    /// A devin that never answers the prompt: timeout, and the prompt is
+    /// cancelled before the session is deleted.
+    #[tokio::test]
+    async fn times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = fake_job(dir.path(), Vec::new());
+        let mut job = job();
+        // Long enough for the fake to start and get to the prompt on a slow
+        // machine; a Python start-up alone can take most of a second.
+        job.timeout = Duration::from_secs(5);
+        let e = structured(&exe, "swe-2-high", &job, dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("took longer"), "{e:#}");
+        assert_eq!(
+            methods(dir.path())[4..],
+            ["session/prompt", "session/cancel", "session/delete"]
+        );
+    }
+
+    /// A subagent's tool call becomes a ToolUse with its parent, and isn't
+    /// remembered for results.
+    #[test]
+    fn a_subagents_call_names_its_parent() {
+        let mut u = Updates::new();
+        let events = u.update(&serde_json::from_str(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"exec:0#a6e9","rawInput":{"command":"ls"},"_meta":{"cognition.ai/inferenceToolName":"exec","cognition.ai/subagent_context":{"parentAgentId":"a6e974a3"}}}"#,
+        ).unwrap());
+        assert_eq!(
+            events,
+            [AgentEventKind::ToolUse {
+                id: "exec:0#a6e9".into(),
+                name: "Bash".into(),
+                input: r#"{"command":"ls"}"#.into(),
+                parent: Some("a6e974a3".into()),
+            }]
+        );
+        assert!(u.update(&serde_json::from_str(
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"exec:0#a6e9","status":"completed","content":[{"type":"content","content":{"type":"text","text":"x"}}],"_meta":{"cognition.ai/subagent_context":{"parentAgentId":"a6e974a3"}}}"#,
+        ).unwrap()).is_empty());
+    }
+
+    /// A subagent's tool call while the root writes its answer doesn't
+    /// cut the answer in two.
+    #[test]
+    fn a_subagents_call_keeps_the_roots_text_whole() {
+        let mut u = Updates::new();
+        let mut events = Vec::new();
+        for body in [
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Half"}}"#,
+            r#"{"sessionUpdate":"tool_call","toolCallId":"exec:0#s","rawInput":{"command":"ls"},"_meta":{"cognition.ai/inferenceToolName":"exec","cognition.ai/subagent_context":{"parentAgentId":"sub-1"}}}"#,
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" whole"}}"#,
+        ] {
+            events.extend(u.update(&serde_json::from_str(body).unwrap()));
+        }
+        events.extend(u.flush());
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEventKind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Half whole"]);
+    }
+
+    /// The reply parser takes the whole reply, the last fenced block
+    /// with an object, or the last object in prose, and fails on garbage.
+    #[test]
+    fn extracts_the_json_reply() {
+        let parse = |reply: &str| parse_reply("t", reply).unwrap();
+        // A fence quoted inside a string of the JSON isn't one.
+        let quoted = r#"{"items":[{"title":"t","detail":"Run:\n```sh\ndocker rm x\n```"}]}"#;
+        assert_eq!(
+            parse(quoted),
+            json!({"items": [{"title": "t", "detail": "Run:\n```sh\ndocker rm x\n```"}]})
+        );
+        assert_eq!(
+            parse("Here you go.\n```json\n{\"a\": 1}\n```\nDone."),
+            json!({"a": 1})
+        );
+        // The last fenced block with an object wins, whatever its info.
+        assert_eq!(
+            parse("```jsonc\n{\"a\": 1}\n```\nor\n```\n{\"a\": 2}\n```\n```sh\nls\n```"),
+            json!({"a": 2})
+        );
+        // Fences that aren't at the start of a line don't count, and an
+        // unclosed one runs to the end.
+        assert_eq!(
+            parse("Use ``` for code.\n```json\n{\"a\": 3}\n"),
+            json!({"a": 3})
+        );
+        // Braces in prose before the object, and objects inside it.
+        assert_eq!(
+            parse("use {x} like {this}: {\"a\": {\"b\": 4}} cheers"),
+            json!({"a": {"b": 4}})
+        );
+        assert_eq!(parse("first {\"a\": 1}, then {\"b\": 5}"), json!({"b": 5}));
+        // An unclosed fence with prose after the object.
+        assert_eq!(parse("```json\n{\"a\": 6}\nThat's all."), json!({"a": 6}));
+        assert!(parse_reply("t", "no json here").is_err());
+        assert!(parse_reply("t", "[1, 2]").is_err());
     }
 }
