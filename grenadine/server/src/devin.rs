@@ -2496,7 +2496,9 @@ mod job_tests {
         let dir = tempfile::tempdir().unwrap();
         let exe = fake_job(dir.path(), Vec::new());
         let mut job = job();
-        job.timeout = Duration::from_millis(500);
+        // Long enough for the fake to start and get to the prompt on a slow
+        // machine; a Python start-up alone can take most of a second.
+        job.timeout = Duration::from_secs(5);
         let e = structured(&exe, "swe-2-high", &job, dir.path())
             .await
             .unwrap_err();
