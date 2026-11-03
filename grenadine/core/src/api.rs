@@ -528,6 +528,9 @@ pub struct Review {
     pub body: String,
     pub submitted_at: String,
     pub url: String,
+    /// The PR head the review was submitted against.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// A comment on the PR itself rather than on its code.

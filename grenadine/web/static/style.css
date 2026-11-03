@@ -698,6 +698,20 @@ input[type="text"] {
 .versions tr.missing {
   opacity: 0.5;
 }
+.versions tr.reviewed td {
+  background: var(--accent-bg);
+}
+.versions tr.reviewed:hover td {
+  background: var(--bg-hover);
+}
+.vreviewed {
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 11px;
+}
 .vnum {
   display: inline-block;
   min-width: 2ch;

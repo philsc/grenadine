@@ -317,6 +317,7 @@ type PullRequestReview {
   body: String!
   submittedAt: DateTime
   url: URI!
+  commit: Commit
   author: Actor
 }
 

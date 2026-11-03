@@ -29,11 +29,13 @@ from playwright.sync_api import Dialog, Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import (
+    APPROVED,
     COMMENTED,
     TEAM,
     TOKEN,
     CheckRun,
     FakeGitHub,
+    Review,
 )
 
 # How long the server may take to start listening.
@@ -1666,6 +1668,16 @@ class VersionsTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
         cls.cases = scenarios.versions_cases(gh)
+        grow = cls.cases.prs[scenarios.GROW]
+        shas = cls.cases.shas[scenarios.GROW]
+        # The viewer last reviewed v3; someone else's later approval of the
+        # head doesn't count.
+        grow.reviews.append(
+            Review(scenarios.VIEWER, COMMENTED, commit=shas[2], submitted_at=gh.tick())
+        )
+        grow.reviews.append(
+            Review(scenarios.OTHER, APPROVED, commit=shas[-1], submitted_at=gh.tick())
+        )
 
     def open(self, title: str) -> None:
         pr = self.cases.prs[title]
@@ -1713,6 +1725,16 @@ class VersionsTest(ServerTestCase):
         # Base can't be the latest version, and Head can't be the base.
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
+
+    def test_marks_the_last_reviewed_version(self) -> None:
+        self.open(scenarios.GROW)
+        picker = self.page.locator("details.picker")
+        picker.locator("summary").click()
+        rows = picker.locator("tbody tr")
+        expect(picker.locator("tr.reviewed")).to_have_count(1)
+        expect(rows.nth(3)).to_have_class(re.compile(r"(?:^| )reviewed(?: |$)"))
+        expect(rows.nth(3).locator(".vreviewed")).to_have_text("last reviewed")
+        expect(picker.locator(".vreviewed")).to_have_count(1)
 
     def test_lines_are_commentable_only_against_the_base(self) -> None:
         self.open(scenarios.GROW)

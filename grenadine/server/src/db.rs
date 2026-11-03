@@ -2107,6 +2107,7 @@ mod tests {
                 body: String::new(),
                 submitted_at: "s".into(),
                 url: "u".into(),
+                commit: None,
             }],
             requested: vec!["team".into()],
             comments: vec![],

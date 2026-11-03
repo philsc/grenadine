@@ -84,6 +84,8 @@ class Review:
     body: str = ""
     # When it was submitted; 0 means at EPOCH.
     submitted_at: int = 0
+    # The PR head the review was submitted against.
+    commit: str | None = None
 
 
 @dataclasses.dataclass
@@ -191,7 +193,7 @@ class PullRequest:
     def submit_review(self, author: str, state: str, body: str = "") -> None:
         """Adds a review by `author`. Like GitHub, submitting a review
         removes the author's pending review request."""
-        self.reviews.append(Review(author, state, body=body))
+        self.reviews.append(Review(author, state, body=body, commit=self.head_oid))
         self.review_requests.discard(author)
         self.touch()
 
@@ -428,7 +430,13 @@ class FakeRepo:
     def review(
         self, pr: PullRequest, *, author: str, state: str, body: str = ""
     ) -> Review:
-        r = Review(author=author, state=state, body=body, submitted_at=self.gh.tick())
+        r = Review(
+            author=author,
+            state=state,
+            body=body,
+            submitted_at=self.gh.tick(),
+            commit=pr.head_oid,
+        )
         pr.reviews.append(r)
         pr.review_requests.discard(author)
         pr.touch()
@@ -1201,6 +1209,7 @@ class FakeGitHub:
                     "body": r.body,
                     "submittedAt": iso(r.submitted_at or EPOCH),
                     "url": f"{pr.url}#pullrequestreview-{i}",
+                    "commit": (self._commit_node(repo, r.commit) if r.commit else None),
                     "author": self._user_node(r.author),
                 }
                 for i, r in enumerate(pr.reviews)
