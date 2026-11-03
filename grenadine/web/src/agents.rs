@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use grenadine_core::api::{
-    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs,
-    AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CleanupState, CostUnit,
-    GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage,
-    SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
+    AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CiStatus, CleanupState,
+    CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
+    PromptImage, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -1488,6 +1488,11 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
     // remounts when that flips, not on every session update.
     let general =
         Memo::new(move |_| current.with(|s| s.as_ref().is_some_and(|s| s.repo == GENERAL)));
+    // The session's repo for the pane below, likewise narrow; a
+    // session's repo never changes.
+    let repo = Memo::new(move |_| {
+        current.with(|s| s.as_ref().map(|s| s.repo.clone()).unwrap_or_default())
+    });
 
     // A session shows on the page of its kind.
     Effect::new(move || {
@@ -1541,7 +1546,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                 </main>
                 // A general session's directory isn't a git worktree.
                 {move || {
-                    (load.get() == Load::Ready && !general.get()).then(|| view! { <ChangesPane id=id.clone() events=events /> })
+                    (load.get() == Load::Ready && !general.get()).then(|| view! { <ChangesPane id=id.clone() repo=repo.get_untracked() events=events /> })
                 }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
@@ -1570,7 +1575,7 @@ fn wide_enough() -> bool {
 /// when the window has room for them. They are refetched as the session's
 /// events come in, since those are when the agent changes files.
 #[component]
-fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
+fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let session = id.clone();
     let wide = RwSignal::new(wide_enough());
@@ -1630,6 +1635,7 @@ fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
         wide.get().then(|| {
             view! {
                 <aside class="changes-pane">
+                    <AssociatedPrs id=session.clone() repo=repo.clone() />
                     <h2>"Unstaged changes"</h2>
                     {move || match loaded.get() {
                         None => view! { <p class="muted">"Loading…"</p> }.into_any(),
@@ -1643,6 +1649,75 @@ fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
                     }}
                     <WorktreeDiff files=files session=session.clone() />
                 </aside>
+            }
+        })
+    }
+}
+
+/// The icon class and tooltip of a PR a session opened. A conflict
+/// outranks the checks, and a closed PR shows neither.
+fn pr_state(pr: &AgentPr) -> (&'static str, &'static str) {
+    match pr.state.as_str() {
+        "MERGED" => ("merged", "Merged"),
+        "CLOSED" => ("closed", "Closed without merging"),
+        _ if pr.conflicting => ("conflict", "Conflicts with its base"),
+        _ => match pr.ci {
+            Some(CiStatus::Failing) => ("failing", "Checks failing"),
+            Some(CiStatus::Running) => ("running", "Checks running"),
+            Some(CiStatus::Passing) => ("passing", "Checks passing"),
+            None => ("open", "No checks"),
+        },
+    }
+}
+
+/// The PRs the session opened, above the unstaged changes. Nothing
+/// renders until the first fetch comes back with at least one.
+#[component]
+fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
+    let updates = expect_context::<Updates>();
+    let prs = LocalResource::new(move || {
+        updates.agents.track();
+        let id = id.clone();
+        async move { api::agent_prs(&id).await }
+    });
+    // Keeps the last list while refetching so that the rows don't
+    // flicker.
+    let loaded = Memo::new(move |prev: Option<&Vec<AgentPr>>| {
+        prs.get()
+            .and_then(|r| r.ok())
+            .or_else(|| prev.cloned())
+            .unwrap_or_default()
+    });
+
+    move || {
+        let list = loaded.get();
+        (!list.is_empty()).then(|| {
+            view! {
+                <section class="associated-prs">
+                    <h2>"Associated PRs"</h2>
+                    <ul>
+                        {list
+                            .into_iter()
+                            .map(|pr| {
+                                let (class, tooltip) = pr_state(&pr);
+                                let label = match pr.key.repo == repo {
+                                    true => format!("#{}", pr.key.number),
+                                    false => format!("{}#{}", pr.key.repo, pr.key.number),
+                                };
+                                view! {
+                                    <li>
+                                        <a href=hash_for(&pr.key)>
+                                            <span class=format!("pr-state {class}") title=tooltip>
+                                                <PrIcon />
+                                            </span>
+                                            {label} " " {pr.title.clone().unwrap_or_default()}
+                                        </a>
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                </section>
             }
         })
     }

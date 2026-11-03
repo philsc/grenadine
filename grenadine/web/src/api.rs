@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentSession, Approval, AutoReviewEntry, Blob, BlobsRequest,
-    BlobsResponse, Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    PromptImage, RepoSettings, SubmitReview, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
+    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoReviewEntry, Blob,
+    BlobsRequest, BlobsResponse, Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest,
+    Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail,
+    PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview, SyncStatus, TerminalInfo,
+    WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -242,6 +243,15 @@ pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     .json()
     .await
     .map_err(|e| e.to_string())
+}
+
+/// The PRs a session opened, as of the last poll.
+pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
+    check(Request::get(&format!("/api/agents/{id}/prs")).send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The session's open terminals, oldest first.
