@@ -2377,6 +2377,12 @@ class AgentTest(ServerTestCase):
         expect(count).to_have_text("1")
         expect(count).to_have_attribute("title", "1 file with unstaged changes")
 
+        # Fold notes.txt. Tagging the pane proves below that the next
+        # turn's session updates don't rebuild it.
+        pane.evaluate("el => el.dataset.probe = '1'")
+        files.locator(".file-header").click()
+        expect(files.locator("table")).to_have_count(0)
+
         # Edits made since show up with the agent's next events.
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         (worktree / "README").write_text("hello\nworld\n")
@@ -2388,8 +2394,22 @@ class AgentTest(ServerTestCase):
         expect(files.locator(".status")).to_have_text(["modified", "added"])
         expect(count).to_have_text("2")
         expect(count).to_have_attribute("title", "2 files with unstaged changes")
+        # The pane kept its element, and notes.txt its fold even though
+        # its contents changed; README starts unfolded.
+        expect(pane).to_have_attribute("data-probe", "1")
         expect(files.first.locator("tr.add .code")).to_have_text(["world"])
+        expect(files.nth(1).locator("table")).to_have_count(0)
+        files.nth(1).locator(".file-header").click()
         expect(files.nth(1).locator("tr.add .code")).to_have_text(["write more"])
+        files.nth(1).locator(".file-header").click()
+        expect(files.nth(1).locator("table")).to_have_count(0)
+
+        # Folds are kept in the tab's session storage, so they survive a
+        # reload.
+        self.page.reload()
+        expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
+        expect(files.first.locator("tr.add .code")).to_have_text(["world"])
+        expect(files.nth(1).locator("table")).to_have_count(0)
 
         # The transcript keeps most of the width.
         main = self.page.locator(".agent-panes > .main").bounding_box()
