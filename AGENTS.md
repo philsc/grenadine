@@ -16,6 +16,14 @@ The `Cargo.toml` files exist only so that crate_universe and rust-analyzer see t
 
 Use plain `bazel` commands. `.bazelrc` already configures what this repo needs. Additional flags are not necessary.
 
+## Keep private repositories private
+
+Information from private repositories must never appear in this repository or on its GitHub pages. That covers code, tests, test data, code comments, commit messages, PR titles and descriptions, review comments, and issues.
+
+This includes names of private repositories, their owners, branches, files, users, PR titles, and any of their content. Don't reference private repositories' PRs or issues either, not even by number or URL.
+
+When a bug was found through a private repository, describe it in generic terms and reproduce it with made-up data.
+
 ## Commands
 
 | Task                     | Command                                                                                             |
