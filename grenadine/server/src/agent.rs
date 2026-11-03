@@ -1700,7 +1700,7 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
             return;
         }
         Ok(Step::Ask { reason, .. }) => Err(anyhow!("{reason}")),
-        Ok(Step::Pushed { .. }) => Err(anyhow!("the PR wasn't opened")),
+        Ok(Step::Pushed { .. }) => Err(pushed_unopened()),
         Err(e) => Err(e),
     };
     state.agents.with_live(id, |l| l.wrap_up = None);
@@ -1712,6 +1712,67 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
         }
     };
     let _ = emit(state, id, kind);
+}
+
+/// Why a landing that pushed its commits but opened none of its PRs
+/// failed.
+fn pushed_unopened() -> anyhow::Error {
+    anyhow!("the PR wasn't opened")
+}
+
+/// `s` with its first letter capitalized.
+fn capitalized(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// What the agent is told when the worktree isn't ready to land: why, and
+/// what to do before calling `tool` again, as `prompt`'s instruction
+/// without the "Wrap up: " it carries for the backend.
+fn ask_again(reason: &str, prompt: &str, tool: &str) -> anyhow::Error {
+    let instruction = prompt.strip_prefix("Wrap up: ").unwrap_or(prompt);
+    anyhow!(
+        "{}\n\n{} Then call `{tool}` again.",
+        capitalized(reason),
+        capitalized(instruction)
+    )
+}
+
+/// Lands the session's work on `target` right away, for the session's own
+/// `update_prs` and `land_on_checkout` MCP tools. Unlike `wrap_up`, which
+/// runs once the turns in front of it are done, this runs inside the turn
+/// that calls it, so it must not wait for one. Its errors are the tool's
+/// result, told to the agent.
+pub async fn land_now(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Landed> {
+    let session = state
+        .db
+        .agent(id)?
+        .ok_or_else(|| anyhow!("the session is gone"))?;
+    if session.kind == SessionKind::AutoReview {
+        bail!("an unattended review's work is never landed");
+    }
+    if state.agents.with_live(id, |l| l.wrap_up.is_some()) {
+        bail!(
+            "the user is wrapping up this session from Grenadine already; wait for that to \
+             finish"
+        );
+    }
+    let tool = match target {
+        WrapUpTarget::PullRequest => "update_prs",
+        WrapUpTarget::Checkout => "land_on_checkout",
+    };
+    match land(state, id, target).await? {
+        Step::Landed(landed) => {
+            record_landed(state, id, &landed)?;
+            emit(state, id, AgentEventKind::Landed(landed.clone()))?;
+            Ok(landed)
+        }
+        Step::Ask { reason, prompt } => Err(ask_again(&reason, &prompt, tool)),
+        Step::Pushed { .. } => Err(pushed_unopened()),
+    }
 }
 
 fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
@@ -1819,7 +1880,7 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
 
 /// The branch the `i`th commit of a session's stack, from 0, is pushed to:
 /// the session's own branch for the bottom one.
-fn stack_branch(branch: &str, i: usize) -> String {
+pub(crate) fn stack_branch(branch: &str, i: usize) -> String {
     match i {
         0 => branch.to_owned(),
         _ => format!("{branch}-{}", i + 1),
@@ -1900,7 +1961,9 @@ fn push_stack(
     }
     if commits.len() < opened {
         bail!(
-            "the session has {} commits but opened {opened} PRs, one per commit",
+            "the session has {} commits but opened {opened} pull requests, one per commit; \
+             keep one commit per pull request, and amend a pull request's commit to change \
+             it rather than squashing commits together",
             commits.len()
         );
     }
@@ -1949,13 +2012,28 @@ fn landed_note(session: &AgentSession) -> Option<String> {
                 "The user had Grenadine, the app running this session, open these pull requests \
                  from this session's commits, one per commit, each stacked on the one before \
                  it:\n{prs}\nThese are this session's PRs. Don't open other PRs for this work or \
-                 push it to other branches. To put new commits on them, ask the user to click \
-                 Open PR again: that pushes each commit to its PR's branch and opens a PR for \
-                 each new commit."
+                 push it to other branches. To update them or open PRs for new commits, call \
+                 the grenadine MCP server's update_prs tool."
             )
         }
     };
     Some(note)
+}
+
+/// What agents working in a repository are told about their pull
+/// requests: Grenadine keeps track of them, so they go through its MCP
+/// tools rather than git.
+fn prs_note(session: &AgentSession) -> Option<String> {
+    if session.repo == GENERAL || session.kind == SessionKind::AutoReview {
+        return None;
+    }
+    Some(
+        "Grenadine, the app running this session, keeps track of this session's pull \
+         requests. To open them or update them, call the grenadine MCP server's update_prs \
+         tool; to land this session's commits on the user's checkout of the repository, call \
+         its land_on_checkout tool. Don't `git push` or open pull requests any other way."
+            .into(),
+    )
 }
 
 /// What Claude is told about the session's terminal tabs, when it has any.
@@ -2012,6 +2090,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     );
     let notes: Vec<_> = [
         (session.kind == SessionKind::AutoReview).then(|| crate::auto_review::NOTE.to_owned()),
+        prs_note(&session),
         landed_note(&session),
         terminals_note(state, id),
     ]
@@ -2503,7 +2582,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         assert!(
             lines[1].contains(
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
-                 mcp__grenadine__wait_for_terminal mcp__grenadine__show_image --mcp-config "
+                 mcp__grenadine__wait_for_terminal mcp__grenadine__show_image \
+                 mcp__grenadine__update_prs mcp__grenadine__land_on_checkout --mcp-config "
             ),
             "{log}"
         );
@@ -3663,6 +3743,255 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
     }
 
+    /// The session's own landing on the checkout, as `land_on_checkout`
+    /// runs it inside the calling turn.
+    #[tokio::test]
+    async fn lands_now_into_the_checkout() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+
+        let Landed::Checkout { sha } = land_now(&state, id, WrapUpTarget::Checkout).await.unwrap()
+        else {
+            panic!("expected a checkout landing");
+        };
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        let landed = state.db.agent(id).unwrap().unwrap();
+        assert_eq!(landed.landed, Some(Landed::Checkout { sha: sha.clone() }));
+        assert_eq!(landed.base_sha, sha);
+        let event = state
+            .db
+            .agent_events(id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .kind
+            .clone();
+        assert_eq!(event, AgentEventKind::Landed(Landed::Checkout { sha }));
+
+        // A checkout the session's commits conflict with tells the agent
+        // to rebase and call the tool again, without queuing a prompt.
+        commit(&clone, "b", "clone\n");
+        send(
+            &state,
+            id,
+            "commit b more".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, id, 2).await;
+        let err = land_now(&state, id, WrapUpTarget::Checkout)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("Rebase your commits onto"), "{text}");
+        assert!(text.contains("call `land_on_checkout` again"), "{text}");
+        let prompts = state
+            .db
+            .agent_events(id)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+            .count();
+        assert_eq!(prompts, 2);
+    }
+
+    /// `update_prs` pushes the session's commits to their PRs' branches,
+    /// an amended one included.
+    #[tokio::test]
+    async fn updates_the_prs_it_opened() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+
+        // An earlier landing opened the session's PR.
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+        run(worktree, &["commit", "--amend", "-qm", "Amended b"]);
+
+        let landed = land_now(&state, id, WrapUpTarget::PullRequest)
+            .await
+            .unwrap();
+        assert_eq!(landed, pr);
+        assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            state.db.agent(id).unwrap().unwrap().landed,
+            Some(pr.clone())
+        );
+        let event = state
+            .db
+            .agent_events(id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .kind
+            .clone();
+        assert_eq!(event, AgentEventKind::Landed(pr));
+    }
+
+    /// A new commit's branch is pushed before its PR fails to open, and
+    /// the PRs already open are kept.
+    #[tokio::test]
+    async fn pushes_new_commits_before_opening_their_prs() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+        send(
+            &state,
+            id,
+            "commit c more".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, id, 2).await;
+
+        // The test state's GitHub is unreachable, so only the push works.
+        land_now(&state, id, WrapUpTarget::PullRequest)
+            .await
+            .unwrap_err();
+        assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD~"]));
+        assert_eq!(
+            tip(&format!("{}-2", session.branch)),
+            run(worktree, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(state.db.agent(id).unwrap().unwrap().landed, Some(pr));
+    }
+
+    /// A worktree that isn't ready gets an instruction, not a prompt.
+    #[tokio::test]
+    async fn update_prs_tells_the_agent_to_commit() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "write b agent").await;
+        let id = &session.id;
+
+        let err = land_now(&state, id, WrapUpTarget::PullRequest)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("uncommitted changes"), "{text}");
+        assert!(text.contains("Commit all of your changes"), "{text}");
+        assert!(!text.contains("Wrap up:"), "{text}");
+        assert!(text.contains("call `update_prs` again"), "{text}");
+        let prompts = state
+            .db
+            .agent_events(id)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+            .count();
+        assert_eq!(prompts, 1);
+    }
+
+    /// Fewer commits than open PRs means a commit was squashed away.
+    #[tokio::test]
+    async fn update_prs_needs_a_commit_per_pr() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let pr = |number| LandedPr {
+            number,
+            url: format!("https://github.com/owner/name/pull/{number}"),
+        };
+        record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
+
+        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("1 commits but opened 2 pull requests"),
+            "{text}"
+        );
+        assert!(text.contains("one commit per pull request"), "{text}");
+        assert!(text.contains("amend"), "{text}");
+    }
+
+    /// The tools wait when the user is wrapping the session up from the
+    /// page already, and unattended reviews never land.
+    #[tokio::test]
+    async fn land_now_refuses_a_pending_wrap_up_and_reviews() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        state.agents.with_live(&session.id, |l| {
+            l.wrap_up = Some(Pending {
+                target: WrapUpTarget::Checkout,
+                mode: PermissionMode::from("auto"),
+                model: None,
+                asked: false,
+            });
+        });
+        for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
+            let err = land_now(&state, &session.id, target).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("wrapping up this session"),
+                "{err:#}"
+            );
+        }
+        state.agents.with_live(&session.id, |l| l.wrap_up = None);
+
+        let review = AgentSession {
+            kind: SessionKind::AutoReview,
+            ..session_row(&uuid(), "o/n", dir.path())
+        };
+        state.db.create_agent(&review).unwrap();
+        for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
+            let err = land_now(&state, &review.id, target).await.unwrap_err();
+            assert!(format!("{err:#}").contains("review"), "{err:#}");
+        }
+    }
+
+    /// Repo sessions hear about the landing tools; general sessions and
+    /// unattended reviews don't.
+    #[test]
+    fn tells_agents_about_the_landing_tools() {
+        let session = |repo: &str, kind| AgentSession {
+            repo: repo.into(),
+            kind,
+            ..session_row("abcdef01-2345", repo, Path::new("/w"))
+        };
+        let note = prs_note(&session("o/n", SessionKind::Interactive)).unwrap();
+        assert!(note.contains("update_prs"), "{note}");
+        assert!(note.contains("land_on_checkout"), "{note}");
+        assert_eq!(prs_note(&session(GENERAL, SessionKind::Interactive)), None);
+        assert_eq!(prs_note(&session("o/n", SessionKind::AutoReview)), None);
+    }
+
     #[test]
     fn notes_what_landed() {
         let pr = |number| LandedPr {
@@ -3693,6 +4022,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             note.contains("#5 https://github.com/o/n/pull/5 from branch `grenadine/agent/abc-2`\n"),
             "{note}"
         );
+        assert!(note.contains("update_prs"), "{note}");
+        assert!(!note.contains("Open PR"), "{note}");
     }
 
     #[tokio::test]
@@ -3721,7 +4052,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit b agent").await;
         let id = &session.id;
         let args = || std::fs::read_to_string(dir.path().join("log.args")).unwrap();
-        assert!(!args().contains("--append-system-prompt"), "{}", args());
+        assert!(args().contains("update_prs"), "{}", args());
 
         // The test state's GitHub is unreachable, so the PR is recorded as
         // wrapping up would have.
@@ -3739,12 +4070,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
         wait_for_turns(&state, id, 2).await;
         let args = args();
-        let last = args
-            .split("--append-system-prompt")
-            .nth(1)
-            .unwrap_or_default();
         assert!(
-            last.contains(&format!(
+            args.contains(&format!(
                 "#24 https://github.com/owner/name/pull/24 from branch `{}`",
                 session.branch
             )),
