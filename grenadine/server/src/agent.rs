@@ -3754,7 +3754,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 }
 
 #[cfg(test)]
-mod devin_tests {
+pub(crate) mod devin_tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use grenadine_core::api::NewAgent;

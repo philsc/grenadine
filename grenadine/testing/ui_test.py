@@ -174,6 +174,26 @@ def devin_scenario(tmp: Path) -> dict:
                 ],
             },
             {
+                "match": "Review pull request",
+                "steps": [
+                    update(
+                        {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "Reviewed."},
+                        }
+                    ),
+                    update(
+                        {
+                            "sessionUpdate": "usage_update",
+                            "used": 1000,
+                            "size": 200000,
+                            "_meta": {"cognition.ai/totalAcuCost": 0.05},
+                        }
+                    ),
+                    end,
+                ],
+            },
+            {
                 "match": "question",
                 "steps": [
                     tool_call("ask_user_question", {"questions": [question]}),
@@ -567,6 +587,14 @@ class ServerTestCase(unittest.TestCase):
             },
         )
         urllib.request.urlopen(req).close()
+
+    def devin_saw(self, needle: str) -> None:
+        # Waits until the fake devin's client log holds `needle`.
+        for _ in range(200):
+            if needle in self.devin_log.read_text():
+                return
+            time.sleep(0.05)
+        self.fail(f"devin never saw {needle}: {self.devin_log.read_text()}")
 
 
 class ChromeTest(ServerTestCase):
@@ -2040,14 +2068,6 @@ class AgentTest(ServerTestCase):
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
 
-    def devin_saw(self, needle: str) -> None:
-        # Waits until the fake devin's client log holds `needle`.
-        for _ in range(200):
-            if needle in self.devin_log.read_text():
-                return
-            time.sleep(0.05)
-        self.fail(f"devin never saw {needle}: {self.devin_log.read_text()}")
-
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:
         self.page.goto(self.url + "#/agents")
         self.page.get_by_label("Repository").select_option(label="General")
@@ -3155,7 +3175,8 @@ class AgentTest(ServerTestCase):
 class AutoReviewTest(ServerTestCase):
     QUIET_REPO = "test/quiet"
     OFF_REPO = "test/off"
-    REPOS: ClassVar[list[str]] = [scenarios.REPO, QUIET_REPO, OFF_REPO]
+    DEVIN_REPO = "test/devin"
+    REPOS: ClassVar[list[str]] = [scenarios.REPO, QUIET_REPO, OFF_REPO, DEVIN_REPO]
     POLL_INTERVAL: ClassVar[int] = 1
 
     @classmethod
@@ -3201,6 +3222,7 @@ class AutoReviewTest(ServerTestCase):
         expect(dialog.get_by_label("Review my pull requests")).to_have_value(
             "non_draft"
         )
+        expect(dialog.get_by_label("Review with")).to_have_value("claude")
         dialog.get_by_label("Review skill").fill("/code-review")
         dialog.get_by_label("Review again after new pushes").check()
         dialog.get_by_role("button", name="Save").click()
@@ -3245,9 +3267,36 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("button", name="Delete", exact=True).click()
         expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
 
+    def test_a_devin_review(self) -> None:
+        dialog = self.settings(self.DEVIN_REPO)
+        dialog.get_by_label("Review with").select_option(label="Devin")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        # Reopened, the pick persisted.
+        dialog = self.settings(self.DEVIN_REPO)
+        expect(dialog.get_by_label("Review with")).to_have_value("devin")
+        self.page.keyboard.press("Escape")
+
+        pr = self.open_pr(self.DEVIN_REPO, "Devin change")
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        entry = self.review_entry("Devin change")
+        # The fake devin can't post to GitHub, so nothing is posted.
+        expect(entry.locator(".agent-status")).to_have_text(
+            "didn't post", timeout=60_000
+        )
+        self.assertEqual(pr.issue_comments, [])
+        self.devin_saw("Review pull request")
+
+        # Its page shows the review's prompt and its cost in ACUs.
+        entry.locator("a").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript).to_contain_text(f"Review pull request {pr.url}")
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])
+
     def test_reviews_can_be_turned_off(self) -> None:
         dialog = self.settings(self.OFF_REPO)
         dialog.get_by_label("Review my pull requests").select_option(label="Never")
+        expect(dialog.get_by_label("Review with")).to_be_disabled()
         expect(dialog.get_by_label("Review skill")).to_be_disabled()
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
