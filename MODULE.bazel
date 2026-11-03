@@ -46,6 +46,16 @@ pip.parse(
     python_version = "3.13",
     requirements_lock = "//:requirements.txt",
 )
+
+# pytest-shard assigns each test to the shard its node ID hashes to, which
+# leaves shards unbalanced and sometimes empty. The patch deals the tests out
+# round-robin instead.
+# See https://github.com/AdamGleave/pytest-shard/issues/6
+pip.override(
+    file = "pytest_shard-0.1.2-py3-none-any.whl",
+    patch_strip = 1,
+    patches = ["//third_party/pytest_shard:0001-Shard-tests-round-robin.patch"],
+)
 use_repo(pip, "grenadine_pypi")
 
 # A hermetic C/C++ toolchain, which rules_rust also links with. Without it,

@@ -1,0 +1,35 @@
+--- a/pytest_shard/pytest_shard.py
++++ b/pytest_shard/pytest_shard.py
+@@ -1,6 +1,5 @@
+ """Shard tests to support parallelism across multiple machines."""
+ 
+-import hashlib
+ from typing import Iterable, List, Sequence
+ 
+ from _pytest import nodes  # for type checking only
+@@ -36,21 +35,14 @@
+     return msg
+ 
+ 
+-def sha256hash(x: str) -> int:
+-    return int.from_bytes(hashlib.sha256(x.encode()).digest(), "little")
+-
+-
+ def filter_items_by_shard(
+     items: Iterable[nodes.Node], shard_id: int, num_shards: int
+ ) -> Sequence[nodes.Node]:
+-    """Computes `items` that should be tested in `shard_id` out of `num_shards` total shards."""
+-    shards = [sha256hash(item.nodeid) % num_shards for item in items]
++    """Computes `items` that should be tested in `shard_id` out of `num_shards` total shards.
+ 
+-    new_items = []
+-    for shard, item in zip(shards, items):
+-        if shard == shard_id:
+-            new_items.append(item)
+-    return new_items
++    The items are dealt out round-robin in collection order, so shard sizes differ by at most one.
++    """
++    return [item for idx, item in enumerate(items) if idx % num_shards == shard_id]
+ 
+ 
+ def pytest_collection_modifyitems(config, items: List[nodes.Node]):
