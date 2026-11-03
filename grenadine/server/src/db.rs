@@ -311,22 +311,15 @@ const MIGRATIONS: &[Migration] = &[
     ),
     Migration::Sql(
         r#"
-    -- search_fetched and search_found record a truncated search: how
-    -- many hits were fetched out of how many GitHub found, NULL
-    -- otherwise.
+    -- Whether the inbox counts in the top bar's total. search_fetched
+    -- and search_found record a truncated search: how many hits were
+    -- fetched out of how many GitHub found, NULL otherwise.
+    ALTER TABLE inboxes ADD COLUMN count_in_total INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE inboxes ADD COLUMN search_fetched INTEGER;
     ALTER TABLE inboxes ADD COLUMN search_found INTEGER;
 "#,
     ),
-    Migration::Sql(
-        r#"
-    -- Whether the inbox counts in the top bar's total. The flagged
-    -- defaults come earlier than this column, so they're set here.
-    ALTER TABLE inboxes ADD COLUMN count_in_total INTEGER NOT NULL DEFAULT 0;
-    UPDATE inboxes SET count_in_total = 1
-     WHERE name IN ('Needs your review', 'Returned to you', 'Approved');
-"#,
-    ),
+    Migration::ResetInboxes,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1692,7 +1685,7 @@ mod tests {
         };
         let id = db.create_inbox(&edit).unwrap();
         let inbox = db.inboxes().unwrap().pop().unwrap();
-        assert_eq!((inbox.id, inbox.position), (id, 9));
+        assert_eq!((inbox.id, inbox.position), (id, 14));
         assert!(inbox.count_in_total);
         assert!(
             db.update_inbox(
@@ -2015,12 +2008,14 @@ mod tests {
             [],
         )
         .unwrap();
-        // Skip migration 4, which would replace the inboxes and cascade
-        // away the inbox_prs row, but apply the later ones that the
+        // Skip the inbox resets, which would replace the inboxes and
+        // cascade away the inbox_prs row, but apply the rest that the
         // listing's query needs.
         migrate(&mut conn, 3).unwrap();
         conn.pragma_update(None, "user_version", 4).unwrap();
-        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len())
+            .unwrap();
         let db = Db {
             conn: Mutex::new(conn),
             _lock: None,
@@ -2098,6 +2093,28 @@ mod tests {
         // A complete search clears it.
         db.set_inbox_results(1, Ok(&[]), None).unwrap();
         assert_eq!(db.inbox_truncation(1).unwrap(), None);
+    }
+
+    #[test]
+    fn reset_inboxes_on_an_old_database() {
+        // A database from before the count_in_total migration picks up
+        // the new defaults, flags included.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 2).unwrap();
+        let db = Db::init(conn, None).unwrap();
+        let inboxes = db.inboxes().unwrap();
+        assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
+        for (inbox, default) in inboxes.iter().zip(crate::inboxes::DEFAULT_INBOXES.iter()) {
+            assert_eq!(
+                (
+                    inbox.name.as_str(),
+                    inbox.filter.as_str(),
+                    inbox.count_in_total
+                ),
+                (default.name, default.filter, default.count_in_total)
+            );
+        }
     }
 
     #[test]

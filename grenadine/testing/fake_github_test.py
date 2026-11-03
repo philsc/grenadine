@@ -156,18 +156,25 @@ class FakeGitHubTest(unittest.TestCase):
 
     def test_default_inboxes_hold_the_expected_prs(self) -> None:
         inboxes = scenarios.default_inboxes()
-        self.assertEqual(len(inboxes), 9)
-        for name, filter in inboxes:
+        self.assertEqual(len(inboxes), 14)
+        for name, filter, _ in inboxes:
             with self.subTest(inbox=name):
                 found = search_prs(
                     self.gh.prs(), scenarios.server_query(filter, [scenarios.REPO])
                 )
-                self.assertEqual(
-                    [pr.title for pr in found], self.inboxes.titles_in(name)
-                )
+                # Local inboxes then keep the hits their filter matches.
+                if "gr:" in filter:
+                    found = [pr for pr in found if scenarios.matches(pr, filter)]
+                    if "gr:sort:title-asc" in filter:
+                        found.sort(key=lambda pr: pr.title.lower())
+                got = [pr.title for pr in found]
+                self.assertEqual(got, self.inboxes.titles_in(name))
         # Every expected inbox exists.
-        names = {name for name, _ in inboxes}
-        self.assertLessEqual(set(self.inboxes.expected.values()) - {None}, names)
+        names = {name for name, _, _ in inboxes}
+        self.assertLessEqual(
+            {i for inboxes in self.inboxes.expected.values() for i in inboxes},
+            names,
+        )
 
     def test_search_syntax(self) -> None:
         pr = self.inboxes.prs["Get changes requested"]
@@ -637,13 +644,15 @@ class FakeGitHubTest(unittest.TestCase):
         with self.assertRaises(SearchError):
             matches(pr, "-gr:review:active")
 
-    def test_dismissed_reviews(self) -> None:
+    def test_dismissed_and_unmerged(self) -> None:
         pr = self.inboxes.prs["Get changes requested"]
         self.assertTrue(matches(pr, "review:changes_requested"))
         pr.reviews.append(Review("other", "DISMISSED"))
         self.assertFalse(matches(pr, "review:changes_requested"))
         # The change request still happened, so the PR isn't review:none.
         self.assertFalse(matches(pr, "review:none"))
+        self.assertTrue(matches(pr, "is:unmerged"))
+        self.assertFalse(matches(self.inboxes.prs["Get merged"], "is:unmerged"))
 
     def test_unknown_fields_are_errors(self) -> None:
         out = self.query('query { repository(owner: "test", name: "test") { nope } }')

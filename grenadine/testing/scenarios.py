@@ -8,12 +8,15 @@ from grenadine.testing.fake_github import (
     APPROVED,
     CHANGES_REQUESTED,
     COMMENTED,
+    DISMISSED,
+    PENDING,
     VIEWER,
     CheckRun,
     FakeGitHub,
     FakeRepo,
     PullRequest,
-    Review,
+    _parse,
+    _term,
 )
 
 REPO = "test/test"
@@ -24,11 +27,16 @@ NEEDS_REVIEW = "Needs your review"
 NEEDS_TEAM_REVIEW = "Needs your teams' review"
 RETURNED = "Returned to you"
 APPROVED_INBOX = "Approved"
-WAITING_FOR_REVIEWERS = "Waiting for reviewers"
-DRAFTS = "Drafts"
 MERGING = "Merging"
-DRAFTS_NEEDING_REVIEW = "Drafts needing your review"
-WAITING_FOR_AUTHORS = "Waiting for authors"
+DRAFTS = "Drafts"
+DRAFTS_FROM_OTHERS = "Drafts from others"
+WAITING_FOR_REVIEWERS = "Waiting for reviewers"
+ALL_MY_OPEN = "All my open PRs"
+WAITING_FOR_AUTHOR = "Waiting for author"
+MERGED_BY_ME = "Merged by me"
+MERGED_BY_OTHERS = "Merged by others"
+ALL_OPEN = "All open PRs"
+UNMERGED_ON_MINE = "Unmerged PRs on mine"
 
 STACK_BASE = "Lay the stack's foundation"
 STACK_TOP = "Build on the foundation"
@@ -47,17 +55,66 @@ fn main() {}
 """
 
 
-def default_inboxes() -> list[tuple[str, str]]:
-    """The `(name, filter)` pairs of the server's default inboxes, read from
-    its source so that they can't drift."""
+def default_inboxes() -> list[tuple[str, str, bool]]:
+    """The `(name, filter, count_in_total)` triples of the server's default
+    inboxes, read from its source so that they can't drift."""
     src = (Path(__file__).parents[1] / "server/src/inboxes.rs").read_text()
-    return re.findall(r'name:\s*"([^"]*)",\s*filter:\s*"([^"]*)"', src)
+    return [
+        (name, filter, counted == "true")
+        for name, filter, counted in re.findall(
+            r'name:\s*"([^"]*)",\s*filter:\s*"([^"]*)",\s*count_in_total:\s*(true|false)',
+            src,
+        )
+    ]
+
+
+def widen(filter: str) -> str:
+    """The widened terms grenadine's filter parsing produces: every gr:
+    literal replaced by TRUE, folded, plus the `sort:` tokens. Mirrors
+    `filter::Filter::search_terms`."""
+    tree, sorts = _parse(filter)
+
+    def w(e: tuple) -> tuple:
+        match e[0]:
+            case "not":
+                inner = w(e[1])
+                return ("term", "TRUE") if inner == ("term", "TRUE") else ("not", inner)
+            case "term":
+                return ("term", "TRUE") if e[1].startswith("gr:") else e
+            case "and":
+                cs = [c for c in (w(x) for x in e[1]) if c != ("term", "TRUE")]
+                if not cs:
+                    return ("term", "TRUE")
+                return cs[0] if len(cs) == 1 else ("and", cs)
+            case "or":
+                cs = [w(x) for x in e[1]]
+                if ("term", "TRUE") in cs:
+                    return ("term", "TRUE")
+                return cs[0] if len(cs) == 1 else ("or", cs)
+        raise AssertionError(e)
+
+    def ser(e: tuple) -> str:
+        match e[0]:
+            case "term":
+                return e[1]
+            case "not":
+                return "-" + ser(e[1])
+            case "and":
+                return " ".join(f"({ser(c)})" if c[0] == "or" else ser(c) for c in e[1])
+            case "or":
+                return " OR ".join(ser(c) for c in e[1])
+        raise AssertionError(e)
+
+    terms = ser(w(tree))
+    if terms == "TRUE":
+        terms = ""
+    return " ".join([terms, *(f"sort:{s}" for s in sorts)]).strip()
 
 
 def server_query(filter: str, repos: list[str]) -> str:
-    """The search query the server sends for an inbox, as built by
-    `github::search_query`."""
-    tokens = filter.split()
+    """The search query the server sends for an inbox: `filter`'s
+    widening, then `github::search_query`'s wrapping."""
+    tokens = widen(filter).split()
     sorts = [t for t in tokens if t.startswith("sort:")]
     terms = [t for t in tokens if not t.startswith("sort:")]
     parts = ["is:pr"]
@@ -68,17 +125,114 @@ def server_query(filter: str, repos: list[str]) -> str:
     return " ".join(parts + sorts)
 
 
+def _verdict(pr: PullRequest, user: str) -> str | None:
+    """`user`'s standing verdict, as README's reviews describe it."""
+    for r in reversed(pr.reviews):
+        if r.author == user and r.state in (APPROVED, CHANGES_REQUESTED, DISMISSED):
+            return None if r.state == DISMISSED else r.state
+    return None
+
+
+def _gr_term(pr: PullRequest, term: str, me: str) -> bool:
+    """One gr: qualifier on one PR, as README's table describes it."""
+    name, _, arg = term[3:].partition(":")
+    user = me if arg == "@me" else arg
+    match name:
+        case "review" if arg == "active":
+            return any(
+                r.state not in (DISMISSED, PENDING)
+                and r.author != pr.author
+                and r.author not in pr.review_requests
+                for r in pr.reviews
+            )
+        case "changes-requested" if arg == "unaddressed":
+            return any(
+                _verdict(pr, u) == CHANGES_REQUESTED and u not in pr.review_requests
+                for u in {r.author for r in pr.reviews}
+            )
+        case "approvals":
+            n = int(arg.removeprefix(">"))
+            return (
+                sum(_verdict(pr, u) == APPROVED for u in {r.author for r in pr.reviews})
+                > n
+            )
+        case "approved-by":
+            return _verdict(pr, user) == APPROVED
+        case "rerequested":
+            return user in pr.review_requests and any(
+                r.author == user and r.state != PENDING for r in pr.reviews
+            )
+        case "sort":
+            return True
+    raise AssertionError(f"unknown gr: qualifier {term!r}")
+
+
+def _is_local(term: str) -> bool:
+    """The GitHub qualifiers grenadine evaluates itself; mirrors
+    filter.rs's is_local."""
+    key, _, value = term.partition(":")
+    if not _:
+        return False
+    match key:
+        case "is":
+            return value in (
+                "pr",
+                "open",
+                "closed",
+                "merged",
+                "unmerged",
+                "draft",
+                "queued",
+            )
+        case "state":
+            return value in ("open", "closed", "merged")
+        case "draft" | "archived":
+            return value in ("true", "false")
+        case "author" | "user-review-requested" | "reviewed-by":
+            return True
+        case "review":
+            return value in ("approved", "changes_requested", "none")
+    return False
+
+
+def matches(pr: PullRequest, filter: str, me: str = VIEWER) -> bool:
+    """Whether `pr` matches `filter` under grenadine's local evaluation:
+    `gr:` and the local GitHub qualifiers by README's rules, search-only
+    terms true."""
+
+    def ev(e: tuple) -> bool:
+        match e[0]:
+            case "and":
+                return all(ev(c) for c in e[1])
+            case "or":
+                return any(ev(c) for c in e[1])
+            case "not":
+                return not ev(e[1])
+            case "term":
+                term = e[1]
+                if term.startswith("gr:"):
+                    return _gr_term(pr, term, me)
+                if not _is_local(term):
+                    return True
+                return _term(pr, term)
+        raise AssertionError(e)
+
+    return ev(_parse(filter)[0])
+
+
 @dataclasses.dataclass
 class Inboxes:
-    """The scenario's PRs by title, and the inbox each belongs in (None for
-    no inbox)."""
+    """The scenario's PRs by title, and the inboxes each belongs in."""
 
     prs: dict[str, PullRequest]
-    expected: dict[str, str | None]
+    expected: dict[str, list[str]]
 
     def titles_in(self, inbox: str) -> list[str]:
-        """The titles `inbox` should list, most recently updated first."""
-        prs = [self.prs[t] for t, i in self.expected.items() if i == inbox]
+        """The titles `inbox` should list, in its own order."""
+        prs = [self.prs[t] for t, i in self.expected.items() if inbox in i]
+        filter = next(f for n, f, _ in default_inboxes() if n == inbox)
+        if "gr:sort:title-asc" in filter:
+            return [pr.title for pr in sorted(prs, key=lambda pr: pr.title.lower())]
         return [
             pr.title for pr in sorted(prs, key=lambda pr: pr.updated_at, reverse=True)
         ]
@@ -103,24 +257,24 @@ def _simple_pr(
 
 
 def inbox_cases(gh: FakeGitHub) -> Inboxes:
-    """One PR for each default inbox, PRs that belong in none, and a
-    two-PR stack."""
+    """PRs covering the default inboxes, PRs that belong in none of the
+    counted ones, and a two-PR stack."""
     repo = gh.repo(REPO)
     repo.checkout("main")
     repo.commit("Seed the repo", {"README.md": "# test\n"})
     repo.push("main")
 
     prs: dict[str, PullRequest] = {}
-    expected: dict[str, str | None] = {}
+    expected: dict[str, list[str]] = {}
 
-    def add(pr: PullRequest, inbox: str | None) -> PullRequest:
+    def add(pr: PullRequest, inboxes: list[str]) -> PullRequest:
         prs[pr.title] = pr
-        expected[pr.title] = inbox
+        expected[pr.title] = inboxes
         return pr
 
     pr = add(
         _simple_pr(repo, "needs-review", "Ask me for a review", author=OTHER),
-        NEEDS_REVIEW,
+        [NEEDS_REVIEW, ALL_OPEN],
     )
     pr.review_requests.add(VIEWER)
     pr.checks = "SUCCESS"
@@ -129,7 +283,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     pr = add(
         _simple_pr(repo, "needs-team-review", "Ask my team for a review", author=OTHER),
-        NEEDS_TEAM_REVIEW,
+        [NEEDS_TEAM_REVIEW, ALL_OPEN],
     )
     pr.team_review_requests.add(VIEWER)
     pr.checks = "FAILURE"
@@ -139,31 +293,41 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         CheckRun("docs", conclusion="SKIPPED"),
     ]
 
-    # GitHub counts a comment-only review as no review; see todo.md.
+    # A comment-only review is an active review.
     pr = add(
         _simple_pr(repo, "returned-commented", "Get a comment-only review"),
-        WAITING_FOR_REVIEWERS,
+        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
     )
-    pr.reviews.append(Review(OTHER, COMMENTED))
+    pr.submit_review(OTHER, COMMENTED)
 
-    pr = add(_simple_pr(repo, "returned-changes", "Get changes requested"), RETURNED)
-    pr.reviews.append(Review(OTHER, CHANGES_REQUESTED, body="Please split this up."))
+    pr = add(
+        _simple_pr(repo, "returned-changes", "Get changes requested"),
+        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+    )
+    pr.submit_review(OTHER, CHANGES_REQUESTED, body="Please split this up.")
     repo.issue_comment(pr, author=VIEWER, body="Will do, thanks!")
     pr.review_requests.add("third")
 
     pr = add(
-        _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION), APPROVED_INBOX
+        _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION),
+        [APPROVED_INBOX, ALL_MY_OPEN, ALL_OPEN],
     )
-    pr.reviews.append(Review(OTHER, APPROVED))
+    pr.submit_review(OTHER, APPROVED)
 
     add(
         _simple_pr(repo, "waiting-reviewers", "Wait for reviewers"),
-        WAITING_FOR_REVIEWERS,
+        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
     )
-    add(_simple_pr(repo, "draft", "Stay a draft", draft=True), DRAFTS)
+    add(
+        _simple_pr(repo, "draft", "Stay a draft", draft=True),
+        [DRAFTS, ALL_MY_OPEN, ALL_OPEN],
+    )
 
-    pr = add(_simple_pr(repo, "merging", "Sit in the merge queue"), MERGING)
-    pr.reviews.append(Review(OTHER, APPROVED))
+    pr = add(
+        _simple_pr(repo, "merging", "Sit in the merge queue"),
+        [MERGING, ALL_MY_OPEN],
+    )
+    pr.submit_review(OTHER, APPROVED)
     pr.queued = True
 
     pr = add(
@@ -174,7 +338,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
             author=OTHER,
             draft=True,
         ),
-        DRAFTS_NEEDING_REVIEW,
+        [DRAFTS_FROM_OTHERS, ALL_OPEN],
     )
     pr.review_requests.add(VIEWER)
 
@@ -182,9 +346,9 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         _simple_pr(
             repo, "waiting-authors", "Wait for the author after my review", author=OTHER
         ),
-        WAITING_FOR_AUTHORS,
+        [WAITING_FOR_AUTHOR, ALL_OPEN],
     )
-    pr.reviews.append(Review(VIEWER, COMMENTED))
+    pr.submit_review(VIEWER, COMMENTED)
     pr.checks = "PENDING"
     path = "inbox/waiting-authors.md"
     root = repo.comment(pr, author=VIEWER, body="Why?", path=path, line=1)
@@ -192,24 +356,42 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     root.resolved = True
     repo.comment(pr, author=VIEWER, body="And this?", path=path, line=1)
 
-    pr = add(_simple_pr(repo, "closed", "Get closed"), None)
+    pr = add(_simple_pr(repo, "closed", "Get closed", author=OTHER), [])
     repo.close(pr)
-    pr = add(_simple_pr(repo, "merged", "Get merged"), None)
+    # state:closed covers unmerged PRs too, so "Merged by me" has it.
+    pr = add(
+        _simple_pr(repo, "closed-mine", "Retract my PR"),
+        [MERGED_BY_ME, UNMERGED_ON_MINE],
+    )
+    repo.close(pr)
+    pr = add(_simple_pr(repo, "merged", "Get merged"), [MERGED_BY_ME])
     repo.merge(pr)
-    pr = add(_simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER), None)
+    pr = add(
+        _simple_pr(repo, "merged-others", "Land the other's PR", author=OTHER),
+        [MERGED_BY_OTHERS],
+    )
+    pr.submit_review(VIEWER, APPROVED)
+    repo.merge(pr)
+    pr = add(
+        _simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER),
+        [ALL_OPEN],
+    )
     pr.conflicting = True
 
     # Stacks only form on non-trunk branches, which are dev/ ones by default.
     repo.checkout("dev/stack-base", "main")
     repo.commit(STACK_BASE, {"stack/base.txt": "base\n"})
     repo.push("dev/stack-base")
-    add(repo.open_pr(STACK_BASE, head="dev/stack-base"), WAITING_FOR_REVIEWERS)
+    add(
+        repo.open_pr(STACK_BASE, head="dev/stack-base"),
+        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+    )
     repo.checkout("dev/stack-top")
     repo.commit(STACK_TOP, {"stack/top.txt": "top\n"})
     repo.push("dev/stack-top")
     add(
         repo.open_pr(STACK_TOP, head="dev/stack-top", base="dev/stack-base"),
-        WAITING_FOR_REVIEWERS,
+        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
     )
 
     return Inboxes(prs, expected)

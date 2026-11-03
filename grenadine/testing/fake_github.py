@@ -183,10 +183,10 @@ class PullRequest:
     def touch(self) -> None:
         self.updated_at = self.repo.gh.tick()
 
-    def submit_review(self, author: str, state: str) -> None:
+    def submit_review(self, author: str, state: str, body: str = "") -> None:
         """Adds a review by `author`. Like GitHub, submitting a review
         removes the author's pending review request."""
-        self.reviews.append(Review(author, state))
+        self.reviews.append(Review(author, state, body=body))
         self.review_requests.discard(author)
         self.touch()
 
@@ -1358,6 +1358,8 @@ def _term(pr: PullRequest, term: str) -> bool:
             return pr.state != OPEN
         case "is", "merged":
             return pr.state == MERGED
+        case "is", "unmerged":
+            return pr.state != MERGED
         case "is", "draft":
             return pr.draft
         case "is", "queued":

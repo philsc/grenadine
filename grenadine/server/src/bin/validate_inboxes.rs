@@ -5,6 +5,9 @@
 #[path = "../github.rs"]
 mod github;
 #[allow(dead_code)]
+#[path = "../inbox_search.rs"]
+mod inbox_search;
+#[allow(dead_code)]
 #[path = "../inboxes.rs"]
 mod inboxes;
 
@@ -26,16 +29,15 @@ struct Args {
 
 const MINE: &str = "state:open archived:false author:@me";
 const MINE_QUEUED: &str = "state:open archived:false author:@me is:queued";
-const MINE_CR: &str = "state:open archived:false draft:false author:@me review:changes_requested";
-const MINE_APPROVED: &str = "state:open archived:false draft:false author:@me review:approved";
-const MINE_NONE: &str = "state:open archived:false draft:false author:@me review:none";
 const USER_REQ: &str = "state:open archived:false user-review-requested:@me";
 const TEAM_REQ: &str = "state:open archived:false team-review-requested-user:@me";
 const REVIEWED: &str = "state:open archived:false reviewed-by:@me -author:@me";
 const REVIEWED_QUEUED: &str = "state:open archived:false reviewed-by:@me -author:@me is:queued";
 
 /// The default inboxes, in DEFAULT_INBOXES order.
-const INBOX_SHORT: &[&str] = &["NR", "NTR", "RET", "APP", "WR", "DR", "MRG", "DNR", "WA"];
+const INBOX_SHORT: &[&str] = &[
+    "NR", "NTR", "RET", "APP", "MRG", "DR", "DFO", "WR", "AMO", "WA", "MBM", "MBO", "AO", "UOM",
+];
 
 fn keys(hits: &[Hit]) -> BTreeSet<PrKey> {
     hits.iter().map(|h| h.key.clone()).collect()
@@ -132,14 +134,20 @@ async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let token = github::gh_token()?;
     let gh = github::GitHub::new(&token, github::API)?;
+    let repo_set: BTreeSet<String> = args.repos.iter().cloned().collect();
 
+    // The default inboxes, computed the way the server computes them.
+    let mut prepared = Vec::new();
+    for inbox in inboxes::DEFAULT_INBOXES {
+        prepared.push(inbox_search::prepare(inbox.filter, &args.repos).unwrap());
+    }
+    let (viewer, inbox_results) = inbox_search::run(&gh, &prepared, &repo_set).await?;
+
+    // The reference queries stay pure GitHub.
     let mut queries: Vec<(String, String)> = Vec::new();
     for (label, filter) in [
         ("MINE", MINE),
         ("MINE_QUEUED", MINE_QUEUED),
-        ("MINE_CR", MINE_CR),
-        ("MINE_APPROVED", MINE_APPROVED),
-        ("MINE_NONE", MINE_NONE),
         ("USER_REQ", USER_REQ),
         ("TEAM_REQ", TEAM_REQ),
         ("REVIEWED", REVIEWED),
@@ -147,27 +155,20 @@ async fn main() -> Result<ExitCode> {
     ] {
         queries.push((label.to_owned(), github::search_query(filter, &args.repos)));
     }
-    for (short, default) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
-        queries.push((
-            short.to_string(),
-            github::search_query(default.filter, &args.repos),
-        ));
-    }
     for repo in &args.repos {
         queries.push((
             format!("MINE_{repo}"),
             github::search_query(MINE, std::slice::from_ref(repo)),
         ));
     }
-
-    let (_, results) = gh
-        .search(
-            &queries
-                .iter()
-                .map(|(_, q)| (q.clone(), None, false))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+    let (_, ref_results) = inbox_search::search_batched(
+        &gh,
+        &queries
+            .iter()
+            .map(|(_, q)| (q.clone(), None, false))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
 
     let mut report = Report {
         passed: 0,
@@ -177,12 +178,12 @@ async fn main() -> Result<ExitCode> {
     // label out of `hits` so dependent checks can skip.
     let mut hits: BTreeMap<String, Vec<Hit>> = BTreeMap::new();
     let mut by_key: BTreeMap<PrKey, Hit> = BTreeMap::new();
-    for ((label, query), result) in queries.iter().zip(results) {
+    for ((label, query), result) in queries.iter().zip(ref_results) {
         match result {
             Ok(page) => {
                 let found = page.hits;
                 println!("INFO {label}: {} hits", found.len());
-                if found.len() == github::SEARCH_LIMIT {
+                if found.len() == github::SEARCH_LIMIT && page.has_next_page {
                     println!(
                         "WARN {query} hit the {}-result limit; set checks involving it are inconclusive",
                         github::SEARCH_LIMIT
@@ -194,6 +195,24 @@ async fn main() -> Result<ExitCode> {
                 hits.insert(label.clone(), found);
             }
             Err(e) => report.check(false, &format!("{label}: {query}"), vec![e]),
+        }
+    }
+    for (short, result) in INBOX_SHORT.iter().zip(inbox_results) {
+        match result {
+            Ok(found) => {
+                println!("INFO {short}: {} hits", found.hits.len());
+                if let Some(t) = found.truncated {
+                    println!(
+                        "WARN {short}: GitHub found {} but only {} were fetched; set checks involving it are inconclusive",
+                        t.found, t.fetched
+                    );
+                }
+                for h in &found.hits {
+                    by_key.entry(h.key.clone()).or_insert_with(|| h.clone());
+                }
+                hits.insert(short.to_string(), found.hits);
+            }
+            Err(e) => report.check(false, short, vec![e]),
         }
     }
 
@@ -208,8 +227,8 @@ async fn main() -> Result<ExitCode> {
     };
     let set = |label: &str| keys(&hits[label]);
 
-    // The inboxes DR, RET, APP, WR and MRG must partition MINE.
-    let mine_members = ["DR", "RET", "APP", "WR", "MRG"];
+    // RET, APP, WR and MRG partition the authored non-draft open PRs.
+    let mine_members = ["RET", "APP", "WR", "MRG"];
     if have(&mine_members) {
         for (i, a) in mine_members.iter().enumerate() {
             for b in &mine_members[i + 1..] {
@@ -221,85 +240,43 @@ async fn main() -> Result<ExitCode> {
                 );
             }
         }
-        let union: BTreeSet<PrKey> = mine_members.iter().flat_map(|l| set(l)).collect();
         if have(&["MINE"]) {
+            let union: BTreeSet<PrKey> = mine_members.iter().flat_map(|l| set(l)).collect();
             report.check_eq(
-                "DR ∪ RET ∪ APP ∪ WR ∪ MRG == MINE",
+                "RET ∪ APP ∪ WR ∪ MRG == nondraft(MINE)",
+                &nondraft(&hits["MINE"]),
                 &union,
-                &set("MINE"),
                 &by_key,
             );
         } else {
-            println!("SKIP DR ∪ RET ∪ APP ∪ WR ∪ MRG == MINE (MINE unavailable)");
+            println!("SKIP union check (MINE unavailable)");
         }
     } else {
         println!("SKIP partition checks (some of {mine_members:?} unavailable)");
     }
 
-    if !skip(
-        "RET == authored, reviewed, not queued, not approved",
-        &["RET", "MINE", "MINE_QUEUED", "MINE_APPROVED", "MINE_NONE"],
-    ) {
-        let mut want = nondraft(&hits["MINE"]);
-        for l in ["MINE_QUEUED", "MINE_APPROVED", "MINE_NONE"] {
-            want = &want - &set(l);
-        }
-        report.check_eq(
-            "RET == (nondraft(MINE) \\ MINE_QUEUED) \\ MINE_APPROVED \\ MINE_NONE",
-            &want,
-            &set("RET"),
-            &by_key,
-        );
-    }
-    if !skip(
-        "changes-requested PRs are in RET",
-        &["MINE_CR", "MINE_QUEUED", "RET"],
-    ) {
-        let missing = &(&set("MINE_CR") - &set("MINE_QUEUED")) - &set("RET");
-        report.check(
-            missing.is_empty(),
-            "MINE_CR \\ MINE_QUEUED ⊆ RET",
-            missing.iter().map(|k| describe(k, &by_key)).collect(),
-        );
-    }
-    if !skip(
-        "APP == approved, not queued",
-        &["APP", "MINE_APPROVED", "MINE_QUEUED"],
-    ) {
-        let want = &set("MINE_APPROVED") - &set("MINE_QUEUED");
-        report.check_eq(
-            "APP == MINE_APPROVED \\ MINE_QUEUED",
-            &want,
-            &set("APP"),
-            &by_key,
-        );
-    }
-    if !skip(
-        "WR == unreviewed, not queued",
-        &["WR", "MINE_NONE", "MINE_QUEUED"],
-    ) {
-        let want = &set("MINE_NONE") - &set("MINE_QUEUED");
-        report.check_eq("WR == MINE_NONE \\ MINE_QUEUED", &want, &set("WR"), &by_key);
-    }
-    if !skip("MRG == queued", &["MRG", "MINE_QUEUED"]) {
-        let want = nondraft(&hits["MINE_QUEUED"]);
-        report.check_eq("MRG == nondraft(MINE_QUEUED)", &want, &set("MRG"), &by_key);
-    }
     if !skip("DR == drafts", &["DR", "MINE"]) {
-        let want = draft(&hits["MINE"]);
-        report.check_eq("DR == draft(MINE)", &want, &set("DR"), &by_key);
-    }
-    if !skip("NR/DNR split USER_REQ by draft", &["NR", "DNR", "USER_REQ"]) {
         report.check_eq(
-            "NR == nondraft(USER_REQ)",
-            &nondraft(&hits["USER_REQ"]),
-            &set("NR"),
+            "DR == draft(MINE)",
+            &draft(&hits["MINE"]),
+            &set("DR"),
             &by_key,
         );
+    }
+    if !skip("NR == requests, not mine, not queued", &["NR", "USER_REQ"]) {
+        // The viewer's own PRs and queued PRs are out, which the facts
+        // the search fetched can tell.
+        let want: BTreeSet<PrKey> = hits["USER_REQ"]
+            .iter()
+            .filter(|h| {
+                !h.is_draft && !h.facts.author.eq_ignore_ascii_case(&viewer) && !h.facts.queued
+            })
+            .map(|h| h.key.clone())
+            .collect();
         report.check_eq(
-            "DNR == draft(USER_REQ)",
-            &draft(&hits["USER_REQ"]),
-            &set("DNR"),
+            "NR == nondraft(USER_REQ) \\ authored \\ queued",
+            &want,
+            &set("NR"),
             &by_key,
         );
     }
@@ -358,19 +335,37 @@ async fn main() -> Result<ExitCode> {
         println!("SKIP union of MINE_<repo> == MINE (needs at least two --repo)");
     }
 
-    // Each inbox's hits must be open PRs in a --repo, matching its
-    // draft: token, newest first.
+    // Inboxes of open PRs must hold open PRs in a --repo with the
+    // filter's draft flag; each inbox's own sort holds.
     let repo_set: BTreeSet<&str> = args.repos.iter().map(String::as_str).collect();
-    for (short, default) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
-        let name = default.name;
-        if !skip(&format!("{name} hits are in scope and sorted"), &[short]) {
-            let found = &hits[*short];
-            let want_draft = default
-                .filter
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("draft:"))
-                .map(|v| v == "true");
-            let mut problems: Vec<String> = Vec::new();
+    for (short, inbox) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
+        if !have(&[short]) {
+            println!(
+                "SKIP {} hits are in scope and sorted ({short} unavailable)",
+                inbox.name
+            );
+            continue;
+        }
+        let found = &hits[*short];
+        let open = inbox
+            .filter
+            .split_whitespace()
+            .any(|t| matches!(t, "state:open" | "is:open"));
+        let want_draft = inbox
+            .filter
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("draft:"))
+            .map(|v| v == "true");
+        let updated_sorted = inbox
+            .filter
+            .split_whitespace()
+            .any(|t| t == "sort:updated-desc");
+        let title_sorted = inbox
+            .filter
+            .split_whitespace()
+            .any(|t| t == "gr:sort:title-asc");
+        let mut problems: Vec<String> = Vec::new();
+        if open {
             for h in found {
                 if h.state != "OPEN" {
                     problems.push(format!("{} is {}", describe(&h.key, &by_key), h.state));
@@ -385,17 +380,24 @@ async fn main() -> Result<ExitCode> {
                     problems.push(format!("{} is not in a --repo", describe(&h.key, &by_key)));
                 }
             }
-            for w in found.windows(2) {
-                if w[0].updated_at < w[1].updated_at {
-                    problems.push(format!("{} is out of order", describe(&w[1].key, &by_key)));
-                }
-            }
-            report.check(
-                problems.is_empty(),
-                &format!("{name} hits are in scope and sorted"),
-                problems,
-            );
         }
+        for w in found.windows(2) {
+            if updated_sorted && w[0].updated_at < w[1].updated_at {
+                problems.push(format!("{} is out of order", describe(&w[1].key, &by_key)));
+            }
+            if title_sorted && w[0].title.to_lowercase() > w[1].title.to_lowercase() {
+                problems.push(format!(
+                    "{} sorts before {}",
+                    describe(&w[0].key, &by_key),
+                    describe(&w[1].key, &by_key)
+                ));
+            }
+        }
+        report.check(
+            problems.is_empty(),
+            &format!("{} hits are in scope and sorted", inbox.name),
+            problems,
+        );
     }
 
     println!("---\n{} passed, {} failed", report.passed, report.failed);

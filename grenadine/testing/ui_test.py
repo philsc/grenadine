@@ -588,10 +588,15 @@ class InboxTest(ServerTestCase):
         )
 
     def row(self, title: str) -> Locator:
-        return self.page.locator(".pr-list li").filter(
-            has=self.page.locator(
-                ".pr-title", has_text=re.compile(f"{re.escape(title)}$")
+        # A PR can be in several inboxes; the first one will do.
+        return (
+            self.page.locator(".pr-list li")
+            .filter(
+                has=self.page.locator(
+                    ".pr-title", has_text=re.compile(f"{re.escape(title)}$")
+                )
             )
+            .first
         )
 
     def expect_titles(self, inbox: Locator, titles: list[str]) -> None:
@@ -611,7 +616,7 @@ class InboxTest(ServerTestCase):
 
     def test_prs_land_in_their_inboxes(self) -> None:
         self.page.goto(self.url)
-        for name, _ in scenarios.default_inboxes():
+        for name, _, _ in scenarios.default_inboxes():
             with self.subTest(inbox=name):
                 self.expect_titles(self.inbox(name), self.cases.titles_in(name))
 
@@ -621,8 +626,8 @@ class InboxTest(ServerTestCase):
         expect(
             self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")
         ).not_to_have_count(0)
-        for title, inbox in self.cases.expected.items():
-            if inbox is None:
+        for title, inboxes in self.cases.expected.items():
+            if not inboxes:
                 expect(self.row(title)).to_have_count(0)
 
     def test_badges(self) -> None:
@@ -692,15 +697,6 @@ class InboxTest(ServerTestCase):
         inbox.locator(".inbox-toggle").click()
         expect(inbox.locator(".pr-list")).to_be_visible()
 
-    def test_invalid_gr_filter_shows_the_save_error(self) -> None:
-        self.page.goto(self.url)
-        self.page.get_by_role("button", name="+ Add inbox").click()
-        form = self.page.locator("form.inbox-form")
-        form.get_by_label("Name").fill("Broken")
-        form.get_by_label("GitHub filter").fill("gr:bogus:x")
-        form.get_by_role("button", name="Save").click()
-        expect(form.locator(".error")).to_contain_text("unknown grenadine qualifier")
-
     def add_inbox(self, name: str, filter: str, counted: bool = False) -> Locator:
         self.addCleanup(self.delete_inbox, name)
         self.page.get_by_role("button", name="+ Add inbox").click()
@@ -711,6 +707,22 @@ class InboxTest(ServerTestCase):
             form.get_by_label("Count in total").check()
         form.get_by_role("button", name="Save").click()
         return self.inbox(name)
+
+    def repoll(self) -> None:
+        """Forces a poll by saving the first inbox unchanged."""
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            inbox = json.load(resp)[0]["inbox"]
+        req = urllib.request.Request(
+            f"{self.url}api/inboxes/{inbox['id']}",
+            data=json.dumps(inbox).encode(),
+            method="PUT",
+            # Writes are only taken from the server's own pages.
+            headers={
+                "Content-Type": "application/json",
+                "Origin": self.url.rstrip("/"),
+            },
+        )
+        urllib.request.urlopen(req).close()
 
     def delete_inbox(self, name: str) -> None:
         """Deletes an inbox a test added, so that it doesn't show up in the
@@ -748,13 +760,55 @@ class InboxTest(ServerTestCase):
         expect(empty.locator(".none")).to_have_text("No PRs")
         expect(empty.locator(".count")).to_have_text("0")
 
+    def test_returned_sorts_by_title(self) -> None:
+        self.page.goto(self.url)
+        expect(self.inbox(scenarios.RETURNED).locator(".pr-title")).to_have_text(
+            [
+                re.compile("Get a comment-only review$"),
+                re.compile("Get changes requested$"),
+            ]
+        )
+
+    def test_re_request_moves_back_to_waiting(self) -> None:
+        pr = self.cases.prs["Get a comment-only review"]
+        self.page.goto(self.url)
+        self.expect_titles(
+            self.inbox(scenarios.RETURNED),
+            ["Get a comment-only review", "Get changes requested"],
+        )
+        # Re-requesting the reviewer's review takes his review out of
+        # "active", so the PR goes back to Waiting for reviewers.
+        pr.review_requests.add(scenarios.OTHER)
+        self.addCleanup(
+            lambda: (pr.review_requests.discard(scenarios.OTHER), self.repoll())
+        )
+        self.repoll()
+        self.expect_titles(
+            self.inbox(scenarios.WAITING_FOR_REVIEWERS),
+            [
+                "Wait for reviewers",
+                scenarios.STACK_BASE,
+                scenarios.STACK_TOP,
+                "Get a comment-only review",
+            ],
+        )
+        self.expect_titles(self.inbox(scenarios.RETURNED), ["Get changes requested"])
+        # Put it back how it was, in the fake and in the database, so
+        # later tests see the scenario's state.
+        pr.review_requests.discard(scenarios.OTHER)
+        self.repoll()
+        self.expect_titles(
+            self.inbox(scenarios.RETURNED),
+            ["Get a comment-only review", "Get changes requested"],
+        )
+
     def test_total_badge_counts_distinct_prs(self) -> None:
         self.page.goto(self.url)
         tab = self.page.locator(".topbar-tabs a").filter(has_text="Inboxes")
-        # Needs your review (1), Returned (1) and Approved (1) count in
+        # Needs your review (1), Returned (2) and Approved (1) count in
         # the total.
-        expect(tab.locator(".count")).to_have_text("3")
-        expect(self.page).to_have_title("(3) grenadine")
+        expect(tab.locator(".count")).to_have_text("4")
+        expect(self.page).to_have_title("(4) grenadine")
         # A counted inbox overlapping them counts its PRs once.
         self.add_inbox("Mine too", "state:open author:@me", counted=True)
         expect(tab.locator(".count")).to_have_text("9")
@@ -772,6 +826,15 @@ class InboxTest(ServerTestCase):
                 i["inbox"] for i in json.load(resp) if i["inbox"]["name"] == "Counted"
             ]
         self.assertTrue(saved["count_in_total"])
+
+    def test_invalid_gr_filter_shows_the_save_error(self) -> None:
+        self.page.goto(self.url)
+        self.page.get_by_role("button", name="+ Add inbox").click()
+        form = self.page.locator("form.inbox-form")
+        form.get_by_label("Name").fill("Broken")
+        form.get_by_label("GitHub filter").fill("gr:bogus:x")
+        form.get_by_role("button", name="Save").click()
+        expect(form.locator(".error")).to_contain_text("unknown grenadine qualifier")
 
     def test_pr_page(self) -> None:
         pr = self.cases.prs["Get approved"]
