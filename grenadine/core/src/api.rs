@@ -41,6 +41,9 @@ pub struct RepoSettings {
     pub auto_review: AutoReview,
     /// The backend that reviews of the viewer's PRs run on.
     pub review_backend: AgentBackend,
+    /// The model reviews run with on each backend, an
+    /// `AgentModelInfo::value`. A backend without one uses its default.
+    pub review_models: BTreeMap<AgentBackend, String>,
     /// Review a PR again when new commits are pushed to it.
     pub rereview_on_push: bool,
     /// Unix seconds. PRs opened before this aren't reviewed, so turning

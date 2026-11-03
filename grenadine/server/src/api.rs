@@ -612,6 +612,12 @@ async fn set_repo_settings(
         Ok(s) => s,
         Err(e) => return Ok((StatusCode::BAD_REQUEST, e).into_response()),
     };
+    for (b, m) in &settings.review_models {
+        if !state.agents.offers(*b, Some(m)).await {
+            let message = format!("{} doesn't offer that model", b.label());
+            return Ok((StatusCode::BAD_REQUEST, message).into_response());
+        }
+    }
     state.db.set_repo_settings(&repo, &settings)?;
     state.send(ServerEvent::RepoSettingsChanged(repo));
     // Reviews that were just turned on look for PRs right away.
@@ -1316,6 +1322,61 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A review model is saved only when the backend offers it.
+    #[tokio::test]
+    async fn repo_settings_check_the_review_model() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // A claude that lists "sonnet" and nothing else.
+        let claude = dir.path().join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\necho '{\"type\":\"control_response\",\"response\":{\"request_id\":\"models\",\"response\":{\"models\":[{\"value\":\"sonnet\",\"displayName\":\"Sonnet\",\"description\":\"d\"}]}}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state = crate::sync::test_state_with_agents(
+            [(fx.clone.slug.clone(), cloned)].into_iter().collect(),
+            claude,
+            "devin".into(),
+            dir.path().join("worktrees"),
+        );
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        let settings = |model: &str| {
+            Json(RepoSettings {
+                review_models: [(grenadine_core::api::AgentBackend::Claude, model.to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..RepoSettings::default()
+            })
+        };
+
+        let response = set_repo_settings(AxState(state.clone()), path(), settings("sonnet"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved = state.db.repo_settings(&fx.clone.slug).unwrap();
+        assert_eq!(
+            saved.review_models[&grenadine_core::api::AgentBackend::Claude],
+            "sonnet"
+        );
+
+        // One the backend doesn't list isn't saved.
+        let response = set_repo_settings(AxState(state.clone()), path(), settings("nope"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await, "Claude Code doesn't offer that model");
     }
 
     #[tokio::test]

@@ -3223,6 +3223,8 @@ class AutoReviewTest(ServerTestCase):
             "non_draft"
         )
         expect(dialog.get_by_label("Review with")).to_have_value("claude")
+        expect(dialog.get_by_label("Review model")).to_have_value("default")
+        dialog.get_by_label("Review model").select_option(label="Sonnet")
         dialog.get_by_label("Review skill").fill("/code-review")
         dialog.get_by_label("Review again after new pushes").check()
         dialog.get_by_role("button", name="Save").click()
@@ -3231,6 +3233,13 @@ class AutoReviewTest(ServerTestCase):
         dialog = self.settings(self.QUIET_REPO)
         expect(dialog.get_by_label("Review skill")).to_have_value("code-review")
         expect(dialog.get_by_label("Review again after new pushes")).to_be_checked()
+        expect(dialog.get_by_label("Review model")).to_have_value("sonnet")
+        # Switching the backend shows that backend's models and default;
+        # Escape leaves the saved settings alone.
+        dialog.get_by_label("Review with").select_option(label="Devin")
+        model = dialog.get_by_label("Review model")
+        expect(model.locator("option")).to_have_text(["Default", "SWE-2", "SWE-2 High"])
+        expect(model).to_have_value("default")
         self.page.keyboard.press("Escape")
 
         pr = self.open_pr(self.QUIET_REPO, "Quiet change")
@@ -3270,11 +3279,13 @@ class AutoReviewTest(ServerTestCase):
     def test_a_devin_review(self) -> None:
         dialog = self.settings(self.DEVIN_REPO)
         dialog.get_by_label("Review with").select_option(label="Devin")
+        dialog.get_by_label("Review model").select_option(label="SWE-2 High")
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
-        # Reopened, the pick persisted.
+        # Reopened, the picks persisted.
         dialog = self.settings(self.DEVIN_REPO)
         expect(dialog.get_by_label("Review with")).to_have_value("devin")
+        expect(dialog.get_by_label("Review model")).to_have_value("swe-2-high")
         self.page.keyboard.press("Escape")
 
         pr = self.open_pr(self.DEVIN_REPO, "Devin change")
@@ -3286,6 +3297,9 @@ class AutoReviewTest(ServerTestCase):
         )
         self.assertEqual(pr.issue_comments, [])
         self.devin_saw("Review pull request")
+        # The review ran on the picked model.
+        self.devin_saw('"method":"session/set_config_option"')
+        self.devin_saw('"value":"swe-2-high"')
 
         # Its page shows the review's prompt and its cost in ACUs.
         entry.locator("a").click()
@@ -3297,6 +3311,7 @@ class AutoReviewTest(ServerTestCase):
         dialog = self.settings(self.OFF_REPO)
         dialog.get_by_label("Review my pull requests").select_option(label="Never")
         expect(dialog.get_by_label("Review with")).to_be_disabled()
+        expect(dialog.get_by_label("Review model")).to_be_disabled()
         expect(dialog.get_by_label("Review skill")).to_be_disabled()
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
