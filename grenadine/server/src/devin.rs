@@ -1346,12 +1346,21 @@ async fn permission(
     };
     let mut follow_up = None;
     let option = decision.and_then(|d| {
-        if !d.allow
-            && let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty())
-        {
-            // The feedback becomes the next prompt; a rejected plan keeps
-            // planning.
-            queue_next(&state, &id, message, tool.name == "ExitPlanMode");
+        let plan = tool.name == "ExitPlanMode";
+        if let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty()) {
+            if !d.allow {
+                // The feedback becomes the next prompt; a rejected plan
+                // keeps planning.
+                queue_next(&state, &id, message, plan.then(PermissionMode::plan));
+            } else if plan {
+                // An approval can't carry the user's notes, so they follow
+                // as the next prompt, in the mode the plan goes on in.
+                let prompt = format!(
+                    "When I approved your plan, I asked you to keep the following in mind:\n\n{}",
+                    message.trim()
+                );
+                queue_next(&state, &id, prompt, d.mode.clone());
+            }
         }
         if d.allow
             && tool.name == "ExitPlanMode"

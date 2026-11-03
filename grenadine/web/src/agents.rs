@@ -2032,7 +2032,7 @@ fn PlanCard(
             let approval = Approval {
                 id: tool.clone(),
                 allow,
-                message: message.filter(|_| !allow),
+                message,
                 mode: allow.then_some(next),
                 option: None,
                 answers: None,
@@ -2081,7 +2081,7 @@ fn PlanCard(
                     class="plan-feedback"
                     rows="2"
                     aria-label="Feedback"
-                    placeholder=format!("What should change? {} gets this when it keeps planning.", backend.agent_name())
+                    placeholder=format!("Anything to add? {} gets this with your approval, or when it keeps planning.", backend.agent_name())
                     prop:value=move || feedback.get()
                     on:input=move |ev| feedback.set(event_target_value(&ev))
                 ></textarea>

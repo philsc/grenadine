@@ -81,6 +81,23 @@ fn allowed(
     answer
 }
 
+/// `ExitPlanMode`'s input with the notes the user approved the plan with
+/// added to the plan. Claude Code repeats the approved plan to Claude, so
+/// that's how Claude hears them.
+fn with_notes(input: &Value, notes: Option<&str>) -> Value {
+    let mut input = input.clone();
+    if let (Some(notes), Some(plan)) = (
+        notes.map(str::trim).filter(|n| !n.is_empty()),
+        input["plan"].as_str(),
+    ) {
+        input["plan"] = format!(
+            "{plan}\n\n---\n\nThe user approved this plan, asking you to keep the following in mind:\n\n{notes}"
+        )
+        .into();
+    }
+    input
+}
+
 /// What Claude is told when the user denies a tool use without saying why.
 fn denied(tool_name: &str) -> &'static str {
     match tool_name {
@@ -236,10 +253,18 @@ pub async fn handle(
             let answer = match decision {
                 Some(Decision {
                     allow: true,
+                    message,
                     mode,
                     answers,
                     ..
-                }) => allowed(&args["input"], mode, answers),
+                }) => {
+                    let input = if tool_name == "ExitPlanMode" {
+                        with_notes(&args["input"], message.as_deref())
+                    } else {
+                        args["input"].clone()
+                    };
+                    allowed(&input, mode, answers)
+                }
                 Some(Decision {
                     allow: false,
                     message,
@@ -618,6 +643,36 @@ mod tests {
             })
             .collect();
         assert_eq!(resolved, [Some("Add a title".into()), None]);
+    }
+
+    /// The notes a plan is approved with reach Claude as part of the plan.
+    #[tokio::test]
+    async fn plans_approved_with_notes() {
+        let state = state();
+        let plan = json!({"plan": "# Plan", "planFilePath": "/p.md"});
+        let notes = Decision {
+            allow: true,
+            message: Some(" Use tabs. \n".into()),
+            ..Decision::default()
+        };
+        let answer = ask_with(&state, "toolu_1", "ExitPlanMode", plan.clone(), notes).await;
+        assert_eq!(
+            answer["updatedInput"],
+            json!({
+                "plan": "# Plan\n\n---\n\nThe user approved this plan, asking you to keep \
+                    the following in mind:\n\nUse tabs.",
+                "planFilePath": "/p.md",
+            })
+        );
+        for (tool_use, message) in [("toolu_2", None), ("toolu_3", Some("  ".into()))] {
+            let silent = Decision {
+                allow: true,
+                message,
+                ..Decision::default()
+            };
+            let answer = ask_with(&state, tool_use, "ExitPlanMode", plan.clone(), silent).await;
+            assert_eq!(answer["updatedInput"], plan);
+        }
     }
 
     /// Calls a terminal tool and returns its text and whether it failed.

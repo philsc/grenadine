@@ -1184,7 +1184,8 @@ pub struct Approval {
     /// Whether the tool use may go ahead. When `option` is set, the
     /// option's kind decides instead.
     pub allow: bool,
-    /// Told to the agent when the tool call is denied.
+    /// Told to the agent when the tool call is denied, or along with an
+    /// `ExitPlanMode` approval.
     pub message: Option<String>,
     /// For `ExitPlanMode`: the mode the turn goes on in once the plan is
     /// approved.
