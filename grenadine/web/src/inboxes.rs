@@ -1,6 +1,8 @@
 //! The landing page: the list of inboxes, each with the PRs its filter
 //! matches. Inboxes can be added, edited, reordered and deleted in place.
 
+use std::collections::HashMap;
+
 use grenadine_core::api::{
     CiStatus, Inbox, InboxEdit, InboxWithPrs, PrKey, ReviewDecision, ThreadCounts,
 };
@@ -9,6 +11,11 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use crate::{Updates, api, hash_for};
+
+/// Rows shown when an inbox section first renders, and added per click of
+/// its "Show more" button.
+const INITIAL_ROWS: usize = 15;
+const MORE_ROWS: usize = 10;
 
 #[component]
 pub fn Inboxes(
@@ -21,6 +28,9 @@ pub fn Inboxes(
         api::inboxes()
     });
     let adding = RwSignal::new(false);
+    // Kept here rather than in InboxSection so a refetch that rebuilds the
+    // sections doesn't reset them; a page reload still does.
+    let shown = RwSignal::new(HashMap::<i64, usize>::new());
 
     view! {
         <div class="inboxes">
@@ -34,7 +44,7 @@ pub fn Inboxes(
                         .map(|(i, inbox)| {
                             let prev = i.checked_sub(1).map(|p| all[p].clone());
                             let next = all.get(i + 1).cloned();
-                            view! { <InboxSection inbox=inbox last=last prev=prev next=next /> }
+                            view! { <InboxSection inbox=inbox last=last prev=prev next=next shown=shown /> }
                         })
                         .collect_view()
                         .into_any()
@@ -93,6 +103,8 @@ fn InboxSection(
     /// The inboxes above and below, to swap places with.
     prev: Option<Inbox>,
     next: Option<Inbox>,
+    /// Rows shown per inbox id.
+    shown: RwSignal<HashMap<i64, usize>>,
 ) -> impl IntoView {
     let collapsed_key = format!("inbox-collapsed-{}", inbox.inbox.id);
     let collapsed = RwSignal::new(load_flag(&collapsed_key, false));
@@ -104,6 +116,10 @@ fn InboxSection(
         truncated,
     } = inbox;
     let count = prs.len();
+    let id = inbox.id;
+    let rows = group_inbox(&prs);
+    let total = rows.len();
+    let limit = move || shown.with(|m| m.get(&id).copied().unwrap_or(INITIAL_ROWS));
     let updates = expect_context::<Updates>();
 
     let reorder = {
@@ -159,65 +175,90 @@ fn InboxSection(
                 </p>
             })}
             <ul class="pr-list" class:hidden=move || collapsed.get()>
-                {if prs.is_empty() {
+                {if rows.is_empty() {
                     view! { <li class="muted none">"No PRs"</li> }.into_any()
                 } else {
-                    let mut above = None;
-                    group_inbox(&prs).into_iter().map(|row| {
-                        let pr = &prs[row.index];
-                        let key = pr.key.clone();
-                        let is_selected = {
-                            let key = key.clone();
-                            move || last.with(|s| s.as_ref() == Some(&key))
-                        };
-                        let link_above = std::mem::replace(&mut above, row.link);
-                        let badge = pr
-                            .stack
-                            .as_ref()
-                            .filter(|s| s.position > 0 && s.length > 1)
-                            .map(|s| view! {
-                                <span class="badge" title="Position in its stack">{format!("{}/{}", s.position, s.length)}</span>
-                            });
-                        view! {
-                            <li
-                                class:stack-above=link_above.is_some()
-                                class:stack-above-gap=link_above == Some(Link::Gap)
-                                class:stack-below=row.link.is_some()
-                                class:stack-below-gap=row.link == Some(Link::Gap)
-                            >
-                                <a
-                                    class="pr-item"
-                                    class:selected=is_selected
-                                    href=hash_for(&key)
-                                >
-                                    <span class="pr-text">
-                                        <span class="pr-title">
-                                            {badge}
-                                            {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
-                                            {pr.title.clone()}
-                                        </span>
-                                        <span class="pr-meta muted" title=pr.sync_error.clone()>
-                                            {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
-                                            {if pr.synced {
-                                                format!("{} versions", pr.version_count).into_any()
-                                            } else if pr.sync_error.is_some() {
-                                                view! { <span class="error">"sync failed"</span> }.into_any()
-                                            } else {
-                                                view! { <span>"syncing…"</span> }.into_any()
-                                            }}
-                                        </span>
-                                    </span>
-                                    <span class="pr-status">
-                                        {pr.threads.filter(|t| t.total > 0).map(|t| view! { <ThreadCount threads=t /> })}
-                                        {pr.review_decision.map(|d| view! { <ReviewIcon decision=d /> })}
-                                        {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
-                                    </span>
-                                </a>
-                            </li>
-                        }
-                    }).collect_view().into_any()
+                    let prs = StoredValue::new_local(prs);
+                    let rows = StoredValue::new_local(rows);
+                    (move || {
+                        let cut = limit().min(total);
+                        let mut above = None;
+                        rows.with_value(|rows| {
+                            rows.iter().take(cut).enumerate().map(|(i, row)| {
+                                let link_above = std::mem::replace(&mut above, row.link);
+                                // A cut that splits a stack dashes the last
+                                // visible row's connector to show that more
+                                // of the stack is hidden.
+                                let link_below = match row.link {
+                                    Some(_) if cut < total && i + 1 == cut => Some(Link::Gap),
+                                    link => link,
+                                };
+                                prs.with_value(|prs| {
+                                    let pr = &prs[row.index];
+                                    let key = pr.key.clone();
+                                    let is_selected = {
+                                        let key = key.clone();
+                                        move || last.with(|s| s.as_ref() == Some(&key))
+                                    };
+                                    let badge = pr
+                                        .stack
+                                        .as_ref()
+                                        .filter(|s| s.position > 0 && s.length > 1)
+                                        .map(|s| view! {
+                                            <span class="badge" title="Position in its stack">{format!("{}/{}", s.position, s.length)}</span>
+                                        });
+                                    view! {
+                                        <li
+                                            class:stack-above=link_above.is_some()
+                                            class:stack-above-gap=link_above == Some(Link::Gap)
+                                            class:stack-below=link_below.is_some()
+                                            class:stack-below-gap=link_below == Some(Link::Gap)
+                                        >
+                                            <a
+                                                class="pr-item"
+                                                class:selected=is_selected
+                                                href=hash_for(&key)
+                                            >
+                                                <span class="pr-text">
+                                                    <span class="pr-title">
+                                                        {badge}
+                                                        {pr.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
+                                                        {pr.title.clone()}
+                                                    </span>
+                                                    <span class="pr-meta muted" title=pr.sync_error.clone()>
+                                                        {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
+                                                        {if pr.synced {
+                                                            format!("{} versions", pr.version_count).into_any()
+                                                        } else if pr.sync_error.is_some() {
+                                                            view! { <span class="error">"sync failed"</span> }.into_any()
+                                                        } else {
+                                                            view! { <span>"syncing…"</span> }.into_any()
+                                                        }}
+                                                    </span>
+                                                </span>
+                                                <span class="pr-status">
+                                                    {pr.threads.filter(|t| t.total > 0).map(|t| view! { <ThreadCount threads=t /> })}
+                                                    {pr.review_decision.map(|d| view! { <ReviewIcon decision=d /> })}
+                                                    {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
+                                                </span>
+                                            </a>
+                                        </li>
+                                    }
+                                })
+                            }).collect_view()
+                        })
+                    }).into_any()
                 }}
             </ul>
+            {move || (total > limit()).then(|| view! {
+                <button
+                    class="inbox-more"
+                    class:hidden=move || collapsed.get()
+                    on:click=move |_| shown.update(|m| *m.entry(id).or_insert(INITIAL_ROWS) += MORE_ROWS)
+                >
+                    {format!("Show {} more", (total - limit()).min(MORE_ROWS))}
+                </button>
+            })}
         </section>
     }
 }
