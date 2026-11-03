@@ -207,6 +207,22 @@ const SEARCH_STATUS_FIELDS: &str = "reviewDecision
     reviewThreads(first: 100) { totalCount nodes { isResolved } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
 
+/// The checks on a commit, as `head_checks` reads them. Every query that
+/// uses it must append it.
+const CHECKS_FRAGMENT: &str = "
+fragment Checks on StatusCheckRollup {
+  contexts(first: 100) {
+    nodes {
+      ... on CheckRun {
+        name status conclusion detailsUrl startedAt
+        checkSuite { workflowRun { workflow { name } } }
+      }
+      ... on StatusContext { context state targetUrl }
+    }
+  }
+}
+";
+
 /// Maps a check run's `CheckStatusState` and `CheckConclusionState`.
 /// Checks that finished without passing or failing, e.g. skipped ones,
 /// have no status.
@@ -328,15 +344,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       head: commits(last: 1) {
         nodes {
           commit {
-            statusCheckRollup {
-              state
-              contexts(first: 100) {
-                nodes {
-                  ... on CheckRun { name status conclusion detailsUrl }
-                  ... on StatusContext { context state targetUrl }
-                }
-              }
-            }
+            statusCheckRollup { state ...Checks }
           }
         }
       }
@@ -427,6 +435,72 @@ fn review_error(errors: &[Value]) -> Option<String> {
                 .unwrap_or("unknown error")
                 .to_owned()
         })
+}
+
+/// The checks of a `...Checks` fragment, the `statusCheckRollup` of a
+/// commit.
+fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
+    // A commit keeps the runs that later runs of the same workflow
+    // superseded, e.g. ones a concurrency group cancelled. Only the run of
+    // each check that started last counts; one that hasn't started yet is a
+    // queued re-run, so it's the newest.
+    let contexts: Vec<&Value> = rollup
+        .map(|r| nodes(r, "/contexts/nodes").collect())
+        .unwrap_or_default();
+    let mut latest: BTreeMap<(&str, &str), &Value> = BTreeMap::new();
+    for &c in contexts.iter().filter(|c| !str_at(c, "/name").is_empty()) {
+        let key = (
+            str_at(c, "/checkSuite/workflowRun/workflow/name"),
+            str_at(c, "/name"),
+        );
+        let started = Some(str_at(c, "/startedAt")).filter(|s| !s.is_empty());
+        latest
+            .entry(key)
+            .and_modify(|kept| {
+                let kept_started = Some(str_at(kept, "/startedAt")).filter(|s| !s.is_empty());
+                if started.is_none() || kept_started.is_some_and(|k| Some(k) <= started) {
+                    *kept = c;
+                }
+            })
+            .or_insert(c);
+    }
+    contexts
+        .into_iter()
+        .filter(|&c| {
+            str_at(c, "/name").is_empty() || latest.values().any(|&kept| std::ptr::eq(kept, c))
+        })
+        .filter_map(|c| {
+            let opt = |ptr: &str| {
+                Some(str_at(c, ptr))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
+            if let Some(name) = opt("/name") {
+                Some(Check {
+                    name,
+                    status: check_run_status(str_at(c, "/status"), str_at(c, "/conclusion")),
+                    url: opt("/detailsUrl"),
+                })
+            } else {
+                Some(Check {
+                    name: opt("/context")?,
+                    status: ci_status(str_at(c, "/state")),
+                    url: opt("/targetUrl"),
+                })
+            }
+        })
+        .collect()
+}
+
+/// The combined state of `checks`. It's GitHub's rule, which counts
+/// checks that were skipped or neutral as passing, but without the runs
+/// that `head_checks` drops: GitHub's own combined state counts those
+/// too, so a cancelled run fails it for good.
+fn combined_ci(checks: &[Check]) -> Option<CiStatus> {
+    [CiStatus::Failing, CiStatus::Running]
+        .into_iter()
+        .find(|&s| checks.iter().any(|c| c.status == Some(s)))
+        .or((!checks.is_empty()).then_some(CiStatus::Passing))
 }
 
 /// A search's PR node as a hit.
@@ -524,31 +598,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             url: str_at(c, "/url").to_owned(),
         })
         .collect();
-    let rollup = pr
-        .pointer("/head/nodes/0/commit/statusCheckRollup")
-        .unwrap_or(&Value::Null);
-    let checks = nodes(rollup, "/contexts/nodes")
-        .filter_map(|c| {
-            let opt = |ptr: &str| {
-                Some(str_at(c, ptr))
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-            };
-            if let Some(name) = opt("/name") {
-                Some(Check {
-                    name,
-                    status: check_run_status(str_at(c, "/status"), str_at(c, "/conclusion")),
-                    url: opt("/detailsUrl"),
-                })
-            } else {
-                Some(Check {
-                    name: opt("/context")?,
-                    status: ci_status(str_at(c, "/state")),
-                    url: opt("/targetUrl"),
-                })
-            }
-        })
-        .collect();
+    let checks = head_checks(pr.pointer("/head/nodes/0/commit/statusCheckRollup"));
     let repo = &data["repository"];
     let methods = [
         ("/mergeCommitAllowed", MergeMethod::Merge),
@@ -565,8 +615,8 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
         reviews,
         requested,
         comments,
+        ci: combined_ci(&checks),
         checks,
-        ci: ci_status(str_at(rollup, "/state")),
         merge: MergeInfo {
             // GitHub says UNKNOWN until it has tried merging.
             conflicting: match str_at(pr, "/mergeable") {
@@ -1270,7 +1320,7 @@ impl GitHub {
         let (owner, name) = split_repo(&key.repo)?;
         let (data, errors) = self
             .graphql(
-                PR_QUERY,
+                &format!("{PR_QUERY}{CHECKS_FRAGMENT}"),
                 json!({ "owner": owner, "name": name, "number": key.number }),
             )
             .await?;
@@ -1893,13 +1943,28 @@ mod tests {
                           "author": { "login": "b", "name": "B", "avatarUrl": "av" } },
                     ] },
                     "head": { "nodes": [ { "commit": { "statusCheckRollup": {
-                        "state": "PENDING",
+                        // GitHub counts the superseded runs too.
+                        "state": "FAILURE",
                         "contexts": { "nodes": [
                             { "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS",
                               "detailsUrl": "d" },
-                            { "name": "test", "status": "IN_PROGRESS", "conclusion": null },
+                            // Superseded by the run below that started later.
+                            { "name": "test", "status": "COMPLETED", "conclusion": "CANCELLED",
+                              "startedAt": "2026-01-01T00:00:00Z",
+                              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
+                            { "name": "test", "status": "IN_PROGRESS", "conclusion": null,
+                              "startedAt": "2026-01-01T00:00:05Z",
+                              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
+                            // The same name in another workflow is another check.
+                            { "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS",
+                              "startedAt": "2026-01-01T00:00:01Z",
+                              "checkSuite": { "workflowRun": { "workflow": { "name": "Nightly" } } } },
+                            // Superseded by the run below that hasn't started yet.
+                            { "name": "e2e", "status": "COMPLETED", "conclusion": "FAILURE",
+                              "startedAt": "2026-01-01T00:00:02Z" },
+                            { "name": "e2e", "status": "QUEUED", "conclusion": null },
                             { "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED" },
-                            { "context": "ci/legacy", "state": "ERROR", "targetUrl": null },
+                            { "context": "ci/legacy", "state": "SUCCESS", "targetUrl": null },
                         ] },
                     } } } ] },
                 },
@@ -1925,8 +1990,10 @@ mod tests {
             [
                 ("lint", Some(CiStatus::Passing), Some("d")),
                 ("test", Some(CiStatus::Running), None),
+                ("test", Some(CiStatus::Passing), None),
+                ("e2e", Some(CiStatus::Running), None),
                 ("docs", None, None),
-                ("ci/legacy", Some(CiStatus::Failing), None),
+                ("ci/legacy", Some(CiStatus::Passing), None),
             ]
         );
         assert_eq!(info.ci, Some(CiStatus::Running));
