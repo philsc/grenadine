@@ -612,6 +612,12 @@ async fn set_repo_settings(
         Ok(s) => s,
         Err(e) => return Ok((StatusCode::BAD_REQUEST, e).into_response()),
     };
+    for (b, m) in &settings.review_models {
+        if !state.agents.offers(*b, Some(m)).await {
+            let message = format!("{} doesn't offer that model", b.label());
+            return Ok((StatusCode::BAD_REQUEST, message).into_response());
+        }
+    }
     state.db.set_repo_settings(&repo, &settings)?;
     state.send(ServerEvent::RepoSettingsChanged(repo));
     // Reviews that were just turned on look for PRs right away.
@@ -1316,6 +1322,47 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A review model is saved only when the backend offers it.
+    #[tokio::test]
+    async fn repo_settings_check_the_review_model() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(
+            &fx,
+            dir.path(),
+            crate::claude::tests::LISTS_SONNET,
+        );
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        let settings = |model: &str| {
+            Json(RepoSettings {
+                review_models: [(grenadine_core::api::AgentBackend::Claude, model.to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..RepoSettings::default()
+            })
+        };
+
+        let response = set_repo_settings(AxState(state.clone()), path(), settings("sonnet"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved = state.db.repo_settings(&fx.clone.slug).unwrap();
+        assert_eq!(
+            saved.review_models[&grenadine_core::api::AgentBackend::Claude],
+            "sonnet"
+        );
+
+        // One the backend doesn't list isn't saved.
+        let response = set_repo_settings(AxState(state.clone()), path(), settings("nope"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await, "Claude Code doesn't offer that model");
     }
 
     #[tokio::test]

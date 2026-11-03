@@ -98,6 +98,16 @@ pub fn to_save(
 ) -> std::result::Result<RepoSettings, String> {
     let review_skill = skill_name(new.review_skill.as_deref())?;
     let session_skill = skill_name(new.session_skill.as_deref())?;
+    // Only real picks are stored: a blank or "default" means the
+    // backend's own default.
+    let review_models = new
+        .review_models
+        .iter()
+        .filter_map(|(b, m)| {
+            let m = m.trim();
+            (!m.is_empty() && m != "default").then(|| (*b, m.to_owned()))
+        })
+        .collect();
     for (backend, mode) in &new.session_modes {
         if !backend.has_mode(mode.as_str()) {
             return Err(format!(
@@ -115,6 +125,7 @@ pub fn to_save(
     Ok(RepoSettings {
         review_skill,
         session_skill,
+        review_models,
         auto_review_since,
         ..new
     })
@@ -288,6 +299,27 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
             return false;
         }
     };
+    // A pick the backend doesn't offer fails the review rather than
+    // keep it waiting: the settings were checked when they were saved,
+    // so this means the backend's models changed since.
+    let model = settings.review_models.get(&settings.review_backend);
+    if let Some(m) = model
+        && !state.agents.offers(settings.review_backend, Some(m)).await
+    {
+        let why = format!(
+            "{} doesn't offer the model {m}",
+            settings.review_backend.label()
+        );
+        let failed =
+            state
+                .db
+                .finish_auto_review(id, AutoReviewState::Failed, Some(&why), agent::now());
+        if let Err(e) = failed {
+            tracing::warn!("{}#{}: can't record a review: {e:#}", key.repo, key.number);
+        }
+        state.send(ServerEvent::AutoReviewsChanged);
+        return false;
+    }
     tracing::info!(
         "{}#{}: starting a review of {}",
         key.repo,
@@ -300,7 +332,7 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
         pr: Some(key.number),
         prompt: prompt(settings.review_skill.as_deref(), detail),
         permission_mode: review_mode(settings.review_backend),
-        model: None,
+        model: model.cloned(),
         images: Vec::new(),
     };
     let title = format!("Review #{}: {}", key.number, detail.summary.title);
@@ -529,7 +561,7 @@ async fn finish(
 mod tests {
     use grenadine_core::api::{
         CostUnit, IssueComment, MergeInfo, MergeState, Person, PrKey, PrSummary, Review,
-        ReviewInfo, ReviewState, Stack, StackPr, ThreadCounts,
+        ReviewInfo, ReviewState, Stack, StackPr, ThreadCounts, Version, VersionKind,
     };
 
     use super::*;
@@ -716,6 +748,27 @@ mod tests {
         };
         let saved = to_save(&off, devin, 0).unwrap();
         assert_eq!(saved.review_backend, AgentBackend::Devin);
+    }
+
+    #[test]
+    fn saving_the_review_models() {
+        let off = RepoSettings {
+            auto_review: AutoReview::Off,
+            ..RepoSettings::default()
+        };
+        // Only real picks are kept, trimmed; "default" and blanks go.
+        let models = RepoSettings {
+            review_models: [
+                (AgentBackend::Claude, " sonnet ".to_owned()),
+                (AgentBackend::Devin, "default".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            ..off.clone()
+        };
+        let saved = to_save(&off, models, 0).unwrap();
+        assert_eq!(saved.review_models.len(), 1);
+        assert_eq!(saved.review_models[&AgentBackend::Claude], "sonnet");
     }
 
     #[test]
@@ -1092,6 +1145,98 @@ sleep 30
         };
         assert!(!start(&state, &hit(false, "a"), &s, &detail(2, None)).await);
         assert!(state.db.auto_reviews().unwrap().is_empty());
+    }
+
+    /// A review runs on the model its repository's settings picked.
+    #[tokio::test]
+    async fn a_review_runs_on_the_picked_model() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), SUCCEED);
+        let key = PrKey {
+            repo: fx.clone.slug.clone(),
+            number: 2,
+        };
+        // The PR synced at a commit the clone has.
+        let head = fx.clone.head().unwrap();
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: key.clone(),
+                    title: "t".into(),
+                    body: String::new(),
+                    author: "me".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "main".into(),
+                    head_ref: "b".into(),
+                    head_oid: head.clone(),
+                    ci: None,
+                    review: None,
+                    review_error: None,
+                },
+                &[Version {
+                    number: 1,
+                    sha: head.clone(),
+                    merge_base: None,
+                    kind: VersionKind::Initial,
+                    pushed_at: None,
+                    pushed_by: None,
+                    pushed_by_is_guess: false,
+                    missing: false,
+                }],
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        let detail = state.db.pr(&key).unwrap().unwrap();
+        let s = RepoSettings {
+            review_models: [(AgentBackend::Claude, "sonnet".to_owned())]
+                .into_iter()
+                .collect(),
+            ..settings(AutoReview::NonDraft, false)
+        };
+        let mut h = hit(false, &head);
+        h.key = key;
+        assert!(start(&state, &h, &s, &detail).await);
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Unposted);
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.contains("--model sonnet"), "{args}");
+    }
+
+    /// A review whose picked model the backend doesn't list is recorded
+    /// failed, without a session.
+    #[tokio::test]
+    async fn a_review_with_an_unoffered_model_fails() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(
+            &fx,
+            dir.path(),
+            crate::claude::tests::LISTS_SONNET,
+        );
+        let s = RepoSettings {
+            review_models: [(AgentBackend::Claude, "nope".to_owned())]
+                .into_iter()
+                .collect(),
+            ..settings(AutoReview::NonDraft, false)
+        };
+        assert!(!start(&state, &hit(false, "a"), &s, &detail(2, None)).await);
+        let review = state.db.auto_reviews().unwrap().remove(0);
+        assert_eq!(review.state, AutoReviewState::Failed);
+        assert_eq!(
+            review.error.as_deref(),
+            Some("Claude Code doesn't offer the model nope")
+        );
+        assert_eq!(review.session, None);
+        assert!(state.db.agents().unwrap().is_empty());
     }
 
     #[test]

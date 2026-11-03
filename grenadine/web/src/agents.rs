@@ -72,13 +72,13 @@ pub fn cost(amount: f64, unit: CostUnit) -> String {
 
 /// The backends the server offers, loaded once for the page; a model
 /// picker loads them again when they came without models.
-fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
+pub(crate) fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
     expect_context()
 }
 
 /// The models `backend` offers: `None` until the backends are in, an
 /// empty list when they can't be.
-fn listed_models(backend: Signal<AgentBackend>) -> Memo<Option<Vec<AgentModelInfo>>> {
+pub(crate) fn listed_models(backend: Signal<AgentBackend>) -> Memo<Option<Vec<AgentModelInfo>>> {
     Memo::new(move |_| {
         let backend = backend.get();
         backends().get().map(|r| {
@@ -913,7 +913,35 @@ const MODEL_KEY: &str = "grenadine.agent-model";
 const BACKEND_KEY: &str = "grenadine.agent-backend";
 
 /// What the model picker shows for the backend's configured default.
-const DEFAULT_MODEL: &str = "default";
+pub(crate) const DEFAULT_MODEL: &str = "default";
+
+/// The models a picker of `backend`'s models offers: `models`, a
+/// "Default" entry first unless the list has one, and `picked` marked
+/// "(not listed)" when the list doesn't have it.
+pub(crate) fn model_options(
+    mut options: Vec<AgentModelInfo>,
+    backend: AgentBackend,
+    picked: &str,
+) -> Vec<AgentModelInfo> {
+    if !options.iter().any(|m| m.value == DEFAULT_MODEL) {
+        options.insert(
+            0,
+            AgentModelInfo {
+                value: DEFAULT_MODEL.into(),
+                display_name: "Default".into(),
+                description: format!("{}'s configured default", backend.label()),
+            },
+        );
+    }
+    if !options.iter().any(|m| m.value == picked) {
+        options.push(AgentModelInfo {
+            display_name: format!("{picked} (not listed)"),
+            description: format!("{} didn't list this model", backend.label()),
+            value: picked.to_owned(),
+        });
+    }
+    options
+}
 
 /// Each backend's model memory, so a model never lands on a backend that
 /// doesn't offer it.
@@ -985,26 +1013,11 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
         backends().refetch();
     }
     let options = Memo::new(move |_| {
-        let mut options = models.get().unwrap_or_default();
-        if !options.iter().any(|m| m.value == DEFAULT_MODEL) {
-            options.insert(
-                0,
-                AgentModelInfo {
-                    value: DEFAULT_MODEL.into(),
-                    display_name: "Default".into(),
-                    description: format!("{}'s configured default", backend.get().label()),
-                },
-            );
-        }
-        let picked = model.get();
-        if !options.iter().any(|m| m.value == picked) {
-            options.push(AgentModelInfo {
-                display_name: format!("{picked} (not listed)"),
-                description: format!("{} didn't list this model", backend.get().label()),
-                value: picked,
-            });
-        }
-        options
+        model_options(
+            models.get().unwrap_or_default(),
+            backend.get(),
+            &model.get(),
+        )
     });
     // A pick that's no longer offered goes back to the default. Without
     // a list there's no telling, and the pick stays.

@@ -4,6 +4,7 @@ use grenadine_core::api::{AgentBackend, AutoReview, PermissionMode, RepoSettings
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::agents::{DEFAULT_MODEL, backends, listed_models, model_options};
 use crate::{Updates, api};
 
 #[component]
@@ -187,6 +188,29 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
         })
     };
     let off = move || draft.with(|d| d.as_ref().is_some_and(|d| d.auto_review == AutoReview::Off));
+    let backend = Signal::derive(move || {
+        draft.with(|d| d.as_ref().map(|d| d.review_backend).unwrap_or_default())
+    });
+    let models = listed_models(backend);
+    // Models that couldn't be listed when the page loaded may be now.
+    if models.get_untracked().is_some_and(|m| m.is_empty()) {
+        backends().refetch();
+    }
+    let picked = Memo::new(move |_| {
+        let backend = backend.get();
+        draft.with(|d| {
+            d.as_ref()
+                .and_then(|d| d.review_models.get(&backend).cloned())
+                .unwrap_or_else(|| DEFAULT_MODEL.into())
+        })
+    });
+    let options = Memo::new(move |_| {
+        model_options(
+            models.get().unwrap_or_default(),
+            backend.get(),
+            &picked.get(),
+        )
+    });
     view! {
         <fieldset class="repo-settings-fields">
             <legend>"Auto-reviews"</legend>
@@ -220,6 +244,31 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
                 >
                     {AgentBackend::ALL.into_iter().map(|b| view! {
                         <option value=b.as_str()>{b.label()}</option>
+                    }).collect_view()}
+                </select>
+            </label>
+            <label>"Review model"
+                <select
+                    prop:disabled=off
+                    prop:value=move || picked.get()
+                    on:change=move |ev| {
+                        let value = event_target_value(&ev);
+                        let backend = backend.get_untracked();
+                        edit(Box::new(move |d| {
+                            if value == DEFAULT_MODEL {
+                                d.review_models.remove(&backend);
+                            } else {
+                                d.review_models.insert(backend, value);
+                            }
+                        }));
+                    }
+                >
+                    {move || options.get().into_iter().map(|m| {
+                        let value = m.value.clone();
+                        let selected = move || picked.with(|p| *p == value);
+                        view! {
+                            <option value=m.value title=m.description selected=selected>{m.display_name}</option>
+                        }
                     }).collect_view()}
                 </select>
             </label>
