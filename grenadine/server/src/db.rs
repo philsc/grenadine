@@ -9,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus,
     CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary,
-    ReviewComment, ReviewDecision, ReviewInfo, Stack, ThreadCounts, Version, VersionKind,
+    RepoSettings, ReviewComment, ReviewDecision, ReviewInfo, Stack, ThreadCounts, Version,
+    VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -320,6 +321,16 @@ const MIGRATIONS: &[Migration] = &[
 "#,
     ),
     Migration::ResetInboxes,
+    Migration::Sql(
+        r#"
+    -- Each configured repository's settings, the JSON of an
+    -- api::RepoSettings. A repository without a row has the defaults.
+    CREATE TABLE repo_settings (
+        repo TEXT PRIMARY KEY,
+        json TEXT NOT NULL
+    );
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -563,6 +574,31 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The repository's settings; the defaults until some are saved.
+    pub fn repo_settings(&self, repo: &str) -> Result<RepoSettings> {
+        let json: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT json FROM repo_settings WHERE repo = ?",
+                [repo],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match json {
+            Some(json) => serde_json::from_str(&json)?,
+            None => RepoSettings::default(),
+        })
+    }
+
+    pub fn set_repo_settings(&self, repo: &str, settings: &RepoSettings) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO repo_settings (repo, json) VALUES (?, ?)
+             ON CONFLICT (repo) DO UPDATE SET json = excluded.json",
+            params![repo, serde_json::to_string(settings)?],
+        )?;
+        Ok(())
     }
 
     pub fn inbox_error(&self, id: i64) -> Result<Option<String>> {
@@ -2043,9 +2079,10 @@ mod tests {
         // listing's query needs.
         migrate(&mut conn, 3).unwrap();
         conn.pragma_update(None, "user_version", 4).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
-        conn.pragma_update(None, "user_version", MIGRATIONS.len())
-            .unwrap();
+        let reset = last_reset();
+        migrate(&mut conn, reset).unwrap();
+        conn.pragma_update(None, "user_version", reset + 1).unwrap();
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
             _lock: None,
@@ -2056,6 +2093,25 @@ mod tests {
         assert_eq!(pr.title, "old title");
         assert_eq!(pr.author, "au");
         assert!(pr.synced);
+    }
+
+    #[test]
+    fn repo_settings_round_trip() {
+        let db = Db::in_memory();
+        assert_eq!(db.repo_settings("o/n").unwrap(), RepoSettings::default());
+        db.set_repo_settings("o/n", &RepoSettings::default())
+            .unwrap();
+        db.set_repo_settings("o/n", &RepoSettings::default())
+            .unwrap();
+        assert_eq!(db.repo_settings("o/n").unwrap(), RepoSettings::default());
+        // Fields that a later version dropped are ignored.
+        db.conn()
+            .execute(
+                "UPDATE repo_settings SET json = '{\"gone\": 1}' WHERE repo = 'o/n'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.repo_settings("o/n").unwrap(), RepoSettings::default());
     }
 
     #[test]
@@ -2125,13 +2181,21 @@ mod tests {
         assert_eq!(db.inbox_truncation(1).unwrap(), None);
     }
 
+    /// The index of the last migration that resets the inboxes.
+    fn last_reset() -> usize {
+        MIGRATIONS
+            .iter()
+            .rposition(|m| matches!(m, Migration::ResetInboxes))
+            .unwrap()
+    }
+
     #[test]
     fn reset_inboxes_on_an_old_database() {
         // A database from before the count_in_total migration picks up
         // the new defaults, flags included.
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 2).unwrap();
+        migrate(&mut conn, last_reset() - 1).unwrap();
         let db = Db::init(conn, None).unwrap();
         let inboxes = db.inboxes().unwrap();
         assert_eq!(inboxes.len(), crate::inboxes::DEFAULT_INBOXES.len());
