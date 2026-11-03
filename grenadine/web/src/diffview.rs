@@ -589,6 +589,46 @@ impl SideLines {
     }
 }
 
+/// The user's per-path fold choices for one agent session, kept in the
+/// tab's session storage as a JSON map so that they survive reloads.
+#[derive(Clone)]
+pub struct Folds {
+    key: String,
+}
+
+impl Folds {
+    pub fn new(session: &str) -> Self {
+        Self {
+            key: format!("worktree-folds.{session}"),
+        }
+    }
+
+    fn read(&self) -> HashMap<String, bool> {
+        window()
+            .session_storage()
+            .ok()
+            .flatten()
+            .and_then(|s| s.get_item(&self.key).ok().flatten())
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn get(&self, path: &str) -> Option<bool> {
+        self.read().get(path).copied()
+    }
+
+    pub fn set(&self, path: &str, expanded: bool) {
+        let Some(storage) = window().session_storage().ok().flatten() else {
+            return;
+        };
+        let mut folds = self.read();
+        folds.insert(path.to_owned(), expanded);
+        if let Ok(json) = serde_json::to_string(&folds) {
+            let _ = storage.set_item(&self.key, &json);
+        }
+    }
+}
+
 #[component]
 fn FileView(
     file: Arc<FileData>,
@@ -596,6 +636,7 @@ fn FileView(
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
     #[prop(optional_no_strip)] commenting: Option<Commenting>,
+    #[prop(optional)] folds: Option<Folds>,
 ) -> impl IntoView {
     let c = &file.change;
     let fc = commenting.map(|commenting| FileCommenting {
@@ -611,7 +652,12 @@ fn FileView(
     } else {
         stats(&file)
     };
-    let expanded = RwSignal::new(!all_upstream && added + removed <= BIG_FILE);
+    let expanded = RwSignal::new(
+        folds
+            .as_ref()
+            .and_then(|f| f.get(c.path()))
+            .unwrap_or(!all_upstream && added + removed <= BIG_FILE),
+    );
     // Roughly: the changed lines and the context around each block.
     let rows = if expanded.get_untracked() {
         added + removed + blocks * (2 * CONTEXT + 1)
@@ -681,7 +727,15 @@ fn FileView(
     };
     view! {
         <section class="file" id=file_id(c.path())>
-            <header class="file-header" on:click=move |_| expanded.update(|e| *e = !*e)>
+            <header class="file-header" on:click={
+                let path = c.path().to_owned();
+                move |_| {
+                    expanded.update(|e| *e = !*e);
+                    if let Some(folds) = &folds {
+                        folds.set(&path, expanded.get_untracked());
+                    }
+                }
+            }>
                 <span class="chevron">{move || if expanded.get() { "▾" } else { "▸" }}</span>
                 <span class=format!("status status-{}", status_label(c.status).replace(' ', "-"))>{status_label(c.status)}</span>
                 <span class="path">{title}</span>
@@ -711,12 +765,13 @@ fn FileView(
 }
 
 /// The unstaged changes in an agent's worktree, laid out like a PR's
-/// unified diff. A file keeps its view, and whether it is collapsed, until
-/// its contents change.
+/// unified diff. A file keeps its view until its contents change, and its
+/// fold is remembered per path for the session in this tab.
 #[component]
-pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>) -> impl IntoView {
+pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl IntoView {
     let inline_changes = Signal::stored(load_flag("inline-changes", true));
     let side_by_side = Signal::stored(false);
+    let folds = Folds::new(&session);
     let key = |f: &WorktreeFile| {
         let mut h = DefaultHasher::new();
         f.hash(&mut h);
@@ -731,7 +786,7 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>) -> impl IntoView {
                     new: f.new.map(Arc::new),
                     upstream: None,
                 });
-                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes /> }
+                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes folds=folds.clone() /> }
             }
         </For>
     }

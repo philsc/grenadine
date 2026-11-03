@@ -1420,6 +1420,10 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
     let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
+    // Whether the session is a general one, so the pane below only
+    // remounts when that flips, not on every session update.
+    let general =
+        Memo::new(move |_| current.with(|s| s.as_ref().is_some_and(|s| s.repo == GENERAL)));
 
     // A session shows on the page of its kind.
     Effect::new(move || {
@@ -1473,8 +1477,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                 </main>
                 // A general session's directory isn't a git worktree.
                 {move || {
-                    let general = current.with(|s| s.as_ref().is_some_and(|s| s.repo == GENERAL));
-                    (load.get() == Load::Ready && !general).then(|| view! { <ChangesPane id=id.clone() events=events /> })
+                    (load.get() == Load::Ready && !general.get()).then(|| view! { <ChangesPane id=id.clone() events=events /> })
                 }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
@@ -1505,6 +1508,7 @@ fn wide_enough() -> bool {
 #[component]
 fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
     let updates = expect_context::<Updates>();
+    let session = id.clone();
     let wide = RwSignal::new(wide_enough());
     let on_resize = window_event_listener_untyped("resize", move |_| {
         let w = wide_enough();
@@ -1573,7 +1577,7 @@ fn ChangesPane(id: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
                             <p class="muted">{format!("{} files changed", f.len())}</p>
                         }.into_any(),
                     }}
-                    <WorktreeDiff files=files />
+                    <WorktreeDiff files=files session=session.clone() />
                 </aside>
             }
         })
