@@ -434,6 +434,17 @@ input[type="text"] {
   border-left-style: dashed;
 }
 
+.inbox-more {
+  width: 100%;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  background: var(--bg-subtle);
+}
+
 .inbox-form {
   padding: 8px 16px 12px;
   display: flex;

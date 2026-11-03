@@ -545,6 +545,27 @@ class ServerTestCase(unittest.TestCase):
         self.page = self.browser.new_page()
         self.addCleanup(self.page.close)
 
+    def inbox(self, name: str) -> Locator:
+        return self.page.locator("section.inbox").filter(
+            has=self.page.locator(".inbox-name", has_text=exactly(name))
+        )
+
+    def repoll(self) -> None:
+        """Forces a poll by saving the first inbox unchanged."""
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            inbox = json.load(resp)[0]["inbox"]
+        req = urllib.request.Request(
+            f"{self.url}api/inboxes/{inbox['id']}",
+            data=json.dumps(inbox).encode(),
+            method="PUT",
+            # Writes are only taken from the server's own pages.
+            headers={
+                "Content-Type": "application/json",
+                "Origin": self.url.rstrip("/"),
+            },
+        )
+        urllib.request.urlopen(req).close()
+
 
 class ChromeTest(ServerTestCase):
     def test_shows_wordmark_top_left(self) -> None:
@@ -605,11 +626,6 @@ class InboxTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
         cls.cases = scenarios.inbox_cases(gh)
-
-    def inbox(self, name: str) -> Locator:
-        return self.page.locator("section.inbox").filter(
-            has=self.page.locator(".inbox-name", has_text=exactly(name))
-        )
 
     def row(self, title: str) -> Locator:
         # A PR can be in several inboxes; the first one will do.
@@ -731,22 +747,6 @@ class InboxTest(ServerTestCase):
             form.get_by_label("Count in total").check()
         form.get_by_role("button", name="Save").click()
         return self.inbox(name)
-
-    def repoll(self) -> None:
-        """Forces a poll by saving the first inbox unchanged."""
-        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
-            inbox = json.load(resp)[0]["inbox"]
-        req = urllib.request.Request(
-            f"{self.url}api/inboxes/{inbox['id']}",
-            data=json.dumps(inbox).encode(),
-            method="PUT",
-            # Writes are only taken from the server's own pages.
-            headers={
-                "Content-Type": "application/json",
-                "Origin": self.url.rstrip("/"),
-            },
-        )
-        urllib.request.urlopen(req).close()
 
     def delete_inbox(self, name: str) -> None:
         """Deletes an inbox a test added, so that it doesn't show up in the
@@ -978,6 +978,81 @@ class InboxTest(ServerTestCase):
         # The PR itself is bold; the others link to GitHub.
         expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
         expect(rows.locator("a")).to_have_attribute("href", base.url)
+
+
+class InboxPagingTest(ServerTestCase):
+    """Inboxes show 15 rows first and grow by 10 per "Show more" click."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.checkout("main")
+        repo.commit("Seed the repo", {"README.md": "# test\n"})
+        repo.push("main")
+        # Oldest first: 21 plain PRs, a two-PR stack, then 14 plain PRs, so
+        # that in the newest-first inbox the cut at 15 rows splits the
+        # stack.
+        for i in range(1, 22):
+            scenarios._simple_pr(repo, f"paging-{i:02}", f"Paging {i:02}")
+        repo.checkout("dev/paging-base", "main")
+        repo.commit("Paging base", {"paging/base.txt": "base\n"})
+        repo.push("dev/paging-base")
+        repo.open_pr("Paging base", head="dev/paging-base")
+        repo.checkout("dev/paging-top")
+        repo.commit("Paging top", {"paging/top.txt": "top\n"})
+        repo.push("dev/paging-top")
+        repo.open_pr("Paging top", head="dev/paging-top", base="dev/paging-base")
+        for i in range(22, 36):
+            scenarios._simple_pr(repo, f"paging-{i:02}", f"Paging {i:02}")
+
+    def test_show_more_grows_the_list(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        rows = inbox.locator(".pr-list li")
+        more = inbox.get_by_role("button", name=re.compile(r"^Show \d+ more$"))
+        expect(inbox.locator(".count")).to_have_text("37")
+        expect(rows).to_have_count(15)
+        # The cut splits the stack, so the last visible row's connector is
+        # dashed.
+        expect(rows.nth(14)).to_have_class(re.compile(r"\bstack-below-gap\b"))
+        first = rows.locator(".pr-title").all_inner_texts()
+
+        # The button collapses with the list.
+        inbox.locator(".inbox-toggle").click()
+        expect(more).to_be_hidden()
+        inbox.locator(".inbox-toggle").click()
+        expect(more).to_be_visible()
+
+        inbox.get_by_role("button", name="Show 10 more", exact=True).click()
+        expect(rows).to_have_count(25)
+        # The list grows downward; the rows already shown don't move.
+        self.assertEqual(rows.locator(".pr-title").all_inner_texts()[:15], first)
+        expect(rows.nth(14)).not_to_have_class(re.compile(r"\bstack-below-gap\b"))
+
+        inbox.get_by_role("button", name="Show 10 more", exact=True).click()
+        expect(rows).to_have_count(35)
+        expect(more).to_have_text("Show 2 more")
+
+        more.click()
+        expect(rows).to_have_count(37)
+        expect(more).to_have_count(0)
+
+    def test_shown_rows_survive_refreshes_but_reset_on_reload(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        rows = inbox.locator(".pr-list li")
+        expect(rows).to_have_count(15)
+
+        inbox.get_by_role("button", name="Show 10 more", exact=True).click()
+        expect(rows).to_have_count(25)
+
+        # A refetch, which rebuilds the section, keeps the count.
+        with self.page.expect_response(re.compile(r"api/inboxes$")):
+            self.repoll()
+        expect(rows).to_have_count(25)
+
+        self.page.reload()
+        expect(rows).to_have_count(15)
 
 
 class ReviewTest(ServerTestCase):
