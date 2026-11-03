@@ -1535,12 +1535,18 @@ textarea {
   flex-direction: column;
   gap: 6px;
 }
+/* Model names and ids can be long, so the active model and the context
+   meter move to a line of their own, still at the right, rather than
+   pushing the meter out of view. */
 .composer .form-buttons {
   align-items: center;
+  flex-wrap: wrap;
 }
 .composer-status {
   margin-left: auto;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
   gap: 10px;
 }

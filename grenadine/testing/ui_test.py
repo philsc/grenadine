@@ -2032,6 +2032,52 @@ class AgentTest(ServerTestCase):
         expect(sessions.filter(has_text="A Devin task")).to_have_count(1)
         self.delete_session("A Devin task")
 
+    def test_composer_wraps_long_model_names(self) -> None:
+        # Long model names make the composer's button row wrap onto a
+        # second line rather than overflow, hiding the context meter.
+        def add_long_model(route) -> None:
+            response = route.fetch()
+            data = response.json()
+            for entry in data:
+                if entry["backend"] == "devin":
+                    entry["models"].append(
+                        {
+                            "value": "fusion-very-long-model-id-for-testing-wrapping",
+                            "displayName": "Fusion (An Extremely Long Model Display Name Medium + Another Long Sidekick Name Medium)",
+                            "description": "",
+                        }
+                    )
+            route.fulfill(response=response, json=data)
+
+        self.page.route("**/api/agents/backends", add_long_model)
+        self.page.set_viewport_size({"width": 800, "height": 900})
+        transcript = self.start_devin_session("Code", "write a note")
+        transcript.locator(".approval").get_by_role("button", name="Allow").click()
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The panes never scroll horizontally.
+        overflow = self.page.locator(".agent-panes > .main").evaluate(
+            "e => e.scrollWidth - e.clientWidth"
+        )
+        self.assertEqual(overflow, 0)
+
+        meter = self.page.get_by_role("meter", name="Context")
+        expect(meter).to_be_in_viewport()
+        meter_box = meter.bounding_box()
+        buttons_box = self.page.locator(".composer .form-buttons").bounding_box()
+        assert meter_box and buttons_box
+        # The status sits at the row's right edge even after wrapping.
+        self.assertAlmostEqual(
+            meter_box["x"] + meter_box["width"],
+            buttons_box["x"] + buttons_box["width"],
+            delta=1,
+        )
+        # The row wrapped: the meter is on a line below Send.
+        send_box = self.page.get_by_role("button", name="Send").bounding_box()
+        assert send_box
+        self.assertGreater(meter_box["y"], send_box["y"] + send_box["height"])
+        self.delete_session("A Devin task")
+
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")
         question = transcript.locator(".approval")
@@ -2260,7 +2306,7 @@ class AgentTest(ServerTestCase):
         )
 
         # Opening a session that doesn't fit shows the end of its transcript.
-        self.page.set_viewport_size({"width": 1000, "height": 300})
+        self.page.set_viewport_size({"width": 1000, "height": 320})
         self.page.get_by_role("link", name="Agents").click()
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
