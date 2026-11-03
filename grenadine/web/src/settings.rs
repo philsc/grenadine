@@ -1,6 +1,6 @@
 //! A repository's settings, edited in a dialog over the agents' pages.
 
-use grenadine_core::api::RepoSettings;
+use grenadine_core::api::{AutoReview, RepoSettings};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -131,9 +131,9 @@ fn SettingsDialog(
                     </button>
                 </header>
                 <div class="repo-settings-body">
-                    {move || match (loaded.get(), draft.get()) {
+                    {move || match (loaded.get(), draft.with(Option::is_some)) {
                         (Some(Err(e)), _) => view! { <p class="error">{e}</p> }.into_any(),
-                        (_, Some(_)) => view! { <p class="muted">"No settings yet."</p> }.into_any(),
+                        (_, true) => view! { <ReviewFields draft=draft /> }.into_any(),
                         _ => view! { <p class="muted">"Loading…"</p> }.into_any(),
                     }}
                     {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
@@ -150,5 +150,91 @@ fn SettingsDialog(
                 </footer>
             </div>
         </dialog>
+    }
+}
+
+fn mode_value(mode: AutoReview) -> &'static str {
+    match mode {
+        AutoReview::Off => "off",
+        AutoReview::NonDraft => "non_draft",
+        AutoReview::IncludingDrafts => "including_drafts",
+    }
+}
+
+fn parse_mode(value: &str) -> AutoReview {
+    match value {
+        "off" => AutoReview::Off,
+        "including_drafts" => AutoReview::IncludingDrafts,
+        _ => AutoReview::NonDraft,
+    }
+}
+
+/// The settings of the reviews of the viewer's own PRs, edited in `draft`,
+/// which is loaded.
+#[component]
+fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
+    let get =
+        move |f: fn(&RepoSettings) -> String| draft.with(|d| d.as_ref().map(f).unwrap_or_default());
+    let edit = move |f: Box<dyn FnOnce(&mut RepoSettings)>| {
+        draft.update(|d| {
+            if let Some(d) = d {
+                f(d);
+            }
+        })
+    };
+    let off = move || draft.with(|d| d.as_ref().is_some_and(|d| d.auto_review == AutoReview::Off));
+    view! {
+        <fieldset class="repo-settings-fields">
+            <legend>"Auto-reviews"</legend>
+            <p class="hint muted">
+                "An unattended agent session reviews each pull request you open, posts its "
+                "review on the pull request and is then deleted. The reviews are in the "
+                "Auto-reviews tab."
+            </p>
+            <label>"Review my pull requests"
+                <select
+                    prop:value=move || get(|d| mode_value(d.auto_review).to_owned())
+                    on:change=move |ev| {
+                        let mode = parse_mode(&event_target_value(&ev));
+                        edit(Box::new(move |d| d.auto_review = mode));
+                    }
+                >
+                    <option value="off">"Never"</option>
+                    <option value="non_draft">"When opened, once they're not drafts"</option>
+                    <option value="including_drafts">"When opened, drafts too"</option>
+                </select>
+            </label>
+            <label class="checkbox">
+                <input
+                    type="checkbox"
+                    prop:disabled=off
+                    prop:checked=move || draft.with(|d| d.as_ref().is_some_and(|d| d.rereview_on_push))
+                    on:change=move |ev| {
+                        let on = event_target_checked(&ev);
+                        edit(Box::new(move |d| d.rereview_on_push = on));
+                    }
+                />
+                "Review again after new pushes"
+            </label>
+            <label>"Review skill"
+                <input
+                    type="text"
+                    class="mono"
+                    placeholder="None"
+                    prop:disabled=off
+                    prop:value=move || get(|d| d.review_skill.clone().unwrap_or_default())
+                    on:input=move |ev| {
+                        let skill = event_target_value(&ev);
+                        edit(Box::new(move |d| {
+                            d.review_skill = (!skill.trim().is_empty()).then_some(skill)
+                        }));
+                    }
+                />
+            </label>
+            <p class="hint muted">
+                "The skill the review runs, e.g. code-review, given the pull request. Without "
+                "one, the agent reviews it with a plain prompt."
+            </p>
+        </fieldset>
     }
 }

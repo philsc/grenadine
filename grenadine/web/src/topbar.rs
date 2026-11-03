@@ -109,7 +109,8 @@ pub fn Topbar(
                         "Inboxes"
                         {move || (total() > 0).then(|| view! { <span class="count">{total()}</span> })}
                     </a>
-                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_)))>"Agents"</a>
+                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup))>"Agents"</a>
+                    <a href="#/auto-reviews" class:active=move || route.with(|r| matches!(r, Route::AutoReviews | Route::AutoReview(_)))>"Auto-reviews"</a>
                 </nav>
             </span>
             <span class="topbar-right">

@@ -273,6 +273,8 @@ if "--json-schema" in args:
         output = {"items": [item]}
     print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
+import os
+import re
 content = json.loads(sys.stdin.read())["message"]["content"]
 images = sum(block["type"] == "image" for block in content)
 prompt = "".join(block["text"] for block in content if block["type"] == "text")
@@ -391,6 +393,16 @@ if mode == "plan":
     result(tool_use, "User has approved your plan.")
     with open(name, "w") as f:
         f.write(decision["updatedPermissions"][0]["mode"])
+# A review of a PR posts a comment on it, as `gh` would, unless the PR
+# asks it not to.
+review = re.search(r"Review pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
+if review and "Quiet" not in review[1]:
+    request = urllib.request.Request(
+        f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
+        data=json.dumps({"body": "Looks good."}).encode(),
+        headers={"content-type": "application/json", "authorization": "Bearer " + os.environ["FAKE_GITHUB_TOKEN"]},
+    )
+    urllib.request.urlopen(request).close()
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
 """
 
@@ -442,7 +454,13 @@ class ServerTestCase(unittest.TestCase):
         devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
         devin.chmod(0o755)
 
-        env = dict(cls.gh.git_env(), PATH=f"{bin_dir}:{os.environ['PATH']}")
+        env = dict(
+            cls.gh.git_env(),
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+            # Where the fake claude posts reviews.
+            FAKE_GITHUB_API=api,
+            FAKE_GITHUB_TOKEN=TOKEN,
+        )
         repo_flags = []
         cls.clones = {}
         for slug in cls.REPOS:
@@ -1806,7 +1824,7 @@ class AgentTest(ServerTestCase):
 
         gear.click()
         expect(dialog).to_be_visible()
-        expect(dialog).to_contain_text("No settings yet.")
+        expect(dialog.get_by_role("group", name="Auto-reviews")).to_be_visible()
         # It stays open while polls redraw the sidebar.
         self.page.wait_for_timeout(2500)
         expect(dialog).to_be_visible()
@@ -2803,6 +2821,114 @@ class AgentTest(ServerTestCase):
         # Once answered, the old plan offers nothing more.
         expect(plan).to_contain_text("Unanswered plan")
         expect(plan.get_by_role("button", name="Approve plan")).to_have_count(0)
+
+
+class AutoReviewTest(ServerTestCase):
+    QUIET_REPO = "test/quiet"
+    OFF_REPO = "test/off"
+    REPOS: ClassVar[list[str]] = [scenarios.REPO, QUIET_REPO, OFF_REPO]
+    POLL_INTERVAL: ClassVar[int] = 1
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        # The PRs the tests open come after the server starts reviewing.
+        gh.clock = int(time.time()) + 3600
+        for slug in cls.REPOS:
+            repo = gh.repo(slug)
+            repo.commit("Seed", {"README": "hello\n"})
+            repo.push("main")
+
+    def open_pr(self, slug: str, title: str) -> Any:
+        repo = self.gh.repo(slug)
+        branch = re.sub(r"\W+", "-", title).lower()
+        repo.checkout(branch, "main")
+        repo.commit(title, {f"{branch}.txt": title})
+        repo.push(branch)
+        return repo.open_pr(title, head=branch)
+
+    def review_entry(self, title: str) -> Locator:
+        return self.page.locator(".agent-entry").filter(has_text=title)
+
+    def settings(self, slug: str) -> Locator:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_role("button", name=f"Settings for {slug}").click()
+        return self.page.get_by_role("dialog", name=f"{slug} settings")
+
+    def test_a_posted_review_deletes_its_session(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Add the feature")
+        self.page.goto(self.url + "#/auto-reviews")
+        entry = self.review_entry("Add the feature")
+        expect(entry.locator(".agent-status")).to_have_text("posted", timeout=30_000)
+        self.assertEqual([c.body for c in pr.issue_comments], ["Looks good."])
+        # Its session is gone, and the entry links to the PR instead.
+        expect(entry.locator("a")).to_have_attribute(
+            "href", f"#/{scenarios.REPO}/{pr.number}"
+        )
+        self.page.get_by_role("link", name="Agents").click()
+        expect(self.page.locator(".agent-sidebar")).not_to_contain_text("Review #")
+
+    def test_a_review_that_posts_nothing_is_kept(self) -> None:
+        dialog = self.settings(self.QUIET_REPO)
+        expect(dialog.get_by_label("Review my pull requests")).to_have_value(
+            "non_draft"
+        )
+        dialog.get_by_label("Review skill").fill("/code-review")
+        dialog.get_by_label("Review again after new pushes").check()
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        # The server keeps the name without its slash.
+        dialog = self.settings(self.QUIET_REPO)
+        expect(dialog.get_by_label("Review skill")).to_have_value("code-review")
+        expect(dialog.get_by_label("Review again after new pushes")).to_be_checked()
+        self.page.keyboard.press("Escape")
+
+        pr = self.open_pr(self.QUIET_REPO, "Quiet change")
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        entry = self.review_entry("Quiet change")
+        # The server looks for the review on GitHub for half a minute.
+        expect(entry.locator(".agent-status")).to_have_text(
+            "didn't post", timeout=60_000
+        )
+        self.assertEqual(pr.issue_comments, [])
+        # It's not among the Agents tab's sessions.
+        self.page.get_by_role("link", name="Agents").click()
+        expect(self.page.locator(".agent-sidebar")).not_to_contain_text("Review #")
+        self.page.get_by_role("link", name="Auto-reviews").click()
+
+        # Its page shows the prompt, with the skill, and takes none.
+        entry.locator("a").click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript).to_contain_text(f"/code-review Review pull request {pr.url}")
+        expect(transcript).to_contain_text("Quiet change")
+        expect(self.page.get_by_label("Follow-up")).to_have_count(0)
+        expect(self.page.locator(".agent-header h1")).to_have_text(
+            f"Review #{pr.number}: Quiet change"
+        )
+
+        # A push gets another review.
+        repo = self.gh.repo(self.QUIET_REPO)
+        repo.commit("More", {"more.txt": "more"})
+        repo.push(pr.head)
+        expect(entry).to_have_count(2, timeout=30_000)
+
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
+
+    def test_reviews_can_be_turned_off(self) -> None:
+        dialog = self.settings(self.OFF_REPO)
+        dialog.get_by_label("Review my pull requests").select_option(label="Never")
+        expect(dialog.get_by_label("Review skill")).to_be_disabled()
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        self.open_pr(self.OFF_REPO, "Unreviewed change")
+        # A review that was due starts within a poll or two.
+        time.sleep(4)
+        self.page.goto(self.url + "#/auto-reviews")
+        expect(self.page.locator(".agent-sidebar")).not_to_contain_text(
+            "Unreviewed change"
+        )
 
 
 class CleanupTest(ServerTestCase):

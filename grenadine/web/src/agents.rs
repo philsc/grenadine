@@ -9,7 +9,7 @@ use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPrs,
     AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CleanupState, CostUnit,
     GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey, PromptImage,
-    WorktreeFile, WrapUp, WrapUpTarget,
+    SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -29,11 +29,19 @@ fn agent_hash(id: &str) -> String {
     format!("#/agents/{id}")
 }
 
-fn go(hash: &str) {
+/// The page of the session `id`, which is `kind`.
+pub fn session_hash(id: &str, kind: SessionKind) -> String {
+    match kind {
+        SessionKind::Interactive => agent_hash(id),
+        SessionKind::AutoReview => crate::auto_reviews::hash(id),
+    }
+}
+
+pub fn go(hash: &str) {
     let _ = window().location().set_hash(hash);
 }
 
-fn status_label(s: AgentStatus) -> &'static str {
+pub fn status_label(s: AgentStatus) -> &'static str {
     match s {
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "working…",
@@ -43,7 +51,7 @@ fn status_label(s: AgentStatus) -> &'static str {
     }
 }
 
-fn status_class(s: AgentStatus) -> &'static str {
+pub fn status_class(s: AgentStatus) -> &'static str {
     match s {
         AgentStatus::Idle => "agent-status",
         AgentStatus::Running => "agent-status running",
@@ -54,7 +62,7 @@ fn status_class(s: AgentStatus) -> &'static str {
 }
 
 /// `amount` in `unit`, as the page shows it.
-fn cost(amount: f64, unit: CostUnit) -> String {
+pub fn cost(amount: f64, unit: CostUnit) -> String {
     match unit {
         CostUnit::Usd => format!("${amount:.2}"),
         CostUnit::Acu => format!("{amount:.3} ACU"),
@@ -149,7 +157,7 @@ fn with_general(mut repos: Vec<String>) -> Vec<String> {
 
 /// Asks before deleting `session`, then deletes it and calls `deleted`, or
 /// `failed` with what went wrong.
-fn delete_session(
+pub fn delete_session(
     session: &AgentSession,
     deleted: impl FnOnce() + 'static,
     failed: impl FnOnce(String) + 'static,
@@ -357,9 +365,16 @@ pub fn Sidebar(
 ) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
+    // Reviews have a tab of their own.
     let sessions = LocalResource::new(move || {
         updates.agents.track();
-        api::agents()
+        async {
+            api::agents().await.map(|list| {
+                list.into_iter()
+                    .filter(|s| s.kind == SessionKind::Interactive)
+                    .collect::<Vec<_>>()
+            })
+        }
     });
     let drafts = expect_context::<Drafts>();
     // Only changes when a draft is added, removed or moved, so typing in
@@ -1367,8 +1382,11 @@ enum Load {
     Ready,
 }
 
+/// A session's page. A review's page is `read_only`: nobody prompts it,
+/// so it has no composer, and the session can only be stopped or
+/// deleted.
 #[component]
-pub fn AgentView(id: String) -> impl IntoView {
+pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let session = {
         let id = id.clone();
@@ -1403,6 +1421,15 @@ pub fn AgentView(id: String) -> impl IntoView {
     let mode = mode_signal(&id, backend);
     let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
 
+    // A session shows on the page of its kind.
+    Effect::new(move || {
+        if let Some(s) = current.get() {
+            let review = s.kind == SessionKind::AutoReview;
+            if review != read_only {
+                let _ = window().location().replace(&session_hash(&s.id, s.kind));
+            }
+        }
+    });
     let terminal_id = id.clone();
     view! {
         <div class="agent-page">
@@ -1430,8 +1457,14 @@ pub fn AgentView(id: String) -> impl IntoView {
                                     <AgentHeader session=session />
                                     <Transcript session=session events=events streaming=streaming mode=mode model=model />
                                     <div class="agent-footer">
-                                        <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                        <AgentActions session=session mode=mode model=model />
+                                        {if read_only {
+                                            view! { <ReviewActions session=session /> }.into_any()
+                                        } else {
+                                            view! {
+                                                <Composer session=session usage=usage active_model=active_model mode=mode model=model />
+                                                <AgentActions session=session mode=mode model=model />
+                                            }.into_any()
+                                        }}
                                     </div>
                                 }.into_any()
                             }
@@ -1643,6 +1676,50 @@ fn AgentActions(
                     disabled=wrapping
                     on:click=move |_| wrap_up(WrapUpTarget::PullRequest)
                 >"Open PR"</button>
+            </Show>
+            <button class="link danger" on:click=delete>"Delete"</button>
+        </div>
+    }
+}
+
+/// What a review's page offers instead of the composer: stopping the
+/// review and deleting the session.
+#[component]
+fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
+    let error = RwSignal::new(None::<String>);
+    let busy = move || {
+        session.with(|s| {
+            matches!(
+                s.status,
+                AgentStatus::Running | AgentStatus::AwaitingApproval
+            )
+        })
+    };
+    let stop = move |_| {
+        let id = session.with_untracked(|s| s.id.clone());
+        spawn_local(async move {
+            if let Err(e) = api::interrupt_agent(&id).await {
+                error.set(Some(e));
+            }
+        });
+    };
+    let delete = move |_| {
+        session.with_untracked(|s| {
+            delete_session(
+                s,
+                || go(crate::auto_reviews::LIST),
+                move |e| error.set(Some(e)),
+            )
+        });
+    };
+    view! {
+        {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        <div class="agent-actions">
+            <span class="muted review-note">
+                "This review runs unattended; tools that need approval are denied."
+            </span>
+            <Show when=busy>
+                <button class="link" on:click=stop>"Stop"</button>
             </Show>
             <button class="link danger" on:click=delete>"Delete"</button>
         </div>

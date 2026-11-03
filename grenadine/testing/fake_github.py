@@ -610,7 +610,21 @@ class FakeGitHub:
             m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls", path)
         ):
             return self._create_pr(m[1], json.loads(body))
+        if method == "POST" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
+        ):
+            return self._create_issue_comment(m[1], int(m[2]), json.loads(body))
         return 404, {"message": "Not Found"}
+
+    def _create_issue_comment(
+        self, slug: str, number: int, req: dict[str, Any]
+    ) -> tuple[int, Any]:
+        repo = self.repos.get(slug)
+        pr = repo.prs.get(number) if repo else None
+        if pr is None:
+            return 404, {"message": "Not Found"}
+        c = repo.issue_comment(pr, author=VIEWER, body=req["body"])
+        return 201, {"body": c.body, "user": {"login": VIEWER}}
 
     def _create_pr(self, slug: str, req: dict[str, Any]) -> tuple[int, Any]:
         repo = self.repos.get(slug)

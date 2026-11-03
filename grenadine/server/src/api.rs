@@ -14,10 +14,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest,
-    BlobsResponse, Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, MergeRequest, Merged,
-    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, RepoSettings, ServerEvent, SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoReviewEntry,
+    BlobsRequest, BlobsResponse, Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs,
+    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ServerEvent, SubmitReview,
+    WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -26,7 +27,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent::{self, Decision};
 use crate::github::ReviewItem;
 use crate::sync::State;
-use crate::{assets, cleanup, mcp, terminal};
+use crate::{assets, auto_review, cleanup, mcp, terminal};
 
 type St = AxState<Arc<State>>;
 
@@ -106,6 +107,7 @@ fn api_routes() -> Router<Arc<State>> {
             "/api/repos/{owner}/{name}/settings",
             get(repo_settings).put(set_repo_settings),
         )
+        .route("/api/auto-reviews", get(auto_reviews))
         .route(
             "/api/agents",
             get(agents)
@@ -599,14 +601,25 @@ async fn set_repo_settings(
     AxState(state): St,
     Path((owner, name)): Path<(String, String)>,
     Json(settings): Json<RepoSettings>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Response> {
     let repo = format!("{owner}/{name}");
     if !state.repos.contains_key(&repo) {
-        return Ok(StatusCode::NOT_FOUND);
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
+    let old = state.db.repo_settings(&repo)?;
+    let settings = match auto_review::to_save(&old, settings, agent::now()) {
+        Ok(s) => s,
+        Err(e) => return Ok((StatusCode::BAD_REQUEST, e).into_response()),
+    };
     state.db.set_repo_settings(&repo, &settings)?;
     state.send(ServerEvent::RepoSettingsChanged(repo));
-    Ok(StatusCode::NO_CONTENT)
+    // Reviews that were just turned on look for PRs right away.
+    state.poke.notify_one();
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn auto_reviews(AxState(state): St) -> ApiResult<Json<Vec<AutoReviewEntry>>> {
+    Ok(Json(state.db.auto_reviews()?))
 }
 
 async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
@@ -1198,12 +1211,20 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body(response).await, "{}");
-        let status = set_repo_settings(AxState(state.clone()), path(), Json(RepoSettings {}))
+        let got: RepoSettings = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(got, RepoSettings::default());
+        let skill = |skill: &str| RepoSettings {
+            review_skill: Some(skill.into()),
+            ..RepoSettings::default()
+        };
+        let response = set_repo_settings(AxState(state.clone()), path(), Json(skill("/review")))
             .await
             .map_err(|e| e.0)
             .unwrap();
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved = state.db.repo_settings(&fx.clone.slug).unwrap();
+        assert_eq!(saved.review_skill.as_deref(), Some("review"));
+        assert!(saved.auto_review_since.is_some());
         assert!(matches!(
             events.try_recv(),
             Ok(ServerEvent::RepoSettingsChanged(repo)) if repo == fx.clone.slug
@@ -1215,11 +1236,21 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let status = set_repo_settings(AxState(state.clone()), other(), Json(RepoSettings {}))
+        let response = set_repo_settings(
+            AxState(state.clone()),
+            other(),
+            Json(RepoSettings::default()),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // A bad skill isn't saved.
+        let response = set_repo_settings(AxState(state.clone()), path(), Json(skill("a b")))
             .await
             .map_err(|e| e.0)
             .unwrap();
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
