@@ -165,6 +165,10 @@ pub struct PrStatus {
     /// Whether it conflicts with its base; `None` while GitHub is still
     /// working that out.
     pub conflicting: Option<bool>,
+    pub title: String,
+    /// The combined state of the checks on its head; `None` when it has
+    /// none.
+    pub ci: Option<CiStatus>,
 }
 
 /// Parses an RFC 3339 timestamp into Unix seconds.
@@ -1654,7 +1658,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable title commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
                     )
                 })
                 .collect();
@@ -1688,6 +1692,13 @@ impl GitHub {
                     PrStatus {
                         state: state.to_owned(),
                         conflicting,
+                        title: str_at(&data, &format!("/p{i}/pullRequest/title")).to_owned(),
+                        ci: ci_status(str_at(
+                            &data,
+                            &format!(
+                                "/p{i}/pullRequest/commits/nodes/0/commit/statusCheckRollup/state"
+                            ),
+                        )),
                     },
                 );
             }

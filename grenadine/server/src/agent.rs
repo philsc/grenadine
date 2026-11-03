@@ -1728,6 +1728,8 @@ fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
                     };
                     state.db.add_agent_pr(id, &key, "OPEN")?;
                 }
+                // The next poll fills in the titles right away.
+                state.poke.notify_one();
             }
         }
     }
@@ -2216,6 +2218,8 @@ fn record_prs(state: &State, id: &str, prs: &[PrKey]) -> Result<()> {
     for key in prs {
         state.db.add_agent_pr(id, key, "OPEN")?;
     }
+    // The next poll fills in the titles right away.
+    state.poke.notify_one();
     state.send(ServerEvent::AgentsChanged);
     Ok(())
 }
