@@ -28,7 +28,13 @@ import pytest_bazel
 from playwright.sync_api import Dialog, Locator, expect, sync_playwright
 
 from grenadine.testing import scenarios
-from grenadine.testing.fake_github import COMMENTED, TEAM, TOKEN, FakeGitHub
+from grenadine.testing.fake_github import (
+    COMMENTED,
+    TEAM,
+    TOKEN,
+    CheckRun,
+    FakeGitHub,
+)
 
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
@@ -2428,6 +2434,8 @@ class AgentTest(ServerTestCase):
 
         # The note the agent wrote isn't tracked yet, so it shows as added.
         pane = self.page.locator(".changes-pane")
+        # The session opened no PRs, so there's no associated section.
+        expect(pane.locator(".associated-prs")).to_have_count(0)
         files = pane.locator("section.file")
         expect(files.locator(".path")).to_have_text(["notes.txt"])
         expect(files.locator(".status")).to_have_text(["added"])
@@ -2751,6 +2759,62 @@ class AgentTest(ServerTestCase):
         repo.close(b)
         expect(count).to_have_text("1/1", timeout=15_000)
         expect(count).to_have_class(re.compile(r"\bdone\b"))
+
+    def test_associated_prs(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        repo = self.gh.repo(self.OTHER_REPO)
+        prs = []
+        for name in ["assoc-a", "assoc-b"]:
+            repo.checkout(name, "main")
+            repo.commit(name, {f"{name}.txt": name})
+            repo.push(name)
+            prs.append(repo.open_pr(f"title-{name[-1]}", head=name))
+        a, b = prs
+
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill(f"open pr {a.url}")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        section = self.page.locator(".associated-prs")
+        items = section.locator("li")
+        icons = section.locator(".pr-state")
+        # The next poll fills in the title.
+        expect(items).to_have_text([f"#{a.number} title-a"], timeout=15_000)
+
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill(f"open pr {b.url}")
+        follow_up.press("Enter")
+        expect(items).to_have_text(
+            [f"#{a.number} title-a", f"#{b.number} title-b"], timeout=15_000
+        )
+        links = items.locator("a")
+        expect(links.nth(0)).to_have_attribute(
+            "href", f"#/{self.OTHER_REPO}/{a.number}"
+        )
+        expect(links.nth(1)).to_have_attribute(
+            "href", f"#/{self.OTHER_REPO}/{b.number}"
+        )
+
+        # Neither head has checks.
+        expect(icons.nth(0)).to_have_class(re.compile(r"\bopen\b"), timeout=15_000)
+        expect(icons.nth(0)).to_have_attribute("title", "No checks")
+        a.check_runs.append(CheckRun("build", status="IN_PROGRESS", conclusion=None))
+        expect(icons.nth(0)).to_have_class(re.compile(r"\brunning\b"), timeout=15_000)
+        a.check_runs[0].status = "COMPLETED"
+        a.check_runs[0].conclusion = "SUCCESS"
+        expect(icons.nth(0)).to_have_class(re.compile(r"\bpassing\b"), timeout=15_000)
+        a.check_runs[0].conclusion = "FAILURE"
+        expect(icons.nth(0)).to_have_class(re.compile(r"\bfailing\b"), timeout=15_000)
+        # A conflict outranks failing checks.
+        a.conflicting = True
+        expect(icons.nth(0)).to_have_class(re.compile(r"\bconflict\b"), timeout=15_000)
+        expect(icons.nth(0)).to_have_attribute("title", "Conflicts with its base")
+        repo.merge(a)
+        expect(icons.nth(0)).to_have_class(re.compile(r"\bmerged\b"), timeout=15_000)
+        repo.close(b)
+        expect(icons.nth(1)).to_have_class(re.compile(r"\bclosed\b"), timeout=15_000)
 
     def test_plan_mode(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
