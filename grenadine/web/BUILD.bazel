@@ -73,6 +73,7 @@ genrule(
 
 exports_files(
     [
+        "static/favicon.svg",
         "static/index.html",
         "static/style.css",
     ],
