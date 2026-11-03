@@ -928,7 +928,15 @@ impl AgentBackend {
     pub fn after_plan(self) -> &'static [&'static str] {
         match self {
             AgentBackend::Claude => &["manual", "acceptEdits", "auto"],
-            AgentBackend::Devin => &["accept-edits", "bypass"],
+            AgentBackend::Devin => &["accept-edits", "smart", "bypass"],
+        }
+    }
+
+    /// The mode the plan card picks first.
+    pub fn plan_default_mode(self) -> &'static str {
+        match self {
+            AgentBackend::Claude => "auto",
+            AgentBackend::Devin => "smart",
         }
     }
 
