@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- A pomegranate shaped like a chat bubble, with a git branch inside. -->
+  <polygon
+    points="26,14 24,4 29.5,9 34,2 38.5,9 44,4 42,14"
+    fill="#8c0f2e"
+    stroke="#8c0f2e"
+    stroke-width="1.5"
+    stroke-linejoin="round"
+  />
+  <circle cx="34" cy="35" r="23" fill="#d62246" />
+  <path
+    d="M15 46 L6 61 L26 55 Z"
+    fill="#d62246"
+    stroke="#d62246"
+    stroke-width="2"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M30 52 V20 M30 45 C30 38 42 40 42 32 C42 26 30 28 30 24"
+    fill="none"
+    stroke="#f6e7c8"
+    stroke-width="3"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <g fill="#ff8fa3" stroke="#f6e7c8" stroke-width="2">
+    <circle cx="30" cy="45" r="4" />
+    <circle cx="42" cy="32" r="4" />
+    <circle cx="30" cy="23" r="4" />
+  </g>
+</svg>

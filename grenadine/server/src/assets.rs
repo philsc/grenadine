@@ -21,6 +21,11 @@ const ASSETS: &[Asset] = &[
         bytes: include_bytes!(env!("GRENADINE_STYLE_CSS")),
     },
     Asset {
+        path: "/favicon.svg",
+        content_type: "image/svg+xml",
+        bytes: include_bytes!(env!("GRENADINE_FAVICON_SVG")),
+    },
+    Asset {
         path: "/grenadine_web.js",
         content_type: "text/javascript; charset=utf-8",
         bytes: include_bytes!(env!("GRENADINE_WEB_JS")),
