@@ -101,6 +101,10 @@ class CheckRun:
     # A CheckStatusState; only COMPLETED runs have a conclusion.
     status: str = "COMPLETED"
     conclusion: str | None = "SUCCESS"
+    # When it started; None for one that hasn't.
+    started_at: int | None = None
+    # The workflow the run belongs to; None for a run outside Actions.
+    workflow: str | None = None
 
 
 @dataclasses.dataclass
@@ -158,9 +162,7 @@ class PullRequest:
     review_required: bool = False
     reviews: list[Review] = dataclasses.field(default_factory=list)
     comments: list[Comment] = dataclasses.field(default_factory=list)
-    # The StatusState of the checks on the head; None when it has none.
-    checks: str | None = None
-    # The individual checks behind `checks`.
+    # The check runs on the head, including ones later runs superseded.
     check_runs: list[CheckRun] = dataclasses.field(default_factory=list)
     issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
     # GitHub's MergeStateStatus; None works it out from the PR.
@@ -204,6 +206,27 @@ class PullRequest:
             return APPROVED
         return REVIEW_REQUIRED if self.review_required else None
 
+    def checks(self) -> str | None:
+        """The StatusState of the checks on the head; None when it has
+        none. Like GitHub, it counts the runs that later runs superseded."""
+        if not self.check_runs:
+            return None
+        if any(
+            r.conclusion
+            in (
+                "FAILURE",
+                "TIMED_OUT",
+                "CANCELLED",
+                "ACTION_REQUIRED",
+                "STARTUP_FAILURE",
+            )
+            for r in self.check_runs
+        ):
+            return "FAILURE"
+        if any(r.status != "COMPLETED" for r in self.check_runs):
+            return "PENDING"
+        return "SUCCESS"
+
     def merge_state_status(self) -> str:
         if self.merge_state is not None:
             return self.merge_state
@@ -211,7 +234,7 @@ class PullRequest:
             return "DIRTY"
         if self.draft:
             return "DRAFT"
-        if self.checks in ("FAILURE", "ERROR"):
+        if self.checks() == "FAILURE":
             return "UNSTABLE"
         return "CLEAN"
 
@@ -1071,7 +1094,7 @@ class FakeGitHub:
             "checkSuites": lambda info, **_: {"nodes": []},
             "statusCheckRollup": (
                 {
-                    "state": pr.checks,
+                    "state": pr.checks(),
                     "contexts": lambda info, **_: {
                         "nodes": [
                             {
@@ -1080,12 +1103,21 @@ class FakeGitHub:
                                 "status": r.status,
                                 "conclusion": r.conclusion,
                                 "detailsUrl": f"{pr.url}/checks?name={r.name}",
+                                "startedAt": (
+                                    iso(r.started_at)
+                                    if r.started_at is not None
+                                    else None
+                                ),
+                                "checkSuite": {
+                                    "workflowRun": r.workflow
+                                    and {"workflow": {"name": r.workflow}}
+                                },
                             }
                             for r in pr.check_runs
                         ]
                     },
                 }
-                if pr and pr.checks
+                if pr and pr.check_runs
                 else None
             ),
         }
