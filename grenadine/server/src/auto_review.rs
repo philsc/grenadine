@@ -921,6 +921,7 @@ sleep 30
                 default_method: None,
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
+                requires_conversation_resolution: false,
             },
         };
         // Someone else's review, or the viewer's from before, don't count.

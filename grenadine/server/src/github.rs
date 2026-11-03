@@ -297,6 +297,16 @@ query($owner: String!, $name: String!, $number: Int!) {
       title body url state isDraft createdAt updatedAt
       author { login }
       baseRefName headRefName headRefOid
+      baseRef {
+        refUpdateRule { requiresConversationResolution }
+        rules(first: 100) {
+          nodes {
+            parameters {
+              ... on PullRequestParameters { requiredReviewThreadResolution }
+            }
+          }
+        }
+      }
       headRepository { nameWithOwner }
       timelineItems(first: 100, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) {
         nodes {
@@ -629,6 +639,18 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             default_method: MergeMethod::from_github(str_at(repo, "/viewerDefaultMergeMethod")),
             delete_branch_on_merge: repo["deleteBranchOnMerge"].as_bool().unwrap_or(false),
             can_merge_as_admin: pr["viewerCanMergeAsAdmin"].as_bool().unwrap_or(false),
+            // Classic branch protection reports the rule through
+            // `refUpdateRule`, rulesets through `rules`. `baseRef` is null
+            // when the base branch is gone.
+            requires_conversation_resolution: pr
+                .pointer("/baseRef/refUpdateRule/requiresConversationResolution")
+                .and_then(Value::as_bool)
+                == Some(true)
+                || nodes(pr, "/baseRef/rules/nodes").any(|r| {
+                    r.pointer("/parameters/requiredReviewThreadResolution")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                }),
         },
         pending_review: None,
     }
@@ -1908,10 +1930,42 @@ mod tests {
             review_error(&[json!({ "path": ["repository", "pullRequest", "head"] })]).as_deref(),
             Some("unknown error")
         );
+        // `baseRef` isn't a review field: a token that can't read its
+        // rules must not fail the sync.
+        assert_eq!(
+            review_error(&[error(json!([
+                "repository",
+                "pullRequest",
+                "baseRef",
+                "rules"
+            ]))]),
+            None
+        );
     }
 
     #[test]
     fn reads_reviews_checks_and_the_merge_state() {
+        let contexts = json!([
+            { "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "detailsUrl": "d" },
+            // Superseded by the run below that started later.
+            { "name": "test", "status": "COMPLETED", "conclusion": "CANCELLED",
+              "startedAt": "2026-01-01T00:00:00Z",
+              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
+            { "name": "test", "status": "IN_PROGRESS", "conclusion": null,
+              "startedAt": "2026-01-01T00:00:05Z",
+              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
+            // The same name in another workflow is another check.
+            { "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "startedAt": "2026-01-01T00:00:01Z",
+              "checkSuite": { "workflowRun": { "workflow": { "name": "Nightly" } } } },
+            // Superseded by the run below that hasn't started yet.
+            { "name": "e2e", "status": "COMPLETED", "conclusion": "FAILURE",
+              "startedAt": "2026-01-01T00:00:02Z" },
+            { "name": "e2e", "status": "QUEUED", "conclusion": null },
+            { "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED" },
+            { "context": "ci/legacy", "state": "SUCCESS", "targetUrl": null },
+        ]);
         let data = json!({
             "viewer": { "login": "me" },
             "repository": {
@@ -1925,6 +1979,10 @@ mod tests {
                     "mergeable": "UNKNOWN",
                     "mergeStateStatus": "BLOCKED",
                     "viewerCanMergeAsAdmin": true,
+                    "baseRef": {
+                        "refUpdateRule": { "requiresConversationResolution": true },
+                        "rules": { "nodes": [] },
+                    },
                     "reviews": { "nodes": [
                         { "state": "PENDING", "body": "", "submittedAt": null, "url": "u0",
                           "author": { "login": "me" } },
@@ -1945,27 +2003,7 @@ mod tests {
                     "head": { "nodes": [ { "commit": { "statusCheckRollup": {
                         // GitHub counts the superseded runs too.
                         "state": "FAILURE",
-                        "contexts": { "nodes": [
-                            { "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS",
-                              "detailsUrl": "d" },
-                            // Superseded by the run below that started later.
-                            { "name": "test", "status": "COMPLETED", "conclusion": "CANCELLED",
-                              "startedAt": "2026-01-01T00:00:00Z",
-                              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
-                            { "name": "test", "status": "IN_PROGRESS", "conclusion": null,
-                              "startedAt": "2026-01-01T00:00:05Z",
-                              "checkSuite": { "workflowRun": { "workflow": { "name": "CI" } } } },
-                            // The same name in another workflow is another check.
-                            { "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS",
-                              "startedAt": "2026-01-01T00:00:01Z",
-                              "checkSuite": { "workflowRun": { "workflow": { "name": "Nightly" } } } },
-                            // Superseded by the run below that hasn't started yet.
-                            { "name": "e2e", "status": "COMPLETED", "conclusion": "FAILURE",
-                              "startedAt": "2026-01-01T00:00:02Z" },
-                            { "name": "e2e", "status": "QUEUED", "conclusion": null },
-                            { "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED" },
-                            { "context": "ci/legacy", "state": "SUCCESS", "targetUrl": null },
-                        ] },
+                        "contexts": { "nodes": contexts },
                     } } } ] },
                 },
             },
@@ -2006,8 +2044,43 @@ mod tests {
                 default_method: Some(MergeMethod::Rebase),
                 delete_branch_on_merge: true,
                 can_merge_as_admin: true,
+                requires_conversation_resolution: true,
             }
         );
+    }
+
+    #[test]
+    fn reads_the_conversation_resolution_rule() {
+        let info = |base_ref: Value| {
+            let data = json!({
+                "viewer": { "login": "me" },
+                "repository": { "pullRequest": { "baseRef": base_ref } },
+            });
+            review_info(&data, &data["repository"]["pullRequest"])
+                .merge
+                .requires_conversation_resolution
+        };
+        // Branch protection reports the rule, rulesets report a rule with
+        // `requiredReviewThreadResolution` among its parameters.
+        assert!(info(json!({
+            "refUpdateRule": { "requiresConversationResolution": true },
+            "rules": { "nodes": [] },
+        })));
+        assert!(info(json!({
+            "refUpdateRule": null,
+            "rules": { "nodes": [
+                { "parameters": { "requiredReviewThreadResolution": true } },
+            ] },
+        })));
+        assert!(!info(json!({
+            "refUpdateRule": { "requiresConversationResolution": false },
+            "rules": { "nodes": [
+                { "parameters": { "requiredReviewThreadResolution": false } },
+                { "parameters": null },
+            ] },
+        })));
+        // The base branch is gone.
+        assert!(!info(Value::Null));
     }
 
     #[test]

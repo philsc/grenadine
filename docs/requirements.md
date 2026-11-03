@@ -638,9 +638,14 @@ from GitHub's merge state:
 | BLOCKED                     | Merging is blocked: _reason_.                           |
 | anything else, e.g. UNKNOWN | GitHub is still working out whether this can be merged. |
 
-The reason for BLOCKED must be "it needs an approving review" when a
-review is required, "changes were requested" when changes were requested,
-and "required checks or rules aren't satisfied" otherwise.
+The reasons for BLOCKED must be joined with "; ": "it needs an approving
+review" when a review is required, "changes were requested" when changes
+were requested, and "N conversations must be resolved" when the base
+branch requires conversation resolution and the PR has unresolved
+submitted review threads, with "1 conversation must be resolved" in the
+singular. The rule comes from the base branch's protection or its
+rulesets. When no reason is known the text must read "required checks or
+rules aren't satisfied".
 
 **REVIEW-MERGE-4.** Reviews, the conversation, checks and the merge state
 must be fetched with each sync of the PR, in the same GraphQL request as
@@ -670,7 +675,9 @@ wherever they merged.
 
 **REVIEW-MERGE-7.** Merge must be disabled, with the reason shown, when
 the PR is a draft, conflicts with its base, isn't known to be mergeable
-yet, or the branch's rules block it or require it to be up to date. When
+yet, or the branch's rules block it or require it to be up to date.
+Unresolved conversations blocking the merge must give "Resolve the
+conversations first." as the reason. When
 GitHub says the viewer may bypass the rules, the button must instead read
 "Merge, bypassing rules" and look dangerous. Conflicts can't be bypassed.
 REVIEW-MERGE-4's follow-up syncs make a merge state that isn't known yet

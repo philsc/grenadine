@@ -579,6 +579,7 @@ SQUASH = "Squash and merge me"
 STALE_HEAD = "Move on before merging"
 BLOCKED = "Wait for the rules"
 BYPASS = "Merge past the rules"
+CONVERSATIONS = "Resolve the conversations"
 KEEP_BRANCH = "Keep my branch"
 AUTO_DELETE = "Leave the branch to GitHub"
 SETTLE = "Wait for GitHub to decide"
@@ -603,6 +604,7 @@ REVIEW_CASES = [
     STALE_HEAD,
     BLOCKED,
     BYPASS,
+    CONVERSATIONS,
     KEEP_BRANCH,
     AUTO_DELETE,
     SETTLE,
@@ -648,6 +650,8 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
         root.can_resolve = title != LOCKED
         if title in (BLOCKED, BYPASS):
             pr.merge_state = "BLOCKED"
+        if title == CONVERSATIONS:
+            pr.thread_resolution = "ruleset"
         if title == BYPASS:
             pr.review_required = True
             pr.can_merge_as_admin = True

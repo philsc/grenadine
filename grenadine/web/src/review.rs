@@ -35,9 +35,32 @@ pub fn latest_reviews<'a>(reviews: &'a [Review], author: &str) -> Vec<&'a Review
     out
 }
 
+/// Why GitHub blocks merging the PR, each reason the way GitHub's merge
+/// box words it, `unresolved` being the PR's unresolved review threads.
+/// GitHub's API reports no reasons, so they're worked out from the
+/// branch's rules and the PR's state; when none is known a catch-all
+/// stands in.
+fn block_reasons(info: &ReviewInfo, unresolved: usize) -> Vec<String> {
+    let mut reasons = Vec::new();
+    match info.decision {
+        Some(ReviewDecision::ReviewRequired) => reasons.push("it needs an approving review".into()),
+        Some(ReviewDecision::ChangesRequested) => reasons.push("changes were requested".into()),
+        _ => {}
+    }
+    if info.merge.requires_conversation_resolution && unresolved > 0 {
+        let s = if unresolved == 1 { "" } else { "s" };
+        reasons.push(format!("{unresolved} conversation{s} must be resolved"));
+    }
+    if reasons.is_empty() {
+        reasons.push("required checks or rules aren't satisfied".into());
+    }
+    reasons
+}
+
 /// One line about whether the PR can be merged: a CSS class, `ok`,
-/// `warn` or `bad`, and the text.
-pub fn merge_status(info: &ReviewInfo) -> (&'static str, String) {
+/// `warn` or `bad`, and the text. `unresolved` is how many review
+/// threads are unresolved.
+pub fn merge_status(info: &ReviewInfo, unresolved: usize) -> (&'static str, String) {
     if info.merge.conflicting == Some(true) {
         return (
             "bad",
@@ -53,14 +76,13 @@ pub fn merge_status(info: &ReviewInfo) -> (&'static str, String) {
             "bad",
             "This branch has conflicts that must be resolved.".into(),
         ),
-        MergeState::Blocked => {
-            let why = match info.decision {
-                Some(ReviewDecision::ReviewRequired) => "it needs an approving review",
-                Some(ReviewDecision::ChangesRequested) => "changes were requested",
-                _ => "required checks or rules aren't satisfied",
-            };
-            ("bad", format!("Merging is blocked: {why}."))
-        }
+        MergeState::Blocked => (
+            "bad",
+            format!(
+                "Merging is blocked: {}.",
+                block_reasons(info, unresolved).join("; ")
+            ),
+        ),
         MergeState::Unknown => (
             "warn",
             "GitHub is still working out whether this can be merged.".into(),
@@ -352,7 +374,12 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
 
 /// Whether the PR may be merged now: `Ok(true)` when only by bypassing the
 /// branch's rules, which the viewer may do, or why it may not.
-pub fn can_merge(info: &ReviewInfo, is_draft: bool) -> Result<bool, &'static str> {
+/// `unresolved` is how many review threads are unresolved.
+pub fn can_merge(
+    info: &ReviewInfo,
+    is_draft: bool,
+    unresolved: usize,
+) -> Result<bool, &'static str> {
     let m = &info.merge;
     if is_draft {
         return Err("Drafts can't be merged.");
@@ -367,6 +394,9 @@ pub fn can_merge(info: &ReviewInfo, is_draft: bool) -> Result<bool, &'static str
         MergeState::Dirty => Err("Resolve the conflicts first."),
         MergeState::Clean | MergeState::HasHooks | MergeState::Unstable => Ok(false),
         MergeState::Blocked | MergeState::Behind if m.can_merge_as_admin => Ok(true),
+        MergeState::Blocked if m.requires_conversation_resolution && unresolved > 0 => {
+            Err("Resolve the conversations first.")
+        }
         MergeState::Blocked => Err("The branch's rules block merging."),
         MergeState::Behind => Err("Bring the branch up to date first."),
         MergeState::Draft => Err("Drafts can't be merged."),
@@ -452,6 +482,8 @@ pub struct MergeTarget {
     pub stack_base: String,
     /// Other open PRs target this one's branch.
     pub has_children: bool,
+    /// Unresolved, submitted review threads.
+    pub unresolved_threads: usize,
 }
 
 /// Merging the PR: the method, the squash message, deleting the branch.
@@ -468,7 +500,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     let name = StoredValue::new(merge_name(&key));
     let busy = move || name.with_value(|n| boxes.sending(n));
     let error = move || name.with_value(|n| boxes.error(n));
-    let allowed = can_merge(info, target.is_draft);
+    let allowed = can_merge(info, target.is_draft, target.unresolved_threads);
     let fallback = pick_method(info);
     let chosen = move || method.get().or(fallback);
     let deletes = !info.merge.delete_branch_on_merge;
@@ -489,7 +521,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     let head = target.head_oid.clone();
     let base_ref = target.base_ref.clone();
     // The viewer may bypass the rules: the dialog says which ones.
-    let bypassed = admin.then(|| merge_status(info).1);
+    let bypassed = admin.then(|| merge_status(info, target.unresolved_threads).1);
     let merge = move |_| {
         let (Some(m), Some(head)) = (chosen(), head.clone()) else {
             return;
@@ -586,7 +618,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
 /// The checks on the PR's head, whether it can be merged and merging it.
 /// Only for open PRs.
 pub fn merge_box(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
-    let (class, text) = merge_status(info);
+    let (class, text) = merge_status(info, target.unresolved_threads);
     let checks = (!info.checks.is_empty()).then(|| {
         let rows = info
             .checks
@@ -658,6 +690,7 @@ mod tests {
                 default_method: None,
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
+                requires_conversation_resolution: false,
             },
         }
     }
@@ -697,11 +730,11 @@ mod tests {
     #[test]
     fn merge_statuses() {
         let mut i = info();
-        assert_eq!(merge_status(&i).0, "ok");
+        assert_eq!(merge_status(&i, 0).0, "ok");
         i.merge.state = MergeState::Blocked;
         i.decision = Some(ReviewDecision::ReviewRequired);
         assert_eq!(
-            merge_status(&i),
+            merge_status(&i, 0),
             (
                 "bad",
                 "Merging is blocked: it needs an approving review.".into()
@@ -709,43 +742,86 @@ mod tests {
         );
         i.decision = Some(ReviewDecision::ChangesRequested);
         assert_eq!(
-            merge_status(&i).1,
+            merge_status(&i, 0).1,
             "Merging is blocked: changes were requested."
         );
         i.merge.state = MergeState::Dirty;
-        assert_eq!(merge_status(&i).0, "bad");
-        assert!(merge_status(&i).1.contains("conflicts"));
+        assert_eq!(merge_status(&i, 0).0, "bad");
+        assert!(merge_status(&i, 0).1.contains("conflicts"));
         i.merge.state = MergeState::Blocked;
         // Conflicts win over everything else.
         i.merge.conflicting = Some(true);
-        assert_eq!(merge_status(&i).0, "bad");
-        assert!(merge_status(&i).1.contains("conflicts"));
+        assert_eq!(merge_status(&i, 0).0, "bad");
+        assert!(merge_status(&i, 0).1.contains("conflicts"));
         i.merge.conflicting = None;
         i.merge.state = MergeState::Unknown;
-        assert_eq!(merge_status(&i).0, "warn");
+        assert_eq!(merge_status(&i, 0).0, "warn");
+    }
+
+    #[test]
+    fn why_merging_is_blocked() {
+        let mut i = info();
+        i.merge.state = MergeState::Blocked;
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Merging is blocked: required checks or rules aren't satisfied."
+        );
+        // Every known reason is listed.
+        i.decision = Some(ReviewDecision::ReviewRequired);
+        i.merge.requires_conversation_resolution = true;
+        assert_eq!(
+            merge_status(&i, 2).1,
+            "Merging is blocked: it needs an approving review; \
+             2 conversations must be resolved."
+        );
+        // One unresolved conversation reads in the singular.
+        i.decision = None;
+        assert_eq!(
+            merge_status(&i, 1).1,
+            "Merging is blocked: 1 conversation must be resolved."
+        );
+        // Without unresolved conversations, or without the rule, the
+        // reason isn't known.
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Merging is blocked: required checks or rules aren't satisfied."
+        );
+        i.merge.requires_conversation_resolution = false;
+        assert_eq!(
+            merge_status(&i, 2).1,
+            "Merging is blocked: required checks or rules aren't satisfied."
+        );
     }
 
     #[test]
     fn when_a_pr_can_be_merged() {
         let mut i = info();
         i.merge.methods = vec![MergeMethod::Squash];
-        assert_eq!(can_merge(&i, false), Ok(false));
-        assert!(can_merge(&i, true).is_err());
+        assert_eq!(can_merge(&i, false, 0), Ok(false));
+        assert!(can_merge(&i, true, 0).is_err());
         i.merge.state = MergeState::Unstable;
-        assert_eq!(can_merge(&i, false), Ok(false));
+        assert_eq!(can_merge(&i, false, 0), Ok(false));
         i.merge.state = MergeState::Blocked;
-        assert!(can_merge(&i, false).is_err());
+        assert_eq!(
+            can_merge(&i, false, 0),
+            Err("The branch's rules block merging.")
+        );
+        i.merge.requires_conversation_resolution = true;
+        assert_eq!(
+            can_merge(&i, false, 1),
+            Err("Resolve the conversations first.")
+        );
         i.merge.can_merge_as_admin = true;
-        assert_eq!(can_merge(&i, false), Ok(true));
+        assert_eq!(can_merge(&i, false, 1), Ok(true));
         // Conflicts can't be bypassed.
         i.merge.conflicting = Some(true);
-        assert!(can_merge(&i, false).is_err());
+        assert!(can_merge(&i, false, 0).is_err());
         i.merge.conflicting = None;
         i.merge.state = MergeState::Unknown;
-        assert!(can_merge(&i, false).is_err());
+        assert!(can_merge(&i, false, 0).is_err());
         i.merge.state = MergeState::Clean;
         i.merge.methods.clear();
-        assert!(can_merge(&i, false).is_err());
+        assert!(can_merge(&i, false, 0).is_err());
     }
 
     #[test]
