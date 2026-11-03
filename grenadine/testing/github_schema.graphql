@@ -377,6 +377,8 @@ type CheckRun {
   status: CheckStatusState!
   conclusion: CheckConclusionState
   detailsUrl: URI
+  startedAt: DateTime
+  checkSuite: CheckSuite
 }
 
 enum CheckStatusState {
@@ -426,6 +428,15 @@ type CheckSuiteConnection {
 
 type CheckSuite {
   createdAt: DateTime!
+  workflowRun: WorkflowRun
+}
+
+type WorkflowRun {
+  workflow: Workflow!
+}
+
+type Workflow {
+  name: String!
 }
 
 interface Actor {
