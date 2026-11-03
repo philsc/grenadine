@@ -19,7 +19,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind, ApprovalOption,
-    PermissionMode,
+    PermissionMode, SessionKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1348,10 +1348,18 @@ async fn permission(
     let option = decision.and_then(|d| {
         let plan = tool.name == "ExitPlanMode";
         if let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty()) {
+            // An unattended review denies every request, and the denial
+            // as a next prompt would start turns nobody reads.
+            let review = matches!(
+                state.db.agent(&id),
+                Ok(Some(s)) if s.kind == SessionKind::AutoReview
+            );
             if !d.allow {
                 // The feedback becomes the next prompt; a rejected plan
                 // keeps planning.
-                queue_next(&state, &id, message, plan.then(PermissionMode::plan));
+                if !review {
+                    queue_next(&state, &id, message, plan.then(PermissionMode::plan));
+                }
             } else if plan {
                 // An approval can't carry the user's notes, so they follow
                 // as the next prompt, in the mode the plan goes on in.

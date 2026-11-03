@@ -208,6 +208,22 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
                     <option value="including_drafts">"When opened, drafts too"</option>
                 </select>
             </label>
+            <label>"Review with"
+                <select
+                    prop:disabled=off
+                    prop:value=move || get(|d| d.review_backend.as_str().to_owned())
+                    on:change=move |ev| {
+                        let backend = AgentBackend::parse(&event_target_value(&ev))
+                            .unwrap_or_default();
+                        edit(Box::new(move |d| d.review_backend = backend));
+                    }
+                >
+                    {AgentBackend::ALL.into_iter().map(|b| view! {
+                        <option value=b.as_str()>{b.label()}</option>
+                    }).collect_view()}
+                </select>
+            </label>
+            <p class="hint muted">"Reviews with Devin run in its Smart mode."</p>
             <label class="checkbox">
                 <input
                     type="checkbox"
