@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 #[path = "../github.rs"]
 mod github;
+#[allow(dead_code)]
 #[path = "../inboxes.rs"]
 mod inboxes;
 
@@ -146,8 +147,11 @@ async fn main() -> Result<ExitCode> {
     ] {
         queries.push((label.to_owned(), github::search_query(filter, &args.repos)));
     }
-    for (short, (_, filter)) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
-        queries.push((short.to_string(), github::search_query(filter, &args.repos)));
+    for (short, default) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
+        queries.push((
+            short.to_string(),
+            github::search_query(default.filter, &args.repos),
+        ));
     }
     for repo in &args.repos {
         queries.push((
@@ -357,10 +361,12 @@ async fn main() -> Result<ExitCode> {
     // Each inbox's hits must be open PRs in a --repo, matching its
     // draft: token, newest first.
     let repo_set: BTreeSet<&str> = args.repos.iter().map(String::as_str).collect();
-    for (short, (name, filter)) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
+    for (short, default) in INBOX_SHORT.iter().zip(inboxes::DEFAULT_INBOXES.iter()) {
+        let name = default.name;
         if !skip(&format!("{name} hits are in scope and sorted"), &[short]) {
             let found = &hits[*short];
-            let want_draft = filter
+            let want_draft = default
+                .filter
                 .split_whitespace()
                 .find_map(|t| t.strip_prefix("draft:"))
                 .map(|v| v == "true");

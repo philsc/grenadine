@@ -2,13 +2,14 @@
 //! theme picker and the poller's sync status on the right. Hovering the
 //! status shows what is syncing or what went wrong.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use grenadine_core::api::{SyncPhase, SyncStatus, SyncingPr};
+use grenadine_core::api::{PrKey, SyncPhase, SyncStatus, SyncingPr};
 use leptos::prelude::*;
 
 use crate::{
-    Route, Updates,
+    Route, Updates, api,
     theme::{self, Theme},
 };
 
@@ -60,6 +61,25 @@ pub fn Topbar(
     let updates = expect_context::<Updates>();
     let theme = theme::signal();
 
+    // How many distinct PRs the inboxes that count in the total list.
+    let inboxes = LocalResource::new(move || {
+        updates.inboxes.track();
+        api::inboxes()
+    });
+    let total = move || {
+        inboxes
+            .get()
+            .and_then(|r| r.ok())
+            .map(|list| {
+                list.iter()
+                    .filter(|i| i.inbox.count_in_total)
+                    .flat_map(|i| i.prs.iter().map(|p| p.key.clone()))
+                    .collect::<BTreeSet<PrKey>>()
+                    .len()
+            })
+            .unwrap_or(0)
+    };
+
     let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
     let handle = set_interval_with_handle(
         move || now.set((js_sys::Date::now() / 1000.0) as i64),
@@ -71,12 +91,24 @@ pub fn Topbar(
         }
     });
 
+    // The tab's title carries the total too.
+    Effect::new(move || {
+        let title = match total() {
+            0 => "grenadine".to_owned(),
+            n => format!("({n}) grenadine"),
+        };
+        document().set_title(&title);
+    });
+
     view! {
         <header class="topbar">
             <span class="topbar-left">
                 <a class="topbar-brand" href="#/">"grenadine"</a>
                 <nav class="topbar-tabs">
-                    <a href="#/" class:active=move || route.with(|r| matches!(r, Route::Inboxes | Route::Pr(_)))>"Inboxes"</a>
+                    <a href="#/" class:active=move || route.with(|r| matches!(r, Route::Inboxes | Route::Pr(_)))>
+                        "Inboxes"
+                        {move || (total() > 0).then(|| view! { <span class="count">{total()}</span> })}
+                    </a>
                     <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_)))>"Agents"</a>
                 </nav>
             </span>

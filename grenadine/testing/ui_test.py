@@ -701,12 +701,14 @@ class InboxTest(ServerTestCase):
         form.get_by_role("button", name="Save").click()
         expect(form.locator(".error")).to_contain_text("unknown grenadine qualifier")
 
-    def add_inbox(self, name: str, filter: str) -> Locator:
+    def add_inbox(self, name: str, filter: str, counted: bool = False) -> Locator:
         self.addCleanup(self.delete_inbox, name)
         self.page.get_by_role("button", name="+ Add inbox").click()
         form = self.page.locator("form.inbox-form")
         form.get_by_label("Name").fill(name)
         form.get_by_label("GitHub filter").fill(filter)
+        if counted:
+            form.get_by_label("Count in total").check()
         form.get_by_role("button", name="Save").click()
         return self.inbox(name)
 
@@ -745,6 +747,31 @@ class InboxTest(ServerTestCase):
         empty = self.add_inbox("Nobody's", "author:nobody")
         expect(empty.locator(".none")).to_have_text("No PRs")
         expect(empty.locator(".count")).to_have_text("0")
+
+    def test_total_badge_counts_distinct_prs(self) -> None:
+        self.page.goto(self.url)
+        tab = self.page.locator(".topbar-tabs a").filter(has_text="Inboxes")
+        # Needs your review (1), Returned (1) and Approved (1) count in
+        # the total.
+        expect(tab.locator(".count")).to_have_text("3")
+        expect(self.page).to_have_title("(3) grenadine")
+        # A counted inbox overlapping them counts its PRs once.
+        self.add_inbox("Mine too", "state:open author:@me", counted=True)
+        expect(tab.locator(".count")).to_have_text("9")
+        expect(self.page).to_have_title("(9) grenadine")
+
+    def test_count_in_total_survives_reorder(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.add_inbox("Counted", "state:open author:@me", counted=True)
+        inbox.locator(".inbox-header").hover()
+        inbox.get_by_title("Move up").click()
+        expect(inbox.locator(".count")).to_have_text("8")
+
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            [saved] = [
+                i["inbox"] for i in json.load(resp) if i["inbox"]["name"] == "Counted"
+            ]
+        self.assertTrue(saved["count_in_total"])
 
     def test_pr_page(self) -> None:
         pr = self.cases.prs["Get approved"]

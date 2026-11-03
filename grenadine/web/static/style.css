@@ -198,6 +198,9 @@ input[type="text"] {
   background: var(--bg-hover);
   text-decoration: none;
 }
+.topbar-tabs a .count {
+  margin-left: 4px;
+}
 .topbar-tabs a.active {
   color: var(--fg);
   background: var(--bg-hover);
@@ -442,6 +445,11 @@ input[type="text"] {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.inbox-form label.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
 }
 .inbox-form .hint {
   margin: 0;

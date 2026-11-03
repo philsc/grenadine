@@ -14,6 +14,9 @@ pub struct Inbox {
     /// `repo:` group and moves any `sort:` tokens to the end.
     pub filter: String,
     pub position: i64,
+    /// Whether the inbox's PRs count in the top bar's total.
+    #[serde(default)]
+    pub count_in_total: bool,
 }
 
 /// The body of a request that creates or edits an inbox.
@@ -22,6 +25,8 @@ pub struct InboxEdit {
     pub name: String,
     pub filter: String,
     pub position: Option<i64>,
+    #[serde(default)]
+    pub count_in_total: bool,
 }
 
 /// Identifies a PR across the configured repositories.
