@@ -56,6 +56,26 @@ input DeleteRefInput {
 type Ref {
   id: ID!
   name: String!
+  refUpdateRule: RefUpdateRule
+  rules(first: Int): RepositoryRuleConnection
+}
+
+type RefUpdateRule {
+  requiresConversationResolution: Boolean!
+}
+
+type RepositoryRuleConnection {
+  nodes: [RepositoryRule]
+}
+
+type RepositoryRule {
+  parameters: RuleParameters
+}
+
+union RuleParameters = PullRequestParameters
+
+type PullRequestParameters {
+  requiredReviewThreadResolution: Boolean!
 }
 
 type AddPullRequestReviewPayload {
@@ -250,6 +270,7 @@ type PullRequest {
   author: Actor
   repository: Repository!
   baseRefName: String!
+  baseRef: Ref
   headRefName: String!
   headRefOid: GitObjectID!
   headRef: Ref

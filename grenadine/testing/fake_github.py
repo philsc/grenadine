@@ -167,6 +167,9 @@ class PullRequest:
     issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
     # GitHub's MergeStateStatus; None works it out from the PR.
     merge_state: str | None = None
+    # The base branch requires conversations to be resolved: "protection"
+    # for classic branch protection, "ruleset" for a ruleset.
+    thread_resolution: str | None = None
     # The viewer may merge it bypassing the branch's rules.
     can_merge_as_admin: bool = False
     pending: PendingReview | None = None
@@ -234,6 +237,10 @@ class PullRequest:
             return "DIRTY"
         if self.draft:
             return "DRAFT"
+        if self.thread_resolution and any(
+            c.in_reply_to is None and not c.resolved for c in self.comments
+        ):
+            return "BLOCKED"
         if self.checks() == "FAILURE":
             return "UNSTABLE"
         return "CLEAN"
@@ -1268,6 +1275,26 @@ class FakeGitHub:
             "author": self._user_node(pr.author),
             "repository": lambda info: self._repo_node(repo),
             "baseRefName": pr.base,
+            "baseRef": {
+                "id": _ref_id(repo, pr.base),
+                "name": pr.base,
+                "refUpdateRule": {
+                    "requiresConversationResolution": pr.thread_resolution
+                    == "protection"
+                },
+                "rules": {
+                    "nodes": [
+                        {
+                            "parameters": {
+                                "__typename": "PullRequestParameters",
+                                "requiredReviewThreadResolution": (
+                                    pr.thread_resolution == "ruleset"
+                                ),
+                            },
+                        }
+                    ]
+                },
+            },
             "headRefName": pr.head,
             "headRefOid": pr.head_oid,
             "headRef": (

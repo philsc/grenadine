@@ -1318,6 +1318,21 @@ class ReviewTest(ServerTestCase):
         )
         expect(box.get_by_role("button", name="Merge")).to_be_disabled()
 
+    def test_unresolved_conversations_block_merging(self) -> None:
+        self.open(scenarios.CONVERSATIONS)
+        box = self.merge_box()
+        expect(box.locator(".merge-status")).to_have_text(
+            "Merging is blocked: 1 conversation must be resolved."
+        )
+        expect(box.locator(".merge-blocked")).to_have_text(
+            "Resolve the conversations first."
+        )
+        expect(box.get_by_role("button", name="Merge")).to_be_disabled()
+
+        self.thread().get_by_role("button", name="Resolve").click()
+        expect(box.locator(".merge-status")).to_have_text("Ready to merge.")
+        expect(box.get_by_role("button", name="Merge")).to_be_enabled()
+
     def test_merge_bypassing_the_rules(self) -> None:
         pr = self.prs[scenarios.BYPASS]
         self.open(scenarios.BYPASS)

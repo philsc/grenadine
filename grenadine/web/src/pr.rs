@@ -522,6 +522,10 @@ fn merge_target(pr: &PrDetail) -> MergeTarget {
         has_children: stack
             .iter()
             .any(|p| p.parent == Some(n) && p.state == "OPEN"),
+        unresolved_threads: threads(&pr.comments)
+            .iter()
+            .filter(|t| t.root.thread_id.is_some() && !t.root.pending && !t.root.resolved)
+            .count(),
     }
 }
 

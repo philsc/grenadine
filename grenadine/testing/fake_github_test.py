@@ -33,6 +33,16 @@ query($owner: String!, $name: String!, $number: Int!) {
       title body url state isDraft createdAt updatedAt
       author { login }
       baseRefName headRefName headRefOid
+      baseRef {
+        refUpdateRule { requiresConversationResolution }
+        rules(first: 100) {
+          nodes {
+            parameters {
+              ... on PullRequestParameters { requiredReviewThreadResolution }
+            }
+          }
+        }
+      }
       headRepository { nameWithOwner }
       timelineItems(first: 100, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) {
         nodes {
@@ -330,6 +340,33 @@ class FakeGitHubTest(unittest.TestCase):
                 ("deploy", "IN_PROGRESS", None, None, {"workflowRun": None}),
             ],
         )
+
+    def test_pr_query_reports_the_conversation_resolution_rule(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        base_ref = lambda: self.query(
+            PR_QUERY, owner="test", name="test", number=pr.number
+        )["data"]["repository"]["pullRequest"]["baseRef"]
+
+        def requires() -> tuple[bool, bool]:
+            ref = base_ref()
+            return (
+                ref["refUpdateRule"]["requiresConversationResolution"],
+                ref["rules"]["nodes"][0]["parameters"][
+                    "requiredReviewThreadResolution"
+                ],
+            )
+
+        self.assertEqual(requires(), (False, False))
+        pr.thread_resolution = "protection"
+        self.assertEqual(requires(), (True, False))
+        pr.thread_resolution = "ruleset"
+        self.assertEqual(requires(), (False, True))
+
+        # The rule makes an unresolved thread block merging.
+        self.repo.comment(pr, author="other", body="Is this right?", path="p", line=1)
+        self.assertEqual(pr.merge_state_status(), "BLOCKED")
+        pr.comments[0].resolved = True
+        self.assertEqual(pr.merge_state_status(), "CLEAN")
 
     def test_pr_query_reports_required_reviews(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]

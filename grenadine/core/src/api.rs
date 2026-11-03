@@ -585,6 +585,10 @@ pub struct MergeInfo {
     pub delete_branch_on_merge: bool,
     /// The viewer may merge despite failing requirements.
     pub can_merge_as_admin: bool,
+    /// The base branch's rules require every review thread to be
+    /// resolved before merging.
+    #[serde(default)]
+    pub requires_conversation_resolution: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
