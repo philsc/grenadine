@@ -5,5 +5,9 @@ pnpm-lock.yaml
 # Claude Code's configuration and helpers.
 .claude/
 
+# Written by trail, which rewrites it at the start of a session in every new
+# checkout. Formatting it would make that rewrite show up as a change.
+.trail/hook.cjs
+
 # GitHub's schema, vendored as is.
 grenadine/testing/github_schema.graphql
