@@ -929,6 +929,21 @@ impl AgentSession {
     }
 }
 
+/// A PR an agent session opened, as of the last poll.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPr {
+    pub key: PrKey,
+    /// `None` until a poll looks it up.
+    pub title: Option<String>,
+    /// OPEN, CLOSED or MERGED.
+    pub state: String,
+    /// The checks on its head; `None` when it has none.
+    pub ci: Option<CiStatus>,
+    /// Whether it conflicted with its base at the last poll that could
+    /// tell.
+    pub conflicting: bool,
+}
+
 /// How far the PRs an agent session opened have come. PRs closed without
 /// merging count in neither number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

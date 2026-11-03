@@ -7,10 +7,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
-    AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, AutoReviewEntry,
-    AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail,
-    PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo, SessionKind, Stack,
-    ThreadCounts, Version, VersionKind,
+    AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
+    AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed,
+    Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo,
+    SessionKind, Stack, ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -359,6 +359,15 @@ const MIGRATIONS: &[Migration] = &[
         error TEXT,
         UNIQUE (repo, number, head_oid)
     );
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- The title and the state of the checks on the head of each PR a
+    -- session opened. The title is NULL until a poll looks it up; ci is
+    -- NULL when the head has no checks.
+    ALTER TABLE agent_prs ADD COLUMN title TEXT;
+    ALTER TABLE agent_prs ADD COLUMN ci TEXT;
 "#,
     ),
 ];
@@ -1369,11 +1378,13 @@ impl Db {
         Ok(())
     }
 
-    /// The PRs that sessions opened that were open at the last poll.
-    pub fn open_agent_prs(&self) -> Result<Vec<PrKey>> {
+    /// The PRs that sessions opened that a poll should look up: the open
+    /// ones, and ones no poll has titled yet.
+    pub fn agent_prs_to_refresh(&self) -> Result<Vec<PrKey>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT repo, number FROM agent_prs WHERE state = 'OPEN' ORDER BY repo, number",
+            "SELECT DISTINCT repo, number FROM agent_prs
+             WHERE state = 'OPEN' OR title IS NULL ORDER BY repo, number",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(PrKey {
@@ -1384,20 +1395,52 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Records the state of a PR that sessions opened and whether it
-    /// conflicts with its base; `None` keeps what's recorded. Returns
-    /// whether either changed.
+    /// The PRs session `id` opened, as of the last poll.
+    pub fn agent_pr_list(&self, id: &str) -> Result<Vec<AgentPr>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT repo, number, title, state, ci, conflicting FROM agent_prs
+             WHERE agent_id = ? ORDER BY repo, number",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            let ci: Option<String> = r.get(4)?;
+            Ok(AgentPr {
+                key: PrKey {
+                    repo: r.get(0)?,
+                    number: r.get(1)?,
+                },
+                title: r.get(2)?,
+                state: r.get(3)?,
+                ci: ci.as_deref().and_then(parse_ci),
+                conflicting: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Records what a poll found for a PR that sessions opened: its
+    /// state, title and the checks on its head, and whether it conflicts
+    /// with its base; a `None` conflicting keeps what's recorded.
+    /// Returns whether anything changed.
     pub fn set_agent_pr_state(
         &self,
         key: &PrKey,
-        state: &str,
-        conflicting: Option<bool>,
+        status: &crate::github::PrStatus,
     ) -> Result<bool> {
         Ok(self.conn().execute(
-            "UPDATE agent_prs SET state = ?1, conflicting = COALESCE(?4, conflicting)
+            "UPDATE agent_prs SET state = ?1, title = ?4, ci = ?5,
+                 conflicting = COALESCE(?6, conflicting)
              WHERE repo = ?2 AND number = ?3
-               AND (state != ?1 OR conflicting != COALESCE(?4, conflicting))",
-            params![state, key.repo, key.number, conflicting],
+               AND (state != ?1 OR title IS NOT ?4 OR ci IS NOT ?5
+                    OR conflicting != COALESCE(?6, conflicting))",
+            params![
+                status.state,
+                key.repo,
+                key.number,
+                status.title,
+                status.ci.map(ci_str),
+                status.conflicting
+            ],
         )? > 0)
     }
 
@@ -2668,26 +2711,75 @@ mod tests {
             })
         };
         assert_eq!(prs("a"), counts(0, 3, 0));
-        assert_eq!(db.open_agent_prs().unwrap(), [key(1), key(2), key(3)]);
+        // Untitled PRs are looked up too, so ones recorded before titles
+        // existed get one.
+        assert_eq!(db.agent_prs_to_refresh().unwrap(), [key(1), key(2), key(3)]);
+
+        let status = |state: &str, conflicting: Option<bool>| crate::github::PrStatus {
+            state: state.into(),
+            conflicting,
+            title: "t".into(),
+            ci: None,
+        };
 
         // PR 2 conflicts, and it still does while GitHub can't tell.
-        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(true)).unwrap());
-        assert!(!db.set_agent_pr_state(&key(2), "OPEN", None).unwrap());
+        let conflicting = status("OPEN", Some(true));
+        assert!(db.set_agent_pr_state(&key(2), &conflicting).unwrap());
+        // The same status changes nothing.
+        assert!(!db.set_agent_pr_state(&key(2), &conflicting).unwrap());
+        let mut still_conflicting = conflicting.clone();
+        still_conflicting.conflicting = None;
+        assert!(!db.set_agent_pr_state(&key(2), &still_conflicting).unwrap());
         assert_eq!(prs("a"), counts(0, 3, 1));
         assert_eq!(prs("b"), counts(0, 1, 1));
-        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(false)).unwrap());
-        assert_eq!(prs("a"), counts(0, 3, 0));
-        assert!(db.set_agent_pr_state(&key(2), "OPEN", Some(true)).unwrap());
+        // A change in the checks alone is a change.
+        let mut failing = still_conflicting.clone();
+        failing.ci = Some(CiStatus::Failing);
+        assert!(db.set_agent_pr_state(&key(2), &failing).unwrap());
 
-        assert!(db.set_agent_pr_state(&key(1), "MERGED", None).unwrap());
-        assert!(!db.set_agent_pr_state(&key(1), "MERGED", None).unwrap());
+        let list = db.agent_pr_list("a").unwrap();
+        assert_eq!(
+            list.iter().map(|p| p.key.number).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(list[1].state, "OPEN");
+        assert_eq!(list[1].title.as_deref(), Some("t"));
+        assert_eq!(list[1].ci, Some(CiStatus::Failing));
+        assert!(list[1].conflicting);
+        assert_eq!(list[0].title, None);
+
+        assert!(
+            db.set_agent_pr_state(&key(2), &status("OPEN", Some(false)))
+                .unwrap()
+        );
+        assert_eq!(prs("a"), counts(0, 3, 0));
+        assert!(
+            db.set_agent_pr_state(&key(2), &status("OPEN", Some(true)))
+                .unwrap()
+        );
+
+        assert!(
+            db.set_agent_pr_state(&key(1), &status("MERGED", None))
+                .unwrap()
+        );
+        assert!(
+            !db.set_agent_pr_state(&key(1), &status("MERGED", None))
+                .unwrap()
+        );
         // Only open PRs count as conflicting.
-        assert!(db.set_agent_pr_state(&key(2), "MERGED", None).unwrap());
+        assert!(
+            db.set_agent_pr_state(&key(2), &status("MERGED", None))
+                .unwrap()
+        );
         // A PR closed without merging counts in neither number.
-        assert!(db.set_agent_pr_state(&key(3), "CLOSED", None).unwrap());
+        assert!(
+            db.set_agent_pr_state(&key(3), &status("CLOSED", None))
+                .unwrap()
+        );
         assert_eq!(prs("a"), counts(2, 2, 0));
         assert_eq!(prs("b"), counts(1, 1, 0));
-        assert_eq!(db.open_agent_prs().unwrap(), []);
+        // All titled, and none open: nothing left to look up.
+        assert_eq!(db.agent_prs_to_refresh().unwrap(), []);
 
         db.delete_agent("a").unwrap();
         let rows: i64 = db
@@ -2736,7 +2828,7 @@ mod tests {
         }
         migrate(&mut db.conn(), MIGRATIONS.len()).unwrap();
         assert_eq!(
-            db.open_agent_prs().unwrap(),
+            db.agent_prs_to_refresh().unwrap(),
             [PrKey {
                 repo: "o/n".into(),
                 number: 4

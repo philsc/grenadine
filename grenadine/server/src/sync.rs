@@ -410,17 +410,16 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     Ok(())
 }
 
-/// Looks up whether the PRs that agent sessions opened are still open.
+/// Looks up the states, titles and checks of the PRs that agent
+/// sessions opened.
 async fn refresh_agent_prs(state: &State) -> Result<()> {
-    let open = state.db.open_agent_prs()?;
+    let open = state.db.agent_prs_to_refresh()?;
     if open.is_empty() {
         return Ok(());
     }
     let mut changed = false;
     for (key, status) in state.github.pr_statuses(&open).await? {
-        changed |= state
-            .db
-            .set_agent_pr_state(&key, &status.state, status.conflicting)?;
+        changed |= state.db.set_agent_pr_state(&key, &status)?;
     }
     if changed {
         state.send(ServerEvent::AgentsChanged);

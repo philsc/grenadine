@@ -126,6 +126,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
+        .route("/api/agents/{id}/prs", get(agent_prs))
         .route("/api/images/{id}", get(image))
         .route(
             "/api/agents/{id}/terminals",
@@ -769,6 +770,14 @@ async fn agent_changes(AxState(state): St, Path(id): Path<String>) -> ApiResult<
     Ok(Json(WorktreeChanges { files }).into_response())
 }
 
+/// The PRs the session opened, as of the last poll.
+async fn agent_prs(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(state.db.agent_pr_list(&id)?).into_response())
+}
+
 async fn terminals(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
@@ -1175,6 +1184,50 @@ mod tests {
         let response = get(id).await.map_err(|e| e.0).unwrap();
         assert_eq!(body(response).await, r#"{"files":[]}"#);
         assert_eq!(unstaged().await, 0);
+
+        let response = get("00000000-0000-0000-0000-000000000001")
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn agent_prs_come_from_the_polls() {
+        let state = crate::sync::test_state();
+        let id = "00000000-0000-0000-0000-000000000000";
+        state
+            .db
+            .create_agent(&AgentSession::fixture(id, "o/n"))
+            .unwrap();
+        let get = |id: &str| agent_prs(AxState(state.clone()), Path(id.to_owned()));
+
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        assert_eq!(body(response).await, "[]");
+
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        state.db.add_agent_pr(id, &key, "OPEN").unwrap();
+        state
+            .db
+            .set_agent_pr_state(
+                &key,
+                &crate::github::PrStatus {
+                    state: "OPEN".into(),
+                    conflicting: Some(false),
+                    title: "Fix it".into(),
+                    ci: Some(grenadine_core::api::CiStatus::Passing),
+                },
+            )
+            .unwrap();
+
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        assert_eq!(
+            body(response).await,
+            r#"[{"key":{"repo":"o/n","number":7},"title":"Fix it","state":"OPEN","ci":"Passing","conflicting":false}]"#
+        );
 
         let response = get("00000000-0000-0000-0000-000000000001")
             .await
