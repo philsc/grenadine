@@ -2011,14 +2011,8 @@ fn PlanCard(
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
-    // The mode prompts start with, if the turn can go on in it.
-    let then = RwSignal::new(PermissionMode::new(
-        if backend.allows_after_plan(backend.default_mode()) {
-            backend.default_mode()
-        } else {
-            backend.after_plan()[0]
-        },
-    ));
+    // The mode the backend prefers the turn to go on in.
+    let then = RwSignal::new(PermissionMode::new(backend.plan_default_mode()));
     let state = {
         let tool = tool.clone();
         Signal::derive(move || resolved.with(|r| r.get(&tool).copied()))

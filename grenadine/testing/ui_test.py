@@ -1802,8 +1802,8 @@ class AgentTest(ServerTestCase):
         expect(plan).to_contain_text("Devin's plan is waiting for your approval")
         expect(plan.locator(".plan-text")).to_contain_text("Do the thing.")
         expect(plan.locator(".plan-text")).not_to_contain_text("agent: devin")
-        # Devin's after-plan modes are Code and Bypass permissions.
-        expect(plan.get_by_label("After the plan")).to_have_value("accept-edits")
+        # Devin's after-plan modes are Code, Smart and Bypass permissions.
+        expect(plan.get_by_label("After the plan")).to_have_value("smart")
         # Sent back with feedback, the plan's denial goes to Devin as
         # reject_once and the feedback runs as the next prompt.
         plan.get_by_label("Feedback").fill("more detail")
@@ -1818,6 +1818,10 @@ class AgentTest(ServerTestCase):
         expect(revised).to_contain_text("Devin's plan is waiting for your approval")
         revised.get_by_role("button", name="Approve plan").click()
         self.devin_saw('"optionId":"plan_accept_edits"')
+        # Devin offers no plan_smart, so a set_mode to smart follows the
+        # approval's plan_accept_edits.
+        self.devin_saw('"method":"session/set_mode"')
+        self.devin_saw('"modeId":"smart"')
         expect(revised).to_contain_text("Plan approved")
         expect(transcript.locator(".turn-end")).to_have_count(2)
         # The second turn resumed the session, whose replayed answer the

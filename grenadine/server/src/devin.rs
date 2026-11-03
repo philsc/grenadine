@@ -19,6 +19,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind, ApprovalOption,
+    PermissionMode,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -913,6 +914,8 @@ struct TurnCtx<'a, 'b> {
     /// While a `session/load` replays the conversation, its updates are
     /// discarded.
     loading: bool,
+    /// Devin's session id, once session/new or session/load has answered.
+    session: Option<String>,
 }
 
 impl TurnCtx<'_, '_> {
@@ -964,16 +967,18 @@ impl TurnCtx<'_, '_> {
 
     /// Answers the request `r` the agent made, on a task of its own.
     fn request(&mut self, acp: &Arc<Acp>, r: Request) {
-        let (acp, state, id, tools) = (
+        let (acp, state, id, session, tools) = (
             acp.clone(),
             self.state.clone(),
             self.id.to_owned(),
+            self.session.clone(),
             self.updates.tools.clone(),
         );
         match r.method.as_str() {
             "session/request_permission" => match parse::<PermissionRequest>(r.params) {
                 Ok(p) => {
-                    self.tasks.spawn(permission(acp, state, id, tools, r.id, p));
+                    self.tasks
+                        .spawn(permission(acp, state, id, session, tools, r.id, p));
                 }
                 Err(e) => acp.respond_error(&r.id, -32602, &format!("{e}")),
             },
@@ -1010,6 +1015,7 @@ async fn turn(
             updates: Updates::new(),
             tasks: JoinSet::new(),
             loading: false,
+            session: None,
         };
         let result = run_turn(&mut rpc, session, &t, &mut ctx).await;
         (result, ctx.updates.total())
@@ -1092,6 +1098,7 @@ async fn run_turn(
         let model = current_model(&created.config_options);
         (created.session_id, model)
     };
+    ctx.session = Some(backend_session.clone());
     // Interrupts and shutdown now stop the turn with session/cancel; Devin
     // ignores one with nothing running, so stopping again is harmless.
     let stopper = {
@@ -1210,6 +1217,29 @@ fn first_option(options: &[ApprovalOption], kind: ApprovalKind) -> Option<String
         .map(|o| o.id.clone())
 }
 
+/// The `optionId` a plan approved to go on in `mode` picks, and a mode
+/// to switch to after the answer when Devin offers no option for it.
+/// Devin's exit_plan_mode options are plan_accept_edits, plan_bypass and
+/// the rejects — there is no plan_smart — so smart answers
+/// plan_accept_edits, which is never more permissive than smart, and a
+/// session/set_mode to smart follows.
+fn plan_option(
+    mode: &PermissionMode,
+    options: &[ApprovalOption],
+) -> Option<(String, Option<PermissionMode>)> {
+    let want = format!("plan_{}", mode.as_str().replace('-', "_"));
+    if options.iter().any(|o| o.id == want) {
+        return Some((want, None));
+    }
+    if mode.as_str() == "smart" && options.iter().any(|o| o.id == "plan_accept_edits") {
+        return Some((
+            "plan_accept_edits".into(),
+            Some(PermissionMode::from("smart")),
+        ));
+    }
+    None
+}
+
 /// The `optionId` the user's decision picks: their explicit choice, a
 /// plan approval's `plan_<mode>` option, or an allow or a reject as the
 /// decision says. With none of the decision's kind there's nothing to
@@ -1222,11 +1252,9 @@ fn decide(d: &Decision, tool: &Tool, options: &[ApprovalOption]) -> Option<Strin
     if d.allow {
         if tool.name == "ExitPlanMode"
             && let Some(m) = &d.mode
+            && let Some((option, _)) = plan_option(m, options)
         {
-            let want = format!("plan_{}", m.as_str().replace('-', "_"));
-            if options.iter().any(|o| o.id == want) {
-                return Some(want);
-            }
+            return Some(option);
         }
         first(&[ApprovalKind::AllowOnce, ApprovalKind::AllowAlways])
     } else {
@@ -1280,6 +1308,7 @@ async fn permission(
     acp: Arc<Acp>,
     state: Arc<State>,
     id: String,
+    session: Option<String>,
     tools: Tools,
     rpc_id: RequestId,
     request: PermissionRequest,
@@ -1315,6 +1344,7 @@ async fn permission(
         )
         .await
     };
+    let mut follow_up = None;
     let option = decision.and_then(|d| {
         if !d.allow
             && let Some(message) = d.message.clone().filter(|m| !m.trim().is_empty())
@@ -1323,9 +1353,25 @@ async fn permission(
             // planning.
             queue_next(&state, &id, message, tool.name == "ExitPlanMode");
         }
+        if d.allow
+            && tool.name == "ExitPlanMode"
+            && let Some(m) = &d.mode
+            && let Some((_, mode)) = plan_option(m, &options)
+        {
+            follow_up = mode;
+        }
         decide(&d, &tool, &options)
     });
     acp.respond(&rpc_id, permission_outcome(option));
+    // Devin applies the answered option first, so a follow-up set_mode
+    // sent now lands after it. Its response arrives under an id nothing
+    // waits on, which the turn ignores.
+    if let (Some(mode), Some(session)) = (follow_up, session) {
+        acp.request(
+            "session/set_mode",
+            json!({"sessionId": session, "modeId": mode.as_str()}),
+        );
+    }
 }
 
 /// Answers an `elicitation/create` request, the questions of a
@@ -2062,6 +2108,19 @@ mod tests {
             ),
             Some("plan_accept_edits".into())
         );
+        // Devin offers no plan_smart, so smart picks plan_accept_edits.
+        assert_eq!(
+            decide(
+                &Decision {
+                    allow: true,
+                    mode: Some(PermissionMode::from("smart")),
+                    ..Default::default()
+                },
+                &plan,
+                &options
+            ),
+            Some("plan_accept_edits".into())
+        );
         assert_eq!(
             decide(
                 &Decision {
@@ -2102,6 +2161,35 @@ mod tests {
         let deny = Decision::default();
         let allows = [option("allow_once", "Yes", ApprovalKind::AllowOnce)];
         assert_eq!(decide(&deny, &tool, &allows), None);
+    }
+
+    /// The mode a plan option asks to switch to after the answer: only
+    /// smart, which Devin offers no option for.
+    #[test]
+    fn plan_options_name_a_follow_up_for_smart_only() {
+        let option = |id: &str| ApprovalOption {
+            id: id.into(),
+            label: id.into(),
+            kind: ApprovalKind::AllowOnce,
+        };
+        let options = [
+            option("plan_accept_edits"),
+            option("plan_bypass"),
+            option("reject_once"),
+        ];
+        assert_eq!(
+            plan_option(&PermissionMode::from("smart"), &options),
+            Some((
+                "plan_accept_edits".into(),
+                Some(PermissionMode::from("smart"))
+            ))
+        );
+        for mode in ["accept-edits", "bypass"] {
+            assert_eq!(
+                plan_option(&PermissionMode::from(mode), &options),
+                Some((format!("plan_{}", mode.replace('-', "_")), None))
+            );
+        }
     }
 
     /// The listing asks a throwaway session for its models and deletes
@@ -2200,7 +2288,8 @@ mod tests {
             ]
         );
         assert_eq!(devin.default_mode(), "accept-edits");
-        assert_eq!(devin.after_plan(), ["accept-edits", "bypass"]);
+        assert_eq!(devin.after_plan(), ["accept-edits", "smart", "bypass"]);
+        assert_eq!(devin.plan_default_mode(), "smart");
         assert_eq!(devin.cost_unit(), grenadine_core::api::CostUnit::Acu);
     }
 }
