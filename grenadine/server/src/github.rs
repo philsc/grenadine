@@ -11,6 +11,7 @@ use grenadine_core::api::{
     Person, PrKey, Review, ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState,
     Side, StackPr, SubmitReview, ThreadCounts,
 };
+use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
@@ -56,6 +57,19 @@ pub struct Hit {
     pub ci: Option<CiStatus>,
     /// `None` when GitHub has no decision.
     pub review_decision: Option<ReviewDecision>,
+    /// What the inbox filters evaluate locally; see core::filter.
+    pub facts: PrFacts,
+}
+
+/// One page of a search's results.
+#[derive(Clone, Debug)]
+pub struct SearchPage {
+    pub hits: Vec<Hit>,
+    /// How many hits the search found in total, fetched or not.
+    pub issue_count: u64,
+    pub has_next_page: bool,
+    /// Pass back as `after` for the next page.
+    pub end_cursor: Option<String>,
 }
 
 /// Everything about a PR that its sync needs from GraphQL.
@@ -240,6 +254,15 @@ fn merge_state(s: &str) -> MergeState {
         }
     }
 }
+
+/// The extra fields a search selects when its inbox filter is evaluated
+/// locally, besides the review decision that every search has. They
+/// cost a lot — every review and review request counts
+/// towards the request's node limit — so searches that never read them
+/// don't ask.
+const SEARCH_FACT_FIELDS: &str = "isInMergeQueue
+    reviews(first: 100) { nodes { author { login } state } }
+    reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } }";
 
 /// Maps a `StatusState` of a commit's check rollup.
 fn ci_status(state: &str) -> Option<CiStatus> {
@@ -433,6 +456,31 @@ fn hit_from_node(n: &Value) -> Hit {
         },
         ci: ci_status(str_at(n, "/commits/nodes/0/commit/statusCheckRollup/state")),
         review_decision: review_decision(str_at(n, "/reviewDecision")),
+        facts: PrFacts {
+            title: str_at(n, "/title").to_owned(),
+            author: author_login(n).to_owned(),
+            state: str_at(n, "/state").to_owned(),
+            is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+            archived: n
+                .pointer("/repository/isArchived")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
+            queued: n["isInMergeQueue"].as_bool().unwrap_or_default(),
+            review_decision: Some(str_at(n, "/reviewDecision"))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            reviews: nodes(n, "/reviews/nodes")
+                .map(|r| ReviewFact {
+                    author: str_at(r, "/author/login").to_owned(),
+                    state: str_at(r, "/state").to_owned(),
+                })
+                .collect(),
+            // Teams asked to review aren't Users, so they don't make it.
+            user_review_requests: nodes(n, "/reviewRequests/nodes")
+                .filter(|r| str_at(r, "/requestedReviewer/__typename") == "User")
+                .map(|r| str_at(r, "/requestedReviewer/login").to_owned())
+                .collect(),
+        },
     }
 }
 
@@ -1052,34 +1100,45 @@ impl GitHub {
         Ok(())
     }
 
-    /// Runs several searches in one GraphQL request. Each result is either
-    /// the PRs found, in GitHub's order, or the error for that search.
-    /// `ISSUE_ADVANCED` is what makes AND, OR and parentheses work; plain
-    /// `ISSUE` finds nothing for a query with parentheses.
+    /// Runs several searches in one GraphQL request; each entry is a
+    /// query, the cursor to continue it from if any, and whether the
+    /// fact fields the local filters evaluate should be selected (they
+    /// cost a lot, so searches that don't need them skip them). Returns
+    /// the token owner's login plus, per search, either a page of PRs in
+    /// GitHub's order or that search's error. `ISSUE_ADVANCED` is what
+    /// makes AND, OR and parentheses work; plain `ISSUE` finds nothing
+    /// for a query with parentheses.
     pub async fn search(
         &self,
-        queries: &[String],
-    ) -> Result<Vec<std::result::Result<Vec<Hit>, String>>> {
+        queries: &[(String, Option<String>, bool)],
+    ) -> Result<(String, Vec<std::result::Result<SearchPage, String>>)> {
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok((String::new(), Vec::new()));
         }
         let mut gql = String::from("query(");
         gql += &(0..queries.len())
-            .map(|i| format!("$q{i}: String!"))
+            .map(|i| format!("$q{i}: String!, $a{i}: String"))
             .collect::<Vec<_>>()
             .join(", ");
-        gql += ") {\n";
+        gql += ") {\n  viewer { login }\n";
         let mut vars = serde_json::Map::new();
-        for (i, q) in queries.iter().enumerate() {
+        for (i, (q, after, with_facts)) in queries.iter().enumerate() {
+            let (facts, archived) = match *with_facts {
+                true => (SEARCH_FACT_FIELDS, " isArchived"),
+                false => ("", ""),
+            };
             gql += &format!(
-                "s{i}: search(type: ISSUE_ADVANCED, query: $q{i}, first: {SEARCH_LIMIT}) {{
-                   nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner }} {SEARCH_STATUS_FIELDS} }} }}
+                "s{i}: search(type: ISSUE_ADVANCED, query: $q{i}, first: {SEARCH_LIMIT}, after: $a{i}) {{
+                   issueCount pageInfo {{ hasNextPage endCursor }}
+                   nodes {{ ... on PullRequest {{ number title author {{ login }} state isDraft url updatedAt headRefOid repository {{ nameWithOwner{archived} }} {SEARCH_STATUS_FIELDS} {facts} }} }}
                  }}\n"
             );
             vars.insert(format!("q{i}"), json!(q));
+            vars.insert(format!("a{i}"), json!(after));
         }
         gql += "}";
         let (data, errors) = self.graphql(&gql, Value::Object(vars)).await?;
+        let viewer = str_at(&data, "/viewer/login").to_owned();
         let mut error_for: BTreeMap<String, String> = BTreeMap::new();
         for e in &errors {
             let alias = e
@@ -1094,7 +1153,7 @@ impl GitHub {
                 .entry(alias.to_owned())
                 .or_insert_with(|| msg.to_owned());
         }
-        Ok((0..queries.len())
+        let pages = (0..queries.len())
             .map(|i| {
                 let alias = format!("s{i}");
                 let Some(found) = data
@@ -1107,13 +1166,27 @@ impl GitHub {
                         .cloned()
                         .unwrap_or_else(|| "search failed".to_owned()));
                 };
-                Ok(found
-                    .iter()
-                    .filter(|n| n.get("number").is_some())
-                    .map(hit_from_node)
-                    .collect())
+                Ok(SearchPage {
+                    issue_count: data
+                        .pointer(&format!("/{alias}/issueCount"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    has_next_page: data
+                        .pointer(&format!("/{alias}/pageInfo/hasNextPage"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or_default(),
+                    end_cursor: Some(str_at(&data, &format!("/{alias}/pageInfo/endCursor")))
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned),
+                    hits: found
+                        .iter()
+                        .filter(|n| n.get("number").is_some())
+                        .map(hit_from_node)
+                        .collect(),
+                })
             })
-            .collect())
+            .collect();
+        Ok((viewer, pages))
     }
 
     /// The open and merged PRs of `repo` whose head (or base) branch is

@@ -189,6 +189,17 @@ pub struct InboxWithPrs {
     /// Set when the inbox's last search failed, e.g. because of a typo in
     /// the filter.
     pub error: Option<String>,
+    /// Set when GitHub found more PRs than were fetched.
+    pub truncated: Option<Truncation>,
+}
+
+/// How much of an inbox's search result was fetched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Truncation {
+    /// How many hits grenadine fetched.
+    pub fetched: u32,
+    /// How many GitHub found.
+    pub found: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -156,8 +156,13 @@ async fn main() -> Result<ExitCode> {
         ));
     }
 
-    let results = gh
-        .search(&queries.iter().map(|(_, q)| q.clone()).collect::<Vec<_>>())
+    let (_, results) = gh
+        .search(
+            &queries
+                .iter()
+                .map(|(_, q)| (q.clone(), None, false))
+                .collect::<Vec<_>>(),
+        )
         .await?;
 
     let mut report = Report {
@@ -170,7 +175,8 @@ async fn main() -> Result<ExitCode> {
     let mut by_key: BTreeMap<PrKey, Hit> = BTreeMap::new();
     for ((label, query), result) in queries.iter().zip(results) {
         match result {
-            Ok(found) => {
+            Ok(page) => {
+                let found = page.hits;
                 println!("INFO {label}: {} hits", found.len());
                 if found.len() == github::SEARCH_LIMIT {
                     println!(

@@ -692,6 +692,15 @@ class InboxTest(ServerTestCase):
         inbox.locator(".inbox-toggle").click()
         expect(inbox.locator(".pr-list")).to_be_visible()
 
+    def test_invalid_gr_filter_shows_the_save_error(self) -> None:
+        self.page.goto(self.url)
+        self.page.get_by_role("button", name="+ Add inbox").click()
+        form = self.page.locator("form.inbox-form")
+        form.get_by_label("Name").fill("Broken")
+        form.get_by_label("GitHub filter").fill("gr:bogus:x")
+        form.get_by_role("button", name="Save").click()
+        expect(form.locator(".error")).to_contain_text("unknown grenadine qualifier")
+
     def add_inbox(self, name: str, filter: str) -> Locator:
         self.addCleanup(self.delete_inbox, name)
         self.page.get_by_role("button", name="+ Add inbox").click()

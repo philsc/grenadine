@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use crate::db::{Db, PrMeta, SyncMark};
 use crate::git::{REF_PREFIX, Repo};
 use crate::github::{self, GitHub, PrData, ThreadState};
+use crate::inbox_search::{self, InboxResult};
 use crate::stack;
 
 /// How many PRs sync at the same time.
@@ -314,29 +315,44 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     state.status_searching();
     let inboxes = state.db.inboxes()?;
     let slugs: Vec<String> = state.repos.keys().cloned().collect();
-    let queries: Vec<String> = inboxes
-        .iter()
-        .map(|i| github::search_query(&i.filter, &slugs))
-        .collect();
+    // A filter that doesn't parse costs its inbox its search but not
+    // the poll's.
+    let mut prepared = Vec::new();
+    let mut searched = Vec::new();
+    for inbox in &inboxes {
+        match inbox_search::prepare(&inbox.filter, &slugs) {
+            Ok(p) => {
+                prepared.push(p);
+                searched.push(inbox);
+            }
+            Err(e) => {
+                tracing::warn!("inbox {:?} ({}): {e}", inbox.name, inbox.filter);
+                state.db.set_inbox_results(inbox.id, Err(&e), None)?;
+            }
+        }
+    }
+    let repos: BTreeSet<String> = state.repos.keys().cloned().collect();
     let results = tokio::select! {
-        r = state.github.search(&queries) => r?,
+        r = inbox_search::run(&state.github, &prepared, &repos) => r?,
         _ = state.shutdown.cancelled() => return Ok(()),
-    };
+    }
+    .1;
 
     let mut hits = BTreeMap::new();
-    for (inbox, result) in inboxes.iter().zip(results) {
+    for (inbox, result) in searched.iter().zip(results) {
         match result {
-            Ok(found) => {
-                let found: Vec<_> = found
-                    .into_iter()
-                    .filter(|h| state.repos.contains_key(&h.key.repo))
-                    .collect();
-                state.db.set_inbox_results(inbox.id, Ok(&found))?;
+            Ok(InboxResult {
+                hits: found,
+                truncated,
+            }) => {
+                state
+                    .db
+                    .set_inbox_results(inbox.id, Ok(&found), truncated)?;
                 hits.extend(found.into_iter().map(|h| (h.key.clone(), h)));
             }
             Err(e) => {
                 tracing::warn!("inbox {:?} ({}): {e}", inbox.name, inbox.filter);
-                state.db.set_inbox_results(inbox.id, Err(&e))?;
+                state.db.set_inbox_results(inbox.id, Err(&e), None)?;
             }
         }
     }
