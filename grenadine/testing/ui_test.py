@@ -2943,6 +2943,12 @@ class AgentTest(ServerTestCase):
         repo.close(b)
         expect(icons.nth(1)).to_have_class(re.compile(r"\bclosed\b"), timeout=15_000)
 
+        # The session goes too, so later tests' counts aren't off.
+        entry = self.section(self.OTHER_REPO).locator(".agent-entry")
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        entry.get_by_role("button", name="Delete session").click()
+        expect(entry).to_have_count(0)
+
     def test_plan_mode(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
         expect(self.page.get_by_label("Permissions")).to_have_value("plan")
