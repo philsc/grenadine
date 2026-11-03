@@ -277,7 +277,11 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         [NEEDS_REVIEW, ALL_OPEN],
     )
     pr.review_requests.add(VIEWER)
-    pr.checks = "SUCCESS"
+    # A cancelled run that a later one superseded doesn't count.
+    pr.check_runs = [
+        CheckRun("test", conclusion="CANCELLED", started_at=1, workflow="Test"),
+        CheckRun("test", started_at=2, workflow="Test"),
+    ]
     pr.review_required = True
     pr.merge_state = "BLOCKED"
 
@@ -286,7 +290,6 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         [NEEDS_TEAM_REVIEW, ALL_OPEN],
     )
     pr.team_review_requests.add(VIEWER)
-    pr.checks = "FAILURE"
     pr.check_runs = [
         CheckRun("lint"),
         CheckRun("test", conclusion="FAILURE"),
@@ -349,7 +352,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         [WAITING_FOR_AUTHOR, ALL_OPEN],
     )
     pr.submit_review(VIEWER, COMMENTED)
-    pr.checks = "PENDING"
+    pr.check_runs = [CheckRun("test", status="IN_PROGRESS", conclusion=None)]
     path = "inbox/waiting-authors.md"
     root = repo.comment(pr, author=VIEWER, body="Why?", path=path, line=1)
     repo.comment(pr, author=OTHER, body="Because.", path=path, line=1, reply_to=root)

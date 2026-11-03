@@ -365,15 +365,7 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
 
     let stale: Vec<PrKey> = hits
         .into_values()
-        .filter(|h| {
-            sync_all
-                || state.db.sync_mark(&h.key).ok().flatten()
-                    != Some(SyncMark {
-                        updated_at: h.updated_at.clone(),
-                        head_oid: h.head_oid.clone(),
-                        ci: h.ci,
-                    })
-        })
+        .filter(|h| sync_all || needs_sync(state.db.sync_mark(&h.key).ok().flatten(), h))
         .map(|h| h.key)
         .collect();
     state.status_stale(stale.len());
@@ -430,6 +422,19 @@ fn short(versions: &[Version]) -> String {
         .map(|v| format!("v{}={}", v.number, &v.sha[..v.sha.len().min(10)]))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether a PR that a search found as `hit` needs a sync, given the
+/// `mark` of its last one: one that never synced does, and so does one
+/// that changed since. So does one whose checks were running at its last
+/// sync, until they aren't: GitHub's state, which the search reports,
+/// stays failing while a superseded run failed, so it doesn't change when
+/// they finish.
+fn needs_sync(mark: Option<SyncMark>, hit: &github::Hit) -> bool {
+    mark.is_none_or(|m| {
+        m.checks_running
+            || (&m.updated_at, &m.head_oid, m.ci) != (&hit.updated_at, &hit.head_oid, hit.ci)
+    })
 }
 
 /// Whether GitHub was still working out the merge state or checks of a PR
@@ -935,6 +940,46 @@ mod tests {
         .expect("the follow-ups did not stop after shutdown");
         // It stopped before syncing, which would have failed.
         assert_eq!(state.db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn running_checks_need_a_sync_until_they_finish() {
+        let hit = github::Hit {
+            key: PrKey {
+                repo: "o/r".into(),
+                number: 1,
+            },
+            title: "t".into(),
+            author: "a".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "u".into(),
+            updated_at: "t1".into(),
+            head_oid: "h".into(),
+            threads: Default::default(),
+            // A superseded run failed.
+            ci: Some(CiStatus::Failing),
+            review_decision: None,
+            facts: Default::default(),
+        };
+        let synced = SyncMark {
+            updated_at: "t1".into(),
+            head_oid: "h".into(),
+            ci: Some(CiStatus::Failing),
+            checks_running: false,
+        };
+        assert!(needs_sync(None, &hit));
+        assert!(!needs_sync(Some(synced.clone()), &hit));
+        let pushed = SyncMark {
+            head_oid: "old".into(),
+            ..synced.clone()
+        };
+        assert!(needs_sync(Some(pushed), &hit));
+        let running = SyncMark {
+            checks_running: true,
+            ..synced
+        };
+        assert!(needs_sync(Some(running), &hit));
     }
 
     #[test]

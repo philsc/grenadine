@@ -80,15 +80,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       head: commits(last: 1) {
         nodes {
           commit {
-            statusCheckRollup {
-              state
-              contexts(first: 100) {
-                nodes {
-                  ... on CheckRun { name status conclusion detailsUrl }
-                  ... on StatusContext { context state targetUrl }
-                }
-              }
-            }
+            statusCheckRollup { state ...Checks }
           }
         }
       }
@@ -100,6 +92,18 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 
 fragment Who on Actor { login avatarUrl ... on User { name } }
+
+fragment Checks on StatusCheckRollup {
+  contexts(first: 100) {
+    nodes {
+      ... on CheckRun {
+        name status conclusion detailsUrl startedAt
+        checkSuite { workflowRun { workflow { name } } }
+      }
+      ... on StatusContext { context state targetUrl }
+    }
+  }
+}
 """
 
 THREADS_QUERY = """
@@ -209,7 +213,12 @@ class FakeGitHubTest(unittest.TestCase):
         )
         self.repo.comment(pr, author="other", body="And?", path="inbox/x.md", line=1)
         root.resolved = True
-        pr.checks = "FAILURE"
+        # Like GitHub's, the state counts the run that a later one
+        # superseded.
+        pr.check_runs = [
+            CheckRun("test", conclusion="CANCELLED", started_at=1, workflow="Test"),
+            CheckRun("test", started_at=2, workflow="Test"),
+        ]
         out = self.query(
             SEARCH_QUERY, q0=f"is:pr {pr.title}", q1="is:pr Wait for reviewers"
         )
@@ -258,9 +267,8 @@ class FakeGitHubTest(unittest.TestCase):
         self.repo.issue_comment(pr, author="other", body="Thanks!")
         pr.review_requests.add("third")
         pr.team_review_requests.add("me")
-        pr.checks = "FAILURE"
         pr.check_runs = [
-            CheckRun("lint"),
+            CheckRun("lint", started_at=1, workflow="Lint"),
             CheckRun("test", conclusion="FAILURE"),
             CheckRun("deploy", status="IN_PROGRESS", conclusion=None),
         ]
@@ -301,13 +309,25 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(rollup["state"], "FAILURE")
         self.assertEqual(
             [
-                (c["name"], c["status"], c["conclusion"])
+                (
+                    c["name"],
+                    c["status"],
+                    c["conclusion"],
+                    c["startedAt"],
+                    c["checkSuite"],
+                )
                 for c in rollup["contexts"]["nodes"]
             ],
             [
-                ("lint", "COMPLETED", "SUCCESS"),
-                ("test", "COMPLETED", "FAILURE"),
-                ("deploy", "IN_PROGRESS", None),
+                (
+                    "lint",
+                    "COMPLETED",
+                    "SUCCESS",
+                    "1970-01-01T00:00:01Z",
+                    {"workflowRun": {"workflow": {"name": "Lint"}}},
+                ),
+                ("test", "COMPLETED", "FAILURE", None, {"workflowRun": None}),
+                ("deploy", "IN_PROGRESS", None, None, {"workflowRun": None}),
             ],
         )
 

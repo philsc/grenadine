@@ -439,6 +439,10 @@ pub struct SyncMark {
     pub head_oid: String,
     /// Checks finishing don't change `updated_at`.
     pub ci: Option<CiStatus>,
+    /// Whether the sync's own combined state, which leaves out superseded
+    /// runs, said checks were running. GitHub's `ci` stays failing while
+    /// a superseded run failed, so it doesn't change when they finish.
+    pub checks_running: bool,
 }
 
 fn kind_str(k: VersionKind) -> &'static str {
@@ -706,7 +710,10 @@ impl Db {
         // fields from prs until the next poll rewrites them. The review
         // decision comes from the PR's last sync once one read the
         // reviews: it's what the PR's page shows, and a resync after the
-        // viewer reviewed it updates it before the next search does.
+        // viewer reviewed it updates it before the next search does. So
+        // does the state of the checks, which leaves out the runs that
+        // later runs superseded, but only while the search still reports
+        // what GitHub said at that sync; otherwise the search is newer.
         let mut stmt = conn.prepare(
             "SELECT i.repo, i.number,
                     CASE WHEN i.title = '' THEN COALESCE(p.title, '') ELSE i.title END,
@@ -718,7 +725,9 @@ impl Db {
                     (SELECT COUNT(*) FROM versions v WHERE v.repo = i.repo AND v.number = i.number),
                     p.repo IS NOT NULL,
                     CASE WHEN p.repo IS NULL THEN i.sync_error END,
-                    p.stack, i.threads_resolved, i.threads_total, i.ci,
+                    p.stack, i.threads_resolved, i.threads_total,
+                    CASE WHEN p.review IS NOT NULL AND p.synced_ci IS i.ci
+                         THEN lower(json_extract(p.review, '$.ci')) ELSE i.ci END,
                     CASE WHEN p.review IS NULL THEN i.review_decision
                          ELSE json_extract(p.review, '$.decision') END
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
@@ -742,20 +751,23 @@ impl Db {
     }
 
     pub fn sync_mark(&self, key: &PrKey) -> Result<Option<SyncMark>> {
-        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+        type Row = (Option<String>, Option<String>, Option<String>, bool);
+        let row: Option<Row> = self
             .conn()
             .query_row(
-                "SELECT synced_updated_at, synced_head_oid, synced_ci FROM prs
-                 WHERE repo = ? AND number = ?",
+                "SELECT synced_updated_at, synced_head_oid, synced_ci,
+                        COALESCE(json_extract(review, '$.ci') = 'Running', 0)
+                 FROM prs WHERE repo = ? AND number = ?",
                 params![key.repo, key.number],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
         Ok(match row {
-            Some((Some(updated_at), Some(head_oid), ci)) => Some(SyncMark {
+            Some((Some(updated_at), Some(head_oid), ci, checks_running)) => Some(SyncMark {
                 updated_at,
                 head_oid,
                 ci: ci.as_deref().and_then(parse_ci),
+                checks_running,
             }),
             _ => None,
         })
@@ -1847,8 +1859,26 @@ mod tests {
                 updated_at: "2026-01-02T00:00:00Z".into(),
                 head_oid: "h".into(),
                 ci: Some(CiStatus::Running),
+                checks_running: false,
             })
         );
+        // The search reports something other than what GitHub said at the
+        // sync, so it's newer.
+        assert_eq!(db.inbox_prs(1).unwrap()[0].ci, Some(CiStatus::Failing));
+        // Once they agree, the sync's state counts: unlike GitHub's, it
+        // leaves out the runs that later runs superseded.
+        let mut agreed = with_review.clone();
+        agreed.ci = Some(CiStatus::Failing);
+        db.store_sync(&agreed, &versions, &comments, None, false, None)
+            .unwrap();
+        assert_eq!(db.inbox_prs(1).unwrap()[0].ci, Some(CiStatus::Passing));
+        agreed.review.as_mut().unwrap().ci = Some(CiStatus::Running);
+        db.store_sync(&agreed, &versions, &comments, None, false, None)
+            .unwrap();
+        assert_eq!(db.inbox_prs(1).unwrap()[0].ci, Some(CiStatus::Running));
+        assert!(db.sync_mark(&key).unwrap().unwrap().checks_running);
+        db.store_sync(&with_review, &versions, &comments, None, false, None)
+            .unwrap();
 
         // A sync that couldn't read the reviews keeps the stored ones and
         // says why.
