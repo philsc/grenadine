@@ -1336,21 +1336,21 @@ pub fn offered_option(
 }
 
 /// Queues `prompt` next, before the ones already waiting, with the
-/// running turn's mode and model unless the follow-up plans again.
-pub fn queue_next(state: &State, id: &str, prompt: String, plan: bool) {
+/// running turn's model, and its mode unless `mode` says otherwise.
+pub fn queue_next(state: &State, id: &str, prompt: String, mode: Option<PermissionMode>) {
     state.agents.with_live(id, |l| {
         // An interrupted turn doesn't send the denial's feedback again.
         if l.interrupted {
             return;
         }
-        let (mode, model) = l
+        let (turn_mode, model) = l
             .turn
             .clone()
             .unwrap_or_else(|| (PermissionMode::plan(), None));
         l.queue.push_front(Queued {
             prompt,
             images: Vec::new(),
-            mode: if plan { PermissionMode::plan() } else { mode },
+            mode: mode.clone().unwrap_or(turn_mode),
             model,
         });
     });
