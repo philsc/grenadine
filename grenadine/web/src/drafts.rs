@@ -24,6 +24,10 @@ pub struct Draft {
     #[serde(default)]
     pub backend: AgentBackend,
     pub mode: PermissionMode,
+    /// Whether the user picked `mode`; until then the form's mode follows
+    /// the repository's default for the backend.
+    #[serde(default)]
+    pub mode_picked: bool,
     pub model: String,
     /// When the form was opened, in milliseconds since the epoch.
     pub created_at: f64,
@@ -104,6 +108,7 @@ impl Drafts {
                 // New sessions start out planning, whatever the others go
                 // on with.
                 mode: PermissionMode::plan(),
+                mode_picked: false,
                 model: crate::agents::last_model(backend),
                 created_at: now,
             })
@@ -128,6 +133,7 @@ impl Drafts {
             prompt: String::new(),
             backend,
             mode: PermissionMode::plan(),
+            mode_picked: false,
             model: crate::agents::last_model(backend),
             created_at: js_sys::Date::now(),
         };
@@ -177,6 +183,7 @@ mod tests {
             prompt: prompt.into(),
             backend: AgentBackend::Claude,
             mode: PermissionMode::plan(),
+            mode_picked: false,
             model: "default".into(),
             created_at,
         }

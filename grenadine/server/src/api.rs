@@ -1251,6 +1251,18 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // A permission mode the backend doesn't have isn't either.
+        let bad_mode = RepoSettings {
+            session_modes: [(grenadine_core::api::AgentBackend::Devin, "auto".into())]
+                .into_iter()
+                .collect(),
+            ..RepoSettings::default()
+        };
+        let response = set_repo_settings(AxState(state.clone()), path(), Json(bad_mode))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

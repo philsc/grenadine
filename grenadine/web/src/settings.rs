@@ -1,6 +1,6 @@
 //! A repository's settings, edited in a dialog over the agents' pages.
 
-use grenadine_core::api::{AutoReview, RepoSettings};
+use grenadine_core::api::{AgentBackend, AutoReview, PermissionMode, RepoSettings};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -133,7 +133,11 @@ fn SettingsDialog(
                 <div class="repo-settings-body">
                     {move || match (loaded.get(), draft.with(Option::is_some)) {
                         (Some(Err(e)), _) => view! { <p class="error">{e}</p> }.into_any(),
-                        (_, true) => view! { <ReviewFields draft=draft /> }.into_any(),
+                        (_, true) => view! {
+                            <ReviewFields draft=draft />
+                            <NewSessionFields draft=draft />
+                        }
+                        .into_any(),
                         _ => view! { <p class="muted">"Loading…"</p> }.into_any(),
                     }}
                     {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
@@ -234,6 +238,69 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
             <p class="hint muted">
                 "The skill the review runs, e.g. code-review, given the pull request. Without "
                 "one, the agent reviews it with a plain prompt."
+            </p>
+        </fieldset>
+    }
+}
+
+/// The settings the New session form starts with, edited in `draft`,
+/// which is loaded.
+#[component]
+fn NewSessionFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
+    let get =
+        move |f: fn(&RepoSettings) -> String| draft.with(|d| d.as_ref().map(f).unwrap_or_default());
+    let edit = move |f: Box<dyn FnOnce(&mut RepoSettings)>| {
+        draft.update(|d| {
+            if let Some(d) = d {
+                f(d);
+            }
+        })
+    };
+    view! {
+        <fieldset class="repo-settings-fields">
+            <legend>"New sessions"</legend>
+            {AgentBackend::ALL.into_iter().map(|b| {
+                let label = format!("{} permissions", b.agent_name());
+                view! {
+                    <label>{label}
+                        <select
+                            prop:value=move || draft.with(|d| {
+                                d.as_ref()
+                                    .and_then(|d| d.session_modes.get(&b))
+                                    .map(|m| m.as_str().to_owned())
+                                    .unwrap_or_else(|| PermissionMode::plan().as_str().to_owned())
+                            })
+                            on:change=move |ev| {
+                                let mode = PermissionMode::new(event_target_value(&ev));
+                                edit(Box::new(move |d| {
+                                    d.session_modes.insert(b, mode);
+                                }));
+                            }
+                        >
+                            {b.modes().iter().map(|&(value, label)| view! {
+                                <option value=value>{label}</option>
+                            }).collect_view()}
+                        </select>
+                    </label>
+                }
+            }).collect_view()}
+            <label>"Default skill"
+                <input
+                    type="text"
+                    class="mono"
+                    placeholder="None"
+                    prop:value=move || get(|d| d.session_skill.clone().unwrap_or_default())
+                    on:input=move |ev| {
+                        let skill = event_target_value(&ev);
+                        edit(Box::new(move |d| {
+                            d.session_skill = (!skill.trim().is_empty()).then_some(skill)
+                        }));
+                    }
+                />
+            </label>
+            <p class="hint muted">
+                "The skill a new session's prompt runs, e.g. foo makes \"bar\" start as "
+                "\"/foo bar\". A prompt that starts with its own /skill runs that instead."
             </p>
         </fieldset>
     }

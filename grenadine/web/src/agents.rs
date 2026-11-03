@@ -869,13 +869,15 @@ fn mode_signal(id: &str, backend: Signal<Option<AgentBackend>>) -> RwSignal<Perm
 }
 
 /// Picks one of `backend`'s permission modes, or with `after_plan`, one
-/// a turn can go on in once a plan is approved.
+/// a turn can go on in once a plan is approved. `picked`, if given, is
+/// set once the user picks a mode.
 #[component]
 fn ModeSelect(
     mode: RwSignal<PermissionMode>,
     backend: Signal<AgentBackend>,
     #[prop(default = false)] after_plan: bool,
     #[prop(default = "Permissions")] label: &'static str,
+    #[prop(optional)] picked: Option<RwSignal<bool>>,
 ) -> impl IntoView {
     view! {
         <select
@@ -883,7 +885,12 @@ fn ModeSelect(
             aria-label=label
             title=move || format!("What {} may do without asking here", backend.get().agent_name())
             prop:value=move || mode.with(|m| m.as_str().to_owned())
-            on:change=move |ev| mode.set(PermissionMode::new(event_target_value(&ev)))
+            on:change=move |ev| {
+                mode.set(PermissionMode::new(event_target_value(&ev)));
+                if let Some(picked) = picked {
+                    picked.set(true);
+                }
+            }
         >
             {move || {
                 let backend = backend.get();
@@ -1057,11 +1064,23 @@ fn submits(ev: &web_sys::KeyboardEvent) -> bool {
     ev.key() == "Enter" && !ev.shift_key() && !ev.is_composing()
 }
 
+/// The prompt a session's first turn gets: `skill` applied to `prompt`,
+/// unless the prompt starts with a `/` and so names its own skill, or
+/// there is none.
+fn with_skill(prompt: &str, skill: Option<&str>) -> String {
+    let trimmed = prompt.trim_start();
+    match (skill, trimmed.starts_with('/')) {
+        (Some(skill), false) => format!("/{skill} {trimmed}"),
+        _ => prompt.to_owned(),
+    }
+}
+
 /// The form that starts a session, filled in from the draft with id
 /// `draft` and kept in it as it changes.
 #[component]
 pub fn NewSession(draft: String) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
+    let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
     let saved = drafts.open(&draft);
     // Drafts saved before they defaulted to `GENERAL` have no repository.
@@ -1088,29 +1107,65 @@ pub fn NewSession(draft: String) -> impl IntoView {
         }
     });
     let mode = RwSignal::new(offered_mode(saved.backend, Some(saved.mode.as_str())));
-    // The draft's model goes until the backend changes.
-    let model = model_signal(backend.into());
-    model.set(saved.model);
-    // A mode the backend doesn't offer goes back to its default.
+    // Whether the user picked the mode; until then it follows the
+    // repository's default for the backend.
+    let mode_picked = RwSignal::new(saved.mode_picked);
+    // The repository's session defaults, refetched when they change; a
+    // session in no repository has none, and a failed fetch counts as
+    // none.
+    let settings = LocalResource::new(move || {
+        updates.repo_settings.track();
+        let repo = repo.get();
+        async move {
+            if repo == GENERAL {
+                None
+            } else {
+                api::repo_settings(&repo).await.ok()
+            }
+        }
+    });
+    // The mode the repository starts a session of this backend with;
+    // `plan` until it says otherwise.
+    let default_mode = Memo::new(move |_| {
+        let backend = backend.get();
+        settings
+            .get()
+            .flatten()
+            .and_then(|s| s.session_modes.get(&backend).cloned())
+            .filter(|m| backend.has_mode(m.as_str()))
+            .unwrap_or_else(PermissionMode::plan)
+    });
+    // The skill the repository starts a session's first prompt with.
+    let default_skill = Memo::new(move |_| settings.get().flatten().and_then(|s| s.session_skill));
+    // An unpicked mode follows the repository's default for the backend;
+    // a picked one the backend doesn't offer goes back to its default.
     Effect::new(move |_| {
         let m = mode.get_untracked();
-        let offered = offered_mode(backend.get(), Some(m.as_str()));
+        let offered = if mode_picked.get() {
+            offered_mode(backend.get(), Some(m.as_str()))
+        } else {
+            default_mode.get()
+        };
         if offered != m {
             mode.set(offered);
         }
     });
+    // The draft's model goes until the backend changes.
+    let model = model_signal(backend.into());
+    model.set(saved.model);
     // Drafts keep only the text; images last as long as the form.
     let images = RwSignal::new(Vec::<PromptImage>::new());
     let error = RwSignal::new(None::<String>);
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
-        let (repo, pr, prompt, backend, mode, model) = (
+        let (repo, pr, prompt, backend, mode, mode_picked, model) = (
             repo.get(),
             number.get(),
             prompt.get(),
             picked.get(),
             mode.get(),
+            mode_picked.get(),
             model.get(),
         );
         drafts.update(&id.get_value(), |d| {
@@ -1120,6 +1175,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 prompt,
                 backend,
                 mode,
+                mode_picked,
                 model,
                 ..d.clone()
             }
@@ -1151,7 +1207,10 @@ pub fn NewSession(draft: String) -> impl IntoView {
             backend: backend.get_untracked(),
             repo: repo.get_untracked(),
             pr,
-            prompt: prompt.get_untracked(),
+            prompt: with_skill(
+                &prompt.get_untracked(),
+                default_skill.get_untracked().as_deref(),
+            ),
             permission_mode: mode.get_untracked(),
             model: model_arg(model),
             images: images.get_untracked(),
@@ -1232,7 +1291,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         />
                     </label>
                     <label>"Permissions"
-                        <ModeSelect mode=mode backend=backend.into() />
+                        <ModeSelect mode=mode backend=backend.into() picked=mode_picked />
                     </label>
                     <label>"Model" <ModelSelect model=model backend=backend.into() /></label>
                 </div>
@@ -1253,6 +1312,11 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 ></textarea>
                 <Attachments images=images />
                 <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
+                {move || default_skill.get().map(|skill| view! {
+                    <p class="hint muted">
+                        {format!("Starts as /{skill} …, unless the prompt starts with a /skill of its own.")}
+                    </p>
+                })}
                 {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
@@ -2735,6 +2799,15 @@ mod tests {
         assert_eq!(usage_level(75.0), "orange");
         assert_eq!(usage_level(75.1), "red");
         assert_eq!(usage_level(120.0), "red");
+    }
+
+    #[test]
+    fn prompt_with_skill() {
+        assert_eq!(with_skill("bar", Some("foo")), "/foo bar");
+        assert_eq!(with_skill("/baz bar", Some("foo")), "/baz bar");
+        assert_eq!(with_skill("  /baz bar", Some("foo")), "  /baz bar");
+        assert_eq!(with_skill("bar", None), "bar");
+        assert_eq!(with_skill("bar\nbaz", Some("foo")), "/foo bar\nbaz");
     }
 
     #[test]
