@@ -2048,7 +2048,13 @@ fn PlanCard(
         }
         // The turn that asked is gone, so the answer starts a new one.
         let prompt = if allow {
-            "I approve the plan. Carry it out.".to_string()
+            match message {
+                Some(m) => format!(
+                    "I approve the plan. Carry it out, keeping the following in mind:\n\n{}",
+                    m.trim()
+                ),
+                None => "I approve the plan. Carry it out.".to_string(),
+            }
         } else {
             message.unwrap_or_else(|| "Keep planning.".to_string())
         };
