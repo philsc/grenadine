@@ -2762,9 +2762,11 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(plan).to_contain_text("The turn ended before the plan was answered")
         plan.get_by_label("After the plan").select_option(label="Accept edits")
+        # What's in the box goes along with the approval.
+        plan.get_by_label("Feedback").fill("Use tabs.")
         plan.get_by_role("button", name="Approve plan").click()
         expect(transcript.locator(".turn-prompt").last).to_have_text(
-            "I approve the plan. Carry it out."
+            "I approve the plan. Carry it out, keeping the following in mind:\n\nUse tabs."
         )
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
         expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
