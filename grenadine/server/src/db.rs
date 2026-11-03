@@ -7,10 +7,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
-    AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, CiStatus,
-    CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary,
-    RepoSettings, ReviewComment, ReviewDecision, ReviewInfo, Stack, ThreadCounts, Version,
-    VersionKind,
+    AgentBackend, AgentEvent, AgentEventKind, AgentPrs, AgentSession, AgentStatus, AutoReviewEntry,
+    AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed, Person, PrDetail,
+    PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo, SessionKind, Stack,
+    ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -328,6 +328,36 @@ const MIGRATIONS: &[Migration] = &[
     CREATE TABLE repo_settings (
         repo TEXT PRIMARY KEY,
         json TEXT NOT NULL
+    );
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- Who started the session, an api::SessionKind.
+    ALTER TABLE agents ADD COLUMN kind TEXT NOT NULL DEFAULT 'interactive';
+
+    -- The reviews of the viewer's PRs that the server started. A row
+    -- outlives its session, which is deleted once it posted the review,
+    -- and keeps the same commit of a PR from being reviewed twice.
+    CREATE TABLE auto_reviews (
+        id INTEGER PRIMARY KEY,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_oid TEXT NOT NULL,
+        title TEXT NOT NULL,
+        url TEXT NOT NULL,
+        -- NULL once the session is deleted.
+        agent_id TEXT,
+        -- An api::AutoReviewState: running, posted, unposted, failed or
+        -- cancelled.
+        state TEXT NOT NULL,
+        -- Unix seconds.
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        cost REAL NOT NULL DEFAULT 0,
+        cost_unit TEXT NOT NULL DEFAULT 'usd',
+        error TEXT,
+        UNIQUE (repo, number, head_oid)
     );
 "#,
     ),
@@ -1147,8 +1177,8 @@ impl Db {
         self.conn().execute(
             "INSERT INTO agents
                 (id, backend, repo, pr_number, title, branch, worktree, base_sha, status,
-                 cost, cost_unit, context_tokens, context_window, model, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 cost, cost_unit, context_tokens, context_window, model, created_at, kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -1164,7 +1194,8 @@ impl Db {
                 a.context_tokens,
                 a.context_window,
                 a.model,
-                a.created_at
+                a.created_at,
+                a.kind.as_str()
             ],
         )?;
         Ok(())
@@ -1389,6 +1420,142 @@ impl Db {
         Ok(())
     }
 
+    /// Ends the reviews whose sessions were working when the server
+    /// stopped, as `interrupt_agents` does to the sessions.
+    pub fn interrupt_auto_reviews(&self, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reviews SET state = 'failed', finished_at = ?,
+                error = 'The server stopped during the review.'
+             WHERE state = 'running'",
+            [now],
+        )?;
+        Ok(())
+    }
+
+    /// Records a review of `key` at `head_oid` starting. Returns its id,
+    /// or `None` when that commit already had a review.
+    pub fn start_auto_review(
+        &self,
+        key: &PrKey,
+        head_oid: &str,
+        title: &str,
+        url: &str,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        let conn = self.conn();
+        let n = conn.execute(
+            "INSERT INTO auto_reviews (repo, number, head_oid, title, url, state, started_at)
+             VALUES (?, ?, ?, ?, ?, 'running', ?)
+             ON CONFLICT (repo, number, head_oid) DO NOTHING",
+            params![key.repo, key.number, head_oid, title, url, now],
+        )?;
+        Ok((n > 0).then(|| conn.last_insert_rowid()))
+    }
+
+    pub fn set_auto_review_session(&self, id: i64, agent_id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reviews SET agent_id = ? WHERE id = ?",
+            params![agent_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Records how the review `id` ended, unless it already had.
+    pub fn finish_auto_review(
+        &self,
+        id: i64,
+        state: AutoReviewState,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reviews SET state = ?, error = ?, finished_at = ?
+             WHERE id = ? AND state = 'running'",
+            params![auto_review_state_str(state), error, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// The review that session `agent_id` is doing, if it's doing one.
+    pub fn auto_review_of(&self, agent_id: &str) -> Result<Option<AutoReviewEntry>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {AUTO_REVIEW_COLUMNS} WHERE r.agent_id = ?"),
+                [agent_id],
+                auto_review_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Cancels the review that session `agent_id` is doing, if it's still
+    /// running, as the session is about to be deleted.
+    pub fn cancel_auto_review(&self, agent_id: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reviews SET state = 'cancelled', finished_at = ?
+             WHERE agent_id = ? AND state = 'running'",
+            params![now, agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Detaches the review of session `agent_id` from it as the session is
+    /// deleted, keeping the session's cost.
+    pub fn auto_review_session_deleted(&self, agent_id: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE auto_reviews SET
+                cost = COALESCE((SELECT cost FROM agents WHERE id = ?1), cost),
+                cost_unit = COALESCE((SELECT cost_unit FROM agents WHERE id = ?1), cost_unit),
+                agent_id = NULL
+             WHERE agent_id = ?1",
+            [agent_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every review, newest first.
+    pub fn auto_reviews(&self) -> Result<Vec<AutoReviewEntry>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AUTO_REVIEW_COLUMNS} ORDER BY r.started_at DESC, r.id DESC"
+        ))?;
+        let rows = stmt.query_map([], auto_review_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The reviews of `key`, newest first.
+    pub fn auto_reviews_of(&self, key: &PrKey) -> Result<Vec<AutoReviewEntry>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AUTO_REVIEW_COLUMNS} WHERE r.repo = ? AND r.number = ?
+             ORDER BY r.started_at DESC, r.id DESC"
+        ))?;
+        let rows = stmt.query_map(params![key.repo, key.number], auto_review_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets the reviews that ended before `before` and whose sessions
+    /// are gone. Returns whether there were any.
+    pub fn prune_auto_reviews(&self, before: i64) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM auto_reviews
+             WHERE agent_id IS NULL AND finished_at IS NOT NULL AND finished_at < ?",
+            [before],
+        )? > 0)
+    }
+
+    /// When the PR was opened, as GitHub has it, once it synced.
+    pub fn pr_created_at(&self, key: &PrKey) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT created_at FROM prs WHERE repo = ? AND number = ?",
+                params![key.repo, key.number],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Appends an event to a session's transcript and returns its `seq`.
     pub fn append_agent_event(&self, id: &str, kind: &AgentEventKind) -> Result<u64> {
         let conn = self.conn();
@@ -1511,7 +1678,8 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state != 'CLOSED'), \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id), \
      (SELECT COUNT(*) FROM agent_prs p \
-      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting)";
+      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting), \
+     kind";
 
 /// The session in `r`, and whether this build knows its backend and cost
 /// unit; unknown ones read as the defaults.
@@ -1546,8 +1714,55 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
         }),
         // The listing looks at the worktree for these.
         unstaged: 0,
+        kind: SessionKind::parse(&r.get::<_, String>(21)?),
     };
     Ok((session, known))
+}
+
+const AUTO_REVIEW_COLUMNS: &str = "r.id, r.repo, r.number, r.title, r.url, r.head_oid, r.state, \
+     r.agent_id, a.status, r.started_at, r.finished_at, COALESCE(a.cost, r.cost), \
+     COALESCE(a.cost_unit, r.cost_unit), r.error \
+     FROM auto_reviews r LEFT JOIN agents a ON a.id = r.agent_id";
+
+fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> {
+    Ok(AutoReviewEntry {
+        id: r.get(0)?,
+        key: PrKey {
+            repo: r.get(1)?,
+            number: r.get(2)?,
+        },
+        title: r.get(3)?,
+        url: r.get(4)?,
+        head_oid: r.get(5)?,
+        state: parse_auto_review_state(&r.get::<_, String>(6)?),
+        session: r.get(7)?,
+        status: r.get::<_, Option<String>>(8)?.map(|s| parse_status(&s)),
+        started_at: r.get(9)?,
+        finished_at: r.get(10)?,
+        cost: r.get(11)?,
+        cost_unit: CostUnit::parse(&r.get::<_, String>(12)?).unwrap_or_default(),
+        error: r.get(13)?,
+    })
+}
+
+fn auto_review_state_str(s: AutoReviewState) -> &'static str {
+    match s {
+        AutoReviewState::Running => "running",
+        AutoReviewState::Posted => "posted",
+        AutoReviewState::Unposted => "unposted",
+        AutoReviewState::Failed => "failed",
+        AutoReviewState::Cancelled => "cancelled",
+    }
+}
+
+fn parse_auto_review_state(s: &str) -> AutoReviewState {
+    match s {
+        "running" => AutoReviewState::Running,
+        "posted" => AutoReviewState::Posted,
+        "unposted" => AutoReviewState::Unposted,
+        "cancelled" => AutoReviewState::Cancelled,
+        _ => AutoReviewState::Failed,
+    }
 }
 
 fn status_str(s: AgentStatus) -> &'static str {

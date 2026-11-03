@@ -4,6 +4,7 @@
 
 mod agents;
 mod api;
+mod auto_reviews;
 mod composer;
 mod diffview;
 mod drafts;
@@ -40,6 +41,8 @@ pub struct Updates {
     pub terminals: RwSignal<u64>,
     /// Bumped when a repository's settings changed.
     pub repo_settings: RwSignal<u64>,
+    /// Bumped when a review of the viewer's PRs started or ended.
+    pub auto_reviews: RwSignal<u64>,
 }
 
 /// What the URL's hash shows.
@@ -62,6 +65,10 @@ pub enum Route {
     Agent(String),
     /// `#/agents/cleanup`: what deleted sessions left behind.
     Cleanup,
+    /// `#/auto-reviews`: the reviews of the viewer's PRs.
+    AutoReviews,
+    /// `#/auto-reviews/<id>`: the session doing one of them.
+    AutoReview(String),
 }
 
 fn pr_key(owner: &str, name: &str, number: &str) -> Option<PrKey> {
@@ -98,6 +105,8 @@ fn route_from_hash(hash: &str) -> Route {
         ["agents", "draft", id] if !id.is_empty() => Some(Route::Draft(id.to_owned())),
         ["agents", "cleanup"] => Some(Route::Cleanup),
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
+        ["auto-reviews"] => Some(Route::AutoReviews),
+        ["auto-reviews", id] if !id.is_empty() => Some(Route::AutoReview(id.to_owned())),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
         _ => None,
     };
@@ -150,6 +159,7 @@ fn listen(updates: Updates) {
         Ok(ServerEvent::CleanupChanged) => updates.cleanup.update(|n| *n += 1),
         Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
         Ok(ServerEvent::RepoSettingsChanged(_)) => updates.repo_settings.update(|n| *n += 1),
+        Ok(ServerEvent::AutoReviewsChanged) => updates.auto_reviews.update(|n| *n += 1),
         Err(_) => {}
     };
     // After a reconnect (e.g. the server restarted or the machine slept)
@@ -164,6 +174,7 @@ fn listen(updates: Updates) {
         updates.cleanup.update(|n| *n += 1);
         updates.terminals.update(|n| *n += 1);
         updates.repo_settings.update(|n| *n += 1);
+        updates.auto_reviews.update(|n| *n += 1);
         refetch_sync(updates);
     };
     events::subscribe("/api/events".into(), on_message, on_open);
@@ -186,6 +197,7 @@ fn App() -> impl IntoView {
         cleanup: RwSignal::new(0),
         terminals: RwSignal::new(0),
         repo_settings: RwSignal::new(0),
+        auto_reviews: RwSignal::new(0),
     };
     provide_context(updates);
     listen(updates);
@@ -218,6 +230,13 @@ fn App() -> impl IntoView {
     });
     // The sidebar stays mounted while going between the agents' pages.
     let on_agents = Memo::new(move |_| agents.with(Option::is_some));
+    let reviews = Memo::new(move |_| {
+        route.with(|r| match r {
+            Route::AutoReviews | Route::AutoReview(_) => Some(r.clone()),
+            _ => None,
+        })
+    });
+    let on_reviews = Memo::new(move |_| reviews.with(Option::is_some));
 
     // The inboxes stay mounted while another page is shown so that going
     // back is instant. Hiding them loses their scroll position, so
@@ -261,6 +280,15 @@ fn App() -> impl IntoView {
                         }.into_any(),
                         Route::Cleanup => view! { <main class="main"><agents::CleanupView /></main> }.into_any(),
                         _ => ().into_any(),
+                    })}
+                </div>
+            })}
+            {move || on_reviews.get().then(|| view! {
+                <div class="agents-page">
+                    <auto_reviews::Sidebar route=route.into() />
+                    {move || reviews.get().map(|r| match r {
+                        Route::AutoReview(id) => view! { <agents::AgentView id=id read_only=true /> }.into_any(),
+                        _ => view! { <main class="main"><auto_reviews::Overview /></main> }.into_any(),
                     })}
                 </div>
             })}
@@ -335,6 +363,12 @@ mod tests {
         assert_eq!(route_from_hash("#/agents/abc"), Route::Agent("abc".into()));
         assert_eq!(route_from_hash("#/agents/cleanup"), Route::Cleanup);
         assert_eq!(route_from_hash("#/agents/"), Route::Inboxes);
+        assert_eq!(route_from_hash("#/auto-reviews"), Route::AutoReviews);
+        assert_eq!(
+            route_from_hash("#/auto-reviews/abc"),
+            Route::AutoReview("abc".into())
+        );
+        assert_eq!(route_from_hash("#/auto-reviews/"), Route::Inboxes);
         // An owner called "agents" still has PRs.
         assert_eq!(
             route_from_hash("#/agents/n/7"),

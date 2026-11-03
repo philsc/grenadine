@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
     AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey,
-    PromptImage, ServerEvent, WrapUp, WrapUpTarget,
+    PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -875,6 +875,7 @@ impl Agents {
         summaries: bool,
     ) -> Result<Agents> {
         db.interrupt_agents()?;
+        db.interrupt_auto_reviews(now())?;
         // The backend runs in the worktrees, so a relative path would
         // resolve differently there.
         let worktrees = std::path::absolute(&worktrees)?;
@@ -1024,6 +1025,18 @@ pub fn set_status(state: &State, id: &str, status: AgentStatus) {
 /// Creates the session's worktree, or a plain directory for a general
 /// session, and starts working on its first prompt.
 pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
+    create_session(state, req, SessionKind::Interactive, None).await
+}
+
+/// Creates a session as `create` does, of `kind`, titled `title` or
+/// else after its first prompt. Only interactive sessions get a summary
+/// of their prompt.
+pub async fn create_session(
+    state: &Arc<State>,
+    req: NewAgent,
+    kind: SessionKind,
+    title: Option<String>,
+) -> Result<AgentSession> {
     if req.prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
@@ -1046,7 +1059,7 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         backend: req.backend,
         repo: req.repo,
         pr: req.pr,
-        title: title(&req.prompt),
+        title: title.unwrap_or_else(|| self::title(&req.prompt)),
         summary: None,
         branch,
         worktree: worktree.to_string_lossy().into_owned(),
@@ -1061,11 +1074,14 @@ pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
         landed: None,
         prs: None,
         unstaged: 0,
+        kind,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
-    crate::summary::start(state, &id, session.backend, &req.prompt);
+    if kind == SessionKind::Interactive {
+        crate::summary::start(state, &id, session.backend, &req.prompt);
+    }
     send_with_images(
         state,
         &id,
@@ -1384,6 +1400,9 @@ pub async fn await_approval(
     input: &Value,
     options: Vec<ApprovalOption>,
 ) -> Option<Decision> {
+    if matches!(state.db.agent(id), Ok(Some(s)) if s.kind == SessionKind::AutoReview) {
+        return Some(deny_unattended(state, id, tool_use, tool_name, input));
+    }
     let rx = match request_approval(state, id, tool_use, tool_name, input, options) {
         Ok(rx) => rx,
         Err(e) => {
@@ -1399,6 +1418,43 @@ pub async fn await_approval(
     tokio::select! {
         d = rx => d.ok(),
         _ = state.shutdown.cancelled() => None,
+    }
+}
+
+/// What an unattended session is told when it asks for a tool.
+pub const UNATTENDED_DENIAL: &str = "This is an unattended review that nobody can answer or \
+     approve tools for. Go on without this tool.";
+
+/// Denies a request of an unattended session right away, showing the
+/// request and its denial in the transcript as if the user had answered.
+fn deny_unattended(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    tool_name: &str,
+    input: &Value,
+) -> Decision {
+    for kind in [
+        AgentEventKind::ApprovalRequested {
+            id: tool_use.to_owned(),
+            tool_name: tool_name.to_owned(),
+            input: input.to_string(),
+            options: Vec::new(),
+        },
+        AgentEventKind::ApprovalResolved {
+            id: tool_use.to_owned(),
+            allow: false,
+            message: Some(UNATTENDED_DENIAL.to_owned()),
+        },
+    ] {
+        if let Err(e) = emit(state, id, kind) {
+            tracing::warn!("agent {id}: {e:#}");
+        }
+    }
+    Decision {
+        allow: false,
+        message: Some(UNATTENDED_DENIAL.to_owned()),
+        ..Decision::default()
     }
 }
 
@@ -1457,6 +1513,11 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     // The transcript goes with the session; the scan reads it after.
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
+    // Before the interrupt, which would end the review on its own.
+    let reviewing = session.kind == SessionKind::AutoReview;
+    if reviewing {
+        state.db.cancel_auto_review(id, now())?;
+    }
     interrupt(state, id);
     // The worktree's processes that have a terminal are left alone below,
     // but these shells go with the session.
@@ -1516,11 +1577,18 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         }
         _ => {}
     }
+    if reviewing {
+        state.db.auto_review_session_deleted(id)?;
+    }
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
     state.agents.terminals.forget(id);
     state.send(ServerEvent::AgentsChanged);
-    if known {
+    if reviewing {
+        state.send(ServerEvent::AutoReviewsChanged);
+    }
+    // A review only reads its worktree, so it leaves nothing behind.
+    if known && !reviewing {
         crate::cleanup::scan(state, scanned, events);
     }
     Ok(true)
@@ -1542,6 +1610,7 @@ async fn run(state: Arc<State>, id: String) {
         });
         let Some(queued) = prompt else {
             if !waiting {
+                crate::auto_review::session_done(&state, &id, last);
                 return;
             }
             if last == AgentStatus::Idle {
@@ -1939,10 +2008,14 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         state.agents.base_url,
         state.agents.secret(id)
     );
-    let notes: Vec<_> = [landed_note(&session), terminals_note(state, id)]
-        .into_iter()
-        .flatten()
-        .collect();
+    let notes: Vec<_> = [
+        (session.kind == SessionKind::AutoReview).then(|| crate::auto_review::NOTE.to_owned()),
+        landed_note(&session),
+        terminals_note(state, id),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let sink = TurnSink::new(state, id, &session.repo);
     let turn = Turn {
         prompt: &prompt,

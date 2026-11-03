@@ -3,6 +3,7 @@
 mod agent;
 mod api;
 mod assets;
+mod auto_review;
 mod claude;
 mod cleanup;
 mod db;
@@ -233,6 +234,10 @@ async fn main() -> Result<()> {
     }
     if let Err(e) = agent::remove_orphaned_images(&db, agents.images()) {
         tracing::warn!("can't remove orphaned images: {e:#}");
+    }
+
+    if let Err(e) = auto_review::start_watching(&db, repos.keys(), agent::now()) {
+        tracing::warn!("can't set up reviewing PRs: {e:#}");
     }
 
     let mut signals = Signals::new()?;

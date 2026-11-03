@@ -12,6 +12,7 @@ See [AGENTS.md](AGENTS.md) for building, testing and linting.
 
 - [Inbox filters](#inbox-filters)
 - [Default inboxes](#default-inboxes)
+- [Auto-reviews](#auto-reviews)
 
 ## Inbox filters
 
@@ -142,3 +143,17 @@ Your open PRs that aren't drafts each appear in exactly one of Returned to you, 
 - Waiting for reviewers has the ones with neither an active review nor approval.
 
 `bazel run //grenadine/server:validate_inboxes` checks this against live GitHub data.
+
+## Auto-reviews
+
+Grenadine reviews the pull requests you open in its repositories. Each review runs in an unattended agent session that posts its review on the PR. These sessions are listed in the Auto-reviews tab, not the Agents tab.
+
+The gear next to a repository's name in the Agents tab opens the repository's settings:
+
+- **Review my pull requests**: Never, "When opened, once they're not drafts" (the default), or "When opened, drafts too". PRs opened before reviews were turned on for the repository aren't reviewed.
+- **Review again after new pushes**: off by default, so each PR is reviewed once.
+- **Review skill**: the skill the session runs, e.g. `code-review`. With none, the session gets a plain review prompt.
+
+The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
+
+Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.

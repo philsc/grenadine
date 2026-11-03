@@ -33,7 +33,72 @@ pub struct InboxEdit {
 /// settings saved before a field existed still load.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RepoSettings {}
+pub struct RepoSettings {
+    /// The skill that reviews of the viewer's PRs run, without its `/`;
+    /// `None` reviews them with a plain prompt.
+    pub review_skill: Option<String>,
+    /// Which of the viewer's PRs get reviewed.
+    pub auto_review: AutoReview,
+    /// Review a PR again when new commits are pushed to it.
+    pub rereview_on_push: bool,
+    /// Unix seconds. PRs opened before this aren't reviewed, so turning
+    /// reviews on doesn't review every PR that's already open. The
+    /// server sets it; what a page sends is ignored.
+    pub auto_review_since: Option<i64>,
+}
+
+/// Which of the viewer's open PRs an auto-review session reviews.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReview {
+    Off,
+    /// Those that aren't drafts; a draft once it's marked ready.
+    #[default]
+    NonDraft,
+    /// Drafts too.
+    IncludingDrafts,
+}
+
+/// How a review the server started went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReviewState {
+    /// Its session is working on it.
+    Running,
+    /// Its session posted on the PR, and was deleted.
+    Posted,
+    /// Its session finished without posting anything on the PR; the
+    /// session is kept.
+    Unposted,
+    /// Its session couldn't start, failed or was interrupted; the
+    /// session, if any, is kept.
+    Failed,
+    /// Its session was deleted before it finished.
+    Cancelled,
+}
+
+/// A review of one of the viewer's PRs that the server started.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutoReviewEntry {
+    pub id: i64,
+    pub key: PrKey,
+    pub title: String,
+    pub url: String,
+    /// The commit reviewed.
+    pub head_oid: String,
+    pub state: AutoReviewState,
+    /// The session doing the review; `None` once it's deleted.
+    pub session: Option<String>,
+    /// The session's status while it exists.
+    pub status: Option<AgentStatus>,
+    /// Unix seconds.
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub cost: f64,
+    pub cost_unit: CostUnit,
+    /// Why it failed, for `Failed`.
+    pub error: Option<String>,
+}
 
 /// Identifies a PR across the configured repositories.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -665,6 +730,8 @@ pub enum ServerEvent {
     TerminalsChanged(String),
     /// The settings of this repository (`owner/name`) changed.
     RepoSettingsChanged(String),
+    /// A review of the viewer's PRs started, finished or went away.
+    AutoReviewsChanged,
 }
 
 /// A login shell in an agent session's worktree.
@@ -793,6 +860,39 @@ pub struct AgentSession {
     /// `WorktreeChanges` has them; 0 once the worktree is gone.
     #[serde(default)]
     pub unstaged: u32,
+    /// Who started the session.
+    #[serde(default)]
+    pub kind: SessionKind,
+}
+
+/// Who started an agent session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// The user, from the Agents tab.
+    #[default]
+    Interactive,
+    /// The server, to review one of the viewer's PRs unattended. It's
+    /// listed in the Auto-reviews tab rather than the Agents tab.
+    AutoReview,
+}
+
+impl SessionKind {
+    /// The value the database names it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Interactive => "interactive",
+            SessionKind::AutoReview => "auto_review",
+        }
+    }
+
+    /// The kind `as_str` names; unknown ones are interactive.
+    pub fn parse(s: &str) -> SessionKind {
+        match s {
+            "auto_review" => SessionKind::AutoReview,
+            _ => SessionKind::Interactive,
+        }
+    }
 }
 
 impl AgentSession {
@@ -820,6 +920,7 @@ impl AgentSession {
             landed: None,
             prs: None,
             unstaged: 0,
+            kind: SessionKind::Interactive,
         }
     }
 }

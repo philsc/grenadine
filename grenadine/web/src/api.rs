@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
-    Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
+    AgentBackendInfo, AgentMessage, AgentSession, Approval, AutoReviewEntry, Blob, BlobsRequest,
+    BlobsResponse, Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
     NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
     PromptImage, RepoSettings, SubmitReview, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
@@ -76,6 +76,14 @@ pub async fn set_repo_settings(repo: &str, settings: &RepoSettings) -> Result<()
         .json(settings)
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
+}
+
+pub async fn auto_reviews() -> Result<Vec<AutoReviewEntry>> {
+    check(Request::get("/api/auto-reviews").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// What `/api/pr` answered for a PR that isn't synced.

@@ -261,21 +261,29 @@ impl State {
     pub fn resync(self: &Arc<State>, key: PrKey) {
         let state = self.clone();
         tokio::spawn(async move {
-            if !state.wait_to_claim(&key, RESYNC_WAIT).await {
-                if !state.shutdown.is_cancelled() {
-                    tracing::warn!(
-                        "{}#{}: gave up waiting for another sync to resync",
-                        key.repo,
-                        key.number
-                    );
-                }
-                return;
-            }
-            let result = sync_pr(&state, &key).await;
-            state.finish(&key, result);
-            state.send(ServerEvent::PrChanged(key));
-            state.send(ServerEvent::InboxesChanged);
+            state.resync_now(&key).await;
         });
+    }
+
+    /// Syncs `key` as `resync` does and waits for it. Returns whether the
+    /// sync ran and succeeded.
+    pub async fn resync_now(self: &Arc<State>, key: &PrKey) -> bool {
+        if !self.wait_to_claim(key, RESYNC_WAIT).await {
+            if !self.shutdown.is_cancelled() {
+                tracing::warn!(
+                    "{}#{}: gave up waiting for another sync to resync",
+                    key.repo,
+                    key.number
+                );
+            }
+            return false;
+        }
+        let result = sync_pr(self, key).await;
+        let ok = result.is_ok();
+        self.finish(key, result);
+        self.send(ServerEvent::PrChanged(key.clone()));
+        self.send(ServerEvent::InboxesChanged);
+        ok
     }
 
     /// Ends the poll and records its outcome.
@@ -362,6 +370,18 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     if let Err(e) = refresh_agent_prs(state).await {
         tracing::warn!("can't look up the agent sessions' PRs: {e:#}");
     }
+    // So are the viewer's PRs to review, which sync with the inboxes' so
+    // that a review starts from the PR's latest head.
+    let mine = match crate::auto_review::search(state).await {
+        Ok(mine) => mine,
+        Err(e) => {
+            tracing::warn!("can't look for PRs to review: {e:#}");
+            Vec::new()
+        }
+    };
+    for hit in &mine {
+        hits.entry(hit.key.clone()).or_insert_with(|| hit.clone());
+    }
 
     let stale: Vec<PrKey> = hits
         .into_values()
@@ -392,6 +412,9 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
             state.send(ServerEvent::InboxesChanged);
         })
         .await;
+    if !state.shutdown.is_cancelled() {
+        crate::auto_review::start_due(state, &mine).await;
+    }
     Ok(())
 }
 

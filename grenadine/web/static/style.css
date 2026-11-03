@@ -2019,3 +2019,47 @@ dialog.repo-settings::backdrop {
   color: var(--fg);
   background: none;
 }
+.repo-settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+.repo-settings-fields legend {
+  padding: 0;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.repo-settings-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.repo-settings-fields label.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.repo-settings-fields .hint {
+  margin: 0;
+  font-size: 12px;
+}
+
+.agent-status.posted {
+  color: var(--add-fg);
+  border-color: var(--add-fg);
+}
+.auto-reviews-overview {
+  max-width: 720px;
+  padding: 16px 24px;
+}
+.auto-reviews-overview h1 {
+  margin-top: 0;
+  font-size: 20px;
+}
+.review-note {
+  margin-right: auto;
+  font-size: 12px;
+}
