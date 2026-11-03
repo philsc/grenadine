@@ -6,3 +6,6 @@
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# New trail learnings are saved in ~/.trail with `trail note --personal`, not in the repo.
+/.trail/learnings/
