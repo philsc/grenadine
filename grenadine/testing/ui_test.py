@@ -1840,6 +1840,7 @@ class AgentTest(ServerTestCase):
         gear.click()
         expect(dialog).to_be_visible()
         expect(dialog.get_by_role("group", name="Auto-reviews")).to_be_visible()
+        expect(dialog.get_by_role("group", name="New sessions")).to_be_visible()
         # It stays open while polls redraw the sidebar.
         self.page.wait_for_timeout(2500)
         expect(dialog).to_be_visible()
@@ -1854,6 +1855,86 @@ class AgentTest(ServerTestCase):
 
         gear.click()
         dialog.get_by_role("button", name="Cancel").click()
+        expect(dialog).to_have_count(0)
+
+    def test_repo_session_defaults(self) -> None:
+        # The repository's settings pick the New session form's defaults.
+        self.page.goto(self.url + "#/agents")
+        gear = self.section(self.OTHER_REPO).get_by_role(
+            "button", name=f"Settings for {self.OTHER_REPO}"
+        )
+        dialog = self.page.get_by_role("dialog", name=f"{self.OTHER_REPO} settings")
+        gear.click()
+        dialog.get_by_label("Claude permissions").select_option(label="Accept edits")
+        dialog.get_by_label("Devin permissions").select_option(label="Smart")
+        dialog.get_by_label("Default skill").fill("/foo")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+
+        # Reopened, they persisted.
+        gear.click()
+        expect(dialog.get_by_label("Default skill")).to_have_value("foo")
+        expect(dialog.get_by_label("Claude permissions")).to_have_value("acceptEdits")
+        expect(dialog.get_by_label("Devin permissions")).to_have_value("smart")
+        self.page.keyboard.press("Escape")
+        expect(dialog).to_have_count(0)
+
+        # The form starts with them and follows repository and backend
+        # switches until a mode is picked by hand. The dialog's "Claude
+        # permissions"/"Devin permissions" labels contain "Permissions",
+        # so the form's is matched exactly.
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        expect(self.page.locator("dialog")).to_have_count(0)
+        permissions = self.page.get_by_label("Permissions", exact=True)
+        expect(permissions).to_have_value("acceptEdits")
+        expect(self.page.locator(".agent-form")).to_contain_text("/foo")
+        self.page.get_by_label("Backend").select_option(label="Devin")
+        expect(permissions).to_have_value("smart")
+        self.page.get_by_label("Repository").select_option(label="General")
+        expect(permissions).to_have_value("plan")
+        self.page.get_by_label("Repository").select_option(self.OTHER_REPO)
+        expect(permissions).to_have_value("smart")
+        permissions.select_option(label="Ask")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Repository").select_option(self.OTHER_REPO)
+        expect(permissions).to_have_value("ask")
+
+        # A prompt runs the repository's skill, which Devin sees.
+        permissions.select_option(label="Code")
+        self.page.get_by_label("Prompt").fill("bar")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt").first).to_have_text("/foo bar")
+        self.devin_saw("/foo bar")
+        transcript.locator(".approval").get_by_role("button", name="Allow").click()
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # A prompt with a skill of its own doesn't.
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions", exact=True).select_option(label="Code")
+        self.page.get_by_label("Prompt").fill("/baz bar")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(transcript.locator(".turn-prompt").first).to_have_text("/baz bar")
+        self.devin_saw("/baz bar")
+        transcript.locator(".approval").get_by_role("button", name="Allow").click()
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        sessions = self.section(self.OTHER_REPO).locator(".agent-entry")
+        expect(sessions).to_have_count(2)
+        for left in [1, 0]:
+            self.page.once("dialog", lambda dialog: dialog.accept())
+            sessions.first.get_by_role("button", name="Delete session").click()
+            expect(sessions).to_have_count(left)
+
+        # The settings go back to their defaults, "Plan first" and no
+        # skill, for the other tests.
+        gear.click()
+        dialog.get_by_label("Claude permissions").select_option(label="Plan first")
+        dialog.get_by_label("Devin permissions").select_option(label="Plan first")
+        dialog.get_by_label("Default skill").fill("")
+        dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
 
     def devin_saw(self, needle: str) -> None:

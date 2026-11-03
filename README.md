@@ -154,6 +154,11 @@ The gear next to a repository's name in the Agents tab opens the repository's se
 - **Review again after new pushes**: off by default, so each PR is reviewed once.
 - **Review skill**: the skill the session runs, e.g. `code-review`. With none, the session gets a plain review prompt.
 
+The same dialog sets what new sessions in the repository start with:
+
+- **Claude/Devin permissions**: the mode the New session form's Permissions starts with for that backend. Without one it starts in "Plan first".
+- **Default skill**: the skill a new session's first prompt runs, e.g. `foo` sends `bar` as `/foo bar`. A prompt that starts with its own `/skill` runs that instead.
+
 The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
 
 Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.

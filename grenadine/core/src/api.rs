@@ -45,6 +45,13 @@ pub struct RepoSettings {
     /// reviews on doesn't review every PR that's already open. The
     /// server sets it; what a page sends is ignored.
     pub auto_review_since: Option<i64>,
+    /// The skill a new session's first prompt runs, without its `/`. A
+    /// prompt that starts with `/` runs its own skill instead. `None`
+    /// sends the prompt as written.
+    pub session_skill: Option<String>,
+    /// The permissions the New session form starts with, per backend. A
+    /// backend without one starts in `PermissionMode::plan`.
+    pub session_modes: BTreeMap<AgentBackend, PermissionMode>,
 }
 
 /// Which of the viewer's open PRs an auto-review session reviews.

@@ -55,16 +55,12 @@ pub const NOTE: &str = "This is an unattended pull request review. Nobody reads 
 /// The longest skill name a repository's settings take.
 const MAX_SKILL: usize = 100;
 
-/// Checks the settings a page saves for a repository that had `old`, and
-/// returns what to store. Turning reviews on starts them from `now`;
-/// otherwise the old start stays.
-pub fn to_save(
-    old: &RepoSettings,
-    new: RepoSettings,
-    now: i64,
-) -> std::result::Result<RepoSettings, String> {
-    let review_skill = match new.review_skill.as_deref().map(str::trim) {
-        None | Some("") => None,
+/// The skill `raw` names: trimmed and without its `/`, or `None` for a
+/// blank. A name with other than letters, digits, '-', '_', ':' and '.'
+/// is an error.
+fn skill_name(raw: Option<&str>) -> std::result::Result<Option<String>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
         Some(skill) => {
             let skill = skill.strip_prefix('/').unwrap_or(skill);
             let ok = !skill.is_empty()
@@ -77,9 +73,30 @@ pub fn to_save(
                     "{skill:?} isn't a skill name: use letters, digits, '-', '_', ':' and '.'"
                 ));
             }
-            Some(skill.to_owned())
+            Ok(Some(skill.to_owned()))
         }
-    };
+    }
+}
+
+/// Checks the settings a page saves for a repository that had `old`, and
+/// returns what to store. Turning reviews on starts them from `now`;
+/// otherwise the old start stays.
+pub fn to_save(
+    old: &RepoSettings,
+    new: RepoSettings,
+    now: i64,
+) -> std::result::Result<RepoSettings, String> {
+    let review_skill = skill_name(new.review_skill.as_deref())?;
+    let session_skill = skill_name(new.session_skill.as_deref())?;
+    for (backend, mode) in &new.session_modes {
+        if !backend.has_mode(mode.as_str()) {
+            return Err(format!(
+                "{:?} isn't one of {}'s permission modes",
+                mode.as_str(),
+                backend.label()
+            ));
+        }
+    }
     let turned_on = old.auto_review == AutoReview::Off && new.auto_review != AutoReview::Off;
     let auto_review_since = match (turned_on, old.auto_review_since) {
         (false, Some(since)) => Some(since),
@@ -87,6 +104,7 @@ pub fn to_save(
     };
     Ok(RepoSettings {
         review_skill,
+        session_skill,
         auto_review_since,
         ..new
     })
@@ -544,6 +562,7 @@ mod tests {
             auto_review: mode,
             rereview_on_push: rereview,
             auto_review_since: Some(100),
+            ..RepoSettings::default()
         }
     }
 
@@ -616,6 +635,40 @@ mod tests {
             ..off.clone()
         };
         assert!(to_save(&off, plugin, 0).is_ok());
+    }
+
+    #[test]
+    fn saving_session_defaults() {
+        let old = RepoSettings::default();
+        let with = |skill: Option<&str>, modes: &[(&str, &str)]| RepoSettings {
+            session_skill: skill.map(Into::into),
+            session_modes: modes
+                .iter()
+                .map(|(b, m)| {
+                    (
+                        grenadine_core::api::AgentBackend::parse(b).unwrap(),
+                        PermissionMode::new(*m),
+                    )
+                })
+                .collect(),
+            ..RepoSettings::default()
+        };
+        let saved = to_save(&old, with(Some(" /foo "), &[]), 0).unwrap();
+        assert_eq!(saved.session_skill.as_deref(), Some("foo"));
+        assert_eq!(
+            to_save(&old, with(Some("  "), &[]), 0)
+                .unwrap()
+                .session_skill,
+            None
+        );
+        assert!(to_save(&old, with(Some("a b"), &[]), 0).is_err());
+        // A mode the backend doesn't have is rejected.
+        assert!(to_save(&old, with(None, &[("devin", "auto")]), 0).is_err());
+        let saved = to_save(&old, with(None, &[("claude", "acceptEdits")]), 0).unwrap();
+        assert_eq!(
+            saved.session_modes[&grenadine_core::api::AgentBackend::Claude].as_str(),
+            "acceptEdits"
+        );
     }
 
     #[test]
