@@ -10,7 +10,7 @@ use grenadine_core::api::{
     AgentBackendInfo, AgentMessage, AgentSession, Approval, Blob, BlobsRequest, BlobsResponse,
     Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest, Merged, NewAgent,
     NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    PromptImage, SubmitReview, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
+    PromptImage, RepoSettings, SubmitReview, SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -57,6 +57,25 @@ pub async fn delete_inbox(id: i64) -> Result<()> {
     check(Request::delete(&format!("/api/inboxes/{id}")).send().await)
         .await
         .map(|_| ())
+}
+
+pub async fn repo_settings(repo: &str) -> Result<RepoSettings> {
+    check(
+        Request::get(&format!("/api/repos/{repo}/settings"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub async fn set_repo_settings(repo: &str, settings: &RepoSettings) -> Result<()> {
+    let req = Request::put(&format!("/api/repos/{repo}/settings"))
+        .json(settings)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
 }
 
 /// What `/api/pr` answered for a PR that isn't synced.

@@ -17,7 +17,7 @@ use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, BlobsRequest,
     BlobsResponse, Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs, MergeRequest, Merged,
     NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, ServerEvent, SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
+    PrMissing, RepoSettings, ServerEvent, SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -102,6 +102,10 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/sync", get(sync_status))
         .route("/api/events", get(events))
         .route("/api/repos", get(repos))
+        .route(
+            "/api/repos/{owner}/{name}/settings",
+            get(repo_settings).put(set_repo_settings),
+        )
         .route(
             "/api/agents",
             get(agents)
@@ -578,6 +582,31 @@ async fn events(AxState(state): St) -> Sse<impl Stream<Item = Result<Event, Infa
 /// The configured repositories, for the page's repository pickers.
 async fn repos(AxState(state): St) -> Json<Vec<String>> {
     Json(state.repos.keys().cloned().collect())
+}
+
+async fn repo_settings(
+    AxState(state): St,
+    Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let repo = format!("{owner}/{name}");
+    if !state.repos.contains_key(&repo) {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(state.db.repo_settings(&repo)?).into_response())
+}
+
+async fn set_repo_settings(
+    AxState(state): St,
+    Path((owner, name)): Path<(String, String)>,
+    Json(settings): Json<RepoSettings>,
+) -> ApiResult<StatusCode> {
+    let repo = format!("{owner}/{name}");
+    if !state.repos.contains_key(&repo) {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    state.db.set_repo_settings(&repo, &settings)?;
+    state.send(ServerEvent::RepoSettingsChanged(repo));
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
@@ -1149,6 +1178,48 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repo_settings_are_only_for_configured_repos() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        let mut events = state.events.subscribe();
+
+        let response = repo_settings(AxState(state.clone()), path())
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, "{}");
+        let status = set_repo_settings(AxState(state.clone()), path(), Json(RepoSettings {}))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ServerEvent::RepoSettingsChanged(repo)) if repo == fx.clone.slug
+        ));
+
+        let other = || Path(("o".to_owned(), "n".to_owned()));
+        let response = repo_settings(AxState(state.clone()), other())
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let status = set_repo_settings(AxState(state.clone()), other(), Json(RepoSettings {}))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

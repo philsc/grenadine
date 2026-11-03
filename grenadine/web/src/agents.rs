@@ -22,6 +22,7 @@ use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
+use crate::settings::{Settings, SettingsButton};
 use crate::{Route, Updates, api, hash_for, markdown};
 
 fn agent_hash(id: &str) -> String {
@@ -374,6 +375,8 @@ pub fn Sidebar(
     });
     // Deleting from the sidebar failed.
     let error = RwSignal::new(None::<String>);
+    // The repository whose settings are open.
+    let settings = RwSignal::new(None::<String>);
 
     view! {
         <aside class="agent-sidebar">
@@ -385,12 +388,13 @@ pub fn Sidebar(
                 }
                 (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(with_general(repos), sessions, listed.get())
                     .into_iter()
-                    .map(|g| view! { <RepoSessions group=g route=route error=error /> })
+                    .map(|g| view! { <RepoSessions group=g route=route error=error settings=settings /> })
                     .collect_view()
                     .into_any(),
                 _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
             }}
             <CleanupSection route=route />
+            <Settings open=settings />
         </aside>
     }
 }
@@ -636,6 +640,7 @@ fn RepoSessions(
     group: RepoGroup,
     route: Signal<Route>,
     error: RwSignal<Option<String>>,
+    settings: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let RepoGroup {
         repo,
@@ -654,10 +659,12 @@ fn RepoSessions(
             "No agents in this repository yet. ",
         )
     };
+    let configurable = repo != GENERAL;
     view! {
         <section class="agent-repo">
             <h2 class="agent-repo-name">
                 <span>{repo_label(&repo).to_owned()}</span>
+                {configurable.then(|| view! { <SettingsButton repo=repo.clone() open=settings /> })}
                 <a href=new.clone() title=title>"+"</a>
             </h2>
             {if list.is_empty() && drafts.is_empty() {

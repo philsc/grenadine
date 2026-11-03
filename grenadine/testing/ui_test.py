@@ -1793,6 +1793,36 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
         expect(self.page.get_by_label("Repository")).to_have_value(self.OTHER_REPO)
 
+    def test_repo_settings_dialog(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        # Sessions in no repository have no settings.
+        expect(
+            self.section("General").get_by_role("button", name=re.compile("Settings"))
+        ).to_have_count(0)
+        gear = self.section(self.OTHER_REPO).get_by_role(
+            "button", name=f"Settings for {self.OTHER_REPO}"
+        )
+        dialog = self.page.get_by_role("dialog", name=f"{self.OTHER_REPO} settings")
+
+        gear.click()
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text("No settings yet.")
+        # It stays open while polls redraw the sidebar.
+        self.page.wait_for_timeout(2500)
+        expect(dialog).to_be_visible()
+        # Nothing changed, so there's nothing to save.
+        expect(dialog.get_by_role("button", name="Save")).to_be_disabled()
+        self.page.keyboard.press("Escape")
+        expect(dialog).to_have_count(0)
+
+        gear.click()
+        dialog.get_by_role("button", name="Close").click()
+        expect(dialog).to_have_count(0)
+
+        gear.click()
+        dialog.get_by_role("button", name="Cancel").click()
+        expect(dialog).to_have_count(0)
+
     def devin_saw(self, needle: str) -> None:
         # Waits until the fake devin's client log holds `needle`.
         for _ in range(200):

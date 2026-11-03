@@ -14,6 +14,7 @@ mod inboxes;
 mod markdown;
 mod pr;
 mod review;
+mod settings;
 mod terminal;
 mod theme;
 mod topbar;
@@ -37,6 +38,8 @@ pub struct Updates {
     pub cleanup: RwSignal<u64>,
     /// Bumped when a session's terminal opened or closed.
     pub terminals: RwSignal<u64>,
+    /// Bumped when a repository's settings changed.
+    pub repo_settings: RwSignal<u64>,
 }
 
 /// What the URL's hash shows.
@@ -146,6 +149,7 @@ fn listen(updates: Updates) {
         Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
         Ok(ServerEvent::CleanupChanged) => updates.cleanup.update(|n| *n += 1),
         Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
+        Ok(ServerEvent::RepoSettingsChanged(_)) => updates.repo_settings.update(|n| *n += 1),
         Err(_) => {}
     };
     // After a reconnect (e.g. the server restarted or the machine slept)
@@ -159,6 +163,7 @@ fn listen(updates: Updates) {
         updates.agents.update(|n| *n += 1);
         updates.cleanup.update(|n| *n += 1);
         updates.terminals.update(|n| *n += 1);
+        updates.repo_settings.update(|n| *n += 1);
         refetch_sync(updates);
     };
     events::subscribe("/api/events".into(), on_message, on_open);
@@ -180,6 +185,7 @@ fn App() -> impl IntoView {
         agents: RwSignal::new(0),
         cleanup: RwSignal::new(0),
         terminals: RwSignal::new(0),
+        repo_settings: RwSignal::new(0),
     };
     provide_context(updates);
     listen(updates);

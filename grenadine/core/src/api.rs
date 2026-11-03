@@ -29,6 +29,12 @@ pub struct InboxEdit {
     pub count_in_total: bool,
 }
 
+/// A configured repository's settings. Every field has a default, so
+/// settings saved before a field existed still load.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoSettings {}
+
 /// Identifies a PR across the configured repositories.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PrKey {
@@ -657,6 +663,8 @@ pub enum ServerEvent {
     /// A terminal was opened in the agent session with this ID, or one of
     /// its terminals closed.
     TerminalsChanged(String),
+    /// The settings of this repository (`owner/name`) changed.
+    RepoSettingsChanged(String),
 }
 
 /// A login shell in an agent session's worktree.
