@@ -984,6 +984,7 @@ sleep 30
             body: String::new(),
             submitted_at: "2026-01-02T00:00:00Z".into(),
             url: String::new(),
+            commit: None,
         });
         info.reviews.push(Review {
             author: person("me"),
@@ -991,6 +992,7 @@ sleep 30
             body: String::new(),
             submitted_at: "2025-12-31T00:00:00Z".into(),
             url: String::new(),
+            commit: None,
         });
         d.review = Some(info.clone());
         assert!(!posted_since(&d, since));

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use grenadine_core::api::{
-    Person, PrDetail, PrKey, ReviewComment, Side, Stack, Version, VersionKind,
+    Person, PrDetail, PrKey, Review, ReviewComment, ReviewInfo, Side, Stack, Version, VersionKind,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -355,6 +355,7 @@ fn PrBody(
     };
     let s = &pr.summary;
     let review = pr.review.as_ref();
+    let reviewed = last_reviewed(&pr.versions, review);
     let body_html = if pr.body.trim().is_empty() {
         "<p class=\"muted\">No description provided.</p>".to_owned()
     } else {
@@ -443,7 +444,7 @@ fn PrBody(
             {review.filter(|_| s.state == "OPEN").map(|info| merge_box(info, merge_target(&pr)))}
             {merge_warning()}
             <div class="toolbar">
-                <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() chosen=chosen selection=selection />
+                <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() reviewed=reviewed chosen=chosen selection=selection />
                 {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
                     <ReviewPanel
                         pending=pr.comments.iter().filter(|c| c.pending).count()
@@ -641,10 +642,28 @@ pub(crate) fn PersonChip(person: Person, guess: bool) -> impl IntoView {
     }
 }
 
+/// The number of the latest version the viewer reviewed: the version
+/// whose SHA is the commit of their newest submitted review.
+fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u32> {
+    let info = review?;
+    let mut mine: Vec<&Review> = info
+        .reviews
+        .iter()
+        .filter(|r| r.author.login.as_deref() == Some(info.viewer.as_str()))
+        .collect();
+    // RFC 3339 strings sort chronologically.
+    mine.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+    mine.iter()
+        .filter_map(|r| r.commit.as_deref())
+        .find_map(|commit| versions.iter().find(|v| v.sha == commit))
+        .map(|v| v.number)
+}
+
 #[component]
 fn VersionPicker(
     versions: Vec<Version>,
     comments: Vec<ReviewComment>,
+    reviewed: Option<u32>,
     chosen: RwSignal<Option<Selection>>,
     selection: Memo<Selection>,
 ) -> impl IntoView {
@@ -732,7 +751,8 @@ fn VersionPicker(
                 }
             });
             view! {
-                <tr class:missing=v.as_ref().is_some_and(|v| v.missing)>
+                <tr class:missing=v.as_ref().is_some_and(|v| v.missing)
+                    class:reviewed=reviewed == Some(n)>
                     <td class="radio">
                         <input type="radio" name="base" disabled=base_disabled
                             prop:checked=move || selection.get().base == n
@@ -752,6 +772,7 @@ fn VersionPicker(
                                 <code title=v.sha.clone()>{short(&v.sha).to_owned()}</code>
                                 <span class="muted vkind">{kind_label(v)}</span>
                                 {v.pushed_at.clone().map(|t| view! { <span class="muted vtime">{t.replace('T', " ").trim_end_matches("+00:00").to_owned()}</span> })}
+                                {(reviewed == Some(n)).then(|| view! { <span class="vreviewed" title="The latest version you reviewed">"last reviewed"</span> })}
                                 {v.missing.then(|| view! { <span class="error">"missing"</span> })}
                             }.into_any(),
                         }}
@@ -1103,6 +1124,8 @@ fn CommentPanel(
 
 #[cfg(test)]
 mod tests {
+    use grenadine_core::api::{MergeInfo, MergeState, ReviewState};
+
     use super::*;
 
     fn version(n: u32, sha: &str) -> Version {
@@ -1146,6 +1169,43 @@ mod tests {
             can_resolve: false,
             pending: false,
             node_id: None,
+        }
+    }
+
+    fn review(login: &str, at: &str, commit: Option<&str>) -> Review {
+        Review {
+            author: Person {
+                login: Some(login.into()),
+                name: None,
+                avatar_url: None,
+            },
+            state: ReviewState::Commented,
+            body: String::new(),
+            submitted_at: at.into(),
+            url: String::new(),
+            commit: commit.map(str::to_owned),
+        }
+    }
+
+    fn review_info(reviews: Vec<Review>) -> ReviewInfo {
+        ReviewInfo {
+            viewer: "me".into(),
+            decision: None,
+            reviews,
+            requested: vec![],
+            comments: vec![],
+            checks: vec![],
+            ci: None,
+            merge: MergeInfo {
+                conflicting: Some(false),
+                state: MergeState::Clean,
+                methods: vec![],
+                default_method: None,
+                delete_branch_on_merge: false,
+                can_merge_as_admin: false,
+                requires_conversation_resolution: false,
+            },
+            pending_review: None,
         }
     }
 
@@ -1219,5 +1279,39 @@ mod tests {
         ];
         let counts = thread_counts(&comments, &versions);
         assert_eq!(counts, HashMap::from([(1, (1, 2)), (2, (1, 1))]));
+    }
+
+    #[test]
+    fn last_reviewed_picks_the_viewers_latest_review() {
+        let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
+        let info = review_info(vec![
+            review("me", "2026-01-01T00:00:00Z", Some("a")),
+            review("other", "2026-01-02T00:00:00Z", Some("c")),
+            review("me", "2026-01-03T00:00:00Z", Some("b")),
+        ]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
+    }
+
+    #[test]
+    fn last_reviewed_falls_back_past_a_nonversion_commit() {
+        let versions = [version(1, "a"), version(2, "b")];
+        let info = review_info(vec![
+            review("me", "2026-01-01T00:00:00Z", Some("a")),
+            // An approximate history folded this commit away.
+            review("me", "2026-01-02T00:00:00Z", Some("x")),
+        ]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn last_reviewed_is_none_without_a_matching_review() {
+        let versions = [version(1, "a")];
+        assert_eq!(last_reviewed(&versions, None), None);
+        assert_eq!(last_reviewed(&versions, Some(&review_info(vec![]))), None);
+        let info = review_info(vec![
+            review("other", "2026-01-01T00:00:00Z", Some("a")),
+            review("me", "2026-01-02T00:00:00Z", None),
+        ]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), None);
     }
 }

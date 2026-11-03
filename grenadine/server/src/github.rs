@@ -327,7 +327,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       }
       reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
       reviews(last: 100) {
-        nodes { state body submittedAt url author { ...Who } }
+        nodes { state body submittedAt url commit { oid } author { ...Who } }
       }
       pending: reviews(states: [PENDING], first: 1) {
         nodes {
@@ -592,6 +592,10 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
                 body: str_at(r, "/body").to_owned(),
                 submitted_at: str_at(r, "/submittedAt").to_owned(),
                 url: str_at(r, "/url").to_owned(),
+                commit: r
+                    .pointer("/commit/oid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             })
         })
         .collect();
@@ -1998,7 +2002,7 @@ mod tests {
                         { "state": "PENDING", "body": "", "submittedAt": null, "url": "u0",
                           "author": { "login": "me" } },
                         { "state": "CHANGES_REQUESTED", "body": "No", "submittedAt": "t1",
-                          "url": "u1", "author": null },
+                          "url": "u1", "commit": { "oid": "abc" }, "author": null },
                     ] },
                     "reviewRequests": { "nodes": [
                         { "requestedReviewer": { "login": "a" } },
@@ -2026,6 +2030,7 @@ mod tests {
             panic!("{:?}", info.reviews)
         };
         assert_eq!(review.state, ReviewState::ChangesRequested);
+        assert_eq!(review.commit.as_deref(), Some("abc"));
         assert_eq!(review.author.login.as_deref(), Some("ghost"));
         assert_eq!(info.requested, ["a", "team", "copilot"]);
         assert_eq!(info.comments[0].author.name.as_deref(), Some("B"));

@@ -670,6 +670,7 @@ mod tests {
             body: String::new(),
             submitted_at: at.into(),
             url: String::new(),
+            commit: None,
         }
     }
 
