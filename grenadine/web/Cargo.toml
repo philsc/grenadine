@@ -54,4 +54,11 @@ web-sys = { workspace = true, features = [
   "HtmlInputElement",
   "HtmlDialogElement",
   "CanvasRenderingContext2d",
+  "IdbDatabase",
+  "IdbFactory",
+  "IdbObjectStore",
+  "IdbOpenDbRequest",
+  "IdbRequest",
+  "IdbTransaction",
+  "IdbTransactionMode",
 ] }

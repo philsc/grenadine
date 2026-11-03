@@ -1,6 +1,7 @@
 //! The new sessions still being written: each form is a draft of its own,
 //! kept in local storage so that it survives going to another page and
-//! back, or a reload, until its session starts or it's discarded.
+//! back, or a reload, until its session starts or it's discarded. The
+//! draft's images are kept in IndexedDB (see `image_drafts`).
 
 use grenadine_core::api::{AgentBackend, GENERAL, PermissionMode};
 use leptos::prelude::*;
@@ -20,6 +21,10 @@ pub struct Draft {
     /// The PR to start from, as typed.
     pub pr: String,
     pub prompt: String,
+    /// Whether images are kept for the draft (in IndexedDB); they make it
+    /// worth keeping even without text.
+    #[serde(default)]
+    pub has_images: bool,
     /// Which agent backend runs the session's turns.
     #[serde(default)]
     pub backend: AgentBackend,
@@ -35,7 +40,7 @@ pub struct Draft {
 
 impl Draft {
     pub fn is_blank(&self) -> bool {
-        self.prompt.trim().is_empty()
+        self.prompt.trim().is_empty() && !self.has_images
     }
 }
 
@@ -104,6 +109,7 @@ impl Drafts {
                 repo: repo.unwrap_or_else(|| GENERAL.to_owned()),
                 pr: pr.map(|n| n.to_string()).unwrap_or_default(),
                 prompt: String::new(),
+                has_images: false,
                 backend,
                 // New sessions start out planning, whatever the others go
                 // on with.
@@ -131,6 +137,7 @@ impl Drafts {
             repo: GENERAL.to_owned(),
             pr: String::new(),
             prompt: String::new(),
+            has_images: false,
             backend,
             mode: PermissionMode::plan(),
             mode_picked: false,
@@ -156,6 +163,7 @@ impl Drafts {
 
     pub fn remove(self, id: &str) {
         self.0.update(|l| l.retain(|d| d.id != id));
+        crate::image_drafts::forget(&crate::image_drafts::new_session_key(id));
     }
 
     /// Drops the draft `id` if nothing was written in it.
@@ -181,6 +189,7 @@ mod tests {
             repo: repo.into(),
             pr: String::new(),
             prompt: prompt.into(),
+            has_images: false,
             backend: AgentBackend::Claude,
             mode: PermissionMode::plan(),
             mode_picked: false,
@@ -205,6 +214,16 @@ mod tests {
         ];
         let ids: Vec<String> = prune(list, Some("c")).into_iter().map(|d| d.id).collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn images_make_a_draft_not_blank() {
+        let mut d = draft("a", "o/n", "", 1.0);
+        d.has_images = true;
+        assert!(!d.is_blank());
+        // A draft with only images survives the load-time prune.
+        let ids: Vec<String> = prune(vec![d], None).into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, ["a"]);
     }
 
     #[test]
