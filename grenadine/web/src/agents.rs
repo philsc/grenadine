@@ -2353,7 +2353,7 @@ struct Question {
     header: String,
     #[serde(default)]
     options: Vec<QuestionOption>,
-    #[serde(default, rename = "multiSelect")]
+    #[serde(default, rename = "multiSelect", alias = "multi_select")]
     multi_select: bool,
 }
 
@@ -2364,16 +2364,16 @@ struct QuestionOption {
     description: String,
 }
 
-/// The answer to a question the way Claude Code puts it together: the
-/// picked options in their order, then whatever the user wrote.
-fn answer_text(q: &Question, picked: &[String], other: &str) -> String {
+/// The answer to a question: the picked options in their order, then
+/// whatever the user wrote.
+fn answer_values(q: &Question, picked: &[String], other: &str) -> Vec<String> {
     q.options
         .iter()
         .map(|o| o.label.as_str())
         .filter(|l| picked.iter().any(|p| p == l))
         .chain(Some(other.trim()).filter(|o| !o.is_empty()))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `AskUserQuestion`: Claude's questions with their options and room for
@@ -2403,7 +2403,7 @@ fn QuestionCard(
                 qs.iter()
                     .zip(ps)
                     .map(|(q, (picked, other))| {
-                        let answer = picked.with(|p| other.with(|o| answer_text(q, p, o)));
+                        let answer = picked.with(|p| other.with(|o| answer_values(q, p, o)));
                         (q.question.clone(), answer)
                     })
                     .collect::<BTreeMap<_, _>>()
@@ -2828,16 +2828,25 @@ mod tests {
 
     #[test]
     fn answers() {
-        let q: Question = serde_json::from_value(serde_json::json!({
-            "question": "Drinks?",
-            "options": [{"label": "Tea"}, {"label": "Coffee"}],
-            "multiSelect": true,
-        }))
-        .unwrap();
+        let question = |flag: &str| {
+            serde_json::from_value::<Question>(serde_json::json!({
+                "question": "Drinks?",
+                "options": [{"label": "Tea"}, {"label": "Coffee"}],
+                flag: true,
+            }))
+            .unwrap()
+        };
+        for flag in ["multiSelect", "multi_select"] {
+            assert!(question(flag).multi_select, "{flag}");
+        }
+        let q = question("multiSelect");
         let picked = ["Coffee".to_owned(), "Tea".to_owned()];
-        assert_eq!(answer_text(&q, &picked, ""), "Tea, Coffee");
-        assert_eq!(answer_text(&q, &picked[..1], " Water "), "Coffee, Water");
-        assert_eq!(answer_text(&q, &[], "  "), "");
+        assert_eq!(answer_values(&q, &picked, ""), ["Tea", "Coffee"]);
+        assert_eq!(
+            answer_values(&q, &picked[..1], " Water "),
+            ["Coffee", "Water"]
+        );
+        assert_eq!(answer_values(&q, &[], "  "), Vec::<String>::new());
     }
 
     #[test]

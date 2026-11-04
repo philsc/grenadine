@@ -113,7 +113,7 @@ pub struct Decision {
     /// offered any.
     pub option: Option<String>,
     /// The answers to `AskUserQuestion`, by question.
-    pub answers: Option<BTreeMap<String, String>>,
+    pub answers: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// An agent backend: what runs sessions' turns and background jobs.

@@ -459,6 +459,8 @@ struct ElicitationSchema {
 
 #[derive(Debug, Deserialize)]
 struct ElicitationProperty {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     #[serde(default)]
     description: Option<String>,
 }
@@ -1425,22 +1427,34 @@ async fn elicitation(
     let answer = match decision {
         Some(d) if d.allow => {
             let answers = d.answers.unwrap_or_default();
-            // The schema's questions are keyed q0, q1, ...; their text is
-            // each property's description, which the answers are keyed by.
-            let content: serde_json::Map<_, _> = request
-                .requested_schema
-                .properties
-                .iter()
-                .filter_map(|(qid, prop)| {
-                    let a = answers.get(prop.description.as_deref()?)?;
-                    Some((qid.clone(), json!(a)))
-                })
-                .collect();
+            let content = elicitation_content(&request.requested_schema, &answers);
             json!({"action": "accept", "content": content})
         }
         _ => json!({"action": "decline"}),
     };
     acp.respond(&rpc_id, answer);
+}
+
+/// The elicitation's `content`: the schema's questions are keyed q0,
+/// q1, ...; their text is each property's description, which the
+/// answers are keyed by. An array property — a multi-select question —
+/// gets the answers as a JSON array, the rest as a joined string.
+fn elicitation_content(
+    schema: &ElicitationSchema,
+    answers: &BTreeMap<String, Vec<String>>,
+) -> serde_json::Map<String, Value> {
+    schema
+        .properties
+        .iter()
+        .filter_map(|(qid, prop)| {
+            let a = answers.get(prop.description.as_deref()?)?;
+            let value = match prop.kind.as_deref() {
+                Some("array") => json!(a),
+                _ => json!(a.join(", ")),
+            };
+            Some((qid.clone(), value))
+        })
+        .collect()
 }
 
 /// The JSON object in `reply`: all of it, else the last fenced block
@@ -2699,5 +2713,42 @@ mod job_tests {
         assert_eq!(parse("```json\n{\"a\": 6}\nThat's all."), json!({"a": 6}));
         assert!(parse_reply("t", "no json here").is_err());
         assert!(parse_reply("t", "[1, 2]").is_err());
+    }
+
+    /// An array property takes its answers as a JSON array, anything
+    /// else as a joined string.
+    #[test]
+    fn builds_the_elicitations_content() {
+        let schema: ElicitationSchema = serde_json::from_value(json!({
+            "properties": {
+                "q0": {
+                    "title": "Drinks",
+                    "description": "Which drinks?",
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"anyOf": [{"const": "Tea"}, {"const": "Coffee"}]},
+                },
+                "q1": {
+                    "title": "Drink",
+                    "description": "Tea or coffee?",
+                    "oneOf": [{"const": "Tea"}, {"const": "Coffee"}],
+                },
+            },
+        }))
+        .unwrap();
+        let answers = BTreeMap::from([
+            (
+                "Which drinks?".to_owned(),
+                vec!["Tea".to_owned(), "Coffee".to_owned()],
+            ),
+            ("Tea or coffee?".to_owned(), vec!["Tea".to_owned()]),
+        ]);
+        assert_eq!(
+            elicitation_content(&schema, &answers),
+            serde_json::Map::from_iter([
+                ("q0".to_owned(), json!(["Tea", "Coffee"])),
+                ("q1".to_owned(), json!("Tea")),
+            ])
+        );
     }
 }

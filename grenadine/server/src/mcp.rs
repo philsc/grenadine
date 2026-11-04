@@ -68,11 +68,19 @@ fn error(id: &Value, code: i64, message: &str) -> Response {
 fn allowed(
     input: &Value,
     mode: Option<PermissionMode>,
-    answers: Option<BTreeMap<String, String>>,
+    answers: Option<BTreeMap<String, Vec<String>>>,
 ) -> Value {
     let mut input = input.clone();
     if let (Some(answers), Some(fields)) = (answers, input.as_object_mut()) {
-        fields.insert("answers".into(), json!(answers));
+        fields.insert(
+            "answers".into(),
+            json!(
+                answers
+                    .into_iter()
+                    .map(|(q, a)| (q, a.join(", ")))
+                    .collect::<BTreeMap<_, _>>()
+            ),
+        );
     }
     let mut answer = json!({"behavior": "allow", "updatedInput": input});
     if let Some(mode) = mode {
@@ -937,7 +945,7 @@ mod tests {
             })
         );
         let questions = json!({"questions": [{"question": "Tea?", "options": []}]});
-        let answers = BTreeMap::from([("Tea?".to_owned(), "Yes".to_owned())]);
+        let answers = BTreeMap::from([("Tea?".to_owned(), vec!["Yes".to_owned()])]);
         assert_eq!(
             allowed(&questions, None, Some(answers)),
             json!({
@@ -947,6 +955,14 @@ mod tests {
                     "answers": {"Tea?": "Yes"},
                 },
             })
+        );
+        let answers = BTreeMap::from([(
+            "Tea?".to_owned(),
+            vec!["Tea".to_owned(), "Coffee".to_owned()],
+        )]);
+        assert_eq!(
+            allowed(&questions, None, Some(answers))["updatedInput"]["answers"],
+            json!({"Tea?": "Tea, Coffee"})
         );
     }
 
