@@ -3,6 +3,7 @@
 //! requests and a box for follow-up prompts.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use grenadine_core::api::{
@@ -1353,46 +1354,143 @@ pub fn NewSession(draft: String) -> impl IntoView {
     }
 }
 
+/// Something that arrived over the stream and waits for the next frame.
+enum Incoming {
+    Event(AgentEvent),
+    /// The stream (re)opened.
+    Opened,
+}
+
+/// How a batch changes the text being streamed.
+enum Streaming {
+    Keep,
+    Replace(String),
+    Append(String),
+}
+
+/// What the queued messages change, applied in one update per signal.
+struct Batch {
+    events: Vec<Arc<AgentEvent>>,
+    streaming: Streaming,
+    usage: Option<(Option<u64>, Option<u64>)>,
+    model: Option<String>,
+}
+
+/// Turns queued stream messages into the signals' next values, as though
+/// each had been applied in order. `last_seq` is the transcript's last
+/// seq: a stored event repeats from there, so both it and a seq repeated
+/// inside the batch are skipped. A stored event or a reopen ends the
+/// text being streamed: deltas before it are discarded.
+fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
+    let mut batch = Batch {
+        events: Vec::new(),
+        streaming: Streaming::Keep,
+        usage: None,
+        model: None,
+    };
+    let mut last = last_seq;
+    // Text appended since the last clear.
+    let mut delta = String::new();
+    let mut cleared = false;
+    for incoming in queue {
+        match incoming {
+            Incoming::Opened => {
+                delta.clear();
+                cleared = true;
+            }
+            Incoming::Event(event) => match event.seq {
+                None => match event.kind {
+                    AgentEventKind::TextDelta(t) => delta.push_str(&t),
+                    AgentEventKind::Usage { tokens, window } => {
+                        let (t, w) = batch.usage.get_or_insert((None, None));
+                        *t = tokens.or(*t);
+                        *w = window.or(*w);
+                    }
+                    AgentEventKind::Model(m) => batch.model = Some(m),
+                    _ => {}
+                },
+                Some(seq) => {
+                    if last.is_some_and(|l| seq <= l) {
+                        continue;
+                    }
+                    last = Some(seq);
+                    // The streamed text is complete once anything else
+                    // comes along.
+                    delta.clear();
+                    cleared = true;
+                    batch.events.push(Arc::new(event));
+                }
+            },
+        }
+    }
+    batch.streaming = match (cleared, delta.is_empty()) {
+        (false, false) => Streaming::Append(delta),
+        (false, true) => Streaming::Keep,
+        (true, _) => Streaming::Replace(delta),
+    };
+    batch
+}
+
 /// Follows a session's event stream while the page is open. Events arrive
 /// in `seq` order; a reconnect replays the transcript, which is skipped up
 /// to the last event seen. `usage` gets the context window's tokens and
 /// size as Claude Code reports them, and `model` the model it runs.
+///
+/// Messages queue up and flush once per frame, so replaying a long
+/// transcript is one update per signal per frame rather than one per
+/// stored event.
 fn follow(
     id: &str,
-    events: RwSignal<Vec<AgentEvent>>,
+    events: RwSignal<Vec<Arc<AgentEvent>>>,
     streaming: RwSignal<String>,
     usage: RwSignal<(Option<u64>, Option<u64>)>,
     model: RwSignal<Option<String>>,
 ) {
+    let queue = StoredValue::new(Vec::<Incoming>::new());
+    let scheduled = StoredValue::new(false);
+    let flush = move || {
+        scheduled.set_value(false);
+        let mut pending = Vec::new();
+        queue.update_value(|q| std::mem::swap(q, &mut pending));
+        if pending.is_empty() {
+            return;
+        }
+        let last = events.with_untracked(|e| e.last().and_then(|e| e.seq));
+        let batch = drain(pending, last);
+        if !batch.events.is_empty() {
+            events.update(|e| e.extend(batch.events));
+        }
+        match batch.streaming {
+            Streaming::Keep => {}
+            Streaming::Replace(s) => streaming.set(s),
+            Streaming::Append(t) => streaming.update(|s| s.push_str(&t)),
+        }
+        if let Some((tokens, window)) = batch.usage {
+            usage.update(|(t, w)| {
+                *t = tokens.or(*t);
+                *w = window.or(*w);
+            });
+        }
+        if let Some(m) = batch.model {
+            model.set(Some(m));
+        }
+    };
+    let push = move |incoming: Incoming| {
+        queue.update_value(|q| q.push(incoming));
+        if !scheduled.get_value() {
+            scheduled.set_value(true);
+            request_animation_frame(flush);
+        }
+    };
     let on_message = move |data: String| {
         let Ok(event) = serde_json::from_str::<AgentEvent>(&data) else {
             return;
         };
-        match event.seq {
-            None => match event.kind {
-                AgentEventKind::TextDelta(t) => streaming.update(|s| s.push_str(&t)),
-                AgentEventKind::Usage { tokens, window } => usage.update(|(t, w)| {
-                    *t = tokens.or(*t);
-                    *w = window.or(*w);
-                }),
-                AgentEventKind::Model(m) => model.set(Some(m)),
-                _ => {}
-            },
-            Some(seq) => {
-                let last = events.with_untracked(|e| e.last().and_then(|e| e.seq));
-                if last.is_some_and(|l| seq <= l) {
-                    return;
-                }
-                // The streamed text is complete once anything else
-                // comes along.
-                streaming.set(String::new());
-                events.update(|e| e.push(event));
-            }
-        }
+        push(Incoming::Event(event));
     };
     // Text streamed on a connection that died is incomplete; the replay
     // brings the finished message.
-    let on_open = move || streaming.set(String::new());
+    let on_open = move || push(Incoming::Opened);
     crate::events::subscribe(format!("/api/agents/{id}/events"), on_message, on_open);
 }
 
@@ -1491,7 +1589,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
             .flatten()
             .or_else(|| prev.cloned().flatten())
     });
-    let events = RwSignal::new(Vec::<AgentEvent>::new());
+    let events = RwSignal::new(Vec::<Arc<AgentEvent>>::new());
     let streaming = RwSignal::new(String::new());
     let live_usage = RwSignal::new((None, None));
     let live_model = RwSignal::new(None);
@@ -1591,7 +1689,7 @@ fn wide_enough() -> bool {
 /// when the window has room for them. They are refetched as the session's
 /// events come in, since those are when the agent changes files.
 #[component]
-fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<AgentEvent>>) -> impl IntoView {
+fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<Arc<AgentEvent>>>) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let session = id.clone();
     let wide = RwSignal::new(wide_enough());
@@ -1888,8 +1986,8 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
 /// The events to show, without the repeated ends of a turn that older
 /// servers stored: one for each background task that finished after the
 /// answer.
-fn shown(events: &[AgentEvent]) -> Vec<AgentEvent> {
-    let ended = |e: &AgentEvent| matches!(e.kind, AgentEventKind::TurnEnded { .. });
+fn shown(events: &[Arc<AgentEvent>]) -> Vec<Arc<AgentEvent>> {
+    let ended = |e: &Arc<AgentEvent>| matches!(e.kind, AgentEventKind::TurnEnded { .. });
     events
         .iter()
         .enumerate()
@@ -1902,36 +2000,54 @@ fn shown(events: &[AgentEvent]) -> Vec<AgentEvent> {
         .collect()
 }
 
+/// The pieces of a `ToolResult` event's `kind`, when it is one.
+fn tool_result(e: &AgentEvent) -> Option<(&str, bool, &[PatchHunk], &[String])> {
+    let AgentEventKind::ToolResult {
+        content,
+        is_error,
+        patch,
+        images,
+        ..
+    } = &e.kind
+    else {
+        return None;
+    };
+    Some((content, *is_error, patch, images))
+}
+
 #[component]
 fn Transcript(
     session: Signal<AgentSession>,
-    events: RwSignal<Vec<AgentEvent>>,
+    events: RwSignal<Vec<Arc<AgentEvent>>>,
     streaming: RwSignal<String>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
 ) -> impl IntoView {
     // Tool results and approval answers are shown with the event they
-    // belong to.
-    let results = Memo::new(move |_| {
-        events.with(|events| {
-            events
-                .iter()
-                .filter_map(|e| match &e.kind {
-                    AgentEventKind::ToolResult {
-                        id,
-                        content,
-                        is_error,
-                        patch,
-                        images,
-                    } => Some((
-                        id.clone(),
-                        (content.clone(), *is_error, patch.clone(), images.clone()),
-                    )),
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>()
-        })
-    });
+    // belong to. The map compares by pointer rather than by content, so a
+    // rebuild doesn't re-read every result's text.
+    let results = Memo::new_with_compare(
+        move |_| {
+            events.with(|events| {
+                events
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        AgentEventKind::ToolResult { id, .. } => Some((id.clone(), e.clone())),
+                        _ => None,
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+        },
+        |prev, cur| match (prev, cur) {
+            (None, None) => false,
+            (Some(p), Some(c)) => {
+                p.len() != c.len()
+                    || c.iter()
+                        .any(|(id, e)| p.get(id).is_none_or(|o| !Arc::ptr_eq(o, e)))
+            }
+            _ => true,
+        },
+    );
     let resolved = Memo::new(move |_| {
         events.with(|events| {
             events
@@ -2027,16 +2143,16 @@ fn Transcript(
                 children=move |e| {
                     let repo = repo.clone();
                     let id = id.clone();
-                    match e.kind {
+                    match &e.kind {
                         // A prompt can be only images.
                         AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
                         AgentEventKind::Prompt(p)
                         | AgentEventKind::ApprovalResolved { message: Some(p), .. } => view! {
-                            <div class="turn-prompt">{p}</div>
+                            <div class="turn-prompt">{p.clone()}</div>
                         }.into_any(),
                         AgentEventKind::Images(names) => view! {
                             <div class="turn-images">
-                                {names.into_iter().map(|name| {
+                                {names.iter().map(|name| {
                                     let url = format!("/api/agents/{id}/images/{name}");
                                     view! {
                                         <a href=url.clone() target="_blank" rel="noopener">
@@ -2047,18 +2163,31 @@ fn Transcript(
                             </div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
-                            <div class="turn-text markdown" inner_html=markdown::to_html(&t, &repo)></div>
+                            <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
                         }.into_any(),
                         AgentEventKind::ToolUse { parent: Some(_), .. } => ().into_any(),
                         AgentEventKind::ToolUse { id: tool, name, input, .. } => {
-                            let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
-                            let summary = tool_summary(&name, &value);
-                            let result = Signal::derive(move || results.with(|r| r.get(&tool).cloned()));
-                            let is_edit = edit_fragments(&name, &value, &[]).is_some();
+                            let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+                            let summary = tool_summary(name, &value);
+                            let tool = tool.clone();
+                            let result = Memo::new_with_compare(
+                                move |_| results.with(|r| r.get(&tool).cloned()),
+                                |prev, cur| match (prev, cur) {
+                                    (Some(Some(p)), Some(Some(c))) => !Arc::ptr_eq(p, c),
+                                    (Some(None), Some(None)) => false,
+                                    _ => true,
+                                },
+                            );
+                            let is_edit = edit_fragments(name, &value, &[]).is_some();
                             let body = {
                                 let name = name.clone();
+                                let input = input.clone();
                                 move || {
-                                    let patch = result.with(|r| r.as_ref().map(|(_, _, p, _)| p.clone()));
+                                    let patch = result.with(|r| {
+                                        r.as_ref()
+                                            .and_then(|e| tool_result(e))
+                                            .map(|(_, _, p, _)| p.to_vec())
+                                    });
                                     match edit_fragments(&name, &value, &patch.unwrap_or_default()) {
                                         Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
                                         None => view! { <pre class="tool-input">{pretty(&input)}</pre> }.into_any(),
@@ -2068,26 +2197,35 @@ fn Transcript(
                             view! {
                                 <details class="tool">
                                     <summary>
-                                        <span class="tool-name">{name}</span>
+                                        <span class="tool-name">{name.clone()}</span>
                                         " " <code>{summary}</code>
-                                        {move || match result.get() {
+                                        {move || match result.with(|r| {
+                                            r.as_ref()
+                                                .and_then(|e| tool_result(e))
+                                                .map(|(_, is_error, _, _)| is_error)
+                                        }) {
                                             None => view! { <span class="muted">" …"</span> }.into_any(),
-                                            Some((_, true, _, _)) => view! { <span class="error">" failed"</span> }.into_any(),
-                                            Some(_) => ().into_any(),
+                                            Some(true) => view! { <span class="error">" failed"</span> }.into_any(),
+                                            Some(false) => ().into_any(),
                                         }}
                                     </summary>
                                     {body}
                                     // A successful edit's result only repeats the diff.
-                                    {move || result.get()
+                                    {move || result.with(|r| r.as_ref()
+                                        .and_then(|e| tool_result(e))
                                         .filter(|(_, is_error, _, _)| *is_error || !is_edit)
                                         .map(|(content, is_error, _, _)| view! {
-                                            <pre class="tool-result" class:error=is_error>{content}</pre>
-                                        })}
+                                            <pre class="tool-result" class:error=is_error>{content.to_owned()}</pre>
+                                        }))}
                                 </details>
                                 // Outside the details, so that screenshots show without
                                 // opening the tool call.
                                 {move || {
-                                    let images = result.with(|r| r.as_ref().map(|(_, _, _, i)| i.clone()));
+                                    let images = result.with(|r| {
+                                        r.as_ref()
+                                            .and_then(|e| tool_result(e))
+                                            .map(|(_, _, _, i)| i.to_vec())
+                                    });
                                     images.unwrap_or_default().into_iter().map(|image| view! {
                                         <TranscriptImage id=image caption=None />
                                     }).collect_view()
@@ -2095,10 +2233,10 @@ fn Transcript(
                             }.into_any()
                         }
                         AgentEventKind::Image { id: image, caption } => view! {
-                            <TranscriptImage id=image caption=caption />
+                            <TranscriptImage id=image.clone() caption=caption.clone() />
                         }.into_any(),
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, .. } if tool_name == "ExitPlanMode" => {
-                            let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                            let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
                             let plan = value["plan"].as_str().unwrap_or_default();
                             let open = {
                                 let tool = tool.clone();
@@ -2107,7 +2245,7 @@ fn Transcript(
                             view! {
                                 <PlanCard
                                     agent=id
-                                    tool=tool
+                                    tool=tool.clone()
                                     plan=markdown::to_html(plan, &repo)
                                     backend=backend
                                     resolved=resolved
@@ -2119,13 +2257,13 @@ fn Transcript(
                             }.into_any()
                         }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, .. } if tool_name == "AskUserQuestion" => {
-                            let questions = serde_json::from_str::<Questions>(&input)
+                            let questions = serde_json::from_str::<Questions>(input)
                                 .map(|q| q.questions)
                                 .unwrap_or_default();
                             view! {
                                 <QuestionCard
                                     agent=id
-                                    tool=tool
+                                    tool=tool.clone()
                                     backend=backend
                                     questions=questions
                                     resolved=resolved
@@ -2134,19 +2272,19 @@ fn Transcript(
                             }.into_any()
                         }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, options } => {
-                            let value = serde_json::from_str(&input).unwrap_or_default();
-                            let summary = tool_summary(&tool_name, &value);
-                            let diff = edit_fragments(&tool_name, &value, &[]);
+                            let value = serde_json::from_str(input).unwrap_or_default();
+                            let summary = tool_summary(tool_name, &value);
+                            let diff = edit_fragments(tool_name, &value, &[]);
                             view! {
                                 <ApprovalCard
                                     agent=id
-                                    tool=tool
+                                    tool=tool.clone()
                                     backend=backend
-                                    tool_name=tool_name
+                                    tool_name=tool_name.clone()
                                     summary=summary
-                                    input=pretty(&input)
+                                    input=pretty(input)
                                     diff=diff
-                                    options=options
+                                    options=options.clone()
                                     resolved=resolved
                                     waiting=waiting
                                 />
@@ -2159,11 +2297,11 @@ fn Transcript(
                             <p class="turn-end muted">{format!("Done · {}", cost(c.unwrap_or_default(), unit))}</p>
                         }.into_any(),
                         AgentEventKind::Error(e) => view! {
-                            <pre class="turn-error">{e}</pre>
+                            <pre class="turn-error">{e.clone()}</pre>
                         }.into_any(),
                         AgentEventKind::Landed(Landed::Checkout { sha }) => view! {
                             <p class="turn-end wrapped-up">
-                                "Merged into the checkout at " <code>{sha}</code>
+                                "Merged into the checkout at " <code>{sha.clone()}</code>
                             </p>
                         }.into_any(),
                         AgentEventKind::Landed(landed) => {
@@ -2771,9 +2909,141 @@ mod tests {
             event(5, ended(None)),
             event(6, AgentEventKind::Text("b".into())),
             event(7, ended(None)),
-        ];
+        ]
+        .map(Arc::new);
         let seqs: Vec<_> = shown(&events).iter().filter_map(|e| e.seq).collect();
         assert_eq!(seqs, [1, 2, 4, 6, 7]);
+    }
+
+    fn event(seq: Option<u64>, kind: AgentEventKind) -> Incoming {
+        Incoming::Event(AgentEvent { seq, kind })
+    }
+
+    fn seqs(batch: &Batch) -> Vec<u64> {
+        batch.events.iter().filter_map(|e| e.seq).collect()
+    }
+
+    #[test]
+    fn drain_dedups_stored_events() {
+        // Across the boundary, against the transcript's last seq.
+        let batch = drain(
+            vec![
+                event(Some(4), AgentEventKind::Text("a".into())),
+                event(Some(5), AgentEventKind::Text("b".into())),
+                event(Some(6), AgentEventKind::Text("c".into())),
+            ],
+            Some(5),
+        );
+        assert_eq!(seqs(&batch), [6]);
+        // And inside the batch itself.
+        let batch = drain(
+            vec![
+                event(Some(6), AgentEventKind::Text("a".into())),
+                event(Some(7), AgentEventKind::Text("b".into())),
+                event(Some(6), AgentEventKind::Text("c".into())),
+                event(Some(7), AgentEventKind::Text("d".into())),
+            ],
+            None,
+        );
+        assert_eq!(seqs(&batch), [6, 7]);
+    }
+
+    #[test]
+    fn drain_clears_deltas_on_stored_events() {
+        // A delta before a stored event is discarded; one after accrues.
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::TextDelta("a".into())),
+                event(Some(1), AgentEventKind::Text("b".into())),
+                event(None, AgentEventKind::TextDelta("c".into())),
+                event(None, AgentEventKind::TextDelta("d".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.streaming, Streaming::Replace(s) if s == "cd"));
+        // With nothing after, the streamed text just clears.
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::TextDelta("a".into())),
+                event(Some(1), AgentEventKind::Text("b".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.streaming, Streaming::Replace(s) if s.is_empty()));
+        // Deltas alone append.
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::TextDelta("a".into())),
+                event(None, AgentEventKind::TextDelta("b".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.streaming, Streaming::Append(s) if s == "ab"));
+        assert!(matches!(drain(vec![], None).streaming, Streaming::Keep));
+    }
+
+    #[test]
+    fn drain_clears_deltas_on_open() {
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::TextDelta("a".into())),
+                Incoming::Opened,
+                event(None, AgentEventKind::TextDelta("b".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.streaming, Streaming::Replace(s) if s == "b"));
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::TextDelta("a".into())),
+                Incoming::Opened,
+            ],
+            None,
+        );
+        assert!(matches!(batch.streaming, Streaming::Replace(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn drain_merges_usage() {
+        let batch = drain(
+            vec![
+                event(
+                    None,
+                    AgentEventKind::Usage {
+                        tokens: Some(1),
+                        window: None,
+                    },
+                ),
+                event(
+                    None,
+                    AgentEventKind::Usage {
+                        tokens: Some(2),
+                        window: None,
+                    },
+                ),
+                event(
+                    None,
+                    AgentEventKind::Usage {
+                        tokens: None,
+                        window: Some(3),
+                    },
+                ),
+            ],
+            None,
+        );
+        assert_eq!(batch.usage, Some((Some(2), Some(3))));
+    }
+
+    #[test]
+    fn drain_keeps_the_latest_model() {
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::Model("a".into())),
+                event(None, AgentEventKind::Model("b".into())),
+            ],
+            None,
+        );
+        assert_eq!(batch.model.as_deref(), Some("b"));
     }
 
     #[test]

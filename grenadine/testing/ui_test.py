@@ -266,7 +266,9 @@ def devin_scenario(tmp: Path) -> dict:
 # session's request as "Task: " and its first line, answers the scans of
 # deleted sessions with a container they left behind, and finds no stale
 # cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME". It
-# says how many images came with the prompt.
+# says how many images came with the prompt. `long transcript N` has it
+# run N Bash calls whose results grow from ~1 KB to ~30 KB and start with
+# "result i:", so a page can tell them and which call they answer apart.
 FAKE_CLAUDE = r"""
 import base64
 import json
@@ -431,6 +433,17 @@ if review and "Quiet" not in review[1]:
         headers={"content-type": "application/json", "authorization": "Bearer " + os.environ["FAKE_GITHUB_TOKEN"]},
     )
     urllib.request.urlopen(request).close()
+# `long transcript N` runs N Bash calls; the results pad made-up output
+# from ~1 KB to ~30 KB and start with "result i:" so which call each
+# answers is checkable.
+long = re.fullmatch(r"long transcript (\d+)", prompt)
+if long:
+    count = int(long[1])
+    for i in range(count):
+        tool_use = use("Bash", {"command": f"step {i}"})
+        size = 1024 + (29 * 1024) * i // max(count - 1, 1)
+        padding = ("0123456789abcdef" * ((size // 16) + 1))[:size]
+        result(tool_use, f"result {i}: {padding}")
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
 """
 
@@ -2130,12 +2143,12 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
         return self.page.locator(".transcript")
 
-    def delete_session(self, title: str) -> None:
+    def delete_session(self, title: str, repo: str = "General") -> None:
         self.page.once("dialog", lambda dialog: dialog.accept())
         self.page.get_by_role("button", name="Delete", exact=True).click()
         # Deleting scans the worktree for leftovers, which may leave a
         # cleanup entry; the session's own entry is gone.
-        sessions = self.section("General").locator(".agent-entry")
+        sessions = self.section(repo).locator(".agent-entry")
         expect(sessions.filter(has_text=title)).to_have_count(0)
 
     def test_backends_keep_their_own_models(self) -> None:
@@ -2480,6 +2493,52 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_long_transcript(self) -> None:
+        # A session whose transcript has hundreds of tool calls renders
+        # them both as they stream in and replayed on a reload. Each tool
+        # call opens to its own result, and the view follows the output.
+        count = 300
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill(f"long transcript {count}")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        transcript = self.page.locator(".transcript")
+        tools = transcript.locator(".tool")
+        main = self.page.locator(".agent-page .main")
+
+        def at_bottom() -> None:
+            deadline = time.monotonic() + 15
+            while True:
+                top, height, total = main.evaluate(
+                    "(e) => [e.scrollTop, e.clientHeight, e.scrollHeight]"
+                )
+                if abs(top + height - total) <= 1:
+                    return
+                self.assertLess(time.monotonic(), deadline, "transcript not at bottom")
+                time.sleep(0.1)
+
+        def check() -> None:
+            expect(tools).to_have_count(count)
+            at_bottom()
+            for i in [0, count - 1]:
+                tool = tools.nth(i)
+                tool.locator("summary").click()
+                expect(tool.locator(".tool-result")).to_contain_text(f"result {i}:")
+                tool.locator("summary").click()
+
+        # As it streams in.
+        expect(transcript.locator(".turn-end")).to_have_text(
+            ["Done · $0.01"], timeout=60_000
+        )
+        check()
+        # Replayed from the stored transcript after a reload.
+        self.page.reload()
+        check()
+        self.delete_session(f"long transcript {count}", repo=scenarios.REPO)
 
     def test_images(self) -> None:
         self.page.goto(self.url + "#/agents")
