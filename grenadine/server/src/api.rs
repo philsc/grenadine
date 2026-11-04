@@ -856,7 +856,13 @@ async fn terminal_socket(
 async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
     // Not `find_agent`: a session whose backend this build doesn't know
     // can still be deleted.
-    if !agent::valid_id(&id) || !agent::delete(&state, &id).await? {
+    if !agent::valid_id(&id) {
+        return Ok(StatusCode::NOT_FOUND);
+    }
+    // The deletion runs in a task of its own so that a page closing
+    // mid-request doesn't stop it halfway.
+    let state = state.clone();
+    if !tokio::spawn(async move { agent::delete(&state, &id).await }).await?? {
         return Ok(StatusCode::NOT_FOUND);
     }
     Ok(StatusCode::NO_CONTENT)
