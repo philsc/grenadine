@@ -2601,6 +2601,24 @@ class AgentTest(ServerTestCase):
         check()
         self.delete_session(f"long transcript {count}", repo=scenarios.REPO)
 
+    def test_activity_bar(self) -> None:
+        # The activity bar waits with the agent for the approval and goes
+        # once the turn ends.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("please write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        transcript = self.page.locator(".transcript")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Claude wants to use Write notes.txt")
+        activity = self.page.locator(".activity")
+        expect(activity).to_contain_text("Waiting for your approval")
+        approval.get_by_role("button", name="Allow").click()
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        expect(activity).to_have_count(0)
+
     def test_images(self) -> None:
         self.page.goto(self.url + "#/agents")
         self.page.get_by_label("Repository").select_option(scenarios.REPO)
