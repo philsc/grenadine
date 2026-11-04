@@ -1243,8 +1243,11 @@ class InboxTest(ServerTestCase):
         status = self.page.locator(".sync-status")
         expect(status).to_have_text(re.compile(r"^Synced"))
 
-        # Below a tenth of the limit, the next poll does nothing at all.
-        self.gh.set_rate_limit(400)
+        # Below a tenth of the limit, the next poll does nothing at
+        # all. The window ends in a few seconds so the pause is
+        # short-lived.
+        reset = time.time() + 5
+        self.gh.set_rate_limit(400, reset_in=5)
         self.addCleanup(self.gh.set_rate_limit, 5000)
         self.repoll()
         expect(status).to_have_text(re.compile(r"^Paused until "))
@@ -1252,16 +1255,20 @@ class InboxTest(ServerTestCase):
         expect(inbox.locator(".pr-list li")).not_to_have_count(0)
         expect(self.page.locator(".sync-error")).to_have_count(0)
 
-        self.gh.set_rate_limit(5000)
-        # The server's last-known state still says 400 until a request
-        # goes through; the viewer's own actions still go at that level.
-        # A PR no inbox covers is synced when its page opens.
+        # The viewer's own actions still go at that level: a PR no
+        # inbox covers is synced when its page opens.
         title = next(t for t, i in self.cases.expected.items() if not i)
         pr = self.cases.prs[title]
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
         expect(self.page.locator(".pr-header h1")).to_have_text(
             f"{pr.title} #{pr.number}"
         )
+
+        # The server's last-known state still says 400; it only lets
+        # searches go once the window's reset has passed, the way
+        # GitHub refills the budget.
+        self.gh.set_rate_limit(5000)
+        time.sleep(max(0, reset + 1 - time.time()))
         self.repoll()
         expect(status).to_have_text(re.compile(r"^Synced"))
 

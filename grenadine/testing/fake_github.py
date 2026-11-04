@@ -513,8 +513,9 @@ class FakeGitHub:
         # When set, the next mutation fails with this message and changes
         # nothing.
         self.fail_next_mutation: str | None = None
-        # What the x-ratelimit-* headers report. The window is static:
-        # `used` is limit - remaining and `reset` moves with every reply.
+        # What the x-ratelimit-* headers report: `used` is
+        # limit - remaining and `reset` only moves when
+        # `set_rate_limit` moves it.
         self.rate_limit = {
             "limit": 5000,
             "remaining": 5000,
@@ -538,13 +539,16 @@ class FakeGitHub:
         self._hold = threading.Event(), threading.Event()
         return self._hold
 
-    def set_rate_limit(self, remaining: int) -> None:
+    def set_rate_limit(self, remaining: int, reset_in: int | None = None) -> None:
         """Sets the budget the headers report; 0 answers every request
-        with a rate-limit error. Raising it resets the window, the way
-        GitHub refills the budget when the window ends."""
+        with a rate-limit error. `reset_in` moves the window's end to
+        now + reset_in seconds; raising the budget without it starts a
+        fresh window, the way GitHub refills when the old one ends."""
         with self.lock:
-            if remaining > self.rate_limit["remaining"]:
-                self.rate_limit["reset"] = int(time.time())
+            if reset_in is not None:
+                self.rate_limit["reset"] = int(time.time()) + reset_in
+            elif remaining > self.rate_limit["remaining"]:
+                self.rate_limit["reset"] = int(time.time()) + 3600
             self.rate_limit["remaining"] = remaining
 
     def git_env(self) -> dict[str, str]:
