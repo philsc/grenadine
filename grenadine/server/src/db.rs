@@ -2412,6 +2412,35 @@ mod tests {
         assert!(db.cached_users(&logins, 101).unwrap().is_empty());
     }
 
+    /// Rows landed before pull requests recorded their branches still
+    /// load, with the branch empty for the caller to fall back on.
+    #[test]
+    fn landed_stored_before_branches_load() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Running)).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agents SET landed = ? WHERE id = 'a'",
+                [r#"{"pull_request":{"number":3,"url":"https://github.com/o/n/pull/3"}}"#],
+            )
+            .unwrap();
+        let landed = db.agent("a").unwrap().unwrap().landed.unwrap();
+        let [pr] = &landed.prs()[..] else {
+            panic!("{landed:?}")
+        };
+        assert_eq!((pr.number, pr.branch.as_str()), (3, ""));
+
+        db.conn()
+            .execute(
+                "UPDATE agents SET landed = ? WHERE id = 'a'",
+                [r#"{"stack":{"prs":[{"number":3,"url":"u"},{"number":4,"url":"v"}]}}"#],
+            )
+            .unwrap();
+        let landed = db.agent("a").unwrap().unwrap().landed.unwrap();
+        let branches: Vec<_> = landed.prs().iter().map(|pr| pr.branch.clone()).collect();
+        assert_eq!(branches, ["", ""]);
+    }
+
     #[test]
     fn comments_stored_before_resolved_existed_load() {
         let db = Db::in_memory();
@@ -2638,6 +2667,7 @@ mod tests {
         let landed = Landed::PullRequest {
             number: 3,
             url: "https://github.com/o/n/pull/3".into(),
+            branch: "feat".into(),
         };
         db.set_agent_landed("a", &landed).unwrap();
         db.set_agent_base("a", "t").unwrap();
@@ -2646,6 +2676,7 @@ mod tests {
         let pr = |number| grenadine_core::api::LandedPr {
             number,
             url: format!("https://github.com/o/n/pull/{number}"),
+            branch: format!("feat-{number}"),
         };
         let landed = Landed::Stack {
             prs: vec![pr(3), pr(4)],

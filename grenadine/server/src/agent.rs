@@ -1840,7 +1840,7 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
         _ => None,
     };
     // The PRs an earlier wrap-up opened stay the bottom of the stack.
-    let opened = session.landed.as_ref().map(Landed::prs).unwrap_or_default();
+    let opened = landed_prs(&session);
     let count = opened.len();
     let step = {
         let _guard = cloned.git_lock.lock().await;
@@ -1868,7 +1868,11 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
                 .create_pr(&session.repo, &branch, &below, &title, &body)
                 .await
             {
-                Ok((number, url)) => prs.push(LandedPr { number, url }),
+                Ok((number, url)) => prs.push(LandedPr {
+                    number,
+                    url,
+                    branch: branch.clone(),
+                }),
                 Err(e) => {
                     // The next wrap-up goes on from the PRs opened so far.
                     if prs.len() > before {
@@ -1896,6 +1900,25 @@ pub(crate) fn stack_branch(branch: &str, i: usize) -> String {
         0 => branch.to_owned(),
         _ => format!("{branch}-{}", i + 1),
     }
+}
+
+/// The session's landed PRs with their branches filled in: a PR landed
+/// before branches were recorded gets the branch its position had.
+pub(crate) fn landed_prs(session: &AgentSession) -> Vec<LandedPr> {
+    session
+        .landed
+        .as_ref()
+        .map(Landed::prs)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut pr)| {
+            if pr.branch.is_empty() {
+                pr.branch = stack_branch(&session.branch, i);
+            }
+            pr
+        })
+        .collect()
 }
 
 fn short(sha: &str) -> &str {
@@ -2017,15 +2040,10 @@ fn landed_note(session: &AgentSession) -> Option<String> {
             "The user had Grenadine, the app running this session, land this session's commits \
              on their checkout, up to {sha}. Later commits land when the user wraps up again."
         ),
-        landed => {
-            let prs = landed
-                .prs()
+        _ => {
+            let prs = landed_prs(session)
                 .iter()
-                .enumerate()
-                .map(|(i, pr)| {
-                    let branch = stack_branch(&session.branch, i);
-                    format!("- #{} {} from branch `{branch}`", pr.number, pr.url)
-                })
+                .map(|pr| format!("- #{} {} from branch `{}`", pr.number, pr.url, pr.branch))
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
@@ -3454,6 +3472,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             AgentEventKind::Landed(Landed::PullRequest {
                 number: 8,
                 url: "https://github.com/o/n/pull/8".into(),
+                branch: "b".into(),
             }),
         ];
         let mut opened = OpenedPrs::default();
@@ -3836,6 +3855,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let pr = Landed::PullRequest {
             number: 24,
             url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
         };
         record_landed(&state, id, &pr).unwrap();
         run(worktree, &["commit", "--amend", "-qm", "Amended b"]);
@@ -3880,6 +3900,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let pr = Landed::PullRequest {
             number: 24,
             url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
         };
         record_landed(&state, id, &pr).unwrap();
         send(
@@ -3991,6 +4012,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let pr = |number| LandedPr {
             number,
             url: format!("https://github.com/owner/name/pull/{number}"),
+            branch: String::new(),
         };
         record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
 
@@ -4063,6 +4085,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let pr = |number| LandedPr {
             number,
             url: format!("https://github.com/o/n/pull/{number}"),
+            branch: String::new(),
         };
         let session = |landed| AgentSession {
             branch: "grenadine/agent/abc".into(),
@@ -4125,6 +4148,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let landed = Landed::PullRequest {
             number: 24,
             url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
         };
         record_landed(&state, id, &landed).unwrap();
         send(
