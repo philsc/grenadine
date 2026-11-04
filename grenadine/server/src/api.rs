@@ -101,6 +101,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/changes", get(changes))
         .route("/api/blobs", post(blobs))
         .route("/api/sync", get(sync_status))
+        .route("/api/debug/github", get(github_usage))
         .route("/api/events", get(events))
         .route("/api/repos", get(repos))
         .route(
@@ -556,6 +557,12 @@ async fn blobs(AxState(state): St, Json(req): Json<BlobsRequest>) -> ApiResult<R
 /// SyncStatus events.
 async fn sync_status(AxState(state): St) -> Json<grenadine_core::api::SyncStatus> {
     Json(state.sync_status.lock().unwrap().clone())
+}
+
+/// What the GitHub client spent and where the limits stand, for the
+/// Debug tab.
+async fn github_usage(AxState(state): St) -> Json<grenadine_core::api::GitHubUsage> {
+    Json(state.github.usage())
 }
 
 /// Keep-alives as a named "ping" event rather than a comment, so that the

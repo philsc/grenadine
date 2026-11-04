@@ -11,8 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use grenadine_core::api::{
-    CiStatus, MergeState, Person, PrDetail, PrKey, ReviewComment, ReviewInfo, ServerEvent, StackPr,
-    SyncPhase, SyncStatus, SyncingPr, Version,
+    CiStatus, MergeState, Person, PrDetail, PrKey, RequestPriority, ReviewComment, ReviewInfo,
+    ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
 };
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -21,6 +21,7 @@ use crate::db::{Db, PrMeta, SyncMark};
 use crate::git::{REF_PREFIX, Repo};
 use crate::github::{self, GitHub, PrData, ThreadState};
 use crate::inbox_search::{self, InboxResult};
+use crate::ratelimit;
 use crate::stack;
 
 /// How many PRs sync at the same time.
@@ -214,6 +215,11 @@ impl State {
         match result {
             Ok(true) => self.follow_up(key.clone()),
             Ok(false) => {}
+            Err(e) if ratelimit::is_rate_limited(&e) => {
+                // The sync ran out of budget, not into a bug; the mark is
+                // unchanged so the next poll picks the PR up again.
+                tracing::info!("{}#{}: {e:#}", key.repo, key.number);
+            }
             Err(e) => {
                 tracing::warn!("{}#{}: {e:#}", key.repo, key.number);
                 let _ = self.db.store_sync_error(key, &format!("{e:#}"));
@@ -240,7 +246,10 @@ impl State {
                 if !state.claim(&key) {
                     continue;
                 }
-                let result = sync_pr(&state, &key).await;
+                // A spawned task doesn't inherit the task-local priority.
+                let result =
+                    ratelimit::with_priority(RequestPriority::Background, sync_pr(&state, &key))
+                        .await;
                 let again = matches!(result, Ok(true));
                 // While this runs, `synced` doesn't start more follow-ups.
                 state.finish(&key, result);
@@ -293,7 +302,12 @@ impl State {
             s.remaining = 0;
             s.in_flight.clear();
             s.last_finished = Some(chrono::Utc::now().timestamp());
-            s.last_error = result.as_ref().err().map(|e| format!("{e:#}"));
+            s.last_error = result
+                .as_ref()
+                .err()
+                .filter(|e| !ratelimit::is_rate_limited(e))
+                .map(|e| format!("{e:#}"));
+            s.paused_until = self.github.paused_until(RequestPriority::Background);
         });
     }
 }
@@ -320,6 +334,11 @@ pub async fn run(state: Arc<State>, interval: Duration) {
 }
 
 async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
+    // While searches are paused to keep the rate limit, the poll does
+    // nothing at all: the inboxes keep their last results.
+    if state.github.paused_until(RequestPriority::Search).is_some() {
+        return Ok(());
+    }
     state.status_searching();
     let inboxes = state.db.inboxes()?;
     let slugs: Vec<String> = state.repos.keys().cloned().collect();
@@ -341,7 +360,10 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     }
     let repos: BTreeSet<String> = state.repos.keys().cloned().collect();
     let results = tokio::select! {
-        r = inbox_search::run(&state.github, &prepared, &repos) => r?,
+        r = ratelimit::with_priority(
+            RequestPriority::Search,
+            inbox_search::run(&state.github, &prepared, &repos),
+        ) => r?,
         _ = state.shutdown.cancelled() => return Ok(()),
     }
     .1;
@@ -367,18 +389,22 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     state.send(ServerEvent::InboxesChanged);
     // The sessions' PRs are secondary; failing to look them up doesn't
     // fail the poll.
-    if let Err(e) = refresh_agent_prs(state).await {
+    let agents = ratelimit::with_priority(RequestPriority::Background, refresh_agent_prs(state));
+    if let Err(e) = agents.await {
         tracing::warn!("can't look up the agent sessions' PRs: {e:#}");
     }
     // So are the viewer's PRs to review, which sync with the inboxes' so
     // that a review starts from the PR's latest head.
-    let mine = match crate::auto_review::search(state).await {
-        Ok(mine) => mine,
-        Err(e) => {
-            tracing::warn!("can't look for PRs to review: {e:#}");
-            Vec::new()
-        }
-    };
+    let mine =
+        match ratelimit::with_priority(RequestPriority::Search, crate::auto_review::search(state))
+            .await
+        {
+            Ok(mine) => mine,
+            Err(e) => {
+                tracing::warn!("can't look for PRs to review: {e:#}");
+                Vec::new()
+            }
+        };
     for hit in &mine {
         hits.entry(hit.key.clone()).or_insert_with(|| hit.clone());
     }
@@ -396,12 +422,24 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         .take_until(state.shutdown.cancelled())
         .for_each_concurrent(CONCURRENCY, |key| async move {
             state.status_started(&key);
-            let result = sync_pr(state, &key).await;
+            // While background syncs pause to keep the rate limit the PR
+            // is skipped, not failed: its mark is unchanged, so the next
+            // poll picks it up again.
+            if state
+                .github
+                .paused_until(RequestPriority::Background)
+                .is_none()
+            {
+                let result =
+                    ratelimit::with_priority(RequestPriority::Background, sync_pr(state, &key))
+                        .await;
+                state.synced(&key, result);
+                state.send(ServerEvent::PrChanged(key.clone()));
+                // A synced or failed PR shows up differently in the
+                // inboxes.
+                state.send(ServerEvent::InboxesChanged);
+            }
             state.status_finished(&key);
-            state.synced(&key, result);
-            state.send(ServerEvent::PrChanged(key));
-            // A synced or failed PR shows up differently in the inboxes.
-            state.send(ServerEvent::InboxesChanged);
         })
         .await;
     if !state.shutdown.is_cancelled() {
@@ -962,6 +1000,26 @@ mod tests {
         .expect("the follow-ups did not stop after shutdown");
         // It stopped before syncing, which would have failed.
         assert_eq!(state.db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn rate_limited_syncs_store_no_error() {
+        let state = test_state();
+        let key = key();
+        state.synced(
+            &key,
+            Err(anyhow::Error::new(ratelimit::RateLimited {
+                resource: grenadine_core::api::ApiResource::GraphQl,
+                until: 0,
+            })),
+        );
+        assert_eq!(state.db.pr_sync_error(&key).unwrap(), None);
+
+        state.synced(&key, Err(anyhow!("boom")));
+        assert_eq!(
+            state.db.pr_sync_error(&key).unwrap().as_deref(),
+            Some("boom")
+        );
     }
 
     #[test]

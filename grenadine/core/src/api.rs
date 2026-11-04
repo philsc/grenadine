@@ -727,6 +727,86 @@ pub struct SyncStatus {
     pub last_finished: Option<i64>,
     /// Set when the last poll failed as a whole.
     pub last_error: Option<String>,
+    /// Unix seconds until which background syncs pause to stay within
+    /// GitHub's rate limit; `None` when nothing is paused.
+    #[serde(default)]
+    pub paused_until: Option<i64>,
+}
+
+/// How urgently a GitHub request is needed. Less urgent requests pause
+/// first: the viewer's own actions go last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RequestPriority {
+    /// A page's action or a PR it opened.
+    User,
+    /// The poller's inbox searches.
+    Search,
+    /// Syncs and lookups nobody is waiting for.
+    Background,
+}
+
+/// Which of GitHub's rate limits a request spends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ApiResource {
+    /// The GraphQL API's points.
+    GraphQl,
+    /// The REST API's requests.
+    Rest,
+}
+
+/// What the server spent on GitHub and what the limits look like, for
+/// the Debug tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubUsage {
+    /// Unix seconds when the snapshot was taken.
+    pub now: i64,
+    /// The last known state of each resource's limit.
+    pub limits: Vec<RateLimitInfo>,
+    /// Last hour, grouped by (kind, resource, priority), sorted by
+    /// points desc then requests desc.
+    pub kinds: Vec<RequestKindUsage>,
+    /// 60 entries, oldest first, the last one is the current minute.
+    pub minutes: Vec<MinuteUsage>,
+}
+
+/// A resource's limit as the last response's headers reported it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitInfo {
+    pub resource: ApiResource,
+    pub limit: u32,
+    pub remaining: u32,
+    pub used: u32,
+    /// Unix seconds when the window resets.
+    pub reset: i64,
+    /// What grenadine spent since this window started (reset - 3600):
+    /// GraphQL points, or REST requests.
+    pub ours: u32,
+    /// The tiers that are paused right now.
+    pub paused: Vec<RequestPriority>,
+}
+
+/// A kind of request's use over the last hour.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestKindUsage {
+    /// What the request was for, e.g. "search" or "pr".
+    pub kind: String,
+    pub resource: ApiResource,
+    pub priority: RequestPriority,
+    pub requests: u32,
+    /// The GraphQL points spent; `None` where they can't be known, e.g.
+    /// mutations and REST calls.
+    pub points: Option<u32>,
+    /// How many were refused without being sent to keep the limit.
+    pub deferred: u32,
+}
+
+/// One minute's spending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinuteUsage {
+    /// Unix seconds at the minute's start.
+    pub start: i64,
+    pub graphql_points: u32,
+    pub rest_requests: u32,
 }
 
 /// Pushed to the page over server-sent events.

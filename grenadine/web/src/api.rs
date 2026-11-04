@@ -8,10 +8,10 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoReviewEntry, Blob,
-    BlobsRequest, BlobsResponse, Changes, CleanupState, InboxEdit, InboxWithPrs, MergeRequest,
-    Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail,
-    PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview, SyncStatus, TerminalInfo,
-    WorktreeChanges, WrapUp,
+    BlobsRequest, BlobsResponse, Changes, CleanupState, GitHubUsage, InboxEdit, InboxWithPrs,
+    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview,
+    SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -125,6 +125,15 @@ pub async fn pr(key: &PrKey) -> Result<PrResponse> {
     resp.json()
         .await
         .map(|d| PrResponse::Ready(Box::new(d)))
+        .map_err(|e| e.to_string())
+}
+
+/// What the server spent on GitHub, for the Debug tab.
+pub async fn github_usage() -> Result<GitHubUsage> {
+    check(Request::get("/api/debug/github").send().await)
+        .await?
+        .json()
+        .await
         .map_err(|e| e.to_string())
 }
 

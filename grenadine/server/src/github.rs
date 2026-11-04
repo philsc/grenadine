@@ -7,15 +7,17 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeInfo, MergeMethod, MergeRequest, MergeState, NewThread,
-    Person, PrKey, Review, ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState,
-    Side, StackPr, SubmitReview, ThreadCounts,
+    ApiResource, Check, CiStatus, GitHubUsage, IssueComment, MergeInfo, MergeMethod, MergeRequest,
+    MergeState, NewThread, Person, PrKey, RequestPriority, Review, ReviewComment, ReviewDecision,
+    ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
 use reqwest::header;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::ratelimit::{self, LimitState, RateLimited};
 
 pub const API: &str = "https://api.github.com";
 
@@ -38,6 +40,9 @@ pub fn gh_token() -> Result<String> {
 pub struct GitHub {
     http: reqwest::Client,
     api: String,
+    /// The limits the responses reported and the requests sent, for
+    /// admission and the Debug tab.
+    usage: std::sync::Arc<std::sync::Mutex<ratelimit::Usage>>,
 }
 
 /// One PR that a search found.
@@ -781,6 +786,31 @@ fn str_at<'a>(v: &'a Value, ptr: &str) -> &'a str {
     v.pointer(ptr).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// `query` with `rateLimit { cost }` added to the operation's top-level
+/// selection set, so the response reports what it cost. All of
+/// grenadine's queries start `query(...) {`, so inserting after the
+/// first `{` lands in the operation, not in a fragment.
+fn with_cost(query: &str) -> String {
+    match query.find('{') {
+        Some(i) => format!("{} rateLimit {{ cost }}\n{}", &query[..=i], &query[i + 1..]),
+        None => query.to_owned(),
+    }
+}
+
+/// The window a response's `x-ratelimit-*` headers report; `None`
+/// without them.
+fn limit_from_headers(headers: &header::HeaderMap) -> Option<LimitState> {
+    fn get<T: std::str::FromStr>(headers: &header::HeaderMap, name: &str) -> Option<T> {
+        headers.get(name)?.to_str().ok()?.parse().ok()
+    }
+    Some(LimitState {
+        limit: get(headers, "x-ratelimit-limit")?,
+        remaining: get(headers, "x-ratelimit-remaining")?,
+        used: get(headers, "x-ratelimit-used")?,
+        reset: get(headers, "x-ratelimit-reset")?,
+    })
+}
+
 /// The URL of the `rel="next"` page in a `Link` header.
 fn next_link(headers: &header::HeaderMap) -> Option<String> {
     let link = headers.get(header::LINK)?.to_str().ok()?;
@@ -819,32 +849,169 @@ impl GitHub {
         Ok(GitHub {
             http,
             api: api.to_owned(),
+            usage: std::sync::Arc::new(std::sync::Mutex::new(ratelimit::Usage::default())),
         })
     }
 
-    /// Runs a GraphQL query. Returns `data` and the `errors`, if any.
-    async fn graphql(&self, query: &str, variables: Value) -> Result<(Value, Vec<Value>)> {
-        let resp: Value = self
+    /// What the Debug tab shows: the known limits and the last hour's
+    /// requests.
+    pub fn usage(&self) -> GitHubUsage {
+        self.usage
+            .lock()
+            .unwrap()
+            .snapshot(chrono::Utc::now().timestamp())
+    }
+
+    /// The reset time when `priority`'s requests pause on any resource,
+    /// else `None`.
+    pub fn paused_until(&self, priority: RequestPriority) -> Option<i64> {
+        self.usage
+            .lock()
+            .unwrap()
+            .paused_until(priority, chrono::Utc::now().timestamp())
+    }
+
+    /// Lets `kind`'s request on `resource` go under the current
+    /// priority, or refuses it to keep the limit.
+    fn admit(&self, kind: &'static str, resource: ApiResource) -> Result<()> {
+        self.usage.lock().unwrap().admit(
+            kind,
+            resource,
+            ratelimit::current(),
+            chrono::Utc::now().timestamp(),
+        )?;
+        Ok(())
+    }
+
+    /// Updates `resource`'s window from the response's headers.
+    fn saw_headers(&self, resource: ApiResource, headers: &header::HeaderMap) {
+        if let Some(state) = limit_from_headers(headers) {
+            self.usage.lock().unwrap().saw(resource, state);
+        }
+    }
+
+    /// Logs a request that was sent, `points` what it cost where the
+    /// response says.
+    fn logged(&self, kind: &'static str, resource: ApiResource, points: Option<u32>, at: i64) {
+        self.usage.lock().unwrap().log(ratelimit::Entry {
+            at,
+            kind,
+            resource,
+            priority: ratelimit::current(),
+            points,
+            deferred: false,
+        });
+    }
+
+    /// Fails with `RateLimited` when the response says the resource's
+    /// limit is out: 403 or 429 with nothing left.
+    fn check_exhausted(
+        &self,
+        resource: ApiResource,
+        resp: reqwest::Response,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if status != reqwest::StatusCode::FORBIDDEN
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Ok(resp);
+        }
+        let Some(state) = self.usage.lock().unwrap().state(resource) else {
+            return Ok(resp);
+        };
+        if state.remaining != 0 {
+            return Ok(resp);
+        }
+        Err(RateLimited {
+            resource,
+            until: state.reset,
+        }
+        .into())
+    }
+
+    /// Runs a GraphQL query, labelled `kind` in the usage log. Returns
+    /// `data` and the `errors`, if any.
+    async fn graphql(
+        &self,
+        kind: &'static str,
+        query: &str,
+        variables: Value,
+    ) -> Result<(Value, Vec<Value>)> {
+        self.run_graphql(kind, query, variables, true).await
+    }
+
+    /// Runs `query` with `rateLimit { cost }` added when `cost`, so
+    /// responses report what queries spent.
+    async fn run_graphql(
+        &self,
+        kind: &'static str,
+        query: &str,
+        variables: Value,
+        cost: bool,
+    ) -> Result<(Value, Vec<Value>)> {
+        self.admit(kind, ApiResource::GraphQl)?;
+        let at = chrono::Utc::now().timestamp();
+        let query = if cost {
+            with_cost(query)
+        } else {
+            query.to_owned()
+        };
+        let resp = self
             .http
             .post(format!("{}/graphql", self.api))
             .json(&json!({ "query": query, "variables": variables }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        self.saw_headers(ApiResource::GraphQl, resp.headers());
+        // A refused or failed response still counts at GitHub, so it's
+        // logged too.
+        let resp = match self
+            .check_exhausted(ApiResource::GraphQl, resp)
+            .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.logged(kind, ApiResource::GraphQl, None, at);
+                return Err(e);
+            }
+        };
+        let resp: Value = resp.json().await?;
+        let points = resp
+            .pointer("/data/rateLimit/cost")
+            .and_then(Value::as_u64)
+            .map(|p| p as u32);
+        self.logged(kind, ApiResource::GraphQl, points, at);
         let errors = resp
             .get("errors")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if errors
+            .iter()
+            .any(|e| e["type"].as_str() == Some("RATE_LIMITED"))
+        {
+            let until = self
+                .usage
+                .lock()
+                .unwrap()
+                .state(ApiResource::GraphQl)
+                .map(|s| s.reset)
+                .unwrap_or(at + 3600);
+            return Err(RateLimited {
+                resource: ApiResource::GraphQl,
+                until,
+            }
+            .into());
+        }
         Ok((resp.get("data").cloned().unwrap_or(Value::Null), errors))
     }
 
     /// Runs a GraphQL mutation. Unlike a query's, any error fails it: a
     /// change must not half succeed silently.
     async fn mutate(&self, query: &str, variables: Value) -> Result<Value> {
-        let (data, errors) = self.graphql(query, variables).await?;
+        let (data, errors) = self
+            .run_graphql("mutation", query, variables, false)
+            .await?;
         if let Some(e) = errors.first() {
             bail!(
                 "GitHub refused the change: {}",
@@ -862,6 +1029,7 @@ impl GitHub {
         let (owner, name) = split_repo(&key.repo)?;
         let (data, errors) = self
             .graphql(
+                "pr_node",
                 &format!(
                     "query($owner: String!, $name: String!, $number: Int!) {{
                        repository(owner: $owner, name: $name) {{
@@ -1217,7 +1385,7 @@ impl GitHub {
             vars.insert(format!("a{i}"), json!(after));
         }
         gql += "}";
-        let (data, errors) = self.graphql(&gql, Value::Object(vars)).await?;
+        let (data, errors) = self.graphql("search", &gql, Value::Object(vars)).await?;
         let viewer = str_at(&data, "/viewer/login").to_owned();
         let mut error_for: BTreeMap<String, String> = BTreeMap::new();
         for e in &errors {
@@ -1305,7 +1473,9 @@ impl GitHub {
             vars.insert(format!("r{i}"), json!(r));
         }
         gql += "  }\n}";
-        let (data, errors) = self.graphql(&gql, Value::Object(vars)).await?;
+        let (data, errors) = self
+            .graphql("prs_by_ref", &gql, Value::Object(vars))
+            .await?;
         (0..refs.len())
             .map(|i| {
                 let nodes = data
@@ -1350,6 +1520,7 @@ impl GitHub {
         let (owner, name) = split_repo(&key.repo)?;
         let (data, errors) = self
             .graphql(
+                "pr",
                 &format!("{PR_QUERY}{CHECKS_FRAGMENT}"),
                 json!({ "owner": owner, "name": name, "number": key.number }),
             )
@@ -1446,12 +1617,23 @@ impl GitHub {
         title: &str,
         body: &str,
     ) -> Result<(u64, String)> {
+        self.admit("create_pr", ApiResource::Rest)?;
+        let at = chrono::Utc::now().timestamp();
         let resp = self
             .http
             .post(format!("{}/repos/{repo}/pulls", self.api))
             .json(&json!({ "head": head, "base": base, "title": title, "body": body }))
             .send()
             .await?;
+        self.saw_headers(ApiResource::Rest, resp.headers());
+        let resp = match self.check_exhausted(ApiResource::Rest, resp) {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.logged("create_pr", ApiResource::Rest, None, at);
+                return Err(e);
+            }
+        };
+        self.logged("create_pr", ApiResource::Rest, None, at);
         let status = resp.status();
         let v: Value = resp.json().await.unwrap_or_default();
         if !status.is_success() {
@@ -1467,14 +1649,32 @@ impl GitHub {
         Ok((number, str_at(&v, "/html_url").to_owned()))
     }
 
-    /// GETs every page of a REST list.
-    async fn get_all<T: serde::de::DeserializeOwned>(&self, url: String) -> Result<Vec<T>> {
+    /// GETs every page of a REST list, labelled `kind` in the usage log.
+    async fn get_all<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: &'static str,
+        url: String,
+    ) -> Result<Vec<T>> {
         let mut out = Vec::new();
         let mut next = Some(url);
         while let Some(url) = next.take() {
-            let resp = self.http.get(&url).send().await?.error_for_status()?;
+            self.admit(kind, ApiResource::Rest)?;
+            let at = chrono::Utc::now().timestamp();
+            let resp = self.http.get(&url).send().await?;
+            self.saw_headers(ApiResource::Rest, resp.headers());
+            let resp = match self
+                .check_exhausted(ApiResource::Rest, resp)
+                .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.logged(kind, ApiResource::Rest, None, at);
+                    return Err(e);
+                }
+            };
             next = next_link(resp.headers());
             out.extend(resp.json::<Vec<T>>().await?);
+            self.logged(kind, ApiResource::Rest, None, at);
         }
         Ok(out)
     }
@@ -1486,7 +1686,7 @@ impl GitHub {
             "{}/repos/{repo}/activity?ref=refs/heads/{branch}&direction=asc&per_page=100",
             self.api
         );
-        let raw: Vec<RestActivity> = match self.get_all(url).await {
+        let raw: Vec<RestActivity> = match self.get_all("activity", url).await {
             Ok(raw) => raw,
             Err(e)
                 if e.downcast_ref::<reqwest::Error>()
@@ -1529,7 +1729,7 @@ impl GitHub {
             "{}/repos/{}/pulls/{}/comments?per_page=100",
             self.api, key.repo, key.number
         );
-        let raw: Vec<RestComment> = self.get_all(url).await?;
+        let raw: Vec<RestComment> = self.get_all("review_comments", url).await?;
         Ok(raw
             .into_iter()
             .map(|c| ReviewComment {
@@ -1568,6 +1768,7 @@ impl GitHub {
         loop {
             let (data, errors) = self
                 .graphql(
+                    "review_threads",
                     THREADS_QUERY,
                     json!({ "owner": owner, "name": name, "number": key.number, "after": after }),
                 )
@@ -1636,6 +1837,7 @@ impl GitHub {
             // A login that isn't a user is an error for its alias only.
             let (data, _) = self
                 .graphql(
+                    "users",
                     &format!("query({params}) {{\n{fields}}}"),
                     Value::Object(vars),
                 )
@@ -1676,6 +1878,7 @@ impl GitHub {
             // A PR that can't be found is an error for its alias only.
             let (data, _) = self
                 .graphql(
+                    "pr_statuses",
                     &format!("query({params}) {{\n{fields}}}"),
                     Value::Object(vars),
                 )
@@ -1738,6 +1941,7 @@ impl GitHub {
             }
             let (data, _) = self
                 .graphql(
+                    "commit_authors",
                     &format!(
                         "query({}) {{\nrepository(owner: $owner, name: $name) {{\n{fields}}}\n}}",
                         params.join(", ")
@@ -1796,6 +2000,48 @@ mod tests {
         assert_eq!(search_query("is:open", &[]), "is:pr (is:open)");
         assert_eq!(search_query(" ", &["a/b".into()]), "is:pr (repo:a/b)");
         assert_eq!(search_query("", &[]), "is:pr");
+    }
+
+    #[test]
+    fn with_cost_joins_the_operation() {
+        let q = "query($x: Int!) { viewer { login } }";
+        assert_eq!(
+            with_cost(q),
+            "query($x: Int!) { rateLimit { cost }\n viewer { login } }"
+        );
+        // The PR query trails a fragment; the cost must land in the
+        // operation's selection set, not the fragment's.
+        let q = with_cost(&format!("{PR_QUERY}{CHECKS_FRAGMENT}"));
+        assert!(q.find("rateLimit { cost }").unwrap() < q.find("fragment Checks").unwrap());
+    }
+
+    #[test]
+    fn rate_limit_headers_make_a_state() {
+        let mut h = header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ratelimit-limit", "5000"),
+            ("x-ratelimit-remaining", "4999"),
+            ("x-ratelimit-used", "1"),
+            ("x-ratelimit-reset", "1767229200"),
+        ] {
+            h.insert(name, header::HeaderValue::from_static(value));
+        }
+        assert_eq!(
+            limit_from_headers(&h),
+            Some(LimitState {
+                limit: 5000,
+                remaining: 4999,
+                used: 1,
+                reset: 1767229200,
+            })
+        );
+        h.clear();
+        assert_eq!(limit_from_headers(&h), None);
+        h.insert(
+            "x-ratelimit-limit",
+            header::HeaderValue::from_static("5000"),
+        );
+        assert_eq!(limit_from_headers(&h), None);
     }
 
     #[test]

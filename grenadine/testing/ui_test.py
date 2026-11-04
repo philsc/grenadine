@@ -1009,6 +1009,46 @@ class InboxTest(ServerTestCase):
         expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
         expect(rows.locator("a")).to_have_attribute("href", base.url)
 
+    def test_debug_tab_shows_github_usage(self) -> None:
+        self.page.goto(self.url)
+        # Wait for the first poll's searches and syncs.
+        expect(
+            self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")
+        ).not_to_have_count(0)
+        self.page.get_by_role("link", name="Debug", exact=True).click()
+        expect(self.page.locator(".debug h1")).to_have_text("GitHub API usage")
+        expect(self.page.locator(".debug")).to_contain_text("of 5,000 points left")
+        expect(self.page.locator(".usage-table")).to_contain_text("Inbox search")
+
+    def test_pauses_near_the_rate_limit(self) -> None:
+        self.page.goto(self.url)
+        inbox = self.inbox(scenarios.NEEDS_REVIEW)
+        expect(inbox.locator(".pr-list li")).not_to_have_count(0)
+        status = self.page.locator(".sync-status")
+        expect(status).to_have_text(re.compile(r"^Synced"))
+
+        # Below a tenth of the limit, the next poll does nothing at all.
+        self.gh.set_rate_limit(400)
+        self.addCleanup(self.gh.set_rate_limit, 5000)
+        self.repoll()
+        expect(status).to_have_text(re.compile(r"^Paused until "))
+        # The inboxes keep their last results and no error is shown.
+        expect(inbox.locator(".pr-list li")).not_to_have_count(0)
+        expect(self.page.locator(".sync-error")).to_have_count(0)
+
+        self.gh.set_rate_limit(5000)
+        # The server's last-known state still says 400 until a request
+        # goes through; the viewer's own actions still go at that level.
+        # A PR no inbox covers is synced when its page opens.
+        title = next(t for t, i in self.cases.expected.items() if not i)
+        pr = self.cases.prs[title]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.repoll()
+        expect(status).to_have_text(re.compile(r"^Synced"))
+
 
 class InboxPagingTest(ServerTestCase):
     """Inboxes show 15 rows first and grow by 10 per "Show more" click."""

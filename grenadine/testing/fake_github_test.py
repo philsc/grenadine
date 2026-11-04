@@ -28,6 +28,7 @@ from grenadine.testing.fake_github import (
 # what the server sends.
 PR_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       title body url state isDraft createdAt updatedAt
@@ -821,6 +822,44 @@ class FakeGitHubTest(unittest.TestCase):
             (opened.title, opened.base, opened.head_oid), ("Agent work", "main", sha)
         )
         self.assertEqual(created["html_url"], opened.url)
+
+    def test_rate_limit(self) -> None:
+        out = self.query("query { rateLimit { cost limit remaining } }")
+        self.assertEqual(
+            out["data"]["rateLimit"],
+            {"cost": 1, "limit": 5000, "remaining": 5000},
+        )
+
+        base = self.gh.start()
+        self.addCleanup(self.gh.stop)
+
+        def post_graphql() -> urllib.request.addinfourl:
+            req = urllib.request.Request(
+                base + "/graphql",
+                data=json.dumps({"query": "query { viewer { login } }"}).encode(),
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+            return urllib.request.urlopen(req)
+
+        resp = post_graphql()
+        self.assertEqual(resp.headers["x-ratelimit-limit"], "5000")
+        self.assertEqual(resp.headers["x-ratelimit-remaining"], "5000")
+
+        # An empty budget answers GraphQL with a RATE_LIMITED error and
+        # REST with a 403, like GitHub does.
+        self.gh.set_rate_limit(0)
+        out = json.load(post_graphql())
+        self.assertEqual(out["errors"][0]["type"], "RATE_LIMITED")
+        req = urllib.request.Request(
+            base + "/repos/test/test/activity?ref=refs/heads/main",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        self.assertEqual(e.exception.code, 403)
 
     def test_github_urls_resolve_to_the_bare_repo(self) -> None:
         clone = self.gh.root / "clone"

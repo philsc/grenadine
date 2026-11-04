@@ -13,6 +13,7 @@ mod github;
 mod inbox_search;
 mod inboxes;
 mod mcp;
+mod ratelimit;
 mod reflow;
 mod stack;
 mod summary;

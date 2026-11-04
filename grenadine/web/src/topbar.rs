@@ -27,8 +27,26 @@ fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// `ts` (Unix seconds) as local "HH:MM".
+pub(crate) fn hm(ts: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ts as f64 * 1000.0));
+        format!("{:02}:{:02}", d.get_hours(), d.get_minutes())
+    }
+    // The tests don't run under wasm; UTC is close enough there.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mins = ts.rem_euclid(86400) / 60;
+        format!("{:02}:{:02}", mins / 60, mins % 60)
+    }
+}
+
 fn label(status: &SyncStatus, now: i64) -> String {
     match status.phase {
+        SyncPhase::Idle if status.paused_until.is_some_and(|t| t > now) => {
+            format!("Paused until {}", hm(status.paused_until.unwrap()))
+        }
         SyncPhase::Searching => "Checking GitHub…".into(),
         SyncPhase::Syncing => {
             if status.remaining == 1 {
@@ -111,6 +129,7 @@ pub fn Topbar(
                     </a>
                     <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup))>"Agents"</a>
                     <a href="#/auto-reviews" class:active=move || route.with(|r| matches!(r, Route::AutoReviews | Route::AutoReview(_)))>"Auto-reviews"</a>
+                    <a href="#/debug" class:active=move || route.with(|r| matches!(r, Route::Debug))>"Debug"</a>
                 </nav>
             </span>
             <span class="topbar-right">
@@ -128,21 +147,34 @@ pub fn Topbar(
                 let status = updates.sync.get();
                 let at = now.get();
                 let error = status.phase == SyncPhase::Idle && status.last_error.is_some();
-                let popover = match status.phase {
-                    SyncPhase::Syncing if !status.in_flight.is_empty() => {
-                        let lines = status.in_flight.iter().map(pr_line).collect::<Vec<_>>();
-                        Some(view! {
-                            <p class="muted">"Syncing now"</p>
-                            {lines.into_iter().map(|l| view! { <p class="sync-pr">{l}</p> }).collect_view()}
-                        }.into_any())
+                let paused = status.phase == SyncPhase::Idle
+                    && status.paused_until.is_some_and(|t| t > at);
+                let popover = if paused {
+                    Some(view! {
+                        <p class="sync-paused">
+                            "GitHub's rate limit is nearly used up. Background syncs pause when "
+                            "less than 20% of it is left, and inbox searches when less than 10% "
+                            "is left. Your own actions keep working until it runs out."
+                        </p>
+                        <p><a href="#/debug">"Details"</a></p>
+                    }.into_any())
+                } else {
+                    match status.phase {
+                        SyncPhase::Syncing if !status.in_flight.is_empty() => {
+                            let lines = status.in_flight.iter().map(pr_line).collect::<Vec<_>>();
+                            Some(view! {
+                                <p class="muted">"Syncing now"</p>
+                                {lines.into_iter().map(|l| view! { <p class="sync-pr">{l}</p> }).collect_view()}
+                            }.into_any())
+                        }
+                        SyncPhase::Idle => status.last_error.clone().map(|e| {
+                            view! { <p class="sync-error">{e}</p> }.into_any()
+                        }),
+                        _ => None,
                     }
-                    SyncPhase::Idle => status.last_error.clone().map(|e| {
-                        view! { <p class="sync-error">{e}</p> }.into_any()
-                    }),
-                    _ => None,
                 };
                 view! {
-                    <span class="sync-status" class:error=error>
+                    <span class="sync-status" class:error=error class:warning=paused>
                         {label(&status, at)}
                         {popover.map(|p| view! { <div class="sync-popover">{p}</div> })}
                     </span>
@@ -178,6 +210,7 @@ mod tests {
             in_flight: vec![],
             last_finished: finished,
             last_error: error.map(str::to_owned),
+            paused_until: None,
         }
     }
 
@@ -198,6 +231,12 @@ mod tests {
         assert_eq!(label(&s, 0), "Syncing 1 PR…");
         s.remaining = 3;
         assert_eq!(label(&s, 0), "Syncing 3 PRs…");
+
+        let mut s = idle(None, Some(40));
+        s.paused_until = Some(1000);
+        assert!(label(&s, 100).starts_with("Paused until "));
+        // Past the reset the label is back to normal.
+        assert_eq!(label(&s, 1000), "Synced 16m ago");
     }
 
     #[test]
