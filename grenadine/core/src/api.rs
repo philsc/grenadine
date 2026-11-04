@@ -1418,10 +1418,11 @@ pub struct Approval {
     /// `ApprovalOption::id`; `None` for a plain allow/deny.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option: Option<String>,
-    /// For `AskUserQuestion`: the answer to each question, keyed by the
-    /// question's text.
+    /// For `AskUserQuestion`: each question's answer keyed by the
+    /// question's text, the picked option labels in option order, then
+    /// the user's own text if any.
     #[serde(default)]
-    pub answers: Option<BTreeMap<String, String>>,
+    pub answers: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// An answer a backend's permission request offers.

@@ -112,6 +112,32 @@ def devin_scenario(tmp: Path) -> dict:
             }
         },
     }
+    multi_question = {
+        "question": "Which drinks?",
+        "header": "Drinks",
+        "multi_select": True,
+        "options": [
+            {"label": "Tea", "description": "Tea"},
+            {"label": "Coffee", "description": "Coffee"},
+        ],
+    }
+    multi_schema = {
+        "type": "object",
+        "properties": {
+            "q0": {
+                "type": "array",
+                "title": "Drinks",
+                "description": "Which drinks?",
+                "minItems": 1,
+                "items": {
+                    "anyOf": [
+                        {"const": "Tea", "title": "Tea"},
+                        {"const": "Coffee", "title": "Coffee"},
+                    ]
+                },
+            }
+        },
+    }
     end = {"end": "end_turn"}
 
     def reply(answer: dict) -> list:
@@ -190,6 +216,26 @@ def devin_scenario(tmp: Path) -> dict:
                             "_meta": {"cognition.ai/totalAcuCost": 0.05},
                         }
                     ),
+                    end,
+                ],
+            },
+            {
+                "match": "several",
+                "steps": [
+                    tool_call("ask_user_question", {"questions": [multi_question]}),
+                    {
+                        "request": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "sessionId": "devin-test",
+                            "requestedSchema": multi_schema,
+                            "message": "Which drinks?",
+                            "_meta": {
+                                "cognition.ai/toolCallId": "ask_user_question:{turn}"
+                            },
+                        },
+                    },
+                    done("ask_user_question", "Tea, Coffee"),
                     end,
                 ],
             },
@@ -2258,6 +2304,21 @@ class AgentTest(ServerTestCase):
         self.devin_saw('"q0":"Tea"')
         expect(transcript.locator(".turn-end")).to_have_count(1)
         self.delete_session("ask me a question")
+
+    def test_devin_multi_select(self) -> None:
+        transcript = self.start_devin_session("Code", "ask me several drinks")
+        question = transcript.locator(".approval")
+        expect(question).to_contain_text("Devin asks")
+        checkboxes = question.get_by_role("checkbox")
+        expect(checkboxes).to_have_count(2)
+        checkboxes.nth(0).check()
+        checkboxes.nth(1).check()
+        question.get_by_role("button", name="Answer").click()
+        # A multi-select answer goes back to Devin as a JSON array.
+        self.devin_saw('"action":"accept"')
+        self.devin_saw('"q0":["Tea","Coffee"]')
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        self.delete_session("ask me several drinks")
 
     def test_devin_plan(self) -> None:
         transcript = self.start_devin_session("Plan first", "make a plan")
