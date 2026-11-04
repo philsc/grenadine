@@ -27,7 +27,8 @@ use tokio::sync::{broadcast, oneshot};
 use crate::claude;
 use crate::devin;
 use crate::git::Repo;
-use crate::pr_plan::{Planned, PrSpec, plan_prs};
+use crate::github::StackLookup;
+use crate::pr_plan::{Planned, PrSpec, StackOp, plan_prs, plan_stack};
 use crate::reflow::reflow;
 use crate::sync::State;
 
@@ -1912,6 +1913,7 @@ async fn land(
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
         let session = session.clone();
+        let open = open.clone();
         tokio::task::spawn_blocking(move || match target {
             WrapUpTarget::Checkout => land_on_checkout(&repo, &session),
             WrapUpTarget::PullRequest => push_stack(
@@ -1979,6 +1981,35 @@ async fn land(
         }
     }
     let mut notes = Vec::new();
+    // The kept PRs whose base moves, which GitHub may refuse inside a
+    // stack.
+    let retargeted: Vec<u64> = planned
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let pr = p.pr.as_ref()?;
+            let status = statuses.get(&PrKey {
+                repo: session.repo.clone(),
+                number: pr.number,
+            });
+            match status {
+                Some(s) if s.base_ref != bases[i] => Some(pr.number),
+                _ => None,
+            }
+        })
+        .collect();
+    // The GitHub stack the PRs make, kept in sync where the repository
+    // has stacked PRs. Stack work never fails the landing: the PRs are
+    // fine either way.
+    let mut stack_op = gh_stack_plan(state, &session, &open, &prs, &retargeted, &mut notes).await;
+    if let StackOp::Rebuild { stack, .. } = &stack_op {
+        // GitHub may refuse to change a stacked PR's base or to close
+        // it, so it comes apart before either happens.
+        if let Err(e) = state.github.unstack(&session.repo, *stack).await {
+            notes.push(format!("Couldn't unstack the GitHub stack: {e:#}"));
+            stack_op = StackOp::Keep;
+        }
+    }
     if let Err(e) = retarget_and_close(
         state, &session, &planned, &bases, &statuses, &dropped, &prs, &mut notes,
     )
@@ -1998,6 +2029,7 @@ async fn land(
             return Err(e.context("couldn't delete the dropped pull requests' branches"));
         }
     }
+    gh_stack_sync(state, &session, &stack_op, &dropped, &prs, &mut notes).await;
     // The merged PRs' commits are landed; the next wrap-up continues
     // from the trunk's tip.
     if let Some(tip) = rebased {
@@ -2071,6 +2103,129 @@ async fn retarget_and_close(
         notes.push(format!("Closed #{}, dropped from the stack.", pr.number));
     }
     Ok(())
+}
+
+/// Plans the GitHub stack work for the session's PRs after landing:
+/// `open` the ones already open, `prs` all of them after this landing.
+/// Never fails: anything that goes wrong becomes a note and `Keep`.
+async fn gh_stack_plan(
+    state: &Arc<State>,
+    session: &AgentSession,
+    open: &[LandedPr],
+    prs: &[LandedPr],
+    retargeted: &[u64],
+    notes: &mut Vec<String>,
+) -> StackOp {
+    const OFF: &str = "This repository doesn't have GitHub's stacked pull requests turned \
+                       on, so the pull requests are only chained by their base branches.";
+    let mut found = |result: Result<StackLookup>| match result {
+        Ok(StackLookup::Found(stack)) => Some(stack),
+        Err(e) => {
+            notes.push(format!("Couldn't look up the GitHub stack: {e:#}"));
+            None
+        }
+        _ => None,
+    };
+    let ours_stack = match open.first() {
+        Some(pr) => match state.github.stack_of(&session.repo, pr.number).await {
+            Ok(StackLookup::Off) => {
+                notes.push(OFF.into());
+                return StackOp::Keep;
+            }
+            result => found(result),
+        },
+        None => None,
+    };
+    let mut source_stack = None;
+    if ours_stack.is_none()
+        && let Some(source) = session.pr
+    {
+        match state.github.stack_of(&session.repo, source).await {
+            Ok(StackLookup::Off) => {
+                notes.push(OFF.into());
+                return StackOp::Keep;
+            }
+            result => source_stack = found(result),
+        }
+    }
+    let ours: Vec<u64> = prs.iter().map(|pr| pr.number).collect();
+    let session_prs: Vec<u64> = landed_prs(session)
+        .iter()
+        .map(|pr| pr.number)
+        .chain(ours.iter().copied())
+        .collect();
+    plan_stack(
+        &ours,
+        &session_prs,
+        session.pr,
+        ours_stack.as_ref(),
+        source_stack.as_ref(),
+        retargeted,
+    )
+}
+
+/// Runs the planned GitHub stack change after the PRs are opened,
+/// retargeted and closed. Every failure only becomes a note.
+async fn gh_stack_sync(
+    state: &Arc<State>,
+    session: &AgentSession,
+    op: &StackOp,
+    dropped: &[LandedPr],
+    prs: &[LandedPr],
+    notes: &mut Vec<String>,
+) {
+    let gh = &state.github;
+    match op {
+        StackOp::Keep => {}
+        StackOp::Create(prs_to_stack)
+        | StackOp::Rebuild {
+            new: prs_to_stack, ..
+        } if prs_to_stack.len() >= 2 => match gh.create_stack(&session.repo, prs_to_stack).await {
+            Ok(number) => notes.push(format!(
+                "GitHub stack #{number}: {}.",
+                prs_to_stack
+                    .iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Err(e) => {
+                notes.push(format!("Couldn't create the GitHub stack: {e:#}"));
+                if let StackOp::Rebuild { old, .. } = op {
+                    let dropped: Vec<u64> = dropped.iter().map(|pr| pr.number).collect();
+                    let restore: Vec<u64> = old
+                        .iter()
+                        .filter(|n| !dropped.contains(n))
+                        .copied()
+                        .collect();
+                    match gh.create_stack(&session.repo, &restore).await {
+                        Ok(number) => {
+                            notes.push(format!("Restored the GitHub stack as #{number}."))
+                        }
+                        Err(e) => {
+                            notes.push(format!("Couldn't restore the GitHub stack either: {e:#}"))
+                        }
+                    }
+                }
+            }
+        },
+        StackOp::Add { stack, prs: top } => {
+            match gh.add_to_stack(&session.repo, *stack, top).await {
+                Ok(()) => notes.push(format!(
+                    "GitHub stack #{stack}: {}.",
+                    prs.iter()
+                        .map(|pr| format!("#{}", pr.number))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                Err(e) => {
+                    notes.push(format!("Couldn't extend the GitHub stack: {e:#}"));
+                }
+            }
+        }
+        // A rebuild to a single PR needs no stack.
+        StackOp::Rebuild { .. } | StackOp::Create(_) => {}
+    }
 }
 
 /// The branch the `i`th commit of a session's stack, from 0, is pushed to:
@@ -2278,7 +2433,8 @@ fn landed_note(session: &AgentSession) -> Option<String> {
                  from this session's commits, one per commit, each stacked on the one before \
                  it:\n{prs}\nThese are this session's PRs. Don't open other PRs for this work or \
                  push it to other branches. To update them or open PRs for new commits, call \
-                 the grenadine MCP server's update_prs tool; pass `prs` to drop or reorder PRs."
+                 the grenadine MCP server's update_prs tool; pass `prs` to drop or reorder PRs. \
+                 Grenadine keeps the PRs in a GitHub stack."
             )
         }
     };

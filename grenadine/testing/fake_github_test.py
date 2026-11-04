@@ -670,6 +670,136 @@ class FakeGitHubTest(unittest.TestCase):
             out = self.query(mutation, p=pr_id["id"])
             self.assertIn("closed", out["errors"][0]["message"])
 
+    def stacks_rest(
+        self, method: str, path: str, body=None, version="2026-03-10"
+    ) -> tuple[int, object]:
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.api + path,
+            method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={
+                "authorization": f"Bearer {TOKEN}",
+                "content-type": "application/json",
+                "x-github-api-version": version,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_stacks(self) -> None:
+        api = getattr(self, "api", None)
+        if api is None:
+            self.api = self.gh.start()
+            self.addCleanup(self.gh.stop)
+        repo = self.repo
+        a, b = (
+            self.inboxes.prs["Wait for reviewers"],
+            self.inboxes.prs["Get changes requested"],
+        )
+        # Chain b onto a so the stack's bases line up.
+        b.base = a.head
+        c = self.inboxes.prs["Get merged"]
+
+        # The wrong API version and a disabled repo see no endpoint.
+        status, _ = self.stacks_rest(
+            "GET",
+            f"/repos/test/test/stacks?pull_request={a.number}",
+            version="2022-11-28",
+        )
+        self.assertEqual(status, 404)
+        repo.stacks_enabled = False
+        status, _ = self.stacks_rest(
+            "GET", f"/repos/test/test/stacks?pull_request={a.number}"
+        )
+        self.assertEqual(status, 404)
+        repo.stacks_enabled = True
+
+        # One PR doesn't make a stack; bases must chain.
+        status, _ = self.stacks_rest(
+            "POST", "/repos/test/test/stacks", {"pull_requests": [a.number]}
+        )
+        self.assertEqual(status, 422)
+        status, _ = self.stacks_rest(
+            "POST", "/repos/test/test/stacks", {"pull_requests": [a.number, c.number]}
+        )
+        self.assertEqual(status, 422)
+        status, out = self.stacks_rest(
+            "POST", "/repos/test/test/stacks", {"pull_requests": [a.number, b.number]}
+        )
+        self.assertEqual(status, 201)
+        number = out["number"]
+        self.assertEqual(repo.stacks[number], [a.number, b.number])
+
+        status, out = self.stacks_rest(
+            "GET", f"/repos/test/test/stacks?pull_request={b.number}"
+        )
+        self.assertEqual([s["number"] for s in out], [number])
+        self.assertEqual(
+            [p["number"] for p in out[0]["pull_requests"]], [a.number, b.number]
+        )
+
+        # A stacked PR can't be retargeted or closed through GraphQL.
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {b.number}) {{ id }} }} }}"
+        )["data"]["repository"]["pullRequest"]["id"]
+        out = self.query(
+            "mutation($p: ID!) { updatePullRequest(input: {"
+            ' pullRequestId: $p, baseRefName: "main"}) { clientMutationId } }',
+            p=pr_id,
+        )
+        self.assertIn("in a stack", out["errors"][0]["message"])
+        out = self.query(
+            "mutation($p: ID!) { closePullRequest(input: {pullRequestId: $p})"
+            " { clientMutationId } }",
+            p=pr_id,
+        )
+        self.assertIn("in a stack", out["errors"][0]["message"])
+
+        # Add needs the new PR to chain onto the top.
+        other = self.inboxes.prs["Ask me for a review"]
+        other.base = "nope"
+        status, _ = self.stacks_rest(
+            "POST",
+            f"/repos/test/test/stacks/{number}/add",
+            {"pull_requests": [other.number]},
+        )
+        self.assertEqual(status, 409)
+        other.base = b.head
+        status, out = self.stacks_rest(
+            "POST",
+            f"/repos/test/test/stacks/{number}/add",
+            {"pull_requests": [other.number]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repo.stacks[number], [a.number, b.number, other.number])
+
+        # Merged PRs keep the stack alive through an unstack.
+        repo.merge(a)
+        status, out = self.stacks_rest(
+            "POST", f"/repos/test/test/stacks/{number}/unstack", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repo.stacks[number], [a.number])
+        status, out = self.stacks_rest(
+            "GET", f"/repos/test/test/stacks?pull_request={a.number}"
+        )
+        merged = out[0]["pull_requests"][0]
+        self.assertEqual(
+            (merged["state"], merged["merged_at"] is None), ("closed", False)
+        )
+        status, _ = self.stacks_rest(
+            "POST", f"/repos/test/test/stacks/{number}/unstack", {}
+        )
+        self.assertEqual(status, 422)
+        repo.merge(repo.prs[a.number])
+        del repo.stacks[number]
+
     def test_deleting_a_branch_can_fail(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]
         self.repo.undeletable_branches.add(pr.head)
