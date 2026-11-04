@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -508,6 +509,13 @@ class FakeGitHub:
         # When set, the next mutation fails with this message and changes
         # nothing.
         self.fail_next_mutation: str | None = None
+        # What the x-ratelimit-* headers report. The window is static:
+        # `used` is limit - remaining and `reset` moves with every reply.
+        self.rate_limit = {
+            "limit": 5000,
+            "remaining": 5000,
+            "reset": int(time.time()) + 3600,
+        }
         # See `hold_next_mutation`.
         self._hold: tuple[threading.Event, threading.Event] | None = None
         self.gitconfig = root / "gitconfig"
@@ -525,6 +533,15 @@ class FakeGitHub:
         lets it go on."""
         self._hold = threading.Event(), threading.Event()
         return self._hold
+
+    def set_rate_limit(self, remaining: int) -> None:
+        """Sets the budget the headers report; 0 answers every request
+        with a rate-limit error. Raising it resets the window, the way
+        GitHub refills the budget when the window ends."""
+        with self.lock:
+            if remaining > self.rate_limit["remaining"]:
+                self.rate_limit["reset"] = int(time.time())
+            self.rate_limit["remaining"] = remaining
 
     def git_env(self) -> dict[str, str]:
         """The environment for git, the server's included: no system or user
@@ -592,7 +609,7 @@ class FakeGitHub:
         url = urllib.parse.urlsplit(req.path)
         self.requests.append(f"{method} {url.path}")
         if req.headers.get("Authorization") != f"Bearer {TOKEN}":
-            return _reply(req, 401, {"message": "Bad credentials"})
+            return _reply(req, 401, {"message": "Bad credentials"}, self.rate_limit)
         body = req.rfile.read(int(req.headers.get("Content-Length") or 0))
         if self._hold and _is_mutation(method, url.path, body):
             (held, release), self._hold = self._hold, None
@@ -606,11 +623,16 @@ class FakeGitHub:
                 )
             except Exception as e:  # noqa: BLE001 - a fake should report, not hang up.
                 status, payload = 500, {"message": f"fake GitHub: {e!r}"}
-        _reply(req, status, payload)
+        _reply(req, status, payload, self.rate_limit)
 
     def _route(
         self, method: str, path: str, query: dict[str, list[str]], body: bytes
     ) -> tuple[int, Any]:
+        if self.rate_limit["remaining"] == 0:
+            msg = "API rate limit already exceeded for user ID 1."
+            if method == "POST" and path == "/graphql":
+                return 200, {"errors": [{"type": "RATE_LIMITED", "message": msg}]}
+            return 403, {"message": msg}
         if method == "POST" and path == "/graphql":
             return 200, self.graphql(json.loads(body))
         if method == "GET" and (
@@ -770,6 +792,16 @@ class FakeGitHub:
                     f"Could not resolve to a Repository with the name '{owner}/{name}'."
                 )
             return self._repo_node(repo)
+
+        def rate_limit(info: Any) -> Any:
+            return {
+                "cost": 1,
+                "limit": self.rate_limit["limit"],
+                "nodeCount": 0,
+                "remaining": self.rate_limit["remaining"],
+                "resetAt": iso(self.rate_limit["reset"]),
+                "used": self.rate_limit["limit"] - self.rate_limit["remaining"],
+            }
 
         def user(info: Any, login: str) -> Any:
             if login not in self.users:
@@ -947,6 +979,7 @@ class FakeGitHub:
         return {
             "search": search,
             "repository": repository,
+            "rateLimit": rate_limit,
             "user": user,
             "viewer": lambda info: self._user_node(VIEWER),
             "addComment": mutation(add_comment),
@@ -1352,11 +1385,20 @@ def _is_mutation(method: str, path: str, body: bytes) -> bool:
     return query.lstrip().startswith("mutation")
 
 
-def _reply(req: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
+def _reply(
+    req: BaseHTTPRequestHandler, status: int, payload: Any, rate_limit: dict[str, int]
+) -> None:
     data = json.dumps(payload).encode()
     req.send_response(status)
     req.send_header("Content-Type", "application/json")
     req.send_header("Content-Length", str(len(data)))
+    req.send_header("x-ratelimit-limit", str(rate_limit["limit"]))
+    req.send_header("x-ratelimit-remaining", str(rate_limit["remaining"]))
+    req.send_header(
+        "x-ratelimit-used", str(rate_limit["limit"] - rate_limit["remaining"])
+    )
+    req.send_header("x-ratelimit-reset", str(rate_limit["reset"]))
+    req.send_header("x-ratelimit-resource", "graphql")
     req.end_headers()
     req.wfile.write(data)
 

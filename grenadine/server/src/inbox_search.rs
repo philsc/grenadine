@@ -74,6 +74,9 @@ where
     }
     while let Some((start, chunk)) = pending.pop() {
         match search(chunk).await {
+            // A refused request isn't retried or bisected: it's the rate
+            // limit talking, not one heavy search.
+            Err(e) if crate::ratelimit::is_rate_limited(&e) => return Err(e),
             Ok((v, results)) => take(&mut viewer, &mut out, start, v, results),
             Err(_) if chunk.len() > 1 => {
                 let mid = chunk.len() / 2;
@@ -382,5 +385,29 @@ mod tests {
         assert!(calls.contains(&5));
         assert!(calls.contains(&3));
         assert!(calls.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_searches_are_not_retried() {
+        let calls = Arc::new(Mutex::new(0));
+        let calls2 = calls.clone();
+        let search = move |reqs: &[(String, Option<String>, bool)]| {
+            let calls = calls2.clone();
+            let n = reqs.len();
+            Box::pin(async move {
+                *calls.lock().unwrap() += n;
+                Err(anyhow::Error::new(crate::ratelimit::RateLimited {
+                    resource: grenadine_core::api::ApiResource::GraphQl,
+                    until: 0,
+                }))
+            }) as SearchFut<'_>
+        };
+        let requests: Vec<(String, Option<String>, bool)> =
+            (0..9).map(|i| (format!("q{i}"), None, false)).collect();
+        let result = search_batched_with(&requests, &search).await;
+        assert!(result.is_err());
+        // One call — the last chunk of four, popped first — and no
+        // bisect, no retry.
+        assert_eq!(*calls.lock().unwrap(), 4);
     }
 }

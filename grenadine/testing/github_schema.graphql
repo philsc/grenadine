@@ -12,6 +12,16 @@ type Query {
   repository(owner: String!, name: String!): Repository
   user(login: String!): User
   viewer: User!
+  rateLimit: RateLimit
+}
+
+type RateLimit {
+  cost: Int!
+  limit: Int!
+  nodeCount: Int!
+  remaining: Int!
+  resetAt: DateTime!
+  used: Int!
 }
 
 # Each mutation's payload only offers clientMutationId: grenadine resyncs the

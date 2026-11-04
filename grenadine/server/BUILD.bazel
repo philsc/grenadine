@@ -39,6 +39,7 @@ rust_binary(
         "src/github.rs",
         "src/inbox_search.rs",
         "src/inboxes.rs",
+        "src/ratelimit.rs",
     ],
     crate_root = "src/bin/validate_inboxes.rs",
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],

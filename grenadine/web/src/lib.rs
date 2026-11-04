@@ -6,6 +6,7 @@ mod agents;
 mod api;
 mod auto_reviews;
 mod composer;
+mod debug;
 mod diffview;
 mod drafts;
 mod events;
@@ -70,6 +71,8 @@ pub enum Route {
     AutoReviews,
     /// `#/auto-reviews/<id>`: the session doing one of them.
     AutoReview(String),
+    /// `#/debug`: what the server spends on GitHub.
+    Debug,
 }
 
 fn pr_key(owner: &str, name: &str, number: &str) -> Option<PrKey> {
@@ -108,6 +111,7 @@ fn route_from_hash(hash: &str) -> Route {
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         ["auto-reviews"] => Some(Route::AutoReviews),
         ["auto-reviews", id] if !id.is_empty() => Some(Route::AutoReview(id.to_owned())),
+        ["debug"] => Some(Route::Debug),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
         _ => None,
     };
@@ -248,6 +252,7 @@ fn App() -> impl IntoView {
         })
     });
     let on_reviews = Memo::new(move |_| reviews.with(Option::is_some));
+    let on_debug = Memo::new(move |_| route.with(|r| *r == Route::Debug));
 
     // The inboxes stay mounted while another page is shown so that going
     // back is instant. Hiding them loses their scroll position, so
@@ -302,6 +307,9 @@ fn App() -> impl IntoView {
                         _ => view! { <main class="main"><auto_reviews::Overview /></main> }.into_any(),
                     })}
                 </div>
+            })}
+            {move || on_debug.get().then(|| view! {
+                <main class="main"><debug::Debug /></main>
             })}
         </div>
     }
@@ -380,6 +388,7 @@ mod tests {
             Route::AutoReview("abc".into())
         );
         assert_eq!(route_from_hash("#/auto-reviews/"), Route::Inboxes);
+        assert_eq!(route_from_hash("#/debug"), Route::Debug);
         // An owner called "agents" still has PRs.
         assert_eq!(
             route_from_hash("#/agents/n/7"),

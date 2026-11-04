@@ -226,6 +226,9 @@ input[type="text"] {
 .sync-status.error {
   color: var(--error-fg);
 }
+.sync-status.warning {
+  color: var(--warn-fg);
+}
 .sync-popover {
   display: none;
   position: absolute;
@@ -253,6 +256,79 @@ input[type="text"] {
 .sync-popover .muted {
   font-size: 11px;
   margin-bottom: 2px;
+}
+.sync-popover .sync-paused {
+  white-space: normal;
+  max-width: 320px;
+  margin-bottom: 4px;
+}
+
+/* Debug tab */
+
+.debug {
+  padding: 16px 24px;
+  max-width: 720px;
+}
+.debug h1 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+.debug h2 {
+  font-size: 14px;
+  margin: 20px 0 6px;
+}
+.usage-limit {
+  margin-bottom: 8px;
+}
+.usage-limit p {
+  margin: 4px 0;
+}
+.usage-paused {
+  color: var(--warn-fg);
+}
+.usage-meter {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+}
+.usage-meter-ours {
+  background: var(--accent);
+}
+.usage-meter-other {
+  background: var(--warn-fg);
+}
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 48px;
+}
+.usage-bar {
+  flex: 1;
+  min-height: 1px;
+  background: var(--accent);
+  border-radius: 1px 1px 0 0;
+}
+.usage-table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.usage-table th,
+.usage-table td {
+  padding: 3px 12px 3px 0;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.usage-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.usage-table .usage-total td {
+  border-bottom: none;
+  font-weight: 600;
 }
 
 .main {

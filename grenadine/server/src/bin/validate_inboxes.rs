@@ -10,6 +10,9 @@ mod inbox_search;
 #[allow(dead_code)]
 #[path = "../inboxes.rs"]
 mod inboxes;
+#[allow(dead_code)]
+#[path = "../ratelimit.rs"]
+mod ratelimit;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::ExitCode;
