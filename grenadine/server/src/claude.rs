@@ -540,11 +540,16 @@ pub fn structured_output(name: &str, stdout: &[u8]) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use grenadine_core::api::AgentBackend;
 
     use super::*;
     use crate::agent::tests::state_with_claude;
+
+    /// A claude that lists "sonnet" and nothing else. It reads the request
+    /// first: exiting before then would fail the listing with a broken pipe,
+    /// and a backend that can't list its models accepts any model.
+    pub(crate) const LISTS_SONNET: &str = "#!/bin/sh\nread -r request\necho '{\"type\":\"control_response\",\"response\":{\"request_id\":\"models\",\"response\":{\"models\":[{\"value\":\"sonnet\",\"displayName\":\"Sonnet\",\"description\":\"d\"}]}}}'\n";
 
     fn events(line: &str) -> Vec<AgentEventKind> {
         match parse_line(line) {
