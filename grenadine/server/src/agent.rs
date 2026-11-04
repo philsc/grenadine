@@ -32,6 +32,10 @@ use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
 const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
+/// The ref a pull request's target branch is fetched into while a session's
+/// commits are pushed. One ref per repository is enough because pushing
+/// holds the repository's git lock.
+const TARGET_REF: &str = "refs/grenadine/agent/target";
 
 /// The most images one prompt may come with.
 pub const MAX_IMAGES: usize = 20;
@@ -1939,8 +1943,9 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
 }
 
 /// Pushes each of the session's commits to GitHub on its own branch. The
-/// bottom PR goes into `pr_branch`, or the default branch. `opened` PRs are
-/// open already, one for each of the bottom commits.
+/// bottom PR goes into `pr_branch`, or the default branch. Commits already
+/// on the target branch aren't the session's own and don't get pushed.
+/// `opened` PRs are open already, one for each of the bottom commits.
 fn push_stack(
     repo: &Repo,
     session: &AgentSession,
@@ -1955,7 +1960,19 @@ fn push_stack(
         });
     }
     let head = repo.worktree_head(worktree)?;
-    let commits = repo.commits(&session.base_sha, &head)?;
+    let base = match pr_branch {
+        Some(b) => b,
+        None => repo.default_branch()?,
+    };
+    // `session.base_sha` is the target branch's tip when the session was
+    // created, so commits merged to it since then count from the merge
+    // base instead.
+    let target = repo.fetch_branch(&base, TARGET_REF)?;
+    let from = match repo.merge_base(&target, &head) {
+        Some(mb) if repo.is_ancestor(&session.base_sha, &mb) => mb,
+        _ => session.base_sha.clone(),
+    };
+    let commits = repo.commits(&from, &head)?;
     if commits.is_empty() {
         bail!("there are no commits to push");
     }
@@ -1977,10 +1994,6 @@ fn push_stack(
         .map(|(sha, branch, _)| (sha.clone(), branch.clone()))
         .collect();
     repo.push_commits(&refs)?;
-    let base = match pr_branch {
-        Some(b) => b,
-        None => repo.default_branch()?,
-    };
     let commits = commits
         .into_iter()
         .map(|(_, branch, message)| (branch, message))
@@ -3886,6 +3899,57 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             run(worktree, &["rev-parse", "HEAD"])
         );
         assert_eq!(state.db.agent(id).unwrap().unwrap().landed, Some(pr));
+    }
+
+    /// Commits that reached the default branch since the session started
+    /// aren't the session's own, so they aren't pushed or stacked.
+    #[tokio::test]
+    async fn update_prs_skips_commits_already_on_the_default_branch() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+
+        // The session's worktree is rebased onto a default branch that
+        // moved on since the session started.
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+        commit(&fx.upstream, "c", "1\n");
+        run(
+            worktree,
+            &[
+                "fetch",
+                "--quiet",
+                "https://github.com/owner/name.git",
+                "main",
+            ],
+        );
+        run(worktree, &["rebase", "--quiet", "FETCH_HEAD"]);
+
+        // The test state's GitHub is unreachable, so only the push works.
+        land_now(&state, id, WrapUpTarget::PullRequest)
+            .await
+            .unwrap_err();
+        assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}-2", session.branch)
+                ],
+            ),
+            ""
+        );
     }
 
     /// A worktree that isn't ready gets an instruction, not a prompt.
