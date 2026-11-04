@@ -1505,9 +1505,10 @@ impl Db {
     /// interrupted, since their Claude Code processes are gone.
     pub fn interrupt_agents(&self) -> Result<()> {
         self.conn().execute(
-            "UPDATE agents SET status = ? WHERE status IN (?, ?)",
+            "UPDATE agents SET status = ? WHERE status IN (?, ?, ?)",
             params![
                 status_str(AgentStatus::Interrupted),
+                status_str(AgentStatus::Creating),
                 status_str(AgentStatus::Running),
                 status_str(AgentStatus::AwaitingApproval)
             ],
@@ -1871,6 +1872,7 @@ fn parse_auto_review_state(s: &str) -> AutoReviewState {
 
 fn status_str(s: AgentStatus) -> &'static str {
     match s {
+        AgentStatus::Creating => "creating",
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "running",
         AgentStatus::AwaitingApproval => "awaiting_approval",
@@ -1881,6 +1883,7 @@ fn status_str(s: AgentStatus) -> &'static str {
 
 fn parse_status(s: &str) -> AgentStatus {
     match s {
+        "creating" => AgentStatus::Creating,
         "idle" => AgentStatus::Idle,
         "running" => AgentStatus::Running,
         "awaiting_approval" => AgentStatus::AwaitingApproval,
@@ -2683,9 +2686,14 @@ mod tests {
         db.create_agent(&agent("b", AgentStatus::AwaitingApproval))
             .unwrap();
         db.create_agent(&agent("c", AgentStatus::Failed)).unwrap();
+        db.create_agent(&agent("d", AgentStatus::Creating)).unwrap();
         assert_eq!(
             db.agent("a").unwrap(),
             Some(agent("a", AgentStatus::Running))
+        );
+        assert_eq!(
+            db.agent("d").unwrap(),
+            Some(agent("d", AgentStatus::Creating))
         );
         assert_eq!(db.agent("x").unwrap(), None);
 
@@ -2742,7 +2750,8 @@ mod tests {
             [
                 AgentStatus::Interrupted,
                 AgentStatus::Interrupted,
-                AgentStatus::Failed
+                AgentStatus::Failed,
+                AgentStatus::Interrupted,
             ]
         );
 

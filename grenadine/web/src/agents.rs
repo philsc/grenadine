@@ -46,6 +46,7 @@ pub fn go(hash: &str) {
 
 pub fn status_label(s: AgentStatus) -> &'static str {
     match s {
+        AgentStatus::Creating => "creating worktree",
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "working…",
         AgentStatus::AwaitingApproval => "needs approval",
@@ -56,6 +57,7 @@ pub fn status_label(s: AgentStatus) -> &'static str {
 
 pub fn status_class(s: AgentStatus) -> &'static str {
     match s {
+        AgentStatus::Creating => "agent-status running",
         AgentStatus::Idle => "agent-status",
         AgentStatus::Running => "agent-status running",
         AgentStatus::AwaitingApproval => "agent-status waiting",
@@ -1398,11 +1400,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         class="primary"
                         disabled=move || busy() || prompt.with(|p| p.trim().is_empty())
                     >
-                        {move || match (busy(), general.get()) {
-                            (false, _) => "Start",
-                            (true, false) => "Creating worktree…",
-                            (true, true) => "Starting…",
-                        }}
+                        {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
                     <AttachButton images=images error=error />
                 </div>
@@ -1707,7 +1705,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
             s.as_ref().is_some_and(|s| {
                 matches!(
                     s.status,
-                    AgentStatus::Running | AgentStatus::AwaitingApproval
+                    AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
                 )
             })
         });
@@ -1996,7 +1994,11 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                     <h1>{s.title.clone()}</h1>
                     <p class="muted">
                         <StatusBadge status=s.status />
-                        " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
+                        " from " {from}
+                        // Empty while the worktree is being created.
+                        {(!s.base_sha.is_empty()).then(|| {
+                            view! { " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code> }
+                        })}
                         " on " <code>{s.branch.clone()}</code>
                         {format!(" · {}", cost(s.cost, s.cost_unit))}
                         {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l repo=s.repo.clone() /> })}
@@ -2075,7 +2077,7 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
             )
         })
     };
@@ -2282,6 +2284,14 @@ fn ActivityBar(
     view! {
         {move || {
             match session.with(|s| s.status) {
+                AgentStatus::Creating => {
+                    view! {
+                        <p class="activity">
+                            <span class="spinner"></span>
+                            "Creating worktree…"
+                        </p>
+                    }.into_any()
+                }
                 AgentStatus::AwaitingApproval => {
                     let waited = approval_at.get().map(|at| elapsed(now.get() - at));
                     view! {
@@ -2421,7 +2431,7 @@ fn Transcript(
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
             )
         })
     });
@@ -3157,7 +3167,7 @@ fn Composer(
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
             )
         })
     };

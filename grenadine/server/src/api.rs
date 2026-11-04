@@ -808,7 +808,12 @@ async fn open_terminal(AxState(state): St, Path(id): Path<String>) -> ApiResult<
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     if !std::path::Path::new(&session.worktree).is_dir() {
-        return Ok((StatusCode::CONFLICT, "the session's worktree is gone").into_response());
+        let why = if session.repo != GENERAL && session.base_sha.is_empty() {
+            "the session's worktree isn't ready yet"
+        } else {
+            "the session's worktree is gone"
+        };
+        return Ok((StatusCode::CONFLICT, why).into_response());
     }
     Ok(Json(terminal::open(&state, &session)?).into_response())
 }
@@ -954,6 +959,13 @@ async fn wrap_up_agent(
     .await
     {
         return Ok(r);
+    }
+    if session.repo != GENERAL && session.base_sha.is_empty() {
+        return Ok((
+            StatusCode::CONFLICT,
+            "the session's worktree isn't ready yet",
+        )
+            .into_response());
     }
     if !agent::wrap_up(&state, &id, req).await {
         return Ok((StatusCode::CONFLICT, "the session is already wrapping up").into_response());
