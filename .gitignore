@@ -9,3 +9,6 @@
 
 # New trail learnings are saved in ~/.trail with `trail note --personal`, not in the repo.
 /.trail/learnings/
+
+# Devin CLI settings for one machine.
+/.devin/config.local.json
