@@ -128,6 +128,22 @@ pub fn github_url(key: &PrKey) -> String {
     format!("https://github.com/{}/pull/{}", key.repo, key.number)
 }
 
+/// The icon after a PR's in-app link that opens the same page on GitHub.
+/// It's empty: the `.gh-link` CSS draws the icon.
+#[component]
+pub fn GithubLink(url: String) -> impl IntoView {
+    view! {
+        <a
+            class="gh-link"
+            href=url
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open on GitHub"
+            aria-label="Open on GitHub"
+        ></a>
+    }
+}
+
 pub(crate) fn current_hash() -> String {
     window().location().hash().unwrap_or_default()
 }

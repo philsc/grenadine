@@ -79,6 +79,25 @@ a {
 a:hover {
   text-decoration: underline;
 }
+/* The icon after an in-app PR link that opens the same page on GitHub:
+   GitHub's link-external octicon, drawn in the text's colour. */
+.gh-link {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-left: 0.25em;
+  vertical-align: -0.1em;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  opacity: 0.55;
+}
+.gh-link:hover,
+.gh-link:focus-visible {
+  opacity: 1;
+}
 code,
 .mono {
   font-family: var(--mono);
@@ -421,18 +440,32 @@ input[type="text"] {
   font-size: 13px;
 }
 
+/* The row's link is an empty overlay over the li so that the GitHub icon
+   in `.pr-item-body`, which links can't nest in, stays clickable. */
 .pr-item {
+  position: absolute;
+  inset: 0 8px;
+  border-radius: 6px;
+}
+.pr-list li:hover .pr-item {
+  background: var(--bg-hover);
+}
+.pr-item-body {
+  /* Positioned so that it paints above the row's overlay link. */
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
   margin: 0 8px;
   padding: 5px 8px 5px 30px;
-  color: var(--fg);
-  border-radius: 6px;
+  pointer-events: none;
 }
-.pr-item:hover {
-  background: var(--bg-hover);
-  text-decoration: none;
+/* The icon sits above the row's overlay link. */
+.pr-item-body .gh-link,
+.agent-item-body .gh-link {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
 }
 .pr-item.selected {
   background: var(--accent-bg);
@@ -494,6 +527,8 @@ input[type="text"] {
 .pr-list li.stack-below::after {
   content: "";
   position: absolute;
+  /* Above the row's overlay link, whose background would hide them. */
+  z-index: 1;
   left: 26px;
   border-left: 2px solid var(--border);
   pointer-events: none;
@@ -1232,6 +1267,24 @@ textarea {
 .agent-item.selected {
   background: var(--accent-bg);
   box-shadow: inset 0 0 0 2px var(--accent);
+}
+/* Rows whose link is an overlay, like the inbox rows'. */
+.agent-item.overlay {
+  position: absolute;
+  inset: 0 8px;
+  margin: 0;
+  padding: 0;
+}
+.agent-entry:hover .agent-item.overlay {
+  background: var(--bg-hover);
+}
+.agent-item-body {
+  /* Positioned so that it paints above the row's overlay link. */
+  position: relative;
+  display: block;
+  margin: 0 8px;
+  padding: 4px 8px;
+  pointer-events: none;
 }
 .agent-title {
   display: block;

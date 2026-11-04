@@ -35,7 +35,7 @@ fn grenadine_hash(href: &str, issues: bool) -> Option<String> {
     Some(format!("#/{owner}/{name}/{number}"))
 }
 
-/// A `data-grenadine` hash only has `#/owner/name/number`; anything else is
+/// An in-app hash only has `#/owner/name/number`; anything else is
 /// dropped by the sanitizer.
 fn valid_grenadine_hash(value: &str) -> bool {
     let mut parts = value.split('/');
@@ -48,19 +48,32 @@ fn valid_grenadine_hash(value: &str) -> bool {
         && parts.next().is_none()
 }
 
-/// `<inner>` is HTML; the text callers put there is escaped first.
-/// Generated links are all external, so they open in a new tab.
-fn anchor(href: &str, data: Option<&str>, inner: &str) -> Event<'static> {
-    let data = data
-        .map(|d| format!(" data-grenadine=\"{}\"", escape_attr(d)))
-        .unwrap_or_default();
-    Event::InlineHtml(
-        format!(
-            "<a href=\"{}\" target=\"_blank\"{data}>{inner}</a>",
-            escape_attr(href)
-        )
-        .into(),
+/// The icon after an in-app link that opens the same page on GitHub.
+/// It's empty: the `.gh-link` CSS draws the icon.
+fn gh_link(href: &str) -> String {
+    format!(
+        "<a class=\"gh-link\" href=\"{}\" target=\"_blank\" title=\"Open on GitHub\" aria-label=\"Open on GitHub\"></a>",
+        escape_attr(href)
     )
+}
+
+/// `<inner>` is HTML; the text callers put there is escaped first.
+/// A link with a `hash` navigates in-app and is followed by an icon that
+/// opens the same page on GitHub; other generated links are external, so
+/// they open in a new tab.
+fn anchor(href: &str, hash: Option<&str>, inner: &str) -> Event<'static> {
+    let html = match hash {
+        Some(hash) => format!(
+            "<a href=\"{}\">{inner}</a>{}",
+            escape_attr(hash),
+            gh_link(href)
+        ),
+        None => format!(
+            "<a href=\"{}\" target=\"_blank\">{inner}</a>",
+            escape_attr(href)
+        ),
+    };
+    Event::InlineHtml(html.into())
 }
 
 fn is_word(c: char) -> bool {
@@ -337,9 +350,10 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
     // Text inside a link or image is only emoji-expanded; link text the
     // parser produced is never autolinked.
     let mut in_link = false;
-    // The current link's `<a>` tag was already emitted with data-grenadine;
-    // its End tag is replaced too.
-    let mut own_link = false;
+    // The current link's `<a>` tag was hand-written, so its End tag is
+    // replaced too. For a PR link the GitHub URL is kept so the icon
+    // after the link can point at it.
+    let mut own_link: Option<(Option<String>, String)> = None;
     while let Some(event) = parser.next() {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -372,23 +386,22 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
                     continue;
                 }
                 // External links get a hand-written tag so that they open
-                // in a new tab and PR links carry their in-app hash.
-                own_link = true;
+                // in a new tab, and PR links navigate in-app.
+                let hash = grenadine_hash(dest_url, false);
                 let title = if title.is_empty() {
                     String::new()
                 } else {
                     format!(" title=\"{}\"", escape_attr(title))
                 };
-                let data = grenadine_hash(dest_url, false)
-                    .map(|h| format!(" data-grenadine=\"{}\"", escape_attr(&h)))
-                    .unwrap_or_default();
-                events.push(Event::InlineHtml(
-                    format!(
-                        "<a href=\"{}\"{title} target=\"_blank\"{data}>",
+                let open = match &hash {
+                    Some(hash) => format!("<a href=\"{}\"{title}>", escape_attr(hash)),
+                    None => format!(
+                        "<a href=\"{}\"{title} target=\"_blank\">",
                         escape_attr(dest_url)
-                    )
-                    .into(),
-                ));
+                    ),
+                };
+                own_link = Some((hash, dest_url.to_string()));
+                events.push(Event::InlineHtml(open.into()));
             }
             Event::Start(Tag::Image { .. }) => {
                 in_link = true;
@@ -396,11 +409,15 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             }
             Event::End(TagEnd::Link) => {
                 in_link = false;
-                if own_link {
-                    own_link = false;
-                    events.push(Event::InlineHtml("</a>".into()));
-                } else {
-                    events.push(event);
+                match own_link.take() {
+                    Some((hash, url)) => {
+                        let mut close = "</a>".to_owned();
+                        if hash.is_some() {
+                            close += &gh_link(&url);
+                        }
+                        events.push(Event::InlineHtml(close.into()));
+                    }
+                    None => events.push(event),
                 }
             }
             Event::End(TagEnd::Image) => {
@@ -418,7 +435,7 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
     ammonia::Builder::default()
         .add_generic_attributes(["align"])
         .add_tag_attributes("input", ["type", "checked", "disabled"])
-        .add_tag_attributes("a", ["data-grenadine", "target"])
+        .add_tag_attributes("a", ["aria-label", "class", "target"])
         .add_tag_attributes("span", ["class"])
         .add_tag_attributes("code", ["class"])
         .add_tags(["input", "details", "summary"])
@@ -432,9 +449,14 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             {
                 Some(Cow::Borrowed(value))
             }
-            ("a", "data-grenadine") if valid_grenadine_hash(value) => Some(Cow::Borrowed(value)),
+            ("a", "class") if value == "gh-link" => Some(Cow::Borrowed(value)),
+            // In-app hashes only ever have `#/owner/name/number`.
+            ("a", "href") if value.starts_with("#/") && valid_grenadine_hash(value) => {
+                Some(Cow::Borrowed(value))
+            }
             ("a", "target") if value == "_blank" => Some(Cow::Borrowed(value)),
-            ("span" | "code", "class") | ("a", "data-grenadine" | "target") => None,
+            ("a", "href") if value.starts_with("#/") => None,
+            ("span" | "code", "class") | ("a", "class" | "target") => None,
             _ => Some(Cow::Borrowed(value)),
         })
         .clean(&out)
@@ -509,11 +531,28 @@ mod tests {
     #[test]
     fn links_issue_references() {
         let h = html("#12");
-        assert!(h.contains(r#"href="https://github.com/o/r/issues/12""#));
-        assert!(h.contains(r##"data-grenadine="#/o/r/12""##));
+        assert!(
+            h.contains(r##"<a href="#/o/r/12" rel="noopener noreferrer">#12</a>"##),
+            "{h}"
+        );
+        assert!(
+            h.contains(
+                r#"<a class="gh-link" href="https://github.com/o/r/issues/12" target="_blank""#
+            ),
+            "{h}"
+        );
+        assert!(h.contains(r#"aria-label="Open on GitHub""#), "{h}");
         let h = html("x/y#34");
-        assert!(h.contains(r#"href="https://github.com/x/y/issues/34""#));
-        assert!(h.contains(r##"data-grenadine="#/x/y/34""##));
+        assert!(
+            h.contains(r##"<a href="#/x/y/34" rel="noopener noreferrer">x/y#34</a>"##),
+            "{h}"
+        );
+        assert!(
+            h.contains(
+                r#"<a class="gh-link" href="https://github.com/x/y/issues/34" target="_blank""#
+            ),
+            "{h}"
+        );
     }
 
     #[test]
@@ -530,9 +569,19 @@ mod tests {
     #[test]
     fn marks_explicit_pull_links_but_not_issue_links() {
         let h = html("[x](https://github.com/o/r/pull/5)");
-        assert!(h.contains(r##"data-grenadine="#/o/r/5""##));
+        assert!(
+            h.contains(r##"<a href="#/o/r/5" rel="noopener noreferrer">x</a>"##),
+            "{h}"
+        );
+        assert!(
+            h.contains(
+                r#"<a class="gh-link" href="https://github.com/o/r/pull/5" target="_blank""#
+            ),
+            "{h}"
+        );
         let h = html("[x](https://github.com/o/r/issues/5)");
-        assert!(!h.contains("data-grenadine"));
+        assert!(!h.contains("gh-link"));
+        assert!(h.contains(r#"target="_blank""#));
     }
 
     #[test]
@@ -572,5 +621,10 @@ mod tests {
     fn strips_scripts_and_bad_classes() {
         assert!(!html("<script>alert(1)</script>").contains("script"));
         assert!(!html("<span class=\"evil\">x</span>").contains("evil"));
+        let h = html("<a class=\"evil\" href=\"https://a.b\">x</a>");
+        assert!(!h.contains("evil"), "{h}");
+        let h = html("<a href=\"#/evil\">x</a>");
+        assert!(!h.contains("#/evil"), "{h}");
+        assert!(!html("[x](javascript:alert(1))").contains("javascript:"));
     }
 }

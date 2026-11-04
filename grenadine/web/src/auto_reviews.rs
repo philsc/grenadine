@@ -5,7 +5,7 @@ use grenadine_core::api::{AutoReviewEntry, AutoReviewState};
 use leptos::prelude::*;
 
 use crate::agents::{cost, status_class, status_label};
-use crate::{Route, Updates, api, hash_for};
+use crate::{GithubLink, Route, Updates, api, github_url, hash_for};
 
 /// The tab's page.
 pub const LIST: &str = "#/auto-reviews";
@@ -84,20 +84,27 @@ fn Entry(review: AutoReviewEntry, route: Signal<Route>) -> impl IntoView {
         }
     };
     let meta = [
-        format!("{}#{}", review.key.repo, review.key.number),
-        review.head_oid.chars().take(8).collect(),
+        review.head_oid.chars().take(8).collect::<String>(),
         cost(review.cost, review.cost_unit),
     ]
     .join(" · ");
     view! {
         <li class="agent-entry">
-            <a class="agent-item" class:selected=selected href=href title=review.error.clone()>
+            // Links can't nest, so the row's link is an overlay over the
+            // li; the body sits next to it so the GitHub icon can be
+            // clicked.
+            <a class="agent-item overlay" class:selected=selected href=href title=review.error.clone()></a>
+            <div class="agent-item-body">
                 <span class="agent-title" title=review.title.clone()>{review.title.clone()}</span>
                 <span class="agent-status-line">
                     {badge}
-                    <span class="agent-meta muted">{meta}</span>
+                    <span class="agent-meta muted">
+                        {format!("{}#{}", review.key.repo, review.key.number)}
+                        <GithubLink url=github_url(&review.key) />
+                        {format!(" · {meta}")}
+                    </span>
                 </span>
-            </a>
+            </div>
         </li>
     }
 }
