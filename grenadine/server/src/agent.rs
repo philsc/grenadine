@@ -469,10 +469,6 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
-    /// A lock per web draft a session is being created for, so a second
-    /// start with the same draft waits for the first rather than
-    /// creating a duplicate.
-    starting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether each new session's first prompt is summarized.
@@ -904,7 +900,6 @@ impl Agents {
             base_url,
             slices,
             live: std::sync::Mutex::default(),
-            starting: std::sync::Mutex::default(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
             terminals: crate::terminal::Terminals::default(),
@@ -1065,54 +1060,21 @@ pub async fn create_session(
     if req.prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
-    let Some(draft) = req.draft.clone() else {
-        return create_session_locked(state, req, kind, title).await;
-    };
-    // A start from a web draft runs under the draft's lock; a second one
-    // waits for the first, then finds its session rather than creating a
-    // duplicate.
-    let lock = {
-        let mut starting = state.agents.starting.lock().unwrap();
-        starting.entry(draft.clone()).or_default().clone()
-    };
-    let guard = lock.clone().lock_owned().await;
-    let result = async {
-        if let Some(session) = state.db.agent_by_draft(&draft)? {
-            return Ok(session);
-        }
-        create_session_locked(state, req, kind, title).await
-    }
-    .await;
-    drop(guard);
-    {
-        let mut starting = state.agents.starting.lock().unwrap();
-        if starting.get(&draft).is_some_and(|l| Arc::ptr_eq(l, &lock)) {
-            starting.remove(&draft);
-        }
-    }
-    result
-}
-
-/// What `create_session` does once it holds the draft's lock, or right
-/// away when the session doesn't start from one.
-async fn create_session_locked(
-    state: &Arc<State>,
-    req: NewAgent,
-    kind: SessionKind,
-    title: Option<String>,
-) -> Result<AgentSession> {
     let id = uuid();
     let worktree = state.agents.worktrees.join(&req.repo).join(&id);
-    let (branch, base_sha) = if req.repo == GENERAL {
+    let (branch, status) = if req.repo == GENERAL {
         if req.pr.is_some() {
             bail!("a general session can't start from a PR");
         }
-        tokio::fs::create_dir_all(&worktree).await?;
-        (String::new(), String::new())
+        (String::new(), AgentStatus::Idle)
     } else {
-        let branch = session_branch(&id);
-        let base_sha = add_worktree(state, &req, &branch, &worktree).await?;
-        (branch, base_sha)
+        // Checked now so these still fail on the form; the fetch and
+        // worktree add happen when the first turn runs, under `Creating`.
+        if !state.repos.contains_key(&req.repo) {
+            bail!("{} is not a configured repository", req.repo);
+        }
+        pr_head(state, &req.repo, req.pr)?;
+        (session_branch(&id), AgentStatus::Creating)
     };
 
     let session = AgentSession {
@@ -1124,8 +1086,8 @@ async fn create_session_locked(
         summary: None,
         branch,
         worktree: worktree.to_string_lossy().into_owned(),
-        base_sha,
-        status: AgentStatus::Idle,
+        base_sha: String::new(),
+        status,
         created_at: now(),
         cost: 0.0,
         cost_unit: req.backend.cost_unit(),
@@ -1136,9 +1098,25 @@ async fn create_session_locked(
         prs: None,
         unstaged: 0,
         kind,
-        draft: req.draft,
+        draft: req.draft.clone(),
     };
-    state.db.create_agent(&session)?;
+    // A second start with the same draft returns the first one's session.
+    if let Some(d) = &req.draft
+        && let Some(session) = state.db.agent_by_draft(d)?
+    {
+        return Ok(session);
+    }
+    match state.db.create_agent(&session) {
+        Ok(()) => {}
+        Err(e) if req.draft.is_some() && unique_violation(&e) => {
+            // An insert that raced this one claimed the draft.
+            return state
+                .db
+                .agent_by_draft(req.draft.as_deref().unwrap())?
+                .ok_or(e);
+        }
+        Err(e) => return Err(e),
+    }
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
     if kind == SessionKind::Interactive {
@@ -1155,46 +1133,63 @@ async fn create_session_locked(
     Ok(session)
 }
 
-/// Adds the worktree of a new session in `req.repo` at `worktree`, with
-/// `branch` checked out at the trunk or the PR's head, and returns the
-/// commit it starts from.
-async fn add_worktree(
-    state: &State,
-    req: &NewAgent,
-    branch: &str,
-    worktree: &Path,
-) -> Result<String> {
+/// The commit a session starting on `pr` begins from: the head of its
+/// newest version with commits. `None` for a session starting on the
+/// trunk.
+fn pr_head(state: &State, repo: &str, pr: Option<u64>) -> Result<Option<String>> {
+    let Some(number) = pr else { return Ok(None) };
+    let key = PrKey {
+        repo: repo.to_owned(),
+        number,
+    };
+    let pr = state
+        .db
+        .pr(&key)?
+        .ok_or_else(|| anyhow!("{repo}#{number} hasn't synced yet"))?;
+    let head = pr
+        .versions
+        .iter()
+        .rev()
+        .find(|v| !v.missing)
+        .ok_or_else(|| anyhow!("{repo}#{number} has no commits"))?;
+    Ok(Some(head.sha.clone()))
+}
+
+/// Whether `e` is SQLite's UNIQUE constraint, e.g. a second session
+/// insert claiming the same draft.
+fn unique_violation(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+        matches!(
+            e,
+            rusqlite::Error::SqliteFailure(f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation
+        )
+    })
+}
+
+/// Creates `session`'s worktree and branch and records the commit they
+/// start from, for a session whose worktree wasn't built when its row
+/// was inserted. An earlier attempt that failed or died may have left
+/// the worktree or the branch behind, so they go first.
+async fn ensure_worktree(state: &Arc<State>, session: &AgentSession) -> Result<()> {
     let cloned = state
         .repos
-        .get(&req.repo)
-        .ok_or_else(|| anyhow!("{} is not a configured repository", req.repo))?
+        .get(&session.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?
         .clone();
-    let pr_head = match req.pr {
-        Some(number) => {
-            let key = PrKey {
-                repo: req.repo.clone(),
-                number,
-            };
-            let pr = state
-                .db
-                .pr(&key)?
-                .ok_or_else(|| anyhow!("{}#{number} hasn't synced yet", req.repo))?;
-            let head = pr
-                .versions
-                .iter()
-                .rev()
-                .find(|v| !v.missing)
-                .ok_or_else(|| anyhow!("{}#{number} has no commits", req.repo))?;
-            Some(head.sha.clone())
-        }
-        None => None,
-    };
-
+    let base = pr_head(state, &session.repo, session.pr)?;
     let _guard = cloned.git_lock.lock().await;
+    // A delete that won the race for the lock shouldn't leave the
+    // worktree and branch behind.
+    if state.db.agent(&session.id)?.is_none() {
+        bail!("the session is gone");
+    }
     let repo = cloned.repo.clone();
-    let (branch, worktree) = (branch.to_owned(), worktree.to_owned());
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let base = match pr_head {
+    let worktree = PathBuf::from(&session.worktree);
+    let branch = session.branch.clone();
+    let base = tokio::task::spawn_blocking(move || -> Result<String> {
+        repo.worktree_remove(&worktree, &branch)?;
+        let base = match base {
             Some(sha) => sha,
             None => repo.fetch_default_branch(TRUNK_REF)?,
         };
@@ -1204,7 +1199,10 @@ async fn add_worktree(
         repo.worktree_add(&worktree, &branch, &base)?;
         Ok(base)
     })
-    .await?
+    .await??;
+    state.db.set_agent_base(&session.id, &base)?;
+    state.send(ServerEvent::AgentsChanged);
+    Ok(())
 }
 
 /// Queues a prompt; it runs once the turns before it are done, with
@@ -2635,7 +2633,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         mode,
         model,
     } = queued;
-    let session = state
+    let mut session = state
         .db
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
@@ -2643,12 +2641,24 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     if !images.is_empty() {
         emit(state, id, AgentEventKind::Images(images.clone()))?;
     }
-    set_status(state, id, AgentStatus::Running);
     // Nothing of a general session's is lost with its directory, so one
-    // that went away comes back.
+    // that went away comes back. A repo session's worktree is made here,
+    // not when its row is inserted, since the fetch can take a while.
     if session.repo == GENERAL {
         tokio::fs::create_dir_all(&session.worktree).await?;
+    } else if session.base_sha.is_empty() {
+        set_status(state, id, AgentStatus::Creating);
+        ensure_worktree(state, &session).await?;
+        // A delete or interrupt that won the race stops the turn here.
+        session = state
+            .db
+            .agent(id)?
+            .ok_or_else(|| anyhow!("the session is gone"))?;
+        if state.agents.interrupted(id) {
+            return Ok(AgentStatus::Interrupted);
+        }
     }
+    set_status(state, id, AgentStatus::Running);
 
     let mcp_url = format!(
         "{}/mcp/{id}/{}",
@@ -2972,12 +2982,15 @@ pub(crate) mod tests {
         assert_eq!(a.id, b.id);
         assert_eq!(a.draft.as_deref(), Some("d1"));
         assert_eq!(state.db.agents().unwrap().len(), 1);
-        assert_eq!(
-            std::fs::read_dir(state.agents.worktrees.join(GENERAL))
-                .unwrap()
-                .count(),
-            1
-        );
+        // The first turn makes the general session's directory.
+        let dir = state.agents.worktrees.join(GENERAL);
+        for _ in 0..100 {
+            if dir.is_dir() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
 
         let c = create(&state, req(Some("d2"))).await.unwrap();
         let d = create(&state, req(None)).await.unwrap();
@@ -2986,6 +2999,147 @@ pub(crate) mod tests {
         assert_eq!(c.draft.as_deref(), Some("d2"));
         assert_eq!(d.draft, None);
         assert_eq!(state.db.agents().unwrap().len(), 3);
+    }
+
+    /// A fake claude that ends its turn right away.
+    const CLAUDE_OK: &str = r#"#!/bin/sh
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+"#;
+
+    fn new_repo_session() -> NewAgent {
+        NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: None,
+            prompt: "hi".into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            draft: None,
+        }
+    }
+
+    /// The session's row is there before its worktree is: `create`
+    /// doesn't wait for the fetch, the first turn does.
+    #[tokio::test]
+    async fn a_repo_session_creates_its_worktree_in_the_first_turn() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), CLAUDE_OK);
+        let cloned = state.repos["owner/name"].clone();
+        let _held = cloned.git_lock.lock().await;
+        let session = create(&state, new_repo_session()).await.unwrap();
+        assert_eq!(session.status, AgentStatus::Creating);
+        assert!(session.base_sha.is_empty());
+        assert!(!std::path::Path::new(&session.worktree).exists());
+        drop(_held);
+        wait_for_turns(&state, &session.id, 1).await;
+        let done = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(done.status, AgentStatus::Idle);
+        assert!(!done.base_sha.is_empty());
+        assert!(std::path::Path::new(&done.worktree).join(".git").exists());
+    }
+
+    /// A delete that lands while the worktree is being created still
+    /// removes everything once it gets the lock.
+    #[tokio::test]
+    async fn delete_during_creation_leaves_nothing_behind() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), CLAUDE_OK);
+        let cloned = state.repos["owner/name"].clone();
+        let held = cloned.git_lock.lock().await;
+        let session = create(&state, new_repo_session()).await.unwrap();
+        let worktree = session.worktree.clone();
+        let branch = session.branch.clone();
+        let deleter = tokio::spawn({
+            let state = state.clone();
+            let id = session.id.clone();
+            async move { delete(&state, &id).await }
+        });
+        // Give delete the moment to reach the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(held);
+        assert!(deleter.await.unwrap().unwrap());
+        assert!(state.db.agent(&session.id).unwrap().is_none());
+        assert!(!std::path::Path::new(&worktree).exists());
+        assert_eq!(
+            crate::git::tests::run(&fx.clone.path, &["branch", "--list", &branch]),
+            ""
+        );
+    }
+
+    /// A worktree creation that fails fails the turn; the next prompt
+    /// tries again.
+    #[tokio::test]
+    async fn a_failed_creation_retries_with_the_next_prompt() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), CLAUDE_OK);
+        // A file where the worktree's parent directory goes makes the
+        // creation fail.
+        let worktrees = dir.path().join("worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        let blocker = worktrees.join("owner");
+        std::fs::write(&blocker, "x").unwrap();
+        let session = create(&state, new_repo_session()).await.unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let failed = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(failed.status, AgentStatus::Failed);
+        assert!(failed.base_sha.is_empty());
+        let events = state.db.agent_events(&session.id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, AgentEventKind::Error(_)))
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        send(
+            &state,
+            &session.id,
+            "again".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, &session.id, 2).await;
+        let done = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(done.status, AgentStatus::Idle);
+        assert!(!done.base_sha.is_empty());
+        assert!(std::path::Path::new(&done.worktree).join(".git").exists());
+    }
+
+    /// A session left `Creating` when the server stopped comes back
+    /// interrupted; its next prompt builds the worktree.
+    #[tokio::test]
+    async fn a_creation_interrupted_comes_back_on_the_next_prompt() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), CLAUDE_OK);
+        let cloned = state.repos["owner/name"].clone();
+        let held = cloned.git_lock.lock().await;
+        let session = create(&state, new_repo_session()).await.unwrap();
+        // The queued prompt dies with the server, as does `Creating`.
+        interrupt(&state, &session.id);
+        state.db.interrupt_agents().unwrap();
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Interrupted
+        );
+        drop(held);
+        send(
+            &state,
+            &session.id,
+            "go on".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, &session.id, 1).await;
+        let done = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(done.status, AgentStatus::Idle);
+        assert!(!done.base_sha.is_empty());
+        assert!(std::path::Path::new(&done.worktree).join(".git").exists());
     }
 
     /// A state whose agents run `script` as claude, with the git fixture's
@@ -3148,12 +3302,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         .await
         .unwrap();
         assert_eq!(session.title, "-first");
-        assert_eq!(
-            session.base_sha,
-            crate::git::tests::run(&fx.upstream, &["rev-parse", "HEAD"])
-        );
         let mut events = state.agents.subscribe(&session.id);
         wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().base_sha,
+            crate::git::tests::run(&fx.upstream, &["rev-parse", "HEAD"])
+        );
         send(
             &state,
             &session.id,
@@ -4125,7 +4279,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         .await
         .unwrap();
         wait_for_turns(state, &session.id, 1).await;
-        session
+        // The turn built the worktree and set the base.
+        state.db.agent(&session.id).unwrap().unwrap()
     }
 
     /// Records an open PR whose upstream head branch is at `head`, with
@@ -4206,7 +4361,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         .await
         .unwrap();
         wait_for_turns(state, &session.id, 1).await;
-        session
+        // The turn built the worktree and set the base.
+        state.db.agent(&session.id).unwrap().unwrap()
     }
 
     /// Wraps up the session and returns how it ended.

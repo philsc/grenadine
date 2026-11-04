@@ -911,6 +911,9 @@ pub struct NewCleanupSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
+    /// The session's worktree is being created before its first turn
+    /// runs.
+    Creating,
     /// Waiting for a prompt.
     Idle,
     /// The agent is working on a prompt.
