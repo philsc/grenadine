@@ -9,7 +9,7 @@ use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
     AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CiStatus, CleanupState,
     CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    PromptImage, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -20,6 +20,7 @@ use wasm_bindgen::prelude::*;
 use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
+use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
 use crate::settings::{Settings, SettingsButton};
@@ -180,6 +181,7 @@ pub fn delete_session(
                     let _ = s.remove_item(&mode_key(&id));
                 }
                 crate::terminal::forget(&id);
+                image_drafts::forget(&image_drafts::agent_key(&id));
                 deleted()
             }
             Err(e) => failed(e),
@@ -1153,8 +1155,8 @@ pub fn NewSession(draft: String) -> impl IntoView {
     // The draft's model goes until the backend changes.
     let model = model_signal(backend.into());
     model.set(saved.model);
-    // Drafts keep only the text; images last as long as the form.
-    let images = RwSignal::new(Vec::<PromptImage>::new());
+    // The images pasted so far, kept with the draft in IndexedDB.
+    let images = image_drafts::draft_images(image_drafts::new_session_key(&draft));
     let error = RwSignal::new(None::<String>);
     let id = StoredValue::new(draft.clone());
 
@@ -1177,6 +1179,7 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 mode,
                 mode_picked,
                 model,
+                has_images: images.with(|i| !i.is_empty()),
                 ..d.clone()
             }
         });
@@ -2609,7 +2612,8 @@ fn Composer(
     let backend = Signal::derive(move || session.with(|s| s.backend));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
-    let images = RwSignal::new(Vec::<PromptImage>::new());
+    // The images pasted so far, kept with the draft in IndexedDB.
+    let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
     let error = RwSignal::new(None::<String>);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && images.with(Vec::is_empty);
     let working = move || {
@@ -2634,6 +2638,7 @@ fn Composer(
                 Ok(()) => {
                     prompt.set(String::new());
                     images.set(Vec::new());
+                    image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),

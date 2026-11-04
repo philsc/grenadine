@@ -1,6 +1,7 @@
 //! Images that go with a prompt: pasted into its text box, dropped on its
 //! form or picked from a file, shown as thumbnails until the prompt is
-//! sent.
+//! sent. They're kept with the prompt's draft in IndexedDB (see
+//! `image_drafts`), so they survive leaving the form and reloads.
 
 use grenadine_core::api::PromptImage;
 use leptos::prelude::*;

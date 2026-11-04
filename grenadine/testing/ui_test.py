@@ -1893,6 +1893,18 @@ class VersionsTest(ServerTestCase):
 # A new session's form; each is a draft of its own.
 DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"
 
+# Pastes a PNG screenshot into the text box it's evaluated on.
+PASTE_IMAGE = """async (box) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 2000;
+    canvas.height = 1000;
+    canvas.getContext("2d").fillRect(0, 0, 10, 10);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const data = new DataTransfer();
+    data.items.add(new File([blob], "screenshot.png", {type: "image/png"}));
+    box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+}"""
+
 
 class AgentTest(ServerTestCase):
     OTHER_REPO = "test/other"
@@ -2512,20 +2524,10 @@ class AgentTest(ServerTestCase):
         # A screenshot pasted into the text box shows as a thumbnail.
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill("look at this")
-        paste = """async (box) => {
-            const canvas = document.createElement("canvas");
-            canvas.width = 2000;
-            canvas.height = 1000;
-            canvas.getContext("2d").fillRect(0, 0, 10, 10);
-            const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-            const data = new DataTransfer();
-            data.items.add(new File([blob], "screenshot.png", {type: "image/png"}));
-            box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
-        }"""
-        follow_up.evaluate(paste)
+        follow_up.evaluate(PASTE_IMAGE)
         thumbnails = self.page.locator(".prompt-image img")
         expect(thumbnails).to_have_count(1)
-        follow_up.evaluate(paste)
+        follow_up.evaluate(PASTE_IMAGE)
         expect(thumbnails).to_have_count(2)
         self.page.get_by_role("button", name="Remove the image").first.click()
         expect(thumbnails).to_have_count(1)
@@ -2543,6 +2545,75 @@ class AgentTest(ServerTestCase):
         expect(sent).to_have_js_property("naturalWidth", 1568)
         self.page.reload()
         expect(sent).to_have_js_property("naturalWidth", 1568)
+
+    def test_new_session_images_survive_leaving_the_form(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("say hi")
+        prompt.evaluate(PASTE_IMAGE)
+        thumbnails = self.page.locator(".prompt-image img")
+        expect(thumbnails).to_have_count(1)
+
+        # Going away and back to the draft keeps the image.
+        draft = (
+            self.section(scenarios.REPO)
+            .locator(".agent-entry")
+            .filter(has=self.page.locator(".agent-draft"))
+        )
+        expect(draft).to_have_count(1)
+        self.page.get_by_role("link", name="Agents").click()
+        expect(thumbnails).to_have_count(0)
+        draft.click()
+        expect(prompt).to_have_value("say hi")
+        expect(thumbnails).to_have_count(1)
+
+        # And a reload.
+        self.page.reload()
+        expect(thumbnails).to_have_count(1)
+
+        # The image goes with the started session's prompt.
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        expect(transcript.locator(".turn-images img")).to_have_count(1)
+
+        # A fresh form has no images.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(thumbnails).to_have_count(0)
+
+    def test_follow_up_images_survive_switching_sessions(self) -> None:
+        sessions = self.section(scenarios.REPO).locator(".agent-item")
+        transcript = self.page.locator(".transcript")
+        for prompt in ["say left", "say right"]:
+            self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+            self.page.get_by_label("Permissions").select_option(label="Auto")
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+            expect(transcript.locator(".turn-end")).to_have_count(1)
+        follow_up = self.page.get_by_label("Follow-up")
+        thumbnails = self.page.locator(".prompt-image img")
+
+        # An image pasted into "say right"'s composer is its own.
+        follow_up.evaluate(PASTE_IMAGE)
+        expect(thumbnails).to_have_count(1)
+        sessions.filter(has_text="say left").click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say left"])
+        expect(thumbnails).to_have_count(0)
+        sessions.filter(has_text="say right").click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say right"])
+        expect(thumbnails).to_have_count(1)
+
+        # It survives a reload too, until it's sent.
+        self.page.reload()
+        expect(thumbnails).to_have_count(1)
+        follow_up.press("Enter")
+        expect(transcript).to_contain_text("I see 1 images.")
+        expect(thumbnails).to_have_count(0)
+        self.page.reload()
+        expect(thumbnails).to_have_count(0)
 
     def test_new_session_drafts_survive_switching(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

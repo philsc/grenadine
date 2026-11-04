@@ -1,5 +1,5 @@
 {
-  "checksum": "2e5feeb8390939a7ff159416b37cbb6009428482ae76153320cbfa9dffddd729",
+  "checksum": "95e8c9e76cc38ee369bb51f2e5fe2955a335ed9b7358f14a7ace9b4c0e8c3ff8",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16628,6 +16628,13 @@
             "HtmlTrackElement",
             "HtmlUListElement",
             "HtmlVideoElement",
+            "IdbDatabase",
+            "IdbFactory",
+            "IdbObjectStore",
+            "IdbOpenDbRequest",
+            "IdbRequest",
+            "IdbTransaction",
+            "IdbTransactionMode",
             "ImageBitmap",
             "InputEvent",
             "IntersectionObserver",
