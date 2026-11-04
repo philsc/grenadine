@@ -1374,6 +1374,8 @@ struct Batch {
     streaming: Streaming,
     usage: Option<(Option<u64>, Option<u64>)>,
     model: Option<String>,
+    /// The newest `at` the messages carried, stored or ephemeral.
+    last_event: Option<i64>,
 }
 
 /// Turns queued stream messages into the signals' next values, as though
@@ -1387,6 +1389,7 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
         streaming: Streaming::Keep,
         usage: None,
         model: None,
+        last_event: None,
     };
     let mut last = last_seq;
     // Text appended since the last clear.
@@ -1398,29 +1401,34 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
                 delta.clear();
                 cleared = true;
             }
-            Incoming::Event(event) => match event.seq {
-                None => match event.kind {
-                    AgentEventKind::TextDelta(t) => delta.push_str(&t),
-                    AgentEventKind::Usage { tokens, window } => {
-                        let (t, w) = batch.usage.get_or_insert((None, None));
-                        *t = tokens.or(*t);
-                        *w = window.or(*w);
-                    }
-                    AgentEventKind::Model(m) => batch.model = Some(m),
-                    _ => {}
-                },
-                Some(seq) => {
-                    if last.is_some_and(|l| seq <= l) {
-                        continue;
-                    }
-                    last = Some(seq);
-                    // The streamed text is complete once anything else
-                    // comes along.
-                    delta.clear();
-                    cleared = true;
-                    batch.events.push(Arc::new(event));
+            Incoming::Event(event) => {
+                if let Some(at) = event.at {
+                    batch.last_event = Some(at);
                 }
-            },
+                match event.seq {
+                    None => match event.kind {
+                        AgentEventKind::TextDelta(t) => delta.push_str(&t),
+                        AgentEventKind::Usage { tokens, window } => {
+                            let (t, w) = batch.usage.get_or_insert((None, None));
+                            *t = tokens.or(*t);
+                            *w = window.or(*w);
+                        }
+                        AgentEventKind::Model(m) => batch.model = Some(m),
+                        _ => {}
+                    },
+                    Some(seq) => {
+                        if last.is_some_and(|l| seq <= l) {
+                            continue;
+                        }
+                        last = Some(seq);
+                        // The streamed text is complete once anything else
+                        // comes along.
+                        delta.clear();
+                        cleared = true;
+                        batch.events.push(Arc::new(event));
+                    }
+                }
+            }
         }
     }
     batch.streaming = match (cleared, delta.is_empty()) {
@@ -1434,7 +1442,8 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
 /// Follows a session's event stream while the page is open. Events arrive
 /// in `seq` order; a reconnect replays the transcript, which is skipped up
 /// to the last event seen. `usage` gets the context window's tokens and
-/// size as Claude Code reports them, and `model` the model it runs.
+/// size as Claude Code reports them, `model` the model it runs, and
+/// `last_event` the time of the newest event seen.
 ///
 /// Messages queue up and flush once per frame, so replaying a long
 /// transcript is one update per signal per frame rather than one per
@@ -1445,6 +1454,7 @@ fn follow(
     streaming: RwSignal<String>,
     usage: RwSignal<(Option<u64>, Option<u64>)>,
     model: RwSignal<Option<String>>,
+    last_event: RwSignal<Option<i64>>,
 ) {
     let queue = StoredValue::new(Vec::<Incoming>::new());
     let scheduled = StoredValue::new(false);
@@ -1473,6 +1483,9 @@ fn follow(
         }
         if let Some(m) = batch.model {
             model.set(Some(m));
+        }
+        if batch.last_event.is_some() && last_event.get_untracked() != batch.last_event {
+            last_event.set(batch.last_event);
         }
     };
     let push = move |incoming: Incoming| {
@@ -1593,7 +1606,8 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
     let streaming = RwSignal::new(String::new());
     let live_usage = RwSignal::new((None, None));
     let live_model = RwSignal::new(None);
-    follow(&id, events, streaming, live_usage, live_model);
+    let last_event = RwSignal::new(None::<i64>);
+    follow(&id, events, streaming, live_usage, live_model, last_event);
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
@@ -1606,6 +1620,51 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
     // session's repo never changes.
     let repo = Memo::new(move |_| {
         current.with(|s| s.as_ref().map(|s| s.repo.clone()).unwrap_or_default())
+    });
+
+    // The latest prompt starts the current turn: the activity bar times
+    // it and the transcript's timers cover only calls after it. The
+    // pointer comparison keeps a new event from resending the same one.
+    let turn = Memo::new_with_compare(
+        move |_| {
+            events.with(|events| {
+                events
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+                    .cloned()
+            })
+        },
+        |prev, cur| match (prev, cur) {
+            (Some(Some(p)), Some(Some(c))) => !Arc::ptr_eq(p, c),
+            (Some(None), Some(None)) => false,
+            _ => true,
+        },
+    );
+
+    // The page's clock for the timers that show how long the agent has
+    // been at something; it only ticks while it is working.
+    let now = RwSignal::new(js_sys::Date::now() as i64);
+    Effect::new(move |_| {
+        let working = current.with(|s| {
+            s.as_ref().is_some_and(|s| {
+                matches!(
+                    s.status,
+                    AgentStatus::Running | AgentStatus::AwaitingApproval
+                )
+            })
+        });
+        if !working {
+            return;
+        }
+        let tick = move || now.set(js_sys::Date::now() as i64);
+        tick();
+        let handle = set_interval_with_handle(tick, Duration::from_secs(1));
+        on_cleanup(move || {
+            if let Ok(h) = handle {
+                h.clear();
+            }
+        });
     });
 
     // A session shows on the page of its kind.
@@ -1642,8 +1701,9 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                                 });
                                 view! {
                                     <AgentHeader session=session />
-                                    <Transcript session=session events=events streaming=streaming mode=mode model=model />
+                                    <Transcript session=session events=events streaming=streaming mode=mode model=model turn=turn now=now />
                                     <div class="agent-footer">
+                                        <ActivityBar session=session events=events streaming=streaming last_event=last_event turn=turn now=now />
                                         {if read_only {
                                             view! { <ReviewActions session=session /> }.into_any()
                                         } else {
@@ -2015,6 +2075,212 @@ fn tool_result(e: &AgentEvent) -> Option<(&str, bool, &[PatchHunk], &[String])> 
     Some((content, *is_error, patch, images))
 }
 
+/// A duration in milliseconds as the page shows it: `42s` under a
+/// minute, `1m 42s` under an hour, `1h 05m` past it.
+fn elapsed(ms: i64) -> String {
+    let secs = (ms / 1000).max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+/// How long a finished tool call took, when it's worth showing: both ends
+/// timed and ten seconds or more.
+fn tool_duration(start: Option<i64>, end: Option<i64>) -> Option<i64> {
+    let took = end? - start?;
+    (took >= 10_000).then_some(took)
+}
+
+/// What the activity bar shows the agent doing.
+#[derive(Clone, Debug, PartialEq)]
+enum Activity {
+    /// A top-level tool call has no result yet; `more` counts the other
+    /// unfinished calls.
+    Tool {
+        name: String,
+        summary: String,
+        since: Option<i64>,
+        more: usize,
+    },
+    /// The newest event is a subagent's tool call.
+    Subagent {
+        name: String,
+        summary: String,
+        since: Option<i64>,
+    },
+    /// Text is streaming in.
+    Writing { since: Option<i64> },
+    /// Nothing else is going on.
+    Thinking { since: Option<i64> },
+}
+
+/// Picks what the agent is doing from its transcript. `last_event` is the
+/// newest stored event's time. Only calls since the latest prompt count
+/// as the turn's; a subagent's calls never get results, so they can't be
+/// unfinished `Tool`s.
+fn current_activity(
+    events: &[Arc<AgentEvent>],
+    streaming: bool,
+    last_event: Option<i64>,
+) -> Activity {
+    let turn = events
+        .iter()
+        .rposition(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let results: Vec<&str> = events[turn..]
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let unfinished: Vec<&Arc<AgentEvent>> = events[turn..]
+        .iter()
+        .filter(|e| {
+            matches!(&e.kind, AgentEventKind::ToolUse { id, parent: None, .. }
+                if !results.contains(&id.as_str()))
+        })
+        .collect();
+    let summary = |name: &str, input: &str| {
+        tool_summary(name, &serde_json::from_str(input).unwrap_or_default())
+    };
+    if let Some(e) = unfinished.last() {
+        let AgentEventKind::ToolUse { name, input, .. } = &e.kind else {
+            unreachable!()
+        };
+        return Activity::Tool {
+            name: name.clone(),
+            summary: summary(name, input),
+            since: e.at,
+            more: unfinished.len() - 1,
+        };
+    }
+    if streaming {
+        return Activity::Writing { since: last_event };
+    }
+    if let Some(e) = events.last()
+        && let AgentEventKind::ToolUse {
+            name,
+            input,
+            parent: Some(_),
+            ..
+        } = &e.kind
+    {
+        return Activity::Subagent {
+            name: name.clone(),
+            summary: summary(name, input),
+            since: e.at,
+        };
+    }
+    Activity::Thinking {
+        since: events.iter().rev().find_map(|e| e.at).or(last_event),
+    }
+}
+
+/// The line above the composer that shows what the agent is doing, while
+/// it works or waits for an approval. Everything it reads from the
+/// transcript sits behind a memo, so the `now` tick only reformats the
+/// times rather than rescanning it.
+#[component]
+fn ActivityBar(
+    session: Signal<AgentSession>,
+    events: RwSignal<Vec<Arc<AgentEvent>>>,
+    streaming: RwSignal<String>,
+    last_event: RwSignal<Option<i64>>,
+    turn: Memo<Option<Arc<AgentEvent>>>,
+    now: RwSignal<i64>,
+) -> impl IntoView {
+    // Whether text is streaming in; a delta alone doesn't recompute the
+    // activity below.
+    let streaming_text = Memo::new(move |_| streaming.with(|s| !s.is_empty()));
+    let stored_at = Memo::new(move |_| events.with(|e| e.last().and_then(|e| e.at)));
+    let activity = Memo::new(move |_| {
+        events.with(|e| current_activity(e, streaming_text.get(), stored_at.get()))
+    });
+    let approval_at = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.kind, AgentEventKind::ApprovalRequested { .. }))
+                .and_then(|e| e.at)
+        })
+    });
+    let turn_at = Signal::derive(move || turn.get().and_then(|e| e.at));
+    view! {
+        {move || {
+            match session.with(|s| s.status) {
+                AgentStatus::AwaitingApproval => {
+                    let waited = approval_at.get().map(|at| elapsed(now.get() - at));
+                    view! {
+                        <p class="activity waiting">
+                            "Waiting for your approval"
+                            {waited.map(|d| format!(" · {d}"))}
+                        </p>
+                    }.into_any()
+                }
+                AgentStatus::Running => {
+                    let activity = activity.get();
+                    let mut parts = Vec::new();
+                    let since = match &activity {
+                        Activity::Tool { name, summary, since, more } => {
+                            let mut label = name.clone();
+                            if !summary.is_empty() {
+                                label = format!("{label} · {summary}");
+                            }
+                            if *more > 0 {
+                                label = format!("{label} +{more} more");
+                            }
+                            parts.push(label);
+                            *since
+                        }
+                        Activity::Subagent { name, summary, since } => {
+                            let mut label = format!("Subagent · {name}");
+                            if !summary.is_empty() {
+                                label = format!("{label} · {summary}");
+                            }
+                            parts.push(label);
+                            *since
+                        }
+                        Activity::Writing { since } => {
+                            parts.push("Writing…".to_owned());
+                            *since
+                        }
+                        Activity::Thinking { since } => {
+                            parts.push("Thinking…".to_owned());
+                            *since
+                        }
+                    };
+                    if let Some(d) = since.map(|at| elapsed(now.get() - at)) {
+                        parts.push(d);
+                    }
+                    if let Some(d) = turn_at.get().map(|at| elapsed(now.get() - at)) {
+                        parts.push(format!("turn {d}"));
+                    }
+                    if let Some(ago) = last_event.get() {
+                        let quiet = now.get() - ago;
+                        if quiet >= 30_000 {
+                            parts.push(format!("last event {} ago", elapsed(quiet)));
+                        }
+                    }
+                    view! {
+                        <p class="activity">
+                            <span class="spinner"></span>
+                            {parts.join(" · ")}
+                        </p>
+                    }.into_any()
+                }
+                _ => ().into_any(),
+            }
+        }}
+    }
+}
+
 #[component]
 fn Transcript(
     session: Signal<AgentSession>,
@@ -2022,6 +2288,8 @@ fn Transcript(
     streaming: RwSignal<String>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
+    turn: Memo<Option<Arc<AgentEvent>>>,
+    now: RwSignal<i64>,
 ) -> impl IntoView {
     // Tool results and approval answers are shown with the event they
     // belong to. The map compares by pointer rather than by content, so a
@@ -2078,6 +2346,9 @@ fn Transcript(
             })
         })
     });
+    // Calls from before the current turn that have no result belong to
+    // interrupted turns, so they don't get a running timer.
+    let turn_start = Signal::derive(move || turn.get().and_then(|e| e.seq));
     // The page may hear of a request before it refetches the status.
     let waiting = Signal::derive(move || {
         session.with(|s| {
@@ -2143,6 +2414,8 @@ fn Transcript(
                 children=move |e| {
                     let repo = repo.clone();
                     let id = id.clone();
+                    let at = e.at;
+                    let seq = e.seq;
                     match &e.kind {
                         // A prompt can be only images.
                         AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
@@ -2199,14 +2472,49 @@ fn Transcript(
                                     <summary>
                                         <span class="tool-name">{name.clone()}</span>
                                         " " <code>{summary}</code>
-                                        {move || match result.with(|r| {
-                                            r.as_ref()
-                                                .and_then(|e| tool_result(e))
-                                                .map(|(_, is_error, _, _)| is_error)
-                                        }) {
-                                            None => view! { <span class="muted">" …"</span> }.into_any(),
-                                            Some(true) => view! { <span class="error">" failed"</span> }.into_any(),
-                                            Some(false) => ().into_any(),
+                                        {move || {
+                                            let done = result.with(|r| {
+                                                r.as_ref().map(|e| {
+                                                    (
+                                                        tool_result(e)
+                                                            .map(|(_, is_error, _, _)| is_error),
+                                                        e.at,
+                                                    )
+                                                })
+                                            });
+                                            match done {
+                                                // Still running, in this turn: a
+                                                // spinner and, when the call is
+                                                // timed, how long it has taken.
+                                                None if waiting.get()
+                                                    && turn_start
+                                                        .get()
+                                                        .is_none_or(|t| {
+                                                            seq.is_some_and(|s| s > t)
+                                                        }) =>
+                                                {
+                                                    view! {
+                                                        <span class="spinner"></span>
+                                                        {at.map(|at| view! {
+                                                            <span class="muted">" "{elapsed(now.get() - at)}</span>
+                                                        })}
+                                                    }
+                                                    .into_any()
+                                                }
+                                                None => {
+                                                    view! { <span class="muted">" …"</span> }
+                                                        .into_any()
+                                                }
+                                                Some((is_error, result_at)) => view! {
+                                                    {(is_error == Some(true)).then(|| {
+                                                        view! { <span class="error">" failed"</span> }
+                                                    })}
+                                                    {tool_duration(at, result_at).map(|d| view! {
+                                                        <span class="muted">" · "{elapsed(d)}</span>
+                                                    })}
+                                                }
+                                                .into_any(),
+                                            }
                                         }}
                                     </summary>
                                     {body}
@@ -2895,6 +3203,7 @@ mod tests {
     fn shows_a_turn_end_once() {
         let event = |seq, kind| AgentEvent {
             seq: Some(seq),
+            at: None,
             kind,
         };
         let ended = |error: Option<&str>| AgentEventKind::TurnEnded {
@@ -2916,7 +3225,11 @@ mod tests {
     }
 
     fn event(seq: Option<u64>, kind: AgentEventKind) -> Incoming {
-        Incoming::Event(AgentEvent { seq, kind })
+        Incoming::Event(AgentEvent {
+            seq,
+            at: None,
+            kind,
+        })
     }
 
     fn seqs(batch: &Batch) -> Vec<u64> {
@@ -3044,6 +3357,29 @@ mod tests {
             None,
         );
         assert_eq!(batch.model.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn drain_reports_the_newest_event_time() {
+        let timed = |seq, at, kind| Incoming::Event(AgentEvent { seq, at, kind });
+        // Stored and ephemeral events both count, skipped repeats too;
+        // the newest `at` wins.
+        let batch = drain(
+            vec![
+                timed(Some(1), Some(1_000), AgentEventKind::Text("a".into())),
+                timed(Some(2), Some(2_000), AgentEventKind::Text("b".into())),
+                timed(None, Some(3_000), AgentEventKind::TextDelta("c".into())),
+                timed(None, None, AgentEventKind::TextDelta("d".into())),
+            ],
+            Some(1),
+        );
+        assert_eq!(batch.last_event, Some(3_000));
+        // No times at all leaves it unset.
+        let batch = drain(
+            vec![event(None, AgentEventKind::TextDelta("a".into()))],
+            None,
+        );
+        assert_eq!(batch.last_event, None);
     }
 
     #[test]
@@ -3190,5 +3526,135 @@ mod tests {
     fn pretty_prints_json() {
         assert_eq!(pretty(r#"{"a":1}"#), "{\n  \"a\": 1\n}");
         assert_eq!(pretty("not json"), "not json");
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(elapsed(0), "0s");
+        assert_eq!(elapsed(59_999), "59s");
+        assert_eq!(elapsed(60_000), "1m 00s");
+        assert_eq!(elapsed(102_000), "1m 42s");
+        assert_eq!(elapsed(3_599_999), "59m 59s");
+        assert_eq!(elapsed(3_600_000), "1h 00m");
+        assert_eq!(elapsed(3_900_000), "1h 05m");
+    }
+
+    #[test]
+    fn tool_durations_worth_showing() {
+        assert_eq!(tool_duration(None, Some(20_000)), None);
+        assert_eq!(tool_duration(Some(1_000), None), None);
+        assert_eq!(tool_duration(Some(1_000), Some(10_999)), None);
+        assert_eq!(tool_duration(Some(1_000), Some(11_000)), Some(10_000));
+        assert_eq!(tool_duration(Some(0), Some(125_000)), Some(125_000));
+    }
+
+    #[test]
+    fn picks_the_current_activity() {
+        let prompt = || AgentEvent {
+            seq: Some(1),
+            at: Some(1_000),
+            kind: AgentEventKind::Prompt("do it".into()),
+        };
+        let call = |seq, id: &str, parent| AgentEvent {
+            seq: Some(seq),
+            at: Some(seq as i64 * 1_000),
+            kind: AgentEventKind::ToolUse {
+                id: id.into(),
+                name: "Bash".into(),
+                input: format!(r#"{{"command":"cmd {id}"}}"#),
+                parent,
+            },
+        };
+        let result = |seq, id: &str| AgentEvent {
+            seq: Some(seq),
+            at: Some(seq as i64 * 1_000),
+            kind: AgentEventKind::ToolResult {
+                id: id.into(),
+                content: "done".into(),
+                is_error: false,
+                patch: Vec::new(),
+                images: Vec::new(),
+            },
+        };
+
+        // A single unfinished call.
+        let events = [prompt(), call(2, "a", None)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            Activity::Tool {
+                name: "Bash".into(),
+                summary: "cmd a".into(),
+                since: Some(2_000),
+                more: 0,
+            }
+        );
+
+        // Two parallel calls: the newest shows, the other is counted.
+        let events = [prompt(), call(2, "a", None), call(3, "b", None)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(3_000)),
+            Activity::Tool {
+                name: "Bash".into(),
+                summary: "cmd b".into(),
+                since: Some(3_000),
+                more: 1,
+            }
+        );
+
+        // A finished call leaves streaming text: writing.
+        let events = [prompt(), call(2, "a", None), result(3, "a")];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), true, Some(3_000)),
+            Activity::Writing { since: Some(3_000) }
+        );
+
+        // A subagent's newest call shows as such, never as an unfinished
+        // tool call.
+        let events = [
+            prompt(),
+            call(2, "a", None),
+            result(3, "a"),
+            call(4, "sub", Some("task".into())),
+        ];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(4_000)),
+            Activity::Subagent {
+                name: "Bash".into(),
+                summary: "cmd sub".into(),
+                since: Some(4_000),
+            }
+        );
+        // An older subagent call isn't an unfinished tool either; only
+        // top-level calls are.
+        let events = [prompt(), call(2, "sub", Some("task".into()))];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            Activity::Subagent {
+                name: "Bash".into(),
+                summary: "cmd sub".into(),
+                since: Some(2_000),
+            }
+        );
+
+        // Nothing going on: thinking since the newest timed event.
+        let events = [prompt(), result(3, "a")];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(3_000)),
+            Activity::Thinking { since: Some(3_000) }
+        );
+
+        // Calls from before the latest prompt are finished business.
+        let events = [
+            call(1, "a", None),
+            AgentEvent {
+                seq: Some(2),
+                at: Some(2_000),
+                kind: AgentEventKind::Prompt("again".into()),
+            },
+        ];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            Activity::Thinking { since: Some(2_000) }
+        );
     }
 }

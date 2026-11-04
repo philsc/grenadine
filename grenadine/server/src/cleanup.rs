@@ -961,7 +961,11 @@ mod tests {
     use super::*;
 
     fn event(kind: AgentEventKind) -> AgentEvent {
-        AgentEvent { seq: Some(1), kind }
+        AgentEvent {
+            seq: Some(1),
+            at: None,
+            kind,
+        }
     }
 
     fn tool(id: &str, name: &str, input: Value) -> AgentEvent {

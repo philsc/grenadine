@@ -1566,6 +1566,10 @@ impl AgentEventKind {
 pub struct AgentEvent {
     /// The event's position in the transcript; `None` for ephemeral events.
     pub seq: Option<u64>,
+    /// When the server emitted the event, in Unix milliseconds; `None`
+    /// for events stored before times were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
     pub kind: AgentEventKind,
 }
 

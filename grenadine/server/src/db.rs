@@ -370,6 +370,13 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agent_prs ADD COLUMN ci TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- When the server emitted each event, in Unix milliseconds; NULL for
+    -- events stored before times were recorded.
+    ALTER TABLE agent_events ADD COLUMN at INTEGER;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1612,13 +1619,14 @@ impl Db {
     }
 
     /// Appends an event to a session's transcript and returns its `seq`.
-    pub fn append_agent_event(&self, id: &str, kind: &AgentEventKind) -> Result<u64> {
+    /// `at` is when the event was emitted, in Unix milliseconds.
+    pub fn append_agent_event(&self, id: &str, kind: &AgentEventKind, at: i64) -> Result<u64> {
         let conn = self.conn();
         let seq: u64 = conn.query_row(
-            "INSERT INTO agent_events (agent_id, seq, event)
-             SELECT ?1, COALESCE(MAX(seq) + 1, 1), ?2 FROM agent_events WHERE agent_id = ?1
+            "INSERT INTO agent_events (agent_id, seq, event, at)
+             SELECT ?1, COALESCE(MAX(seq) + 1, 1), ?2, ?3 FROM agent_events WHERE agent_id = ?1
              RETURNING seq",
-            params![id, serde_json::to_string(kind)?],
+            params![id, serde_json::to_string(kind)?, at],
             |r| r.get(0),
         )?;
         Ok(seq)
@@ -1648,13 +1656,20 @@ impl Db {
     /// A session's transcript in order.
     pub fn agent_events(&self, id: &str) -> Result<Vec<AgentEvent>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT seq, event FROM agent_events WHERE agent_id = ? ORDER BY seq")?;
-        let rows = stmt.query_map([id], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut stmt = conn
+            .prepare("SELECT seq, event, at FROM agent_events WHERE agent_id = ? ORDER BY seq")?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
         rows.map(|row| {
-            let (seq, json) = row?;
+            let (seq, json, at) = row?;
             Ok(AgentEvent {
                 seq: Some(seq),
+                at,
                 kind: serde_json::from_str(&json)?,
             })
         })
@@ -2650,28 +2665,42 @@ mod tests {
         );
 
         let text = AgentEventKind::Text("hi".into());
-        assert_eq!(db.append_agent_event("a", &text).unwrap(), 1);
-        assert_eq!(db.append_agent_event("b", &text).unwrap(), 1);
+        assert_eq!(db.append_agent_event("a", &text, 1_000).unwrap(), 1);
+        assert_eq!(db.append_agent_event("b", &text, 1_000).unwrap(), 1);
         assert_eq!(
-            db.append_agent_event("a", &AgentEventKind::Error("e".into()))
+            db.append_agent_event("a", &AgentEventKind::Error("e".into()), 2_000)
                 .unwrap(),
             2
         );
+        // An event stored before times were recorded has no `at`.
+        db.conn()
+            .execute(
+                "INSERT INTO agent_events (agent_id, seq, event) VALUES ('a', 3, '{\"text\":\"old\"}')",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             db.agent_events("a").unwrap(),
             [
                 AgentEvent {
                     seq: Some(1),
+                    at: Some(1_000),
                     kind: text.clone()
                 },
                 AgentEvent {
                     seq: Some(2),
+                    at: Some(2_000),
                     kind: AgentEventKind::Error("e".into())
+                },
+                AgentEvent {
+                    seq: Some(3),
+                    at: None,
+                    kind: AgentEventKind::Text("old".into())
                 },
             ]
         );
         // Events need their session.
-        assert!(db.append_agent_event("x", &text).is_err());
+        assert!(db.append_agent_event("x", &text, 3_000).is_err());
 
         db.add_agent_image("a", "i", "image/png", b"png").unwrap();
         assert_eq!(
@@ -2824,8 +2853,15 @@ mod tests {
                 images: Vec::new(),
             },
         ];
+        // The schema at the backfill's position has no `at` column yet.
         for e in &events {
-            db.append_agent_event("a", e).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO agent_events (agent_id, seq, event)
+                     SELECT 'a', COALESCE(MAX(seq) + 1, 1), ? FROM agent_events WHERE agent_id = 'a'",
+                    [serde_json::to_string(e).unwrap()],
+                )
+                .unwrap();
         }
         migrate(&mut db.conn(), MIGRATIONS.len()).unwrap();
         assert_eq!(

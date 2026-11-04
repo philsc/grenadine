@@ -1004,12 +1004,19 @@ impl Agents {
 pub fn emit(state: &State, id: &str, kind: AgentEventKind) -> Result<()> {
     let mut live = state.agents.live.lock().unwrap();
     let live = live.entry(id.to_owned()).or_insert_with(Live::new);
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
     let seq = if kind.is_ephemeral() {
         None
     } else {
-        Some(state.db.append_agent_event(id, &kind)?)
+        Some(state.db.append_agent_event(id, &kind, at)?)
     };
-    let _ = live.events.send(AgentEvent { seq, kind });
+    let _ = live.events.send(AgentEvent {
+        seq,
+        at: Some(at),
+        kind,
+    });
     Ok(())
 }
 
@@ -2607,21 +2614,16 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         while let Ok(e) = events.try_recv() {
             live.push(e);
         }
-        assert!(live.contains(&AgentEvent {
-            seq: None,
-            kind: AgentEventKind::TextDelta("Hi".into())
+        let has = |kind: AgentEventKind| {
+            live.iter()
+                .any(|e| e.seq.is_none() && e.at.is_some() && e.kind == kind)
+        };
+        assert!(has(AgentEventKind::TextDelta("Hi".into())));
+        assert!(has(AgentEventKind::Usage {
+            tokens: Some(15),
+            window: None
         }));
-        assert!(live.contains(&AgentEvent {
-            seq: None,
-            kind: AgentEventKind::Usage {
-                tokens: Some(15),
-                window: None
-            }
-        }));
-        assert!(live.contains(&AgentEvent {
-            seq: None,
-            kind: AgentEventKind::Model("claude-test".into())
-        }));
+        assert!(has(AgentEventKind::Model("claude-test".into())));
         // At least the second turn's, which started after subscribing.
         assert!(live.iter().filter(|e| e.seq.is_some()).count() >= 3);
 
