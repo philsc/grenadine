@@ -407,6 +407,24 @@ pub fn Sidebar(
     let error = RwSignal::new(None::<String>);
     // The repository whose settings are open.
     let settings = RwSignal::new(None::<String>);
+    // A draft whose session started while the page was away, e.g. a
+    // reload or a closed tab mid-request, becomes the session's entry.
+    Effect::new(move |_| {
+        let Some(Ok(list)) = sessions.get() else {
+            return;
+        };
+        for s in &list {
+            let Some(d) = &s.draft else { continue };
+            if !drafts.contains(d) {
+                continue;
+            }
+            let open = route.with_untracked(|r| matches!(r, Route::Draft(x) if *x == *d));
+            drafts.remove(d);
+            if open {
+                go(&agent_hash(&s.id));
+            }
+        }
+    });
 
     view! {
         <aside class="agent-sidebar">
@@ -804,6 +822,21 @@ fn DraftEntry(id: String, route: Signal<Route>) -> impl IntoView {
         let id = id.clone();
         move || route.with(|r| matches!(r, Route::Draft(s) if *s == id))
     };
+    // While its session is starting the draft can't be discarded.
+    let status = {
+        let id = id.clone();
+        move || {
+            if drafts.is_starting(&id) {
+                "Starting…"
+            } else {
+                "Draft"
+            }
+        }
+    };
+    let discardable = {
+        let id = id.clone();
+        move || !drafts.is_starting(&id)
+    };
     let discard = move |_| {
         let open = route.with_untracked(|r| matches!(r, Route::Draft(s) if *s == id));
         drafts.remove(&id);
@@ -820,12 +853,13 @@ fn DraftEntry(id: String, route: Signal<Route>) -> impl IntoView {
                     None => view! { <span class="agent-title muted">"New session"</span> }.into_any(),
                 }}
                 <span class="agent-status-line">
-                    <span class="agent-status draft"><PencilIcon />"Draft"</span>
+                    <span class="agent-status draft"><PencilIcon />{status}</span>
                     <span class="agent-meta muted">{meta}</span>
                 </span>
             </a>
             <button
                 class="icon agent-delete"
+                class:hidden=move || !discardable()
                 title="Discard draft"
                 aria-label="Discard draft"
                 on:click=discard
@@ -1212,13 +1246,15 @@ pub fn NewSession(draft: String) -> impl IntoView {
     });
     // A form left without writing anything isn't worth keeping.
     on_cleanup(move || drafts.remove_if_blank(&draft));
-    let busy = RwSignal::new(false);
+    // Whether the draft's session is being started; it outlives the form,
+    // which may be gone by the time the start answers.
+    let busy = move || drafts.is_starting(&id.get_value());
 
     let general = Memo::new(move |_| repo.with(|r| r == GENERAL));
 
     let start = move || {
         save_backend(backend.get_untracked());
-        if busy.get_untracked() || prompt.with_untracked(|p| p.trim().is_empty()) {
+        if busy() || prompt.with_untracked(|p| p.trim().is_empty()) {
             return;
         }
         let pr = match number.get_untracked().trim() {
@@ -1243,11 +1279,16 @@ pub fn NewSession(draft: String) -> impl IntoView {
             permission_mode: mode.get_untracked(),
             model: model_arg(model),
             images: images.get_untracked(),
+            draft: Some(id.get_value()),
         };
         let id = id.get_value();
-        busy.set(true);
+        drafts.set_starting(&id, true);
+        // The last attempt's error doesn't carry into this one.
+        drafts.set_start_error(&id, None);
         error.set(None);
         spawn_local(async move {
+            // The form may be unmounted by the time the start answers, so
+            // only what outlives it is touched here.
             match api::create_agent(&req).await {
                 Ok(session) => {
                     drafts.remove(&id);
@@ -1255,11 +1296,15 @@ pub fn NewSession(draft: String) -> impl IntoView {
                     if let Some(s) = storage() {
                         let _ = s.set_item(&mode_key(&session.id), req.permission_mode.as_str());
                     }
-                    go(&agent_hash(&session.id));
+                    // Go to the session only while its draft is still
+                    // open; the user may have moved on while it started.
+                    if crate::current_hash() == drafts::hash(&id) {
+                        go(&agent_hash(&session.id));
+                    }
                 }
-                Err(e) => error.set(Some(e)),
+                Err(e) => drafts.set_start_error(&id, Some(e)),
             }
-            busy.set(false);
+            drafts.set_starting(&id, false);
         });
     };
 
@@ -1346,14 +1391,14 @@ pub fn NewSession(draft: String) -> impl IntoView {
                         {format!("Starts as /{skill} …, unless the prompt starts with a /skill of its own.")}
                     </p>
                 })}
-                {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+                {move || error.get().or_else(|| drafts.start_error(&id.get_value())).map(|e| view! { <p class="error">{e}</p> })}
                 <div class="form-buttons">
                     <button
                         type="submit"
                         class="primary"
-                        disabled=move || busy.get() || prompt.with(|p| p.trim().is_empty())
+                        disabled=move || busy() || prompt.with(|p| p.trim().is_empty())
                     >
-                        {move || match (busy.get(), general.get()) {
+                        {move || match (busy(), general.get()) {
                             (false, _) => "Start",
                             (true, false) => "Creating worktree…",
                             (true, true) => "Starting…",

@@ -377,6 +377,14 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agent_events ADD COLUMN at INTEGER;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The web draft each session started from; NULL for sessions that
+    -- didn't start from one.
+    ALTER TABLE agents ADD COLUMN draft_id TEXT;
+    CREATE UNIQUE INDEX agents_draft_id ON agents (draft_id);
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1205,8 +1213,9 @@ impl Db {
         self.conn().execute(
             "INSERT INTO agents
                 (id, backend, repo, pr_number, title, branch, worktree, base_sha, status,
-                 cost, cost_unit, context_tokens, context_window, model, created_at, kind)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 cost, cost_unit, context_tokens, context_window, model, created_at, kind,
+                 draft_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -1223,7 +1232,8 @@ impl Db {
                 a.context_window,
                 a.model,
                 a.created_at,
-                a.kind.as_str()
+                a.kind.as_str(),
+                a.draft
             ],
         )?;
         Ok(())
@@ -1282,6 +1292,29 @@ impl Db {
                 params![backend, cost_unit, id],
             )
             .unwrap();
+    }
+
+    /// The session that started from the web draft `draft`, if one did.
+    pub fn agent_by_draft(&self, draft: &str) -> Result<Option<AgentSession>> {
+        Ok(
+            match self
+                .conn()
+                .query_row(
+                    &format!("SELECT {AGENT_COLUMNS} FROM agents WHERE draft_id = ?"),
+                    [draft],
+                    agent_from_row_unchecked,
+                )
+                .optional()?
+            {
+                Some((session, true)) => Some(session),
+                Some((_, false)) => {
+                    bail!(
+                        "agent for draft {draft}: its backend or cost unit is unknown to this build"
+                    )
+                }
+                None => None,
+            },
+        )
     }
 
     /// The session like `agents_unchecked` has it.
@@ -1749,7 +1782,7 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id), \
      (SELECT COUNT(*) FROM agent_prs p \
       WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting), \
-     kind";
+     kind, draft_id";
 
 /// The session in `r`, and whether this build knows its backend and cost
 /// unit; unknown ones read as the defaults.
@@ -1785,6 +1818,7 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
         // The listing looks at the worktree for these.
         unstaged: 0,
         kind: SessionKind::parse(&r.get::<_, String>(21)?),
+        draft: r.get(22)?,
     };
     Ok((session, known))
 }
@@ -2623,6 +2657,23 @@ mod tests {
         let listed: Vec<_> = db.agents().unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(listed, ["c"]);
         assert_eq!(db.agents_unchecked().unwrap().len(), 3);
+    }
+
+    /// The draft a session started from finds it back, and only one
+    /// session can claim a draft.
+    #[test]
+    fn agent_by_draft_round_trip() {
+        let db = Db::in_memory();
+        let mut a = agent("a", AgentStatus::Idle);
+        a.draft = Some("d1".into());
+        db.create_agent(&a).unwrap();
+        db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
+        assert_eq!(db.agent_by_draft("d1").unwrap(), Some(a));
+        assert_eq!(db.agent_by_draft("x").unwrap(), None);
+        assert_eq!(db.agent("a").unwrap().unwrap().draft.as_deref(), Some("d1"));
+        let mut dup = agent("c", AgentStatus::Idle);
+        dup.draft = Some("d1".into());
+        assert!(db.create_agent(&dup).is_err());
     }
 
     #[test]

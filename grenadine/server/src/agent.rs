@@ -469,6 +469,10 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// A lock per web draft a session is being created for, so a second
+    /// start with the same draft waits for the first rather than
+    /// creating a duplicate.
+    starting: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether each new session's first prompt is summarized.
@@ -900,6 +904,7 @@ impl Agents {
             base_url,
             slices,
             live: std::sync::Mutex::default(),
+            starting: std::sync::Mutex::default(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
             terminals: crate::terminal::Terminals::default(),
@@ -1060,6 +1065,42 @@ pub async fn create_session(
     if req.prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
+    let Some(draft) = req.draft.clone() else {
+        return create_session_locked(state, req, kind, title).await;
+    };
+    // A start from a web draft runs under the draft's lock; a second one
+    // waits for the first, then finds its session rather than creating a
+    // duplicate.
+    let lock = {
+        let mut starting = state.agents.starting.lock().unwrap();
+        starting.entry(draft.clone()).or_default().clone()
+    };
+    let guard = lock.clone().lock_owned().await;
+    let result = async {
+        if let Some(session) = state.db.agent_by_draft(&draft)? {
+            return Ok(session);
+        }
+        create_session_locked(state, req, kind, title).await
+    }
+    .await;
+    drop(guard);
+    {
+        let mut starting = state.agents.starting.lock().unwrap();
+        if starting.get(&draft).is_some_and(|l| Arc::ptr_eq(l, &lock)) {
+            starting.remove(&draft);
+        }
+    }
+    result
+}
+
+/// What `create_session` does once it holds the draft's lock, or right
+/// away when the session doesn't start from one.
+async fn create_session_locked(
+    state: &Arc<State>,
+    req: NewAgent,
+    kind: SessionKind,
+    title: Option<String>,
+) -> Result<AgentSession> {
     let id = uuid();
     let worktree = state.agents.worktrees.join(&req.repo).join(&id);
     let (branch, base_sha) = if req.repo == GENERAL {
@@ -1095,6 +1136,7 @@ pub async fn create_session(
         prs: None,
         unstaged: 0,
         kind,
+        draft: req.draft,
     };
     state.db.create_agent(&session)?;
     state.send(ServerEvent::AgentsChanged);
@@ -2895,6 +2937,57 @@ pub(crate) mod tests {
         assert_eq!(title(""), "");
     }
 
+    /// A test state with no repositories and a claude that isn't there;
+    /// sessions start in `GENERAL` with a plain directory.
+    fn state_without_repos(dir: &std::path::Path) -> Arc<State> {
+        crate::sync::test_state_with_agents(
+            BTreeMap::new(),
+            dir.join("claude"),
+            "devin".into(),
+            dir.join("worktrees"),
+        )
+    }
+
+    /// Two starts with the same draft return the first one's session and
+    /// create only one; a different draft, or none, starts one each.
+    #[tokio::test]
+    async fn a_draft_starts_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_without_repos(dir.path());
+        let req = |draft: Option<&str>| NewAgent {
+            draft: draft.map(str::to_owned),
+            backend: AgentBackend::Claude,
+            repo: GENERAL.into(),
+            pr: None,
+            prompt: "hi".into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+        };
+        let (a, b) = tokio::join!(
+            create(&state, req(Some("d1"))),
+            create(&state, req(Some("d1"))),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.draft.as_deref(), Some("d1"));
+        assert_eq!(state.db.agents().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(state.agents.worktrees.join(GENERAL))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let c = create(&state, req(Some("d2"))).await.unwrap();
+        let d = create(&state, req(None)).await.unwrap();
+        assert_ne!(a.id, c.id);
+        assert_ne!(a.id, d.id);
+        assert_eq!(c.draft.as_deref(), Some("d2"));
+        assert_eq!(d.draft, None);
+        assert_eq!(state.db.agents().unwrap().len(), 3);
+    }
+
     /// A state whose agents run `script` as claude, with the git fixture's
     /// clone configured.
     pub(crate) fn state_with_claude(
@@ -3049,6 +3142,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 permission_mode: PermissionMode::from("auto"),
                 model: Some("sonnet".into()),
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3167,6 +3261,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3216,6 +3311,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            draft: None,
         };
         let err = create(&state, new(Some(1))).await.unwrap_err().to_string();
         assert!(err.contains("can't start from a PR"), "{err}");
@@ -3313,6 +3409,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3394,6 +3491,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3641,6 +3739,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3825,6 +3924,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -3860,6 +3960,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -4018,6 +4119,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -4098,6 +4200,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -5116,6 +5219,7 @@ pub(crate) mod devin_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -5531,6 +5635,7 @@ mod devin_job_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                draft: None,
             },
         )
         .await
@@ -5680,6 +5785,7 @@ cat {dir}/answer
                     permission_mode: "accept-edits".into(),
                     model: None,
                     images: Vec::new(),
+                    draft: None,
                 },
             )
             .await

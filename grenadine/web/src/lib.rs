@@ -128,7 +128,7 @@ pub fn github_url(key: &PrKey) -> String {
     format!("https://github.com/{}/pull/{}", key.repo, key.number)
 }
 
-fn current_hash() -> String {
+pub(crate) fn current_hash() -> String {
     window().location().hash().unwrap_or_default()
 }
 

@@ -698,6 +698,11 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
     if req.prompt.trim().is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
+    if let Some(d) = &req.draft
+        && (d.is_empty() || d.len() > 64 || !d.bytes().all(|b| b.is_ascii_alphanumeric()))
+    {
+        return Ok((StatusCode::BAD_REQUEST, "not a valid draft id").into_response());
+    }
     if let Some(e) = agent::check_images(&req.images) {
         return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
@@ -1728,6 +1733,7 @@ mod tests {
             permission_mode: mode.into(),
             model: None,
             images: Vec::new(),
+            draft: None,
         };
         let response = create_agent(AxState(state.clone()), Json(req("nonsense")))
             .await
