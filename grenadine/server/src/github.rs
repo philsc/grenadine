@@ -8,8 +8,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
     ApiResource, Check, CiStatus, GitHubUsage, IssueComment, MergeInfo, MergeMethod, MergeRequest,
-    MergeState, NewThread, Person, PrKey, RequestPriority, Review, ReviewComment, ReviewDecision,
-    ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview, ThreadCounts,
+    MergeState, NewThread, Person, PrKey, RequestPriority, RequestedReviewer, Review,
+    ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr,
+    SubmitReview, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -350,9 +351,12 @@ query($owner: String!, $name: String!, $number: Int!) {
       reviewRequests(first: 20) {
         nodes {
           requestedReviewer {
-            ... on User { login }
-            ... on Team { name }
-            ... on Bot { login }
+            __typename
+            ... on User { login name avatarUrl }
+            # Team's name isn't nullable while User's is; the same field
+            # can't be both, so the team's is aliased.
+            ... on Team { teamName: name }
+            ... on Bot { login avatarUrl }
             ... on Mannequin { login }
           }
         }
@@ -607,10 +611,12 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
     let requested = nodes(pr, "/reviewRequests/nodes")
         .filter_map(|n| {
             let r = &n["requestedReviewer"];
-            Some(str_at(r, "/login"))
-                .filter(|s| !s.is_empty())
-                .or_else(|| Some(str_at(r, "/name")).filter(|s| !s.is_empty()))
-                .map(str::to_owned)
+            match str_at(r, "/__typename") {
+                "Team" => Some(str_at(r, "/teamName"))
+                    .filter(|s| !s.is_empty())
+                    .map(|name| RequestedReviewer::Team(name.to_owned())),
+                _ => person_at(r).map(RequestedReviewer::Person),
+            }
         })
         .collect();
     let comments = nodes(pr, "/comments/nodes")
@@ -2251,9 +2257,10 @@ mod tests {
                           "url": "u1", "commit": { "oid": "abc" }, "author": null },
                     ] },
                     "reviewRequests": { "nodes": [
-                        { "requestedReviewer": { "login": "a" } },
-                        { "requestedReviewer": { "name": "team" } },
-                        { "requestedReviewer": { "login": "copilot" } },
+                        { "requestedReviewer": { "__typename": "User", "login": "a",
+                          "name": "A Person", "avatarUrl": "av" } },
+                        { "requestedReviewer": { "__typename": "Team", "teamName": "team" } },
+                        { "requestedReviewer": { "__typename": "Bot", "login": "copilot" } },
                         { "requestedReviewer": {} },
                         { "requestedReviewer": null },
                     ] },
@@ -2278,7 +2285,22 @@ mod tests {
         assert_eq!(review.state, ReviewState::ChangesRequested);
         assert_eq!(review.commit.as_deref(), Some("abc"));
         assert_eq!(review.author.login.as_deref(), Some("ghost"));
-        assert_eq!(info.requested, ["a", "team", "copilot"]);
+        assert_eq!(
+            info.requested,
+            [
+                RequestedReviewer::Person(Person {
+                    login: Some("a".into()),
+                    name: Some("A Person".into()),
+                    avatar_url: Some("av".into()),
+                }),
+                RequestedReviewer::Team("team".into()),
+                RequestedReviewer::Person(Person {
+                    login: Some("copilot".into()),
+                    name: None,
+                    avatar_url: None,
+                }),
+            ]
+        );
         assert_eq!(info.comments[0].author.name.as_deref(), Some("B"));
         let checks: Vec<_> = info
             .checks

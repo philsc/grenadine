@@ -337,6 +337,16 @@ input[type="text"] {
   min-width: 0;
 }
 
+/* The PR page is a row: the scrolling content on the left and the
+   sidebar on the right. The overlay's sidebar and the toggle position
+   themselves inside it. */
+.pr-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
 .empty {
   padding: 48px;
   text-align: center;
@@ -470,18 +480,18 @@ input[type="text"] {
   align-items: center;
   gap: 3px;
 }
-/* CI icons in inbox rows and in the PR page's merge box. */
+/* CI icons in inbox rows and in the PR page's sidebar. */
 .pr-status .threads.done,
 .pr-status .ci.passing,
-.merge-box .ci.passing {
+.pr-sidebar .ci.passing {
   color: var(--add-fg);
 }
 .pr-status .ci.failing,
-.merge-box .ci.failing {
+.pr-sidebar .ci.failing {
   color: var(--del-fg);
 }
 .pr-status .ci.running,
-.merge-box .ci.running {
+.pr-sidebar .ci.running {
   color: var(--warn-fg);
 }
 
@@ -1879,14 +1889,9 @@ textarea {
   }
 }
 
-/* Reviews, the conversation and the merge box on the PR page. */
+/* Reviews, the conversation, the merge box and the sidebar on the PR
+   page. */
 
-.review-summary {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
-}
 .review-decision {
   font-weight: 600;
 }
@@ -1904,16 +1909,117 @@ textarea {
 .pr-status .review.required {
   color: var(--warn-fg);
 }
-.review-state.commented {
+.review-state.commented,
+.review-state.pending {
   color: var(--fg-muted);
 }
-.review-summary .review-state.approved .avatar,
-.review-summary .review-state.approved .avatar-generic {
-  box-shadow: 0 0 0 2px var(--add-fg);
+
+/* The sidebar is a full-height column that scrolls on its own. Column
+   or overlay is decided JS-side by PR_SIDEBAR_QUERY in pr.rs; there is
+   no media query here. */
+.pr-sidebar {
+  flex: none;
+  width: 320px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  padding: 4px 16px 48px;
+  font-size: 13px;
+  background: var(--bg);
 }
-.review-summary .review-state.changes .avatar,
-.review-summary .review-state.changes .avatar-generic {
-  box-shadow: 0 0 0 2px var(--del-fg);
+/* Too narrow for a column: the sidebar floats over the content's right
+   edge instead. */
+.pr-sidebar.overlay {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.2);
+}
+.pr-sidebar section {
+  margin-bottom: 16px;
+}
+.pr-sidebar h2 {
+  font-size: 15px;
+  margin: 8px 0;
+}
+/* The toggle sits at the right of the header row while the sidebar
+   shows; it floats at the page's top-right, clear of `.main`'s
+   scrollbar, while it's hidden. */
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sidebar-toggle {
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  color: var(--fg-muted);
+}
+.sidebar-toggle.floating {
+  position: absolute;
+  top: 8px;
+  right: 24px;
+  z-index: 30;
+}
+.reviewers {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 6px 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+.reviewers .reviewer-icon {
+  display: inline-flex;
+  align-items: center;
+  width: 20px;
+  justify-content: center;
+}
+.reviewers .team-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--fg-muted);
+}
+.reviewers .review-state {
+  text-align: right;
+}
+/* About 12 rows; more checks scroll inside the list while the group
+   headers stay put at its top. */
+.check-groups {
+  max-height: calc(12 * 24px);
+  overflow-y: auto;
+}
+.check-group-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 0;
+  border: none;
+  border-radius: 0;
+  background: var(--bg);
+  font-weight: 600;
+  text-align: left;
+}
+.check-group-header .ci,
+.check-list .ci {
+  display: inline-flex;
+  align-items: center;
+}
+.check-list {
+  list-style: none;
+  margin: 0 0 4px;
+  padding-left: 16px;
+}
+.check-list .check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
 }
 .conversation,
 .merge-box {
@@ -1938,23 +2044,6 @@ textarea {
 }
 .merge-box {
   padding: 8px 12px;
-}
-.merge-box .checks summary {
-  cursor: pointer;
-}
-.merge-box .checks ul {
-  list-style: none;
-  margin: 4px 0;
-  padding-left: 16px;
-}
-.merge-box .check {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.merge-box .ci {
-  display: inline-flex;
-  align-items: center;
 }
 .merge-status {
   margin: 4px 0;

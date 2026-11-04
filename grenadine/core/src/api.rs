@@ -606,6 +606,18 @@ pub struct MergeInfo {
     pub requires_conversation_resolution: bool,
 }
 
+/// Someone asked to review a PR who hasn't yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestedReviewer {
+    /// A user or a bot.
+    Person(Person),
+    Team(String),
+    /// A reviewer from PR data saved before reviewers had kinds. The next
+    /// sync replaces it.
+    #[serde(untagged)]
+    Legacy(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewInfo {
     /// The login of the user grenadine acts as.
@@ -616,7 +628,7 @@ pub struct ReviewInfo {
     /// Submitted reviews, oldest first.
     pub reviews: Vec<Review>,
     /// Users and teams asked to review who haven't yet.
-    pub requested: Vec<String>,
+    pub requested: Vec<RequestedReviewer>,
     /// Comments on the PR itself, oldest first.
     pub comments: Vec<IssueComment>,
     /// The checks on the PR's head and their combined state.
@@ -1598,6 +1610,31 @@ mod tests {
             assert_eq!(MergeMethod::from_github(m.as_github()), Some(m));
         }
         assert_eq!(MergeMethod::from_github(""), None);
+    }
+
+    /// PR data saved before requested reviewers had kinds holds plain
+    /// strings; it must still parse, and new values must round-trip.
+    #[test]
+    fn requested_reviewers_from_saved_json() {
+        let legacy: Vec<RequestedReviewer> = serde_json::from_str(r#"["a","team"]"#).unwrap();
+        assert_eq!(
+            legacy,
+            [
+                RequestedReviewer::Legacy("a".into()),
+                RequestedReviewer::Legacy("team".into()),
+            ]
+        );
+        let reviewers = vec![
+            RequestedReviewer::Person(Person {
+                login: Some("a".into()),
+                name: None,
+                avatar_url: Some("av".into()),
+            }),
+            RequestedReviewer::Team("team".into()),
+        ];
+        let back: Vec<RequestedReviewer> =
+            serde_json::from_str(&serde_json::to_string(&reviewers).unwrap()).unwrap();
+        assert_eq!(back, reviewers);
     }
 
     /// `PermissionMode::plan`, the pickers' starting values and plan

@@ -283,7 +283,7 @@ fn App() -> impl IntoView {
                 <inboxes::Inboxes last=last />
             </main>
             {move || selected.get().map(|key| view! {
-                <main class="main"><pr::PrView key=key /></main>
+                <div class="pr-page"><pr::PrView key=key /></div>
             })}
             {move || on_agents.get().then(|| view! {
                 <div class="agents-page">
