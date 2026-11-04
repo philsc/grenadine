@@ -21,11 +21,12 @@ use wasm_bindgen::prelude::*;
 use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
+use crate::global_settings::GlobalSettings;
 use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
 use crate::settings::{Settings, SettingsButton};
-use crate::{Route, Updates, api, hash_for, markdown};
+use crate::{Route, Updates, api, github_url, hash_for, markdown};
 
 fn agent_hash(id: &str) -> String {
     format!("#/agents/{id}")
@@ -135,14 +136,25 @@ fn landed_label(landed: &Landed) -> String {
 
 /// `landed_label`, linking to the PR, or the top PR of a stack.
 #[component]
-fn LandedBadge(landed: Landed) -> impl IntoView {
+fn LandedBadge(landed: Landed, repo: String) -> impl IntoView {
     let label = landed_label(&landed);
     match landed.prs().pop() {
         None => view! { <span class="agent-landed">{label}</span> }.into_any(),
-        Some(top) => view! {
-            <a class="agent-landed" href=top.url target="_blank">{label}</a>
+        Some(top) => {
+            // A session in no repository has no in-app page for its PR.
+            let hash = (repo != GENERAL).then(|| {
+                hash_for(&PrKey {
+                    repo,
+                    number: top.number,
+                })
+            });
+            view! {
+                <a class="agent-landed" href=top.url target="_blank" data-grenadine=hash>
+                    {label}
+                </a>
+            }
+            .into_any()
         }
-        .into_any(),
     }
 }
 
@@ -1849,6 +1861,7 @@ fn pr_state(pr: &AgentPr) -> (&'static str, &'static str) {
 #[component]
 fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
     let updates = expect_context::<Updates>();
+    let settings = expect_context::<GlobalSettings>();
     let prs = LocalResource::new(move || {
         updates.agents.track();
         let id = id.clone();
@@ -1867,7 +1880,8 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
         let list = loaded.get();
         (!list.is_empty()).then(|| {
             view! {
-                <section class="associated-prs">
+                <section class="associated-prs"
+                    on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
                     <h2>"Associated PRs"</h2>
                     <ul>
                         {list
@@ -1880,7 +1894,8 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
                                 };
                                 view! {
                                     <li>
-                                        <a href=hash_for(&pr.key)>
+                                        <a href=github_url(&pr.key) target="_blank" rel="noopener"
+                                            data-grenadine=hash_for(&pr.key)>
                                             <span class=format!("pr-state {class}") title=tooltip>
                                                 <PrIcon />
                                             </span>
@@ -1899,8 +1914,10 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
 
 #[component]
 fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
+    let settings = expect_context::<GlobalSettings>();
     view! {
-        <header class="agent-header">
+        <header class="agent-header"
+            on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
             {move || {
                 let s = session.get();
                 if s.repo == GENERAL {
@@ -1921,7 +1938,12 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                             repo: s.repo.clone(),
                             number: n,
                         };
-                        view! { <a href=hash_for(&key)>{format!("{}#{n}", s.repo)}</a> }.into_any()
+                        view! {
+                            <a href=github_url(&key) target="_blank" rel="noopener"
+                                data-grenadine=hash_for(&key)>
+                                {format!("{}#{n}", s.repo)}
+                            </a>
+                        }.into_any()
                     }
                     None => view! { <span>{format!("{} trunk", s.repo)}</span> }.into_any(),
                 };
@@ -1932,7 +1954,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                         " from " {from} " at " <code>{s.base_sha.chars().take(8).collect::<String>()}</code>
                         " on " <code>{s.branch.clone()}</code>
                         {format!(" · {}", cost(s.cost, s.cost_unit))}
-                        {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l /> })}
+                        {s.landed.clone().map(|l| view! { " · " <LandedBadge landed=l repo=s.repo.clone() /> })}
                     </p>
                     <p class="muted agent-worktree"><code>{s.worktree.clone()}</code></p>
                 }
@@ -2406,8 +2428,10 @@ fn Transcript(
         });
     });
 
+    let settings = expect_context::<GlobalSettings>();
     view! {
-        <div class="transcript">
+        <div class="transcript"
+            on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
             <For
                 each=move || events.with(|events| shown(events))
                 key=|e| e.seq
@@ -2617,11 +2641,20 @@ fn Transcript(
                                 .prs()
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, pr)| view! {
-                                    {(i > 0).then_some(", ")}
-                                    <a href=pr.url target="_blank">
-                                        {format!("PR #{}", pr.number)}
-                                    </a>
+                                .map(|(i, pr)| {
+                                    // A session in no repository has no in-app page for its PR.
+                                    let hash = (repo != GENERAL).then(|| {
+                                        hash_for(&PrKey {
+                                            repo: repo.clone(),
+                                            number: pr.number,
+                                        })
+                                    });
+                                    view! {
+                                        {(i > 0).then_some(", ")}
+                                        <a href=pr.url target="_blank" data-grenadine=hash>
+                                            {format!("PR #{}", pr.number)}
+                                        </a>
+                                    }
                                 })
                                 .collect_view();
                             view! { <p class="turn-end wrapped-up">"Opened " {links}</p> }

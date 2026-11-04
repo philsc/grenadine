@@ -210,15 +210,6 @@ input[type="text"] {
   align-items: center;
   gap: 12px;
 }
-.theme-picker {
-  font: inherit;
-  color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 1px 4px;
-}
-
 .sync-status {
   position: relative;
   cursor: default;
@@ -2249,7 +2240,7 @@ td.ln.commentable:hover {
   color: var(--fg-muted);
 }
 
-dialog.repo-settings {
+dialog.settings-dialog {
   width: min(480px, calc(100vw - 32px));
   padding: 0;
   color: var(--fg);
@@ -2258,47 +2249,49 @@ dialog.repo-settings {
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
-dialog.repo-settings::backdrop {
+dialog.settings-dialog::backdrop {
   background: rgba(0, 0, 0, 0.35);
 }
-.repo-settings-content header,
-.repo-settings-content footer {
+.settings-dialog-content header,
+.settings-dialog-content footer {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 12px 16px;
 }
-.repo-settings-content header {
+.settings-dialog-content header {
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
 }
-.repo-settings-content header h2 {
+.settings-dialog-content header h2 {
   margin: 0;
   font-size: 16px;
 }
-.repo-settings-content header button {
+.settings-dialog-content header button {
   font-size: 18px;
   line-height: 1;
 }
-.repo-settings-body {
+.settings-dialog-body {
   padding: 12px 16px;
 }
-.repo-settings-body p {
+.settings-dialog-body p {
   margin: 0;
 }
-.repo-settings-content footer {
+.settings-dialog-content footer {
   justify-content: flex-end;
   border-top: 1px solid var(--border);
 }
-.repo-settings-button {
+.repo-settings-button,
+.global-settings-button {
   display: inline-flex;
   padding: 0 2px;
 }
-.repo-settings-button:hover:not(:disabled) {
+.repo-settings-button:hover:not(:disabled),
+.global-settings-button:hover:not(:disabled) {
   color: var(--fg);
   background: none;
 }
-.repo-settings-fields {
+.settings-fields {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -2306,22 +2299,22 @@ dialog.repo-settings::backdrop {
   padding: 0;
   border: none;
 }
-.repo-settings-fields legend {
+.settings-fields legend {
   padding: 0;
   margin-bottom: 4px;
   font-weight: 600;
 }
-.repo-settings-fields label {
+.settings-fields label {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
-.repo-settings-fields label.checkbox {
+.settings-fields label.checkbox {
   flex-direction: row;
   align-items: center;
   gap: 6px;
 }
-.repo-settings-fields .hint {
+.settings-fields .hint {
   margin: 0;
   font-size: 12px;
 }

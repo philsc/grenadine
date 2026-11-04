@@ -1,5 +1,5 @@
-//! The top bar: the wordmark and the Inboxes and Agents tabs on the left, a
-//! theme picker and the poller's sync status on the right. Hovering the
+//! The top bar: the wordmark and the Inboxes and Agents tabs on the left, the
+//! poller's sync status and the settings' gear on the right. Hovering the
 //! status shows what is syncing or what went wrong.
 
 use std::collections::BTreeSet;
@@ -8,10 +8,8 @@ use std::time::Duration;
 use grenadine_core::api::{PrKey, SyncPhase, SyncStatus, SyncingPr};
 use leptos::prelude::*;
 
-use crate::{
-    Route, Updates, api,
-    theme::{self, Theme},
-};
+use crate::global_settings::{GlobalSettingsButton, GlobalSettingsDialog};
+use crate::{Route, Updates, api};
 
 /// A relative timestamp like "5m ago" for the status line.
 fn ago(now: i64, then: i64) -> String {
@@ -77,7 +75,7 @@ pub fn Topbar(
     route: Signal<Route>,
 ) -> impl IntoView {
     let updates = expect_context::<Updates>();
-    let theme = theme::signal();
+    let settings_open = RwSignal::new(false);
 
     // How many distinct PRs the inboxes that count in the total list.
     let inboxes = LocalResource::new(move || {
@@ -133,16 +131,6 @@ pub fn Topbar(
                 </nav>
             </span>
             <span class="topbar-right">
-                <select
-                    class="theme-picker"
-                    aria-label="Theme"
-                    prop:value=move || theme.get().as_str()
-                    on:change=move |ev| theme.set(Theme::parse(&event_target_value(&ev)))
-                >
-                    <option value="auto">"Auto"</option>
-                    <option value="light">"Light"</option>
-                    <option value="dark">"Dark"</option>
-                </select>
             {move || {
                 let status = updates.sync.get();
                 let at = now.get();
@@ -180,7 +168,9 @@ pub fn Topbar(
                     </span>
                 }
             }}
+                <GlobalSettingsButton open=settings_open />
             </span>
+            <GlobalSettingsDialog open=settings_open />
         </header>
     }
 }
