@@ -292,6 +292,16 @@ impl Repo {
         Ok(commits)
     }
 
+    /// The commits in `limit..head` whose patch `upstream` already has an
+    /// equivalent of, oldest first.
+    pub fn applied_upstream(&self, upstream: &str, head: &str, limit: &str) -> Result<Vec<String>> {
+        let out = self.git(&["cherry", upstream, head, limit])?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.strip_prefix("- ").map(str::to_owned))
+            .collect())
+    }
+
     /// Runs git in the worktree at `path` and returns its stdout.
     fn git_in(&self, path: &Path, args: &[&str]) -> Result<String> {
         let path = path.to_str().context("the worktree path isn't UTF-8")?;
