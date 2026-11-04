@@ -72,7 +72,15 @@ pub fn listed(list: &[Draft], open: Option<&str>) -> Vec<(String, String)> {
 
 /// All the drafts, saved whenever one changes.
 #[derive(Clone, Copy)]
-pub struct Drafts(RwSignal<Vec<Draft>>);
+pub struct Drafts {
+    list: RwSignal<Vec<Draft>>,
+    /// The drafts whose sessions are being started. In memory only: a
+    /// reload while a start is in flight doesn't keep it.
+    starting: RwSignal<std::collections::HashSet<String>>,
+    /// The error each draft's last start left, if any; in memory only,
+    /// like `starting`.
+    start_errors: RwSignal<std::collections::HashMap<String, String>>,
+}
 
 impl Drafts {
     /// Loads the drafts left from before, with `open` the one whose form is
@@ -91,7 +99,11 @@ impl Drafts {
                 }
             });
         });
-        Drafts(drafts)
+        Drafts {
+            list: drafts,
+            starting: RwSignal::default(),
+            start_errors: RwSignal::default(),
+        }
     }
 
     /// Starts a draft in `repo` and on `pr`, if given, and returns its id.
@@ -103,7 +115,7 @@ impl Drafts {
             (js_sys::Math::random() * f64::from(u32::MAX)) as u32
         );
         let backend = crate::agents::last_backend();
-        self.0.update(|list| {
+        self.list.update(|list| {
             list.push(Draft {
                 id: id.clone(),
                 repo: repo.unwrap_or_else(|| GENERAL.to_owned()),
@@ -126,7 +138,7 @@ impl Drafts {
     /// when going back to a draft whose session started.
     pub fn open(self, id: &str) -> Draft {
         if let Some(d) = self
-            .0
+            .list
             .with_untracked(|l| l.iter().find(|d| d.id == id).cloned())
         {
             return d;
@@ -144,25 +156,64 @@ impl Drafts {
             model: crate::agents::last_model(backend),
             created_at: js_sys::Date::now(),
         };
-        self.0.update(|list| list.push(d.clone()));
+        self.list.update(|list| list.push(d.clone()));
         d
+    }
+
+    /// Whether there is a draft `id`, untracked: callers that react to
+    /// the list instead read it through `with` or `listed`.
+    pub fn contains(self, id: &str) -> bool {
+        self.list.with_untracked(|l| l.iter().any(|d| d.id == id))
     }
 
     /// What `f` makes of the draft `id`, if there is one.
     pub fn with<T>(self, id: &str, f: impl FnOnce(&Draft) -> T) -> Option<T> {
-        self.0.with(|l| l.iter().find(|d| d.id == id).map(f))
+        self.list.with(|l| l.iter().find(|d| d.id == id).map(f))
     }
 
     pub fn update(self, id: &str, f: impl FnOnce(&mut Draft)) {
-        self.0.update(|l| {
+        self.list.update(|l| {
             if let Some(d) = l.iter_mut().find(|d| d.id == id) {
                 f(d);
             }
         });
     }
 
+    /// Whether a session is being started from the draft `id`.
+    pub fn is_starting(self, id: &str) -> bool {
+        self.starting.with(|s| s.contains(id))
+    }
+
+    pub fn set_starting(self, id: &str, on: bool) {
+        self.starting.update(|s| {
+            if on {
+                s.insert(id.to_owned());
+            } else {
+                s.remove(id);
+            }
+        });
+    }
+
+    /// The error the draft's last start left, if any.
+    pub fn start_error(self, id: &str) -> Option<String> {
+        self.start_errors.with(|e| e.get(id).cloned())
+    }
+
+    pub fn set_start_error(self, id: &str, error: Option<String>) {
+        self.start_errors.update(|e| match error {
+            Some(error) => {
+                e.insert(id.to_owned(), error);
+            }
+            None => {
+                e.remove(id);
+            }
+        });
+    }
+
     pub fn remove(self, id: &str) {
-        self.0.update(|l| l.retain(|d| d.id != id));
+        self.list.update(|l| l.retain(|d| d.id != id));
+        self.set_starting(id, false);
+        self.set_start_error(id, None);
         crate::image_drafts::forget(&crate::image_drafts::new_session_key(id));
     }
 
@@ -175,7 +226,7 @@ impl Drafts {
 
     /// See `listed`.
     pub fn listed(self, open: Option<&str>) -> Vec<(String, String)> {
-        self.0.with(|l| listed(l, open))
+        self.list.with(|l| listed(l, open))
     }
 }
 

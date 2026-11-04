@@ -947,6 +947,7 @@ pub async fn hand_off(state: &Arc<State>, req: NewCleanupSession) -> Result<Opti
             permission_mode: PermissionMode::plan(),
             model: req.model,
             images: Vec::new(),
+            draft: None,
         },
     )
     .await?;

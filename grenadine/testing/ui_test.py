@@ -3116,6 +3116,138 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(is_draft).to_have_count(0)
 
+    def hold_agent_posts(self) -> list:
+        """Stashes the routes of POSTs to /api/agents, which start sessions,
+        so the test can release them with `route.continue_()`."""
+        held = []
+
+        def hold(route) -> None:
+            if route.request.method == "POST":
+                held.append(route)
+            else:
+                route.continue_()
+
+        self.page.route("**/api/agents", hold)
+        return held
+
+    def wait_held(self, held: list) -> None:
+        for _ in range(100):
+            if held:
+                return
+            self.page.wait_for_timeout(50)
+        self.fail("no session start reached the server")
+
+    def test_starting_a_draft_leaves_you_where_you_went(self) -> None:
+        # A session to go to while the draft's start is in flight.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        first_url = self.page.url
+
+        held = self.hold_agent_posts()
+        self.page.get_by_role("link", name="+ New session").click()
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Prompt").fill("say second")
+        self.page.get_by_role("button", name="Start").click()
+        # Going to another session while the start is held stays there
+        # once it answers.
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        self.wait_held(held)
+        held[0].continue_()
+        # The row can appear before the start's answer reaches the page,
+        # so wait for the success handler, which writes the new session's
+        # mode key before checking where to go.
+        first_id = first_url.rsplit("/", 1)[-1]
+        self.page.wait_for_function(
+            "() => Object.keys(localStorage).some(k => "
+            "k.startsWith('grenadine.agent-permission-mode.') "
+            f"&& !k.endsWith('{first_id}'))"
+        )
+        entries = self.section(scenarios.REPO).locator(".agent-entry")
+        expect(entries.filter(has_text="say second")).to_have_count(1)
+        self.assertEqual(self.page.url, first_url)
+        expect(self.page.locator(".agent-draft")).to_have_count(0)
+
+    def test_returning_to_a_starting_draft(self) -> None:
+        held = self.hold_agent_posts()
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say held")
+        self.page.get_by_role("button", name="Start").click()
+
+        # Coming back to the draft while its start is held finds it
+        # starting: no second Start, no discard.
+        self.page.get_by_role("link", name="+ New session").click()
+        draft = self.page.locator(".agent-draft", has_text="say held")
+        draft.click()
+        submit = self.page.locator("button.primary[type=submit]")
+        expect(submit).to_be_disabled()
+        expect(submit).not_to_have_text("Start")
+        expect(draft.locator(".agent-status")).to_have_text("Starting…")
+        entry = self.page.locator(
+            ".agent-entry",
+            has=self.page.locator(".agent-draft", has_text="say held"),
+        )
+        expect(entry.get_by_role("button", name="Discard draft")).to_be_hidden()
+
+        # Releasing the start takes the page, still on the draft, to the
+        # session; only one comes of it.
+        self.wait_held(held)
+        held[0].continue_()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        entries = self.section(scenarios.REPO).locator(".agent-entry")
+        expect(entries.filter(has_text="say held")).to_have_count(1)
+        expect(draft).to_have_count(0)
+
+    def test_a_draft_whose_session_started_is_cleaned_up(self) -> None:
+        # The server can start a draft's session without the page seeing
+        # the answer, e.g. a tab closed mid-request; the draft left
+        # behind becomes the session's entry on the next load.
+        resp = self.page.request.post(
+            f"{self.url}api/agents",
+            headers={"Origin": self.url.rstrip("/")},
+            data={
+                "backend": "claude",
+                "repo": scenarios.REPO,
+                "prompt": "say orphaned",
+                "permission_mode": "auto",
+                "draft": "orphandraft1",
+            },
+        )
+        self.assertEqual(resp.status, 200, resp.text())
+        session_id = resp.json()["id"]
+        drafts = json.dumps(
+            [
+                {
+                    "id": "orphandraft1",
+                    "repo": scenarios.REPO,
+                    "pr": "",
+                    "prompt": "say orphaned",
+                    "mode": "plan",
+                    "model": "default",
+                    "createdAt": 1,
+                }
+            ]
+        )
+        self.page.add_init_script(
+            "localStorage.setItem("
+            f"'grenadine.new-session-drafts', {json.dumps(drafts)})"
+        )
+        self.page.goto(self.url + "#/agents/draft/orphandraft1")
+        expect(self.page).to_have_url(re.compile(f"#/agents/{session_id}$"))
+        expect(
+            self.page.locator(".agent-draft", has_text="say orphaned")
+        ).to_have_count(0)
+        expect(
+            self.section(scenarios.REPO)
+            .locator(".agent-entry")
+            .filter(has_text="say orphaned")
+        ).to_have_count(1)
+
     def test_unstaged_changes_pane(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")

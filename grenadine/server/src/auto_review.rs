@@ -334,6 +334,7 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
         permission_mode: review_mode(settings.review_backend),
         model: model.cloned(),
         images: Vec::new(),
+        draft: None,
     };
     let title = format!("Review #{}: {}", key.number, detail.summary.title);
     let (running, recorded) =
@@ -892,6 +893,7 @@ mod tests {
             permission_mode: PermissionMode::new("auto"),
             model: None,
             images: Vec::new(),
+            draft: None,
         };
         let title = Some("Review #2: t".to_owned());
         let session = agent::create_session(&state, req, SessionKind::AutoReview, title)
@@ -1051,6 +1053,7 @@ sleep 30
             permission_mode: review_mode(AgentBackend::Devin),
             model: None,
             images: Vec::new(),
+            draft: None,
         };
         let title = Some("Review #2: t".to_owned());
         let session = agent::create_session(&state, req, SessionKind::AutoReview, title)

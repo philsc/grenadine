@@ -976,6 +976,9 @@ pub struct AgentSession {
     /// Who started the session.
     #[serde(default)]
     pub kind: SessionKind,
+    /// The draft the session started from, if any.
+    #[serde(default)]
+    pub draft: Option<String>,
 }
 
 /// Who started an agent session.
@@ -1034,6 +1037,7 @@ impl AgentSession {
             prs: None,
             unstaged: 0,
             kind: SessionKind::Interactive,
+            draft: None,
         }
     }
 }
@@ -1312,6 +1316,10 @@ pub struct NewAgent {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The web draft the session starts from, if any. A second start with
+    /// the same draft returns the session the first one started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
 }
 
 /// A follow-up prompt for an agent session.
