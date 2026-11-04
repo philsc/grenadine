@@ -267,6 +267,10 @@ class FakeRepo:
         # Branches deleted through the API, and ones that deleting fails
         # for.
         self.deleted_branches: set[str] = set()
+        # GitHub's stacks API: False answers 404 for it, and each stack
+        # is a number mapped to its PRs, bottom first.
+        self.stacks_enabled = True
+        self.stacks: dict[int, list[int]] = {}
         self.undeletable_branches: set[str] = set()
         self.bare.parent.mkdir(parents=True, exist_ok=True)
         self.work.parent.mkdir(parents=True, exist_ok=True)
@@ -619,14 +623,23 @@ class FakeGitHub:
         with self.lock:
             try:
                 status, payload = self._route(
-                    method, url.path, urllib.parse.parse_qs(url.query), body
+                    method,
+                    url.path,
+                    urllib.parse.parse_qs(url.query),
+                    body,
+                    req.headers.get("X-GitHub-Api-Version"),
                 )
             except Exception as e:  # noqa: BLE001 - a fake should report, not hang up.
                 status, payload = 500, {"message": f"fake GitHub: {e!r}"}
         _reply(req, status, payload, self.rate_limit)
 
     def _route(
-        self, method: str, path: str, query: dict[str, list[str]], body: bytes
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: bytes,
+        api_version: str | None,
     ) -> tuple[int, Any]:
         if self.rate_limit["remaining"] == 0:
             msg = "API rate limit already exceeded for user ID 1."
@@ -651,6 +664,16 @@ class FakeGitHub:
             m := re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
         ):
             return self._create_issue_comment(m[1], int(m[2]), json.loads(body))
+        if (m := re.fullmatch(r"/repos/([^/]+/[^/]+)/stacks", path)) is not None:
+            if method == "GET":
+                return self._get_stacks(m[1], query, api_version)
+            if method == "POST":
+                return self._create_stack(m[1], json.loads(body), api_version)
+        if method == "POST" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/stacks/(\d+)/(add|unstack)", path)
+        ):
+            req = json.loads(body) if body else {}
+            return self._change_stack(m[1], int(m[2]), m[3], req, api_version)
         return 404, {"message": "Not Found"}
 
     def _create_issue_comment(
@@ -747,6 +770,119 @@ class FakeGitHub:
             }
             for c in pr.comments
         ]
+
+    # Stacks.
+
+    def _stacks_repo(self, slug: str, api_version: str | None) -> FakeRepo | None:
+        repo = self.repos.get(slug)
+        if repo is None or not repo.stacks_enabled or api_version != "2026-03-10":
+            return None
+        return repo
+
+    def _stack_json(self, repo: FakeRepo, number: int) -> dict[str, Any]:
+        prs = [repo.prs[n] for n in repo.stacks[number]]
+        return {
+            "number": number,
+            "open": any(p.state == OPEN and p.merged_at is None for p in prs),
+            "base": {"ref": prs[0].base},
+            "pull_requests": [
+                {
+                    "number": p.number,
+                    "state": "open" if p.state == OPEN else "closed",
+                    "draft": p.draft,
+                    "merged_at": iso(p.merged_at) if p.merged_at else None,
+                    "head": {"ref": p.head, "sha": p.head_oid},
+                }
+                for p in prs
+            ],
+        }
+
+    def _get_stacks(
+        self, slug: str, query: dict[str, list[str]], api_version: str | None
+    ) -> tuple[int, Any]:
+        repo = self._stacks_repo(slug, api_version)
+        if repo is None:
+            return 404, {"message": "Not Found"}
+        n = int(query.get("pull_request", ["0"])[0])
+        return 200, [
+            self._stack_json(repo, number)
+            for number, prs in repo.stacks.items()
+            if n in prs
+        ]
+
+    def _stack_prs(
+        self, repo: FakeRepo, numbers: list[int]
+    ) -> tuple[list[PullRequest] | None, tuple[int, Any] | None]:
+        """The resolved PRs of a create/add request, or its error."""
+        prs = [repo.prs.get(n) for n in numbers]
+        if not prs or any(p is None or p.state != OPEN for p in prs):
+            return None, (422, {"message": "every PR must exist and be open"})
+        in_a_stack = {n for stack in repo.stacks.values() for n in stack}
+        if any(n in in_a_stack for n in numbers):
+            return None, (422, {"message": "a PR is already in a stack"})
+        return prs, None  # type: ignore[return-value]
+
+    def _create_stack(
+        self, slug: str, req: dict[str, Any], api_version: str | None
+    ) -> tuple[int, Any]:
+        repo = self._stacks_repo(slug, api_version)
+        if repo is None:
+            return 404, {"message": "Not Found"}
+        numbers = req["pull_requests"]
+        if len(numbers) < 2:
+            return 422, {"message": "a stack needs at least two pull requests"}
+        prs, err = self._stack_prs(repo, numbers)
+        if err:
+            return err
+        for above, below in zip(prs[1:], prs):
+            if above.base != below.head:
+                return 422, {
+                    "message": f"#{above.number}'s base is not #{below.number}'s head"
+                }
+        number = self.next_number()
+        repo.stacks[number] = list(numbers)
+        return 201, self._stack_json(repo, number)
+
+    def _change_stack(
+        self,
+        slug: str,
+        number: int,
+        action: str,
+        req: dict[str, Any],
+        api_version: str | None,
+    ) -> tuple[int, Any]:
+        repo = self._stacks_repo(slug, api_version)
+        if repo is None or number not in repo.stacks:
+            return 404, {"message": "Not Found"}
+        if action == "add":
+            numbers = req["pull_requests"]
+            prs, err = self._stack_prs(repo, numbers)
+            if err:
+                return err
+            top = repo.prs[repo.stacks[number][-1]]
+            if prs[0].base != top.head:
+                return 409, {
+                    "message": f"#{prs[0].number}'s base is not the stack's top"
+                }
+            repo.stacks[number] += numbers
+            return 200, self._stack_json(repo, number)
+        # unstack: the unmerged PRs leave; the merged ones keep the stack.
+        remaining = [n for n in repo.stacks[number] if repo.prs[n].state == MERGED]
+        if len(remaining) == len(repo.stacks[number]):
+            return 422, {"message": "nothing could be unstacked"}
+        if not remaining:
+            del repo.stacks[number]
+            return 204, None
+        repo.stacks[number] = remaining
+        return 200, self._stack_json(repo, number)
+
+    def _in_open_stack(self, pr: PullRequest) -> bool:
+        """Whether `pr` is in a stack with unmerged PRs left, where
+        GitHub is assumed to forbid changing its base or closing it."""
+        return any(
+            pr.number in stack and any(pr.repo.prs[n].state != MERGED for n in stack)
+            for stack in pr.repo.stacks.values()
+        )
 
     # GraphQL.
 
@@ -943,6 +1079,8 @@ class FakeGitHub:
             pr = self._pr_by_id(input["pullRequestId"])
             if pr.state != OPEN:
                 raise ValueError("Pull request is closed")
+            if self._in_open_stack(pr) and input.get("baseRefName"):
+                raise ValueError("Pull request is in a stack")
             base = input.get("baseRefName")
             if base is not None:
                 try:
@@ -965,6 +1103,8 @@ class FakeGitHub:
             pr = self._pr_by_id(input["pullRequestId"])
             if pr.state != OPEN:
                 raise ValueError("Pull request is closed")
+            if self._in_open_stack(pr):
+                raise ValueError("Pull request is in a stack")
             pr.repo.close(pr)
             return {"clientMutationId": None}
 

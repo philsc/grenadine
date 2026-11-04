@@ -471,7 +471,12 @@ if prompt.startswith("update prs"):
     arguments = {"prs": prs}
     tool_use = use("mcp__grenadine__update_prs", arguments)
     rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
-    updated = rpc("tools/call", {"name": "update_prs", "arguments": arguments})
+    # The id becomes the approval's key, so a repeat call needs a new one.
+    updated = rpc(
+        "tools/call",
+        {"name": "update_prs", "arguments": arguments},
+        id=tool_use,
+    )
     result(tool_use, updated["result"]["content"][0]["text"], is_error=updated["result"].get("isError", False))
 # `screenshot` has it read a screenshot, whose result carries the image,
 # and then show it to the user.
@@ -3217,7 +3222,10 @@ class AgentTest(ServerTestCase):
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
-            return next(pr for pr in repo.prs.values() if pr.title == title)
+            return max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
 
         a, b = pr("Add stack-a"), pr("Add stack-b")
         self.assertEqual(a.base, "main")
@@ -3234,6 +3242,10 @@ class AgentTest(ServerTestCase):
             .filter(has=self.page.locator(".agent-item.selected"))
         )
         expect(entry.locator(".agent-prs")).to_have_text("0/2")
+        # They make a GitHub stack, bottom first.
+        stacks = {n: s for n, s in repo.stacks.items() if a.number in s}
+        ((number, stack),) = stacks.items()
+        self.assertEqual(stack, [a.number, b.number])
 
         # More work goes on top of the stack; the PRs below stay.
         follow_up.fill("commit stack-c")
@@ -3243,10 +3255,12 @@ class AgentTest(ServerTestCase):
         expect(opened.nth(1).get_by_role("link")).to_have_count(3)
         c = pr("Add stack-c")
         self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
-        self.assertEqual(
-            sum(pr.title.startswith("Add stack-") for pr in repo.prs.values()), 3
-        )
+        self.assertEqual(sum(pr.head.startswith(a.head) for pr in repo.prs.values()), 3)
         expect(entry.locator(".agent-prs")).to_have_text("0/3")
+        # The stack grows its PR on top.
+        stack = next(s for s in repo.stacks.values() if a.number in s)
+        self.assertEqual(stack, [a.number, b.number, c.number])
+        self.assertIn(f"POST /repos/{repo.slug}/stacks/{number}/add", self.gh.requests)
 
     def test_update_prs_drops_and_reorders(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
@@ -3271,7 +3285,10 @@ class AgentTest(ServerTestCase):
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
-            return next(pr for pr in repo.prs.values() if pr.title == title)
+            return max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
 
         a, b, c = pr("Add stack-a"), pr("Add stack-b"), pr("Add stack-c")
         self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
@@ -3322,6 +3339,9 @@ class AgentTest(ServerTestCase):
         self.assertEqual(c.base, a.head)
         self.assertEqual(commits(a), ["Add stack-a"])
         self.assertEqual(commits(c), ["Add stack-c"])
+        stack = next(s for s in repo.stacks.values() if a.number in s)
+        self.assertEqual(stack, [a.number, c.number])
+        expect(transcript).to_contain_text("GitHub stack")
 
         # Reordering the commits retargets their PRs.
         follow_up.fill("swap")
@@ -3333,6 +3353,52 @@ class AgentTest(ServerTestCase):
         self.assertEqual((c.base, a.base), ("main", c.head))
         self.assertEqual(commits(c), ["Add stack-c"])
         self.assertEqual(commits(a), ["Add stack-a"])
+        stack = next(s for s in repo.stacks.values() if c.number in s)
+        self.assertEqual(stack, [c.number, a.number])
+
+    def test_update_prs_with_stacks_off(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("commit stack-a")
+        prompt.press("Enter")
+        transcript = self.page.locator(".transcript")
+        done = transcript.locator(".turn-end.muted")
+        follow_up = self.page.get_by_label("Follow-up")
+        expect(done).to_have_count(1)
+        repo = self.gh.repo(self.OTHER_REPO)
+        repo.stacks_enabled = False
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+
+        # Without stacked PRs turned on, wrap-up still opens the PRs,
+        # chained by their bases.
+        self.page.locator(".agent-actions").get_by_role(
+            "button", name="Open PR"
+        ).click()
+        opened = transcript.locator(".wrapped-up")
+        expect(opened.get_by_role("link")).to_have_count(2)
+        a, b = (
+            max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
+            for title in ["Add stack-a", "Add stack-b"]
+        )
+        self.assertEqual((a.base, b.base), ("main", a.head))
+        self.assertFalse(any(a.number in s for s in repo.stacks.values()))
+
+        follow_up.fill("commit stack-c")
+        follow_up.press("Enter")
+        expect(done).to_have_count(3)
+        follow_up.fill(f"update prs stack-a:{a.number} stack-b:{b.number} stack-c")
+        follow_up.press("Enter")
+        expect(done).to_have_count(4)
+        expect(transcript).to_contain_text(
+            "doesn't have GitHub's stacked pull requests"
+        )
+        self.assertFalse(any(b.number in s for s in repo.stacks.values()))
 
     def test_update_prs_merged_prs_are_frozen(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
@@ -3356,7 +3422,10 @@ class AgentTest(ServerTestCase):
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
-            return next(pr for pr in repo.prs.values() if pr.title == title)
+            return max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
 
         a, b = pr("Add stack-a"), pr("Add stack-b")
 
@@ -3393,6 +3462,151 @@ class AgentTest(ServerTestCase):
         self.assertEqual(out.splitlines(), ["Add stack-b"])
         self.assertEqual(a.state, "MERGED")
         self.assertEqual(a.issue_comments, [])
+
+    def _foreign_pr(self, repo, name: str, base: str):
+        """An open PR `name`, made and pushed by someone else on `base`,
+        waited on until the server has synced it."""
+        repo.checkout(name, base)
+        repo.commit(name, {name + ".txt": name})
+        repo.push(name)
+        pr = repo.open_pr(f"Add {name}", head=name, base=base)
+        for _ in range(40):
+            try:
+                out = json.loads(
+                    urllib.request.urlopen(
+                        self.url + f"api/pr/{self.OTHER_REPO}/{pr.number}"
+                    ).read()
+                )
+            except urllib.error.HTTPError:
+                out = {}
+            if out.get("versions"):
+                break
+            time.sleep(0.25)
+        # Leave the work tree on the default branch again.
+        repo.checkout("main")
+        return pr
+
+    def _session_from_pr(self, number: int):
+        """Starts a session from PR `number`; returns its page locators."""
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Start from PR").fill(str(number))
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("commit stack-a")
+        prompt.press("Enter")
+        transcript = self.page.locator(".transcript")
+        done = transcript.locator(".turn-end.muted")
+        expect(done).to_have_count(1)
+        return transcript, done, self.page.get_by_label("Follow-up")
+
+    def _allow(self, transcript) -> None:
+        # Answered approvals stay in the transcript; the pending one
+        # takes the click.
+        approval = transcript.locator(".approval.pending")
+        expect(approval).to_contain_text("update_prs")
+        approval.get_by_role("button", name="Allow").click()
+
+    def test_update_prs_joins_a_foreign_stack(self) -> None:
+        repo = self.gh.repo(self.OTHER_REPO)
+        x = self._foreign_pr(repo, "x", "main")
+        s = self._foreign_pr(repo, "s", x.head)
+        stack_number = repo.gh.next_number()
+        repo.stacks[stack_number] = [x.number, s.number]
+        transcript, done, follow_up = self._session_from_pr(s.number)
+
+        # The session's PR joins the foreign stack on top.
+        follow_up.fill("update prs stack-a")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(2)
+        a = max(
+            (pr for pr in repo.prs.values() if pr.title == "Add stack-a"),
+            key=lambda pr: pr.number,
+        )
+        self.assertEqual(repo.stacks[stack_number], [x.number, s.number, a.number])
+
+        # More work appends the same way.
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(3)
+        follow_up.fill(f"update prs stack-a:{a.number} stack-b")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(4)
+        b = max(
+            (pr for pr in repo.prs.values() if pr.title == "Add stack-b"),
+            key=lambda pr: pr.number,
+        )
+        self.assertEqual(
+            repo.stacks[stack_number], [x.number, s.number, a.number, b.number]
+        )
+
+        # Dropping one of ours rebuilds the stack; the foreign PRs are
+        # untouched.
+        follow_up.fill("drop stack-a")
+        follow_up.press("Enter")
+        expect(done).to_have_count(5)
+        follow_up.fill(f"update prs stack-b:{b.number}")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(6)
+        stack = next(s for s in repo.stacks.values() if b.number in s)
+        self.assertEqual(stack, [x.number, s.number, b.number])
+        self.assertEqual((x.base, x.head, x.state), ("main", "x", "OPEN"))
+        self.assertEqual((s.base, s.head, s.state), ("x", "s", "OPEN"))
+        self.assertEqual(a.state, "CLOSED")
+
+    def test_update_prs_source_pr_in_no_stack(self) -> None:
+        repo = self.gh.repo(self.OTHER_REPO)
+        s = self._foreign_pr(repo, "s", "main")
+        transcript, done, follow_up = self._session_from_pr(s.number)
+
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+        follow_up.fill("update prs stack-a stack-b")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(3)
+        a, b = (
+            max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
+            for title in ["Add stack-a", "Add stack-b"]
+        )
+        self.assertEqual((a.base, b.base), (s.head, a.head))
+        stack = next(s for s in repo.stacks.values() if a.number in s)
+        self.assertEqual(stack, [s.number, a.number, b.number])
+
+    def test_update_prs_source_pr_in_middle_of_a_stack(self) -> None:
+        repo = self.gh.repo(self.OTHER_REPO)
+        x = self._foreign_pr(repo, "x", "main")
+        s = self._foreign_pr(repo, "s", x.head)
+        y = self._foreign_pr(repo, "y", s.head)
+        foreign = repo.gh.next_number()
+        repo.stacks[foreign] = [x.number, s.number, y.number]
+        transcript, done, follow_up = self._session_from_pr(s.number)
+
+        # S can't take new PRs on top inside [X, S, Y]; ours get a stack
+        # of their own.
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+        follow_up.fill("update prs stack-a stack-b")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(3)
+        a, b = (
+            max(
+                (pr for pr in repo.prs.values() if pr.title == title),
+                key=lambda pr: pr.number,
+            )
+            for title in ["Add stack-a", "Add stack-b"]
+        )
+        self.assertEqual(repo.stacks[foreign], [x.number, s.number, y.number])
+        ours = next(s for s in repo.stacks.values() if a.number in s)
+        self.assertEqual(ours, [a.number, b.number])
 
     def test_sidebar_shows_merged_prs(self) -> None:
         repo = self.gh.repo(self.OTHER_REPO)

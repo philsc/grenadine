@@ -9,6 +9,7 @@ use grenadine_core::api::LandedPr;
 use serde::Deserialize;
 
 use crate::agent::stack_branch;
+use crate::github::GhStack;
 
 /// One entry of `update_prs`'s `prs` argument: the PR `commit` updates,
 /// or a new one when `pr` is omitted.
@@ -152,6 +153,108 @@ pub fn plan_prs(
         .map(|(pr, _)| pr.clone())
         .collect();
     Ok((planned, dropped))
+}
+
+/// What to do with the GitHub stack a session's PRs make after landing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackOp {
+    /// Nothing changes.
+    Keep,
+    /// The PRs get a new stack, bottom first.
+    Create(Vec<u64>),
+    /// `prs` go on top of `stack`.
+    Add { stack: u64, prs: Vec<u64> },
+    /// `stack` (whose open PRs are `old`, bottom first) comes apart and
+    /// `new` becomes a stack if it has 2 or more PRs.
+    Rebuild {
+        stack: u64,
+        old: Vec<u64>,
+        new: Vec<u64>,
+    },
+}
+
+/// Plans the GitHub stack work after landing. `ours` is the session's
+/// PRs after this landing, bottom first; `session_prs` every PR number
+/// the session has had; `source` the PR the session started from;
+/// `ours_stack`/`source_stack` the stack a session or source PR is in;
+/// `retargeted` the kept PRs whose base moves, which GitHub may refuse
+/// for a stacked PR, so theirs comes apart first.
+pub fn plan_stack(
+    ours: &[u64],
+    session_prs: &[u64],
+    source: Option<u64>,
+    ours_stack: Option<&GhStack>,
+    source_stack: Option<&GhStack>,
+    retargeted: &[u64],
+) -> StackOp {
+    // The stack the session's PRs join, G, and what it should end up
+    // holding, F, bottom first. PRs that aren't the session's are left
+    // alone, so foreign members stay in place.
+    let (g, f): (Option<&GhStack>, Vec<u64>) = match ours_stack {
+        Some(g) => (
+            Some(g),
+            [
+                g.open
+                    .iter()
+                    .filter(|n| !session_prs.contains(n))
+                    .copied()
+                    .collect(),
+                ours.to_vec(),
+            ]
+            .concat(),
+        ),
+        None => match source {
+            Some(s) => match source_stack {
+                Some(ss) if ss.open.last() == Some(&s) => (
+                    Some(ss),
+                    [
+                        ss.open
+                            .iter()
+                            .filter(|n| !session_prs.contains(n))
+                            .copied()
+                            .collect(),
+                        ours.to_vec(),
+                    ]
+                    .concat(),
+                ),
+                // The source sits in the middle of a stack; only the
+                // session's own PRs can be stacked on its branch.
+                Some(_) => (None, ours.to_vec()),
+                None => (None, [vec![s], ours.to_vec()].concat()),
+            },
+            None => (None, ours.to_vec()),
+        },
+    };
+    let c: &[u64] = g.map(|g| g.open.as_slice()).unwrap_or(&[]);
+    // GitHub may refuse to move a stacked PR's base, so a stack with one
+    // comes apart and is rebuilt.
+    if !c.is_empty() && retargeted.iter().any(|n| c.contains(n)) {
+        return StackOp::Rebuild {
+            stack: g.unwrap().number,
+            old: c.to_vec(),
+            new: f,
+        };
+    }
+    if c.is_empty() {
+        return match f.len() >= 2 {
+            true => StackOp::Create(f),
+            false => StackOp::Keep,
+        };
+    }
+    if f.starts_with(c) {
+        return match f[c.len()..].is_empty() {
+            true => StackOp::Keep,
+            false => StackOp::Add {
+                stack: g.unwrap().number,
+                prs: f[c.len()..].to_vec(),
+            },
+        };
+    }
+    StackOp::Rebuild {
+        stack: g.unwrap().number,
+        old: c.to_vec(),
+        new: f,
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +533,125 @@ mod tests {
                 Some(&specs)
             )),
             (vec![("b".into(), None), ("b-2".into(), Some(25))], vec![])
+        );
+    }
+
+    fn stack(number: u64, open: &[u64]) -> GhStack {
+        GhStack {
+            number,
+            open: open.to_vec(),
+        }
+    }
+
+    /// One PR never makes a stack; two make one.
+    #[test]
+    fn stack_created_at_two_prs() {
+        assert_eq!(plan_stack(&[7], &[7], None, None, None, &[]), StackOp::Keep);
+        assert_eq!(
+            plan_stack(&[7, 8], &[7, 8], None, None, None, &[]),
+            StackOp::Create(vec![7, 8])
+        );
+    }
+
+    /// Unchanged PRs keep their stack; new ones append to it.
+    #[test]
+    fn stack_appends() {
+        let g = stack(3, &[7, 8]);
+        assert_eq!(
+            plan_stack(&[7, 8], &[7, 8], None, Some(&g), None, &[]),
+            StackOp::Keep
+        );
+        assert_eq!(
+            plan_stack(&[7, 8, 9], &[7, 8, 9], None, Some(&g), None, &[]),
+            StackOp::Add {
+                stack: 3,
+                prs: vec![9]
+            }
+        );
+    }
+
+    /// Dropping a middle PR or reordering rebuilds the stack.
+    #[test]
+    fn stack_rebuilds() {
+        let g = stack(3, &[7, 8, 9]);
+        assert_eq!(
+            plan_stack(&[7, 9], &[7, 8, 9], None, Some(&g), None, &[]),
+            StackOp::Rebuild {
+                stack: 3,
+                old: vec![7, 8, 9],
+                new: vec![7, 9]
+            }
+        );
+        assert_eq!(
+            plan_stack(&[8, 7, 9], &[7, 8, 9], None, Some(&g), None, &[]),
+            StackOp::Rebuild {
+                stack: 3,
+                old: vec![7, 8, 9],
+                new: vec![8, 7, 9]
+            }
+        );
+        assert_eq!(
+            plan_stack(&[9], &[7, 8, 9], None, Some(&g), None, &[]),
+            StackOp::Rebuild {
+                stack: 3,
+                old: vec![7, 8, 9],
+                new: vec![9]
+            }
+        );
+    }
+
+    /// A session starting from the top of a foreign stack joins it; its
+    /// members the session doesn't own stay.
+    #[test]
+    fn source_stack() {
+        let ss = stack(3, &[4, 5]);
+        // The source #5 tops [4, 5]: our PRs join it.
+        assert_eq!(
+            plan_stack(&[7], &[7], Some(5), None, Some(&ss), &[]),
+            StackOp::Add {
+                stack: 3,
+                prs: vec![7]
+            }
+        );
+        // #5 in the middle of [4, 5, 6]: ours get their own stack.
+        let mid = stack(3, &[4, 5, 6]);
+        assert_eq!(
+            plan_stack(&[7, 8], &[7, 8], Some(5), None, Some(&mid), &[]),
+            StackOp::Create(vec![7, 8])
+        );
+        assert_eq!(
+            plan_stack(&[7], &[7], Some(5), None, Some(&mid), &[]),
+            StackOp::Keep
+        );
+        // #5 in no stack: [5, ours].
+        assert_eq!(
+            plan_stack(&[7], &[7], Some(5), None, None, &[]),
+            StackOp::Create(vec![5, 7])
+        );
+    }
+
+    /// A rebuild keeps the foreign PRs and drops the session's; our own
+    /// stack wins over the source's.
+    #[test]
+    fn stack_shared_rebuild() {
+        let g = stack(3, &[4, 5, 7, 8]);
+        // #8 was the session's and is dropped; #4 and #5 are foreign.
+        assert_eq!(
+            plan_stack(&[7], &[7, 8], None, Some(&g), None, &[]),
+            StackOp::Rebuild {
+                stack: 3,
+                old: vec![4, 5, 7, 8],
+                new: vec![4, 5, 7]
+            }
+        );
+        let ss = stack(9, &[5]);
+        assert_eq!(
+            plan_stack(&[7], &[7, 8], Some(5), Some(&g), Some(&ss), &[]),
+            StackOp::Rebuild {
+                stack: 3,
+                old: vec![4, 5, 7, 8],
+                new: vec![4, 5, 7]
+            }
         );
     }
 }

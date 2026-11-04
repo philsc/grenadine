@@ -252,7 +252,8 @@ pub async fn handle(
                     updates, one entry per commit in commit order, bottom first; pull \
                     requests left out are closed and their branches deleted. Without \
                     `prs`, the commits map to the open pull requests by position, which \
-                    only works when commits were added on top.",
+                    only works when commits were added on top. The pull requests are \
+                    kept as a GitHub stack where the repository has them turned on.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -419,7 +420,12 @@ async fn update_prs(
             number,
         };
         let base = state.db.pr(&key).ok().flatten().map(|pr| pr.head_ref);
-        let input = json!({"pr": number, "branch": session.branch, "base": base});
+        let input = json!({
+            "pr": number,
+            "branch": session.branch,
+            "base": base,
+            "stack": format!("Joins #{number}'s GitHub stack when #{number} is its top or in no stack."),
+        });
         let allowed = matches!(
             agent::await_approval(state, id, tool_use, "update_prs", &input, Vec::new()).await,
             Some(Decision { allow: true, .. })

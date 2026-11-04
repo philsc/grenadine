@@ -162,6 +162,23 @@ pub struct RefPr {
     pub merged_at: Option<String>,
 }
 
+/// A GitHub stack: its number and its open, unmerged PRs, bottom first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GhStack {
+    pub number: u64,
+    pub open: Vec<u64>,
+}
+
+/// What looking up a PR's stack found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackLookup {
+    /// The repository doesn't have stacked PRs turned on.
+    Off,
+    /// The PR is in no stack.
+    None,
+    Found(GhStack),
+}
+
 /// Where a PR that `GitHub::pr_statuses` looked up stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrStatus {
@@ -1677,6 +1694,118 @@ impl GitHub {
             .as_u64()
             .ok_or_else(|| anyhow!("GitHub's response has no PR number"))?;
         Ok((number, str_at(&v, "/html_url").to_owned()))
+    }
+
+    /// A request to the stacks API: the only endpoints on the
+    /// 2026-03-10 API version the client otherwise predates.
+    fn stacks_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        self.http
+            .request(method, url)
+            .header("X-GitHub-Api-Version", "2026-03-10")
+    }
+
+    /// Sends `req` to the stacks API, counted as REST like `get_all`.
+    async fn stacks_send(
+        &self,
+        kind: &'static str,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        self.admit(kind, ApiResource::Rest)?;
+        let at = chrono::Utc::now().timestamp();
+        let resp = req.send().await?;
+        self.saw_headers(ApiResource::Rest, resp.headers());
+        let resp = match self.check_exhausted(ApiResource::Rest, resp) {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.logged(kind, ApiResource::Rest, None, at);
+                return Err(e);
+            }
+        };
+        self.logged(kind, ApiResource::Rest, None, at);
+        Ok(resp)
+    }
+
+    /// The stacks `pr` is in: `Off` when the repository has stacked PRs
+    /// turned off, `None` when it has none, else `Found` of each stack's
+    /// number and its open, unmerged PRs, bottom first.
+    pub async fn stack_of(&self, repo: &str, pr: u64) -> Result<StackLookup> {
+        let url = format!("{}/repos/{repo}/stacks?pull_request={pr}", self.api);
+        let resp = self
+            .stacks_send("stack_of", self.stacks_request(reqwest::Method::GET, url))
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(StackLookup::Off);
+        }
+        let v: Value = resp.error_for_status()?.json().await.unwrap_or_default();
+        let mut out = Vec::new();
+        for stack in v.as_array().into_iter().flatten() {
+            let open = stack["pull_requests"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|pr| pr["state"].as_str() == Some("open") && pr["merged_at"].is_null())
+                .filter_map(|pr| pr["number"].as_u64())
+                .collect();
+            out.push(GhStack {
+                number: stack["number"].as_u64().unwrap_or_default(),
+                open,
+            });
+        }
+        match out.is_empty() {
+            true => Ok(StackLookup::None),
+            false => Ok(StackLookup::Found(out.swap_remove(0))),
+        }
+    }
+
+    /// Reads a stacks API response's error message or its stack number.
+    async fn stack_result(&self, resp: reqwest::Response, doing: &str) -> Result<Option<u64>> {
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            let reason = v["message"].as_str().unwrap_or("no reason given");
+            bail!("GitHub {doing} ({status}): {reason}");
+        }
+        Ok(v["number"].as_u64())
+    }
+
+    /// Creates a stack of `prs`, bottom first, and returns its number.
+    pub async fn create_stack(&self, repo: &str, prs: &[u64]) -> Result<u64> {
+        let url = format!("{}/repos/{repo}/stacks", self.api);
+        let resp = self
+            .stacks_send(
+                "create_stack",
+                self.stacks_request(reqwest::Method::POST, url)
+                    .json(&json!({ "pull_requests": prs })),
+            )
+            .await?;
+        self.stack_result(resp, "didn't create the stack")
+            .await?
+            .ok_or_else(|| anyhow!("GitHub's response has no stack number"))
+    }
+
+    /// Appends `prs` on top of `stack`.
+    pub async fn add_to_stack(&self, repo: &str, stack: u64, prs: &[u64]) -> Result<()> {
+        let url = format!("{}/repos/{repo}/stacks/{stack}/add", self.api);
+        let resp = self
+            .stacks_send(
+                "add_to_stack",
+                self.stacks_request(reqwest::Method::POST, url)
+                    .json(&json!({ "pull_requests": prs })),
+            )
+            .await?;
+        self.stack_result(resp, "didn't extend the stack").await?;
+        Ok(())
+    }
+
+    /// Removes all of the stack's unmerged PRs; the stack may or may not
+    /// be dissolved by it.
+    pub async fn unstack(&self, repo: &str, stack: u64) -> Result<()> {
+        let url = format!("{}/repos/{repo}/stacks/{stack}/unstack", self.api);
+        let resp = self
+            .stacks_send("unstack", self.stacks_request(reqwest::Method::POST, url))
+            .await?;
+        self.stack_result(resp, "didn't unstack").await?;
+        Ok(())
     }
 
     /// GETs every page of a REST list, labelled `kind` in the usage log.
