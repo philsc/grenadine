@@ -46,7 +46,20 @@ type Mutation {
   submitPullRequestReview(input: SubmitPullRequestReviewInput!): MutationPayload
   deletePullRequestReview(input: DeletePullRequestReviewInput!): MutationPayload
   mergePullRequest(input: MergePullRequestInput!): MutationPayload
+  updatePullRequest(input: UpdatePullRequestInput!): MutationPayload
+  closePullRequest(input: ClosePullRequestInput!): MutationPayload
   deleteRef(input: DeleteRefInput!): MutationPayload
+}
+
+input UpdatePullRequestInput {
+  pullRequestId: ID!
+  baseRefName: String
+  clientMutationId: String
+}
+
+input ClosePullRequestInput {
+  pullRequestId: ID!
+  clientMutationId: String
 }
 
 input MergePullRequestInput {

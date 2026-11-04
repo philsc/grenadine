@@ -244,12 +244,35 @@ pub async fn handle(
                 },
             }, {
                 "name": "update_prs",
-                "description": "Pushes each of this session's commits to its own branch, \
+                "description": "Pushes each of this session's commits to its PR's branch, \
                     updates this session's open pull requests and opens a pull request for \
                     each new commit, stacked on the one before it, titled and described \
                     from the commit messages. To change a pull request, amend its commit \
-                    and call this again.",
-                "inputSchema": {"type": "object", "properties": {}},
+                    and call this again. `prs` maps each commit to the pull request it \
+                    updates, one entry per commit in commit order, bottom first; pull \
+                    requests left out are closed and their branches deleted. Without \
+                    `prs`, the commits map to the open pull requests by position, which \
+                    only works when commits were added on top.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prs": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "commit": {
+                                        "type": "string",
+                                        "description": "A full or abbreviated SHA of the \
+                                            commit; `pr` omitted opens a new pull request.",
+                                    },
+                                    "pr": {"type": "integer"},
+                                },
+                                "required": ["commit"],
+                            },
+                        },
+                    },
+                },
             }, {
                 "name": "land_on_checkout",
                 "description": "Rebases this session's commits onto the user's checkout \
@@ -310,7 +333,9 @@ pub async fn handle(
             let args = &params["arguments"];
             let result = match name {
                 "show_image" => show_image(&state, &id, args).await,
-                "update_prs" => update_prs(&state, &id, &format!("update_prs-{rpc_id}")).await,
+                "update_prs" => {
+                    update_prs(&state, &id, &format!("update_prs-{rpc_id}"), args).await
+                }
                 "land_on_checkout" => land_on_checkout(&state, &id).await,
                 _ => terminal_tool(&state, &id, name, args).await,
             };
@@ -381,7 +406,12 @@ async fn show_image(state: &State, id: &str, args: &Value) -> anyhow::Result<Str
 /// its pull requests, as the page's Open PR wrap-up does. A session that
 /// started from a PR stacks its pull requests on that PR's branch, so it
 /// asks the user first.
-async fn update_prs(state: &Arc<State>, id: &str, tool_use: &str) -> anyhow::Result<String> {
+async fn update_prs(
+    state: &Arc<State>,
+    id: &str,
+    tool_use: &str,
+    args: &Value,
+) -> anyhow::Result<String> {
     let session = state.db.agent(id)?.context("The session is gone.")?;
     if let Some(number) = session.pr {
         let key = PrKey {
@@ -398,20 +428,31 @@ async fn update_prs(state: &Arc<State>, id: &str, tool_use: &str) -> anyhow::Res
             bail!("The user didn't allow opening or updating pull requests onto #{number}.");
         }
     }
-    let landed = agent::land_now(state, id, WrapUpTarget::PullRequest).await?;
-    Ok(landed
+    let specs = match args.get("prs") {
+        None => None,
+        Some(prs) => Some(
+            serde_json::from_value::<Vec<crate::pr_plan::PrSpec>>(prs.clone())
+                .context("`prs` must be a list of {commit, pr} objects")?,
+        ),
+    };
+    let (landed, notes) = agent::land_now(state, id, WrapUpTarget::PullRequest, specs).await?;
+    let mut out = landed
         .prs()
         .iter()
         .map(|pr| format!("#{} {} (branch `{}`)", pr.number, pr.url, pr.branch))
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    for note in notes {
+        out += &format!("\n{note}");
+    }
+    Ok(out)
 }
 
 /// Rebases the session's commits onto the user's checkout and
 /// fast-forwards it, as the page's Land on checkout wrap-up does.
 async fn land_on_checkout(state: &Arc<State>, id: &str) -> anyhow::Result<String> {
-    match agent::land_now(state, id, WrapUpTarget::Checkout).await? {
-        Landed::Checkout { sha } => Ok(format!("Landed on the checkout at {sha}.")),
+    match agent::land_now(state, id, WrapUpTarget::Checkout, None).await? {
+        (Landed::Checkout { sha }, _) => Ok(format!("Landed on the checkout at {sha}.")),
         _ => bail!("the session didn't land on the checkout"),
     }
 }

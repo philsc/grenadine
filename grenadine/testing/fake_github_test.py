@@ -624,6 +624,52 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertNotIn("errors", merge(pr))
         self.assertEqual(pr.state, "MERGED")
 
+    def test_retargeting_and_closing_a_pr(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id baseRefName headRefOid }} }} }}"
+        )["data"]["repository"]["pullRequest"]
+        self.assertEqual(pr_id["baseRefName"], pr.base)
+        self.assertEqual(pr_id["headRefOid"], pr.head_oid)
+
+        out = self.query(
+            "mutation($p: ID!, $b: String!) { updatePullRequest(input: {"
+            " pullRequestId: $p, baseRefName: $b}) { clientMutationId } }",
+            p=pr_id["id"],
+            b="nope",
+        )
+        self.assertIn("Could not resolve to a Ref", out["errors"][0]["message"])
+        out = self.query(
+            "mutation($p: ID!, $b: String!) { updatePullRequest(input: {"
+            " pullRequestId: $p, baseRefName: $b}) { clientMutationId } }",
+            p=pr_id["id"],
+            b="main",
+        )
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.base, "main")
+
+        out = self.query(
+            "mutation($p: ID!) { closePullRequest(input: {pullRequestId: $p})"
+            " { clientMutationId } }",
+            p=pr_id["id"],
+        )
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.state, "CLOSED")
+        # A closed PR can't be retargeted or closed again.
+        for mutation in (
+            (
+                "mutation($p: ID!) { updatePullRequest(input: {"
+                ' pullRequestId: $p, baseRefName: "main"}) { clientMutationId } }'
+            ),
+            (
+                "mutation($p: ID!) { closePullRequest(input: {pullRequestId: $p})"
+                " { clientMutationId } }"
+            ),
+        ):
+            out = self.query(mutation, p=pr_id["id"])
+            self.assertIn("closed", out["errors"][0]["message"])
+
     def test_deleting_a_branch_can_fail(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]
         self.repo.undeletable_branches.add(pr.head)

@@ -171,6 +171,10 @@ pub struct PrStatus {
     /// working that out.
     pub conflicting: Option<bool>,
     pub title: String,
+    /// The base branch's name.
+    pub base_ref: String,
+    /// The head branch's tip commit.
+    pub head_oid: String,
     /// The combined state of the checks on its head; `None` when it has
     /// none.
     pub ci: Option<CiStatus>,
@@ -1299,6 +1303,32 @@ impl GitHub {
             .map(|e| format!("Merged, but the branch wasn't deleted: {e:#}")))
     }
 
+    /// Retargets the PR at the base branch `base`.
+    pub async fn set_pr_base(&self, key: &PrKey, base: &str) -> Result<()> {
+        self.mutate(
+            "mutation($pr: ID!, $base: String!) {
+               updatePullRequest(input: { pullRequestId: $pr, baseRefName: $base }) {
+                 clientMutationId
+               }
+             }",
+            json!({ "pr": self.pr_id(key).await?, "base": base }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Closes the PR without merging it.
+    pub async fn close_pr(&self, key: &PrKey) -> Result<()> {
+        self.mutate(
+            "mutation($pr: ID!) {
+               closePullRequest(input: { pullRequestId: $pr }) { clientMutationId }
+             }",
+            json!({ "pr": self.pr_id(key).await? }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Discards the viewer's pending review and its comments.
     pub async fn discard_review(&self, key: &PrKey) -> Result<()> {
         match self.pending_review(key).await?.review {
@@ -1864,7 +1894,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable title commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
                     )
                 })
                 .collect();
@@ -1900,6 +1930,10 @@ impl GitHub {
                         state: state.to_owned(),
                         conflicting,
                         title: str_at(&data, &format!("/p{i}/pullRequest/title")).to_owned(),
+                        base_ref: str_at(&data, &format!("/p{i}/pullRequest/baseRefName"))
+                            .to_owned(),
+                        head_oid: str_at(&data, &format!("/p{i}/pullRequest/headRefOid"))
+                            .to_owned(),
                         ci: ci_status(str_at(
                             &data,
                             &format!(
