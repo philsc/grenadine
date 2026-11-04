@@ -779,6 +779,9 @@ pub struct GitHubUsage {
     pub kinds: Vec<RequestKindUsage>,
     /// 60 entries, oldest first, the last one is the current minute.
     pub minutes: Vec<MinuteUsage>,
+    /// The last responses' rate-limit headers, newest first, at most
+    /// 100.
+    pub reports: Vec<RateLimitReport>,
 }
 
 /// A resource's limit as the last response's headers reported it.
@@ -812,6 +815,22 @@ pub struct RequestKindUsage {
     pub points: Option<u32>,
     /// How many were refused without being sent to keep the limit.
     pub deferred: u32,
+}
+
+/// One response's rate-limit headers and what the request named.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitReport {
+    /// Unix seconds when the response came in.
+    pub at: i64,
+    pub resource: ApiResource,
+    pub kind: String,
+    /// The `owner/name` repos the request named, sorted; `owner/*` for
+    /// an org: or user: search qualifier; empty when it named none.
+    pub repos: Vec<String>,
+    pub limit: u32,
+    pub remaining: u32,
+    pub used: u32,
+    pub reset: i64,
 }
 
 /// One minute's spending.

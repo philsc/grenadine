@@ -13,7 +13,8 @@ use std::fmt;
 use std::future::Future;
 
 use grenadine_core::api::{
-    ApiResource, GitHubUsage, MinuteUsage, RateLimitInfo, RequestKindUsage, RequestPriority,
+    ApiResource, GitHubUsage, MinuteUsage, RateLimitInfo, RateLimitReport, RequestKindUsage,
+    RequestPriority,
 };
 
 tokio::task_local! {
@@ -100,10 +101,15 @@ pub struct Usage {
     states: States,
     seq: u64,
     log: VecDeque<Entry>,
+    /// The last responses' reports, oldest first.
+    reports: VecDeque<RateLimitReport>,
 }
 
 /// How long the log and the `ours` counts look back.
 const WINDOW: i64 = 3600;
+
+/// How many reports are kept for the Debug tab.
+const REPORTS: usize = 100;
 
 /// A state per (resource, request kind), the u64 ordering same-second
 /// reports.
@@ -114,9 +120,29 @@ type KindStates = Vec<(&'static str, LimitState, u64)>;
 
 impl Usage {
     /// Records `state` for `resource`, from a `kind` response's headers.
-    pub fn saw(&mut self, resource: ApiResource, kind: &'static str, state: LimitState) {
+    /// `repos` are the `owner/name` repos the request named.
+    pub fn saw(
+        &mut self,
+        resource: ApiResource,
+        kind: &'static str,
+        repos: Vec<String>,
+        state: LimitState,
+    ) {
         self.seq += 1;
         self.states.insert((resource, kind), (state, self.seq));
+        self.reports.push_back(RateLimitReport {
+            at: state.seen,
+            resource,
+            kind: kind.to_owned(),
+            repos,
+            limit: state.limit,
+            remaining: state.remaining,
+            used: state.used,
+            reset: state.reset,
+        });
+        while self.reports.len() > REPORTS {
+            self.reports.pop_front();
+        }
     }
 
     /// The last state `kind`'s responses on `resource` reported.
@@ -327,6 +353,7 @@ impl Usage {
             limits,
             kinds,
             minutes,
+            reports: self.reports.iter().rev().cloned().collect(),
         }
     }
 }
@@ -348,7 +375,12 @@ mod tests {
     /// A `Usage` that saw one response of `kind` on GraphQL.
     fn usage(kind: &'static str, limit: u32, remaining: u32, reset: i64) -> Usage {
         let mut u = Usage::default();
-        u.saw(ApiResource::GraphQl, kind, state(limit, remaining, reset));
+        u.saw(
+            ApiResource::GraphQl,
+            kind,
+            vec![],
+            state(limit, remaining, reset),
+        );
         u
     }
 
@@ -426,7 +458,7 @@ mod tests {
         // A spent REST limit doesn't pause searches: no search kind
         // sent a REST request yet.
         let mut u = Usage::default();
-        u.saw(ApiResource::Rest, "activity", state(60, 0, 3700));
+        u.saw(ApiResource::Rest, "activity", vec![], state(60, 0, 3700));
         assert_eq!(u.paused_until(RequestPriority::Search, 100), None);
         assert_eq!(u.paused_until(RequestPriority::Background, 100), Some(3700));
     }
@@ -465,7 +497,12 @@ mod tests {
                 deferred: false,
             });
         }
-        u.saw(ApiResource::Rest, "activity", state(60, 55, now + 1800));
+        u.saw(
+            ApiResource::Rest,
+            "activity",
+            vec![],
+            state(60, 55, now + 1800),
+        );
         let snap = u.snapshot(now);
         assert_eq!(snap.kinds.len(), 3);
         // Sorted by points desc: pr (6) then search (3) then activity.
@@ -507,7 +544,7 @@ mod tests {
         // GitHub reports different budgets to different kinds: "pr" is
         // nearly out, "search" is fine.
         let mut u = usage("search", 5000, 4000, reset);
-        u.saw(ApiResource::GraphQl, "pr", state(5000, 900, reset));
+        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 900, reset));
         u.admit("pr", ApiResource::GraphQl, RequestPriority::Background, now)
             .unwrap_err();
         u.admit(
@@ -523,8 +560,13 @@ mod tests {
         // A low "search" window holds searches even after a kind with
         // a healthy budget reported more recently; it goes once its
         // own reset passes.
-        u.saw(ApiResource::GraphQl, "search", state(5000, 400, reset));
-        u.saw(ApiResource::GraphQl, "pr", state(5000, 4000, reset));
+        u.saw(
+            ApiResource::GraphQl,
+            "search",
+            vec![],
+            state(5000, 400, reset),
+        );
+        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 4000, reset));
         u.admit("search", ApiResource::GraphQl, RequestPriority::Search, now)
             .unwrap_err();
         u.admit(
@@ -541,7 +583,7 @@ mod tests {
         let now = 100;
         let reset = 3700;
         let mut u = usage("search", 5000, 4000, reset);
-        u.saw(ApiResource::GraphQl, "pr", state(5000, 900, reset));
+        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 900, reset));
         // A Search-priority request ran under the "search" kind, so
         // only its window counts for searches.
         u.log(Entry {
@@ -559,7 +601,7 @@ mod tests {
         );
         // Even "pr" fully spent doesn't pause searches: they don't send
         // it.
-        u.saw(ApiResource::GraphQl, "pr", state(5000, 0, reset));
+        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 0, reset));
         assert_eq!(u.paused_until(RequestPriority::Search, now), None);
     }
 
@@ -576,7 +618,7 @@ mod tests {
         ] {
             let mut s = state(5000, 5000 - used, reset);
             s.seen = now - seen;
-            u.saw(ApiResource::GraphQl, kind, s);
+            u.saw(ApiResource::GraphQl, kind, vec![], s);
             u.log(Entry {
                 at: now - 100,
                 kind,
@@ -606,5 +648,24 @@ mod tests {
         let mut u = usage("pr", 5000, 0, now - 1);
         let snap = u.snapshot(now);
         assert!(snap.limits.is_empty());
+    }
+
+    #[test]
+    fn reports_come_out_newest_first_capped_at_100() {
+        let now = 10_000;
+        let mut u = Usage::default();
+        for i in 0..101 {
+            let mut s = state(5000, 4000, now + 1800);
+            s.seen = now - 100 + i;
+            u.saw(ApiResource::GraphQl, "pr", vec!["o/n".to_owned()], s);
+        }
+        let snap = u.snapshot(now);
+        assert_eq!(snap.reports.len(), 100);
+        // The oldest report was dropped; the rest come out newest first.
+        assert_eq!(snap.reports[0].at, now - 100 + 100);
+        assert_eq!(snap.reports[99].at, now - 100 + 1);
+        assert_eq!(snap.reports[0].kind, "pr");
+        assert_eq!(snap.reports[0].repos, ["o/n"]);
+        assert_eq!(snap.reports[0].limit, 5000);
     }
 }

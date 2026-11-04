@@ -40,6 +40,26 @@ pub(crate) fn hm(ts: i64) -> String {
     }
 }
 
+/// `ts` (Unix seconds) as local "HH:MM:SS".
+pub(crate) fn hms(ts: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ts as f64 * 1000.0));
+        format!(
+            "{:02}:{:02}:{:02}",
+            d.get_hours(),
+            d.get_minutes(),
+            d.get_seconds()
+        )
+    }
+    // The tests don't run under wasm; UTC is close enough there.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let secs = ts.rem_euclid(86400);
+        format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    }
+}
+
 fn label(status: &SyncStatus, now: i64) -> String {
     match status.phase {
         SyncPhase::Idle if status.paused_until.is_some_and(|t| t > now) => {
