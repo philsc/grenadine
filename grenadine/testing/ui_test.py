@@ -723,6 +723,7 @@ class ChromeTest(ServerTestCase):
         self.page.goto(self.url)
         html = self.page.locator("html")
         body = self.page.locator("body")
+        self.page.get_by_role("button", name="Settings", exact=True).click()
         picker = self.page.get_by_label("Theme")
         expect(picker).to_have_value("auto")
         expect(html).to_have_attribute("data-theme", "light")
@@ -744,11 +745,27 @@ class ChromeTest(ServerTestCase):
     def test_theme_survives_reload(self) -> None:
         self.page.emulate_media(color_scheme="light")
         self.page.goto(self.url)
+        self.page.get_by_role("button", name="Settings", exact=True).click()
         self.page.get_by_label("Theme").select_option("dark")
 
         self.page.reload()
+        self.page.get_by_role("button", name="Settings", exact=True).click()
         expect(self.page.get_by_label("Theme")).to_have_value("dark")
         expect(self.page.locator("html")).to_have_attribute("data-theme", "dark")
+
+    def test_settings_dialog_opens_and_closes(self) -> None:
+        self.page.goto(self.url)
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        dialog = self.page.get_by_role("dialog", name="Settings", exact=True)
+        expect(dialog).to_be_visible()
+
+        # Escape closes it; a click beside it, on the backdrop, does too.
+        self.page.keyboard.press("Escape")
+        expect(dialog).to_have_count(0)
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        expect(dialog).to_be_visible()
+        self.page.mouse.click(4, 4)
+        expect(dialog).to_have_count(0)
 
     def test_inboxes_start_empty(self) -> None:
         self.page.goto(self.url)
@@ -1949,6 +1966,22 @@ class ReviewTest(ServerTestCase):
         )
         # The box closes once the comment is sent.
         expect(conversation.get_by_role("textbox")).to_have_count(0)
+
+    def test_pr_links_setting_lives_in_the_settings_dialog(self) -> None:
+        self.open(scenarios.CONVERSE)
+        # The setting isn't on the PR page's toolbar.
+        expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
+
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        checkbox = self.page.get_by_label("Open PR links in grenadine")
+        expect(checkbox).to_be_checked()
+        checkbox.uncheck()
+
+        self.page.reload()
+        self.open(scenarios.CONVERSE)
+        expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        expect(self.page.get_by_label("Open PR links in grenadine")).not_to_be_checked()
 
 
 class VersionsTest(ServerTestCase):
@@ -3799,10 +3832,16 @@ class AgentTest(ServerTestCase):
         )
         links = items.locator("a")
         expect(links.nth(0)).to_have_attribute(
-            "href", f"#/{self.OTHER_REPO}/{a.number}"
+            "href", f"https://github.com/{self.OTHER_REPO}/pull/{a.number}"
+        )
+        expect(links.nth(0)).to_have_attribute(
+            "data-grenadine", f"#/{self.OTHER_REPO}/{a.number}"
         )
         expect(links.nth(1)).to_have_attribute(
-            "href", f"#/{self.OTHER_REPO}/{b.number}"
+            "href", f"https://github.com/{self.OTHER_REPO}/pull/{b.number}"
+        )
+        expect(links.nth(1)).to_have_attribute(
+            "data-grenadine", f"#/{self.OTHER_REPO}/{b.number}"
         )
 
         # Neither head has checks.
@@ -3823,6 +3862,63 @@ class AgentTest(ServerTestCase):
         expect(icons.nth(0)).to_have_class(re.compile(r"\bmerged\b"), timeout=15_000)
         repo.close(b)
         expect(icons.nth(1)).to_have_class(re.compile(r"\bclosed\b"), timeout=15_000)
+
+        # A plain click opens a PR link in grenadine while the setting is on.
+        session = self.page.url
+        # GitHub itself is stubbed so that a click that slips through hits
+        # nothing real.
+        self.page.context.route(
+            "https://github.com/**",
+            lambda route: route.fulfill(body="<p>github</p>"),
+        )
+        links.nth(0).click()
+        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/{a.number}$"))
+        self.page.goto(session)
+        expect(items).to_have_count(2)
+
+        # Turned off, a plain click goes to GitHub and Shift+click stays.
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        self.page.get_by_label("Open PR links in grenadine").uncheck()
+        self.page.keyboard.press("Escape")
+        with self.page.expect_popup() as popup:
+            links.nth(0).click()
+        popup.value.wait_for_load_state()
+        expect(self.page).to_have_url(session)
+        links.nth(0).click(modifiers=["Shift"])
+        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/{a.number}$"))
+        self.page.goto(session)
+        expect(items).to_have_count(2)
+
+        # The session goes too, so later tests' counts aren't off.
+        entry = self.section(self.OTHER_REPO).locator(".agent-entry")
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        entry.get_by_role("button", name="Delete session").click()
+        expect(entry).to_have_count(0)
+
+    def test_transcript_pr_links_follow_the_setting(self) -> None:
+        self.page.context.route(
+            "https://github.com/**",
+            lambda route: route.fulfill(body="<p>github</p>"),
+        )
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        url = f"https://github.com/{self.OTHER_REPO}/pull/1"
+        self.page.get_by_label("Prompt").fill(f"look at {url}")
+        self.page.get_by_role("button", name="Start").click()
+
+        # The echoed prompt's PR URL is marked with its in-app hash.
+        link = self.page.locator(".transcript .turn-text a").filter(has_text=url)
+        expect(link).to_have_attribute("data-grenadine", f"#/{self.OTHER_REPO}/1")
+
+        # With the setting on, a plain click opens the PR in grenadine and
+        # Shift+click goes to GitHub.
+        session = self.page.url
+        link.click()
+        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/1$"))
+        self.page.goto(session)
+        with self.page.expect_popup() as popup:
+            link.click(modifiers=["Shift"])
+        popup.value.wait_for_load_state()
+        expect(self.page).to_have_url(session)
 
         # The session goes too, so later tests' counts aren't off.
         entry = self.section(self.OTHER_REPO).locator(".agent-entry")

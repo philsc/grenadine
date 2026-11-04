@@ -10,6 +10,7 @@ mod debug;
 mod diffview;
 mod drafts;
 mod events;
+mod global_settings;
 mod highlight;
 mod image_drafts;
 mod images;
@@ -122,6 +123,11 @@ pub fn hash_for(key: &PrKey) -> String {
     format!("#/{}/{}", key.repo, key.number)
 }
 
+/// The PR's page on GitHub.
+pub fn github_url(key: &PrKey) -> String {
+    format!("https://github.com/{}/pull/{}", key.repo, key.number)
+}
+
 fn current_hash() -> String {
     window().location().hash().unwrap_or_default()
 }
@@ -223,6 +229,7 @@ fn App() -> impl IntoView {
                 .any(|(_, id)| key == image_drafts::new_session_key(id))
     });
     provide_context(drafts);
+    provide_context(global_settings::provide());
     provide_context(LocalResource::new(api::agent_backends));
     let route = RwSignal::new(open_draft(initial, drafts));
     // The PR shown most recently, highlighted when going back to the inboxes.
@@ -394,5 +401,10 @@ mod tests {
             route_from_hash("#/agents/n/7"),
             Route::Pr(key("agents/n", 7))
         );
+    }
+
+    #[test]
+    fn github_urls() {
+        assert_eq!(github_url(&key("o/n", 7)), "https://github.com/o/n/pull/7");
     }
 }

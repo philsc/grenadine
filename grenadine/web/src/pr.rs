@@ -13,12 +13,13 @@ use wasm_bindgen::JsCast;
 use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
 use crate::diffview::Commenting;
 use crate::diffview::DiffView;
+use crate::global_settings::GlobalSettings;
 use crate::inboxes::{load_flag, save_flag};
 use crate::review::{
     CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, conversation,
     merge_box, merge_warning,
 };
-use crate::{Updates, api, hash_for, highlight, markdown};
+use crate::{Updates, api, github_url, hash_for, highlight, markdown};
 
 /// A review comment and its replies.
 #[derive(Clone, Debug, PartialEq)]
@@ -182,8 +183,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
-    let pr_links = RwSignal::new(load_flag("pr-links-in-app", true));
-    let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
+    let pr_links = expect_context::<GlobalSettings>().pr_links;
+    let github = github_url(&key);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(CheckFolds(RwSignal::new(HashMap::new())));
@@ -592,18 +593,6 @@ fn PrBody(
                         }
                     />
                     " Inline changes"
-                </label>
-                <label class="toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=move || pr_links.get()
-                        on:change=move |ev| {
-                            let on = event_target_checked(&ev);
-                            pr_links.set(on);
-                            save_flag("pr-links-in-app", on);
-                        }
-                    />
-                    " Open PR links in grenadine"
                 </label>
             </div>
             {diff}

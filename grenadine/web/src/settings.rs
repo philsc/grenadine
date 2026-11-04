@@ -8,7 +8,7 @@ use crate::agents::{DEFAULT_MODEL, backends, listed_models, model_options};
 use crate::{Updates, api};
 
 #[component]
-fn GearIcon() -> impl IntoView {
+pub(crate) fn GearIcon() -> impl IntoView {
     view! {
         <svg
             class="gear"
@@ -112,7 +112,7 @@ fn SettingsDialog(
     let label = title.clone();
     view! {
         <dialog
-            class="repo-settings"
+            class="settings-dialog"
             node_ref=dialog
             aria-label=label
             on:close=move |_| on_close()
@@ -124,14 +124,14 @@ fn SettingsDialog(
                 }
             }
         >
-            <div class="repo-settings-content">
+            <div class="settings-dialog-content">
                 <header>
                     <h2>{title}</h2>
                     <button class="icon" title="Close" aria-label="Close" on:click=move |_| on_close()>
                         "×"
                     </button>
                 </header>
-                <div class="repo-settings-body">
+                <div class="settings-dialog-body">
                     {move || match (loaded.get(), draft.with(Option::is_some)) {
                         (Some(Err(e)), _) => view! { <p class="error">{e}</p> }.into_any(),
                         (_, true) => view! {
@@ -212,7 +212,7 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
         )
     });
     view! {
-        <fieldset class="repo-settings-fields">
+        <fieldset class="settings-fields">
             <legend>"Auto-reviews"</legend>
             <p class="hint muted">
                 "An unattended agent session reviews each pull request you open, posts its "
@@ -322,7 +322,7 @@ fn NewSessionFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
         })
     };
     view! {
-        <fieldset class="repo-settings-fields">
+        <fieldset class="settings-fields">
             <legend>"New sessions"</legend>
             {AgentBackend::ALL.into_iter().map(|b| {
                 let label = format!("{} permissions", b.agent_name());
