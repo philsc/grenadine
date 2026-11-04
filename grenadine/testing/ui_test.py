@@ -1167,7 +1167,7 @@ class InboxTest(ServerTestCase):
         # Other tests may have commented on this PR meanwhile.
         n = len(pr.issue_comments)
         expect(self.page.locator("details.conversation summary")).to_have_text(
-            f"{n} comment" + ("" if n == 1 else "s")
+            "No comments" if n == 0 else f"{n} comment" + ("" if n == 1 else "s")
         )
         # The request went to a team, marked with the team icon.
         team = self.sidebar().locator(".reviewers > span.reviewer-icon")
