@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::claude;
 use crate::devin;
 use crate::git::Repo;
+use crate::pr_plan::{Planned, PrSpec, plan_prs};
 use crate::reflow::reflow;
 use crate::sync::State;
 
@@ -87,18 +88,25 @@ struct Pending {
 /// Where a wrap-up stands after a try at landing.
 #[derive(Debug, PartialEq)]
 enum Step {
-    Landed(Landed),
-    /// Claude has to fix the worktree first, as `prompt` tells it.
-    Ask {
-        reason: String,
-        prompt: String,
+    Landed {
+        landed: Landed,
+        /// What landing did besides opening or updating the PRs, e.g.
+        /// closing a PR the mapping dropped.
+        notes: Vec<String>,
     },
-    /// Each commit is on GitHub on its own branch; the PRs that aren't
-    /// open yet are opened next, the bottom one into `base`.
+    /// Claude has to fix the worktree first, as `prompt` tells it.
+    Ask { reason: String, prompt: String },
+    /// Each commit is on GitHub on its branch; the PRs that aren't open
+    /// yet are opened next, the bottom one into `trunk`.
     Pushed {
-        base: String,
-        /// The branch and message of each commit, oldest first.
-        commits: Vec<(String, String)>,
+        trunk: String,
+        /// Each commit with its branch and PR, bottom first.
+        planned: Vec<Planned>,
+        /// The session's open PRs the plan leaves out.
+        dropped: Vec<LandedPr>,
+        /// The tip the commits land on top of, when merged PRs moved the
+        /// stack's lower bound past the session's base.
+        rebased: Option<String>,
     },
 }
 
@@ -1699,8 +1707,13 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
     let Some(pending) = state.agents.with_live(id, |l| l.wrap_up.clone()) else {
         return;
     };
-    let outcome = match land(state, id, pending.target).await {
-        Ok(Step::Landed(landed)) => record_landed(state, id, &landed).map(|()| landed),
+    let outcome = match land(state, id, pending.target, None).await {
+        Ok(Step::Landed { landed, notes }) => {
+            for note in &notes {
+                tracing::info!("agent {id}: {note}");
+            }
+            record_landed(state, id, &landed).map(|()| landed)
+        }
         Ok(Step::Ask { prompt, .. }) if !pending.asked => {
             state.agents.with_live(id, |l| {
                 if let Some(w) = &mut l.wrap_up {
@@ -1757,7 +1770,12 @@ fn ask_again(reason: &str, prompt: &str, tool: &str) -> anyhow::Error {
 /// runs once the turns in front of it are done, this runs inside the turn
 /// that calls it, so it must not wait for one. Its errors are the tool's
 /// result, told to the agent.
-pub async fn land_now(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Landed> {
+pub async fn land_now(
+    state: &Arc<State>,
+    id: &str,
+    target: WrapUpTarget,
+    prs: Option<Vec<PrSpec>>,
+) -> Result<(Landed, Vec<String>)> {
     let session = state
         .db
         .agent(id)?
@@ -1775,11 +1793,11 @@ pub async fn land_now(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Res
         WrapUpTarget::PullRequest => "update_prs",
         WrapUpTarget::Checkout => "land_on_checkout",
     };
-    match land(state, id, target).await? {
-        Step::Landed(landed) => {
+    match land(state, id, target, prs).await? {
+        Step::Landed { landed, notes } => {
             record_landed(state, id, &landed)?;
             emit(state, id, AgentEventKind::Landed(landed.clone()))?;
-            Ok(landed)
+            Ok((landed, notes))
         }
         Step::Ask { reason, prompt } => Err(ask_again(&reason, &prompt, tool)),
         Step::Pushed { .. } => Err(pushed_unopened()),
@@ -1809,8 +1827,14 @@ fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
     Ok(())
 }
 
-/// One try at landing the session's work on `target`.
-async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step> {
+/// One try at landing the session's work on `target`. `prs` maps the
+/// session's commits to its pull requests, as `update_prs` takes it.
+async fn land(
+    state: &Arc<State>,
+    id: &str,
+    target: WrapUpTarget,
+    prs: Option<Vec<PrSpec>>,
+) -> Result<Step> {
     let session = state
         .db
         .agent(id)?
@@ -1839,58 +1863,214 @@ async fn land(state: &Arc<State>, id: &str, target: WrapUpTarget) -> Result<Step
         }
         _ => None,
     };
-    // The PRs an earlier wrap-up opened stay the bottom of the stack.
-    let opened = landed_prs(&session);
-    let count = opened.len();
+    // Where the session's landed PRs stand: open ones can take new
+    // commits and get retargeted, merged ones are frozen, and ones the
+    // user closed are forgotten.
+    let mut open = Vec::new();
+    let mut merged = Vec::new();
+    let mut closed = Vec::new();
+    let mut taken = Vec::new();
+    let mut statuses = BTreeMap::new();
+    if target == WrapUpTarget::PullRequest {
+        let landed = landed_prs(&session);
+        taken = landed.iter().map(|pr| pr.branch.clone()).collect();
+        if !landed.is_empty() {
+            let keys: Vec<PrKey> = landed
+                .iter()
+                .map(|pr| PrKey {
+                    repo: session.repo.clone(),
+                    number: pr.number,
+                })
+                .collect();
+            match state.github.pr_statuses(&keys).await {
+                Ok(found) => statuses = found,
+                // Without the states the landed PRs count as open, the
+                // safest guess; a step that needs GitHub fails later.
+                Err(e) => {
+                    tracing::warn!("agent {id}: can't fetch the session's PRs' states: {e:#}")
+                }
+            }
+            for pr in landed {
+                let key = PrKey {
+                    repo: session.repo.clone(),
+                    number: pr.number,
+                };
+                match statuses.get(&key).map(|s| s.state.as_str()) {
+                    Some("MERGED") => merged.push(pr),
+                    // The user closed it; it's forgotten.
+                    Some("CLOSED") => closed.push(pr.number),
+                    _ => open.push(pr),
+                }
+            }
+        }
+    }
+    let heads: BTreeMap<u64, String> = statuses
+        .iter()
+        .map(|(key, status)| (key.number, status.head_oid.clone()))
+        .collect();
     let step = {
         let _guard = cloned.git_lock.lock().await;
         let repo = cloned.repo.clone();
         let session = session.clone();
         tokio::task::spawn_blocking(move || match target {
             WrapUpTarget::Checkout => land_on_checkout(&repo, &session),
-            WrapUpTarget::PullRequest => push_stack(&repo, &session, pr_branch, count),
+            WrapUpTarget::PullRequest => push_stack(
+                &repo, &session, pr_branch, &open, &merged, &heads, &taken, &closed, prs,
+            ),
         })
         .await??
     };
-    let Step::Pushed { base, commits } = step else {
+    let Step::Pushed {
+        trunk,
+        planned,
+        dropped,
+        rebased,
+    } = step
+    else {
         return Ok(step);
     };
-    // The push updated the PRs already open; each new commit gets a PR
-    // into the branch of the commit below it.
-    let mut prs = opened;
-    let before = prs.len();
-    let mut below = base;
-    for (i, (branch, message)) in commits.into_iter().enumerate() {
-        if i >= prs.len() {
-            let (title, body) = pr_text(&message);
-            match state
-                .github
-                .create_pr(&session.repo, &branch, &below, &title, &body)
-                .await
-            {
-                Ok((number, url)) => prs.push(LandedPr {
-                    number,
-                    url,
-                    branch: branch.clone(),
-                }),
-                Err(e) => {
-                    // The next wrap-up goes on from the PRs opened so far.
-                    if prs.len() > before {
-                        let numbers = prs
-                            .iter()
-                            .map(|pr| format!("#{}", pr.number))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        record_landed(state, id, &Landed::from_prs(prs))?;
-                        return Err(e.context(format!("opened only {numbers}")));
+    // The push updated the PRs already open; each commit without one
+    // gets a PR into the branch of the commit below it.
+    let mut prs: Vec<LandedPr> = Vec::new();
+    let mut opened = 0;
+    let mut below = trunk.clone();
+    // Each entry's base: the branch of the one below it, or the trunk.
+    let bases: Vec<String> = planned
+        .iter()
+        .map(|p| {
+            let base = below.clone();
+            below = p.branch.clone();
+            base
+        })
+        .collect();
+    for (p, base) in planned.iter().zip(&bases) {
+        match &p.pr {
+            Some(pr) => prs.push(pr.clone()),
+            None => {
+                let (title, body) = pr_text(&p.message);
+                match state
+                    .github
+                    .create_pr(&session.repo, &p.branch, base, &title, &body)
+                    .await
+                {
+                    Ok((number, url)) => {
+                        opened += 1;
+                        prs.push(LandedPr {
+                            number,
+                            url,
+                            branch: p.branch.clone(),
+                        });
                     }
-                    return Err(e);
+                    Err(e) => {
+                        // The next wrap-up goes on from the PRs opened so far.
+                        if opened > 0 {
+                            let numbers = prs
+                                .iter()
+                                .map(|pr| format!("#{}", pr.number))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            record_landed(state, id, &Landed::from_prs(prs))?;
+                            return Err(e.context(format!("opened only {numbers}")));
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }
-        below = branch;
     }
-    Ok(Step::Landed(Landed::from_prs(prs)))
+    let mut notes = Vec::new();
+    if let Err(e) = retarget_and_close(
+        state, &session, &planned, &bases, &statuses, &dropped, &prs, &mut notes,
+    )
+    .await
+    {
+        // The PRs are open already, so they count as landed.
+        record_landed(state, id, &Landed::from_prs(prs))?;
+        return Err(e);
+    }
+    if !dropped.is_empty() {
+        let _guard = cloned.git_lock.lock().await;
+        let repo = cloned.repo.clone();
+        let branches: Vec<String> = dropped.iter().map(|pr| pr.branch.clone()).collect();
+        let result = tokio::task::spawn_blocking(move || repo.delete_branches(&branches)).await?;
+        if let Err(e) = result {
+            record_landed(state, id, &Landed::from_prs(prs))?;
+            return Err(e.context("couldn't delete the dropped pull requests' branches"));
+        }
+    }
+    // The merged PRs' commits are landed; the next wrap-up continues
+    // from the trunk's tip.
+    if let Some(tip) = rebased {
+        state.db.set_agent_base(id, &tip)?;
+    }
+    Ok(Step::Landed {
+        landed: Landed::from_prs(prs),
+        notes,
+    })
+}
+
+/// Points the kept PRs at their new bases and closes the dropped ones.
+/// Runs after all of the stack's PRs are open, and before the dropped
+/// ones' branches are deleted: GitHub closes a PR whose base goes away.
+#[allow(clippy::too_many_arguments)]
+async fn retarget_and_close(
+    state: &Arc<State>,
+    session: &AgentSession,
+    planned: &[Planned],
+    bases: &[String],
+    statuses: &BTreeMap<PrKey, crate::github::PrStatus>,
+    dropped: &[LandedPr],
+    prs: &[LandedPr],
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    for (p, base) in planned.iter().zip(bases) {
+        let Some(pr) = &p.pr else { continue };
+        let key = PrKey {
+            repo: session.repo.clone(),
+            number: pr.number,
+        };
+        // Only a base known to differ needs retargeting.
+        let Some(status) = statuses.get(&key) else {
+            continue;
+        };
+        if status.base_ref != *base {
+            state
+                .github
+                .set_pr_base(&key, base)
+                .await
+                .with_context(|| format!("couldn't retarget #{} at {base}", pr.number))?;
+            notes.push(format!("Retargeted #{} at {base}.", pr.number));
+        }
+    }
+    for pr in dropped {
+        let key = PrKey {
+            repo: session.repo.clone(),
+            number: pr.number,
+        };
+        let comment = match prs.is_empty() {
+            true => "Grenadine dropped this pull request from its stack.".to_owned(),
+            false => format!(
+                "Grenadine dropped this pull request from its stack. The work continues in {}.",
+                prs.iter()
+                    .map(|pr| format!("#{}", pr.number))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let pr_id = state.github.pr_id(&key).await?;
+        state
+            .github
+            .add_comment(&pr_id, &comment)
+            .await
+            .with_context(|| format!("couldn't comment on #{}", pr.number))?;
+        state
+            .github
+            .close_pr(&key)
+            .await
+            .with_context(|| format!("couldn't close #{}", pr.number))?;
+        notes.push(format!("Closed #{}, dropped from the stack.", pr.number));
+    }
+    Ok(())
 }
 
 /// The branch the `i`th commit of a session's stack, from 0, is pushed to:
@@ -1964,7 +2144,12 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
         }
         let head = repo.worktree_head(worktree)?;
         match repo.merge_ff_only(&head) {
-            Ok(()) => return Ok(Step::Landed(Landed::Checkout { sha: head })),
+            Ok(()) => {
+                return Ok(Step::Landed {
+                    landed: Landed::Checkout { sha: head },
+                    notes: Vec::new(),
+                });
+            }
             Err(_) if repo.head()? != onto => continue,
             Err(e) => return Err(e),
         }
@@ -1972,15 +2157,23 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
     bail!("the checkout kept moving")
 }
 
-/// Pushes each of the session's commits to GitHub on its own branch. The
-/// bottom PR goes into `pr_branch`, or the default branch. Commits already
-/// on the target branch aren't the session's own and don't get pushed.
-/// `opened` PRs are open already, one for each of the bottom commits.
+/// Pushes each of the session's commits to GitHub on its PR's branch.
+/// The bottom PR goes into `pr_branch`, or the default branch. Commits
+/// already on the target branch aren't the session's own and don't get
+/// pushed. `open` is the session's PRs still open on GitHub, bottom
+/// first; `merged` the ones that merged, with their head commits in
+/// `heads`. `specs` maps commits to PRs as `update_prs` takes it.
+#[allow(clippy::too_many_arguments)]
 fn push_stack(
     repo: &Repo,
     session: &AgentSession,
     pr_branch: Option<String>,
-    opened: usize,
+    open: &[LandedPr],
+    merged: &[LandedPr],
+    heads: &BTreeMap<u64, String>,
+    taken: &[String],
+    closed: &[u64],
+    specs: Option<Vec<PrSpec>>,
 ) -> Result<Step> {
     let worktree = Path::new(&session.worktree);
     if let Some(reason) = repo.worktree_unfinished(worktree)? {
@@ -1990,45 +2183,79 @@ fn push_stack(
         });
     }
     let head = repo.worktree_head(worktree)?;
-    let base = match pr_branch {
+    let trunk = match pr_branch {
         Some(b) => b,
         None => repo.default_branch()?,
     };
     // `session.base_sha` is the target branch's tip when the session was
     // created, so commits merged to it since then count from the merge
     // base instead.
-    let target = repo.fetch_branch(&base, TARGET_REF)?;
+    let target = repo
+        .fetch_branch(&trunk, TARGET_REF)
+        .with_context(|| format!("can't fetch the trunk branch {trunk}"))?;
+    // Merged PRs are frozen: the work lands after them, on the trunk's
+    // tip. Their commits still in the worktree have to be rebased away
+    // first.
+    let mut lower = session.base_sha.clone();
+    let mut rebased = None;
+    if !merged.is_empty() {
+        let tip = &target;
+        if !repo.is_ancestor(tip, &head) {
+            let numbers = merged
+                .iter()
+                .map(|pr| format!("#{}", pr.number))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let top = merged.last().and_then(|pr| heads.get(&pr.number));
+            let prompt = match top.filter(|oid| repo.is_ancestor(oid, &head)) {
+                Some(upstream) => format!(
+                    "Wrap up: rebase your remaining commits onto {tip} with `git rebase --onto \
+                     {tip} {upstream}`, resolve the conflicts, and check that the result still \
+                     builds and passes the relevant tests. Finish the rebase and leave nothing \
+                     uncommitted."
+                ),
+                None => format!(
+                    "Wrap up: drop the commits {numbers} merged from your history, and rebase \
+                     your remaining commits onto {tip} with `git rebase --onto {tip} {}`, \
+                     resolving any conflicts. Finish the rebase and leave nothing uncommitted.",
+                    session.base_sha
+                ),
+            };
+            return Ok(Step::Ask {
+                reason: format!("{numbers} merged into {trunk}"),
+                prompt,
+            });
+        }
+        lower = tip.clone();
+        rebased = Some(tip.clone());
+    }
     let from = match repo.merge_base(&target, &head) {
         Some(mb) if repo.is_ancestor(&session.base_sha, &mb) => mb,
-        _ => session.base_sha.clone(),
+        _ => lower,
     };
     let commits = repo.commits(&from, &head)?;
     if commits.is_empty() {
         bail!("there are no commits to push");
     }
-    if commits.len() < opened {
-        bail!(
-            "the session has {} commits but opened {opened} pull requests, one per commit; \
-             keep one commit per pull request, and amend a pull request's commit to change \
-             it rather than squashing commits together",
-            commits.len()
-        );
-    }
-    let commits: Vec<(String, String, String)> = commits
-        .into_iter()
-        .enumerate()
-        .map(|(i, (sha, message))| (sha, stack_branch(&session.branch, i), message))
-        .collect();
-    let refs: Vec<(String, String)> = commits
+    let (planned, dropped) = plan_prs(
+        &session.branch,
+        &commits,
+        open,
+        taken,
+        closed,
+        specs.as_deref(),
+    )?;
+    let refs: Vec<(String, String)> = planned
         .iter()
-        .map(|(sha, branch, _)| (sha.clone(), branch.clone()))
+        .map(|p| (p.sha.clone(), p.branch.clone()))
         .collect();
     repo.push_commits(&refs)?;
-    let commits = commits
-        .into_iter()
-        .map(|(_, branch, message)| (branch, message))
-        .collect();
-    Ok(Step::Pushed { base, commits })
+    Ok(Step::Pushed {
+        trunk,
+        planned,
+        dropped,
+        rebased,
+    })
 }
 
 /// What Claude is told about the session's work that wrapping up already
@@ -2051,7 +2278,7 @@ fn landed_note(session: &AgentSession) -> Option<String> {
                  from this session's commits, one per commit, each stacked on the one before \
                  it:\n{prs}\nThese are this session's PRs. Don't open other PRs for this work or \
                  push it to other branches. To update them or open PRs for new commits, call \
-                 the grenadine MCP server's update_prs tool."
+                 the grenadine MCP server's update_prs tool; pass `prs` to drop or reorder PRs."
             )
         }
     };
@@ -2748,7 +2975,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         let cwd = worktree.canonicalize().unwrap();
         assert_eq!(log.trim(), format!("{} 0 none", cwd.display()));
 
-        let err = land(&state, &session.id, WrapUpTarget::Checkout)
+        let err = land(&state, &session.id, WrapUpTarget::Checkout, None)
             .await
             .unwrap_err()
             .to_string();
@@ -3788,7 +4015,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit b agent").await;
         let id = &session.id;
 
-        let Landed::Checkout { sha } = land_now(&state, id, WrapUpTarget::Checkout).await.unwrap()
+        let (Landed::Checkout { sha }, _) = land_now(&state, id, WrapUpTarget::Checkout, None)
+            .await
+            .unwrap()
         else {
             panic!("expected a checkout landing");
         };
@@ -3817,7 +4046,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             None,
         );
         wait_for_turns(&state, id, 2).await;
-        let err = land_now(&state, id, WrapUpTarget::Checkout)
+        let err = land_now(&state, id, WrapUpTarget::Checkout, None)
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -3860,7 +4089,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         record_landed(&state, id, &pr).unwrap();
         run(worktree, &["commit", "--amend", "-qm", "Amended b"]);
 
-        let landed = land_now(&state, id, WrapUpTarget::PullRequest)
+        let (landed, _) = land_now(&state, id, WrapUpTarget::PullRequest, None)
             .await
             .unwrap();
         assert_eq!(landed, pr);
@@ -3913,7 +4142,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         wait_for_turns(&state, id, 2).await;
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, id, WrapUpTarget::PullRequest)
+        land_now(&state, id, WrapUpTarget::PullRequest, None)
             .await
             .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD~"]));
@@ -3958,7 +4187,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(worktree, &["rebase", "--quiet", "FETCH_HEAD"]);
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, id, WrapUpTarget::PullRequest)
+        land_now(&state, id, WrapUpTarget::PullRequest, None)
             .await
             .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
@@ -3984,7 +4213,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "write b agent").await;
         let id = &session.id;
 
-        let err = land_now(&state, id, WrapUpTarget::PullRequest)
+        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -4016,7 +4245,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
 
-        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest)
+        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, None)
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -4026,6 +4255,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
         assert!(text.contains("one commit per pull request"), "{text}");
         assert!(text.contains("amend"), "{text}");
+        assert!(text.contains("drop or reorder"), "{text}");
     }
 
     /// The tools wait when the user is wrapping the session up from the
@@ -4045,7 +4275,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             });
         });
         for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
-            let err = land_now(&state, &session.id, target).await.unwrap_err();
+            let err = land_now(&state, &session.id, target, None)
+                .await
+                .unwrap_err();
             assert!(
                 format!("{err:#}").contains("wrapping up this session"),
                 "{err:#}"
@@ -4059,7 +4291,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         state.db.create_agent(&review).unwrap();
         for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
-            let err = land_now(&state, &review.id, target).await.unwrap_err();
+            let err = land_now(&state, &review.id, target, None)
+                .await
+                .unwrap_err();
             assert!(format!("{err:#}").contains("review"), "{err:#}");
         }
     }

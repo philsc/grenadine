@@ -2780,6 +2780,8 @@ mod tests {
             state: state.into(),
             conflicting,
             title: "t".into(),
+            base_ref: "main".into(),
+            head_oid: "h".into(),
             ci: None,
         };
 

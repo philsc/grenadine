@@ -311,9 +311,13 @@ def devin_scenario(tmp: Path) -> dict:
 # lists its models when asked like the Agent SDK does, summarizes a new
 # session's request as "Task: " and its first line, answers the scans of
 # deleted sessions with a container they left behind, and finds no stale
-# cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME". It
-# says how many images came with the prompt. `long transcript N` has it
-# run N Bash calls whose results grow from ~1 KB to ~30 KB and start with
+# cleanup items. `commit NAME` has it commit NAME.txt as "Add NAME",
+# `drop NAME` rebases that commit away, `swap` trades the top two
+# commits, `rebase N` rebases the top N commits onto the pushed main's
+# tip, and `update prs ENTRY...` calls the update_prs MCP tool, ENTRY
+# naming a commit as NAME, or NAME:N to update PR #N. It says how many
+# images came with the prompt. `long transcript N` has it run N Bash
+# calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
 FAKE_CLAUDE = r"""
 import base64
@@ -429,6 +433,46 @@ if prompt.startswith("commit "):
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
     result(tool_use, prompt.removeprefix("open pr ") + "\n")
+
+
+def git(*args):
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def sha_of(name):
+    # The sha of the commit whose subject is `Add NAME`.
+    log = git("log", "--format=%H %s")
+    return next(l.split(" ", 1)[0] for l in log.splitlines() if l.split(" ", 1)[1] == "Add " + name)
+
+
+# `drop NAME` removes the commit "Add NAME" from the worktree's history.
+if prompt.startswith("drop "):
+    sha = sha_of(prompt.removeprefix("drop "))
+    git("rebase", "--onto", sha + "^", sha)
+# `swap` trades the top two commits.
+if prompt == "swap":
+    top = git("log", "-2", "--format=%H").splitlines()
+    git("reset", "--hard", "HEAD~2")
+    git("cherry-pick", top[0], top[1])
+# `rebase N` rebases the top N commits onto the pushed main's tip.
+if prompt.startswith("rebase "):
+    git("fetch", "--quiet", "origin", "main")
+    git("rebase", "--onto", "FETCH_HEAD", "HEAD~" + prompt.removeprefix("rebase "))
+# `update prs ENTRY...` calls the update_prs MCP tool, ENTRY naming an
+# "Add NAME" commit, or NAME:N to update PR #N.
+if prompt.startswith("update prs"):
+    prs = []
+    for entry in prompt.removeprefix("update prs ").split():
+        name, _, pr = entry.partition(":")
+        spec = {"commit": sha_of(name)}
+        if pr:
+            spec["pr"] = int(pr)
+        prs.append(spec)
+    arguments = {"prs": prs}
+    tool_use = use("mcp__grenadine__update_prs", arguments)
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    updated = rpc("tools/call", {"name": "update_prs", "arguments": arguments})
+    result(tool_use, updated["result"]["content"][0]["text"], is_error=updated["result"].get("isError", False))
 # `screenshot` has it read a screenshot, whose result carries the image,
 # and then show it to the user.
 if prompt == "screenshot":
@@ -3203,6 +3247,152 @@ class AgentTest(ServerTestCase):
             sum(pr.title.startswith("Add stack-") for pr in repo.prs.values()), 3
         )
         expect(entry.locator(".agent-prs")).to_have_text("0/3")
+
+    def test_update_prs_drops_and_reorders(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("commit stack-a")
+        prompt.press("Enter")
+        transcript = self.page.locator(".transcript")
+        done = transcript.locator(".turn-end.muted")
+        follow_up = self.page.get_by_label("Follow-up")
+        expect(done).to_have_count(1)
+        for i, name in enumerate(["stack-b", "stack-c"]):
+            follow_up.fill(f"commit {name}")
+            follow_up.press("Enter")
+            expect(done).to_have_count(i + 2)
+
+        # Each commit gets its own PR, into the branch of the one below.
+        actions = self.page.locator(".agent-actions")
+        actions.get_by_role("button", name="Open PR").click()
+        opened = transcript.locator(".wrapped-up")
+        expect(opened.get_by_role("link")).to_have_count(3)
+        repo = self.gh.repo(self.OTHER_REPO)
+
+        def pr(title: str):
+            return next(pr for pr in repo.prs.values() if pr.title == title)
+
+        a, b, c = pr("Add stack-a"), pr("Add stack-b"), pr("Add stack-c")
+        self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
+        self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
+
+        def commits(pr) -> list[str]:
+            """The subjects of `pr`'s commits, from the pushed refs."""
+            out = self.gh.git(
+                "-C",
+                str(repo.bare),
+                "rev-list",
+                "--format=%s",
+                "--no-commit-header",
+                f"refs/heads/{pr.base}..refs/heads/{pr.head}",
+            )
+            return out.splitlines()
+
+        # Dropping the middle commit closes its PR, deletes its branch
+        # and retargets the PR above it.
+        follow_up.fill("drop stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(4)
+        follow_up.fill(f"update prs stack-a:{a.number} stack-c:{c.number}")
+        follow_up.press("Enter")
+        expect(done).to_have_count(5)
+        expect(transcript).to_contain_text(f"Closed #{b.number}")
+        self.assertEqual(b.state, "CLOSED")
+        self.assertTrue(
+            any(
+                "dropped this pull request" in comment.body
+                for comment in b.issue_comments
+            )
+        )
+        gone = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo.bare),
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{b.head}",
+            ],
+            env=self.gh.git_env(),
+            check=False,
+            capture_output=True,
+        )
+        self.assertNotEqual(gone.returncode, 0)
+        self.assertEqual(c.base, a.head)
+        self.assertEqual(commits(a), ["Add stack-a"])
+        self.assertEqual(commits(c), ["Add stack-c"])
+
+        # Reordering the commits retargets their PRs.
+        follow_up.fill("swap")
+        follow_up.press("Enter")
+        expect(done).to_have_count(6)
+        follow_up.fill(f"update prs stack-c:{c.number} stack-a:{a.number}")
+        follow_up.press("Enter")
+        expect(done).to_have_count(7)
+        self.assertEqual((c.base, a.base), ("main", c.head))
+        self.assertEqual(commits(c), ["Add stack-c"])
+        self.assertEqual(commits(a), ["Add stack-a"])
+
+    def test_update_prs_merged_prs_are_frozen(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("commit stack-a")
+        prompt.press("Enter")
+        transcript = self.page.locator(".transcript")
+        done = transcript.locator(".turn-end.muted")
+        follow_up = self.page.get_by_label("Follow-up")
+        expect(done).to_have_count(1)
+        follow_up.fill("commit stack-b")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+
+        self.page.locator(".agent-actions").get_by_role(
+            "button", name="Open PR"
+        ).click()
+        opened = transcript.locator(".wrapped-up")
+        expect(opened.get_by_role("link")).to_have_count(2)
+        repo = self.gh.repo(self.OTHER_REPO)
+
+        def pr(title: str):
+            return next(pr for pr in repo.prs.values() if pr.title == title)
+
+        a, b = pr("Add stack-a"), pr("Add stack-b")
+
+        # A merges while something else lands on main; the agent is asked
+        # to rebase the remaining work onto the trunk's tip.
+        repo.merge(a)
+        repo.checkout("main")
+        repo.commit("Other work", {"other.txt": "other"})
+        repo.push("main")
+        follow_up.fill(f"update prs stack-b:{b.number}")
+        follow_up.press("Enter")
+        expect(done).to_have_count(3)
+        expect(transcript).to_contain_text(f"#{a.number} merged into main")
+        expect(transcript).to_contain_text("git rebase --onto")
+        self.assertEqual(b.state, "OPEN")
+        self.assertEqual(b.base, a.head)
+
+        follow_up.fill("rebase 1")
+        follow_up.press("Enter")
+        expect(done).to_have_count(4)
+        follow_up.fill(f"update prs stack-b:{b.number}")
+        follow_up.press("Enter")
+        expect(done).to_have_count(5)
+        # B is retargeted at the trunk; the merged A isn't touched.
+        self.assertEqual(b.base, "main")
+        out = self.gh.git(
+            "-C",
+            str(repo.bare),
+            "rev-list",
+            "--format=%s",
+            "--no-commit-header",
+            f"refs/heads/{b.base}..refs/heads/{b.head}",
+        )
+        self.assertEqual(out.splitlines(), ["Add stack-b"])
+        self.assertEqual(a.state, "MERGED")
+        self.assertEqual(a.issue_comments, [])
 
     def test_sidebar_shows_merged_prs(self) -> None:
         repo = self.gh.repo(self.OTHER_REPO)

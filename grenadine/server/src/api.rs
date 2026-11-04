@@ -1231,6 +1231,8 @@ mod tests {
                     state: "OPEN".into(),
                     conflicting: Some(false),
                     title: "Fix it".into(),
+                    base_ref: "main".into(),
+                    head_oid: "h".into(),
                     ci: Some(grenadine_core::api::CiStatus::Passing),
                 },
             )

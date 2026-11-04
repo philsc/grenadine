@@ -939,6 +939,35 @@ class FakeGitHub:
             pr.repo.merge(pr)
             return {"clientMutationId": None}
 
+        def update_pr(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            if pr.state != OPEN:
+                raise ValueError("Pull request is closed")
+            base = input.get("baseRefName")
+            if base is not None:
+                try:
+                    self.git(
+                        "-C",
+                        str(pr.repo.bare),
+                        "rev-parse",
+                        "--verify",
+                        f"refs/heads/{base}",
+                    )
+                except subprocess.CalledProcessError:
+                    raise ValueError(
+                        f"Could not resolve to a Ref with the name of '{base}'."
+                    ) from None
+                pr.base = base
+                pr.touch()
+            return {"clientMutationId": None}
+
+        def close_pr(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            if pr.state != OPEN:
+                raise ValueError("Pull request is closed")
+            pr.repo.close(pr)
+            return {"clientMutationId": None}
+
         def delete_ref(info: Any, input: dict[str, Any]) -> Any:
             for repo in self.repos.values():
                 for branch in repo.pushes:
@@ -993,6 +1022,8 @@ class FakeGitHub:
             "submitPullRequestReview": mutation(submit_review),
             "deletePullRequestReview": mutation(delete_review),
             "mergePullRequest": mutation(merge_pr),
+            "updatePullRequest": mutation(update_pr),
+            "closePullRequest": mutation(close_pr),
             "deleteRef": mutation(delete_ref),
         }
 

@@ -243,6 +243,23 @@ impl Repo {
         Ok(())
     }
 
+    /// Deletes the GitHub repository's `branches`, all or none of them.
+    pub fn delete_branches(&self, branches: &[String]) -> Result<()> {
+        if branches.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "push".to_owned(),
+            "--quiet".into(),
+            "--atomic".into(),
+            self.fetch_url(),
+        ];
+        args.extend(branches.iter().map(|b| format!(":refs/heads/{b}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.git(&args)?;
+        Ok(())
+    }
+
     /// The commit checked out in the clone.
     pub fn head(&self) -> Result<String> {
         Ok(self.git(&["rev-parse", "HEAD"])?.trim().to_owned())
