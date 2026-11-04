@@ -2260,6 +2260,42 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
+/// Where a session's own commits start in the worktree's history.
+enum Lower {
+    /// After the merge base of the target and HEAD.
+    MergeBase(String),
+    /// After the commit the session started from, which HEAD still
+    /// descends from.
+    Base,
+    /// After the target's tip, which HEAD is on top of but doesn't
+    /// descend from the base anymore, e.g. after a rebase onto a
+    /// force-pushed branch.
+    Target,
+    /// HEAD descends from neither.
+    Unrelated,
+}
+
+/// Where the session's own commits start: after the merge base when the
+/// target moved on and the worktree picked the move up, after the
+/// session's base while the worktree still builds on it, and after the
+/// target's tip when the worktree sits on it but no longer builds on the
+/// base. A history that fits none of these doesn't say which commits are
+/// the session's, so it isn't guessed.
+fn session_lower(repo: &Repo, base: &str, target: &str, head: &str) -> Lower {
+    if let Some(mb) = repo.merge_base(target, head)
+        && repo.is_ancestor(base, &mb)
+    {
+        return Lower::MergeBase(mb);
+    }
+    if repo.is_ancestor(base, head) {
+        return Lower::Base;
+    }
+    if repo.is_ancestor(target, head) {
+        return Lower::Target;
+    }
+    Lower::Unrelated
+}
+
 /// Rebases the worktree's commits onto the clone's checkout and
 /// fast-forwards the checkout to them.
 fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
@@ -2281,9 +2317,26 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
         if !repo.is_ancestor(&onto, &head) {
             // Only the session's own commits move: those after its base,
             // or after the checkout's history if it was merged in already.
-            let upstream = match repo.merge_base(&onto, &head) {
-                Some(mb) if repo.is_ancestor(base, &mb) => mb,
-                _ => base.clone(),
+            let upstream = match session_lower(repo, base, &onto, &head) {
+                Lower::MergeBase(mb) => mb,
+                // `Target` can't happen here: it means HEAD is on top of
+                // the checkout, which this block has ruled out.
+                Lower::Base | Lower::Target => base.clone(),
+                Lower::Unrelated => {
+                    return Ok(Step::Ask {
+                        reason: format!(
+                            "the commits don't build on the checkout at {} or on the session's \
+                             base",
+                            short(&onto)
+                        ),
+                        prompt: format!(
+                            "Wrap up: rebase your commits onto {onto} with `git rebase --onto \
+                             {onto} {base}`, resolve the conflicts, and check that the result \
+                             still builds and passes the relevant tests. Finish the rebase and \
+                             leave nothing uncommitted."
+                        ),
+                    });
+                }
             };
             if !repo.worktree_rebase(worktree, &onto, &upstream)? {
                 return Ok(Step::Ask {
@@ -2384,13 +2437,64 @@ fn push_stack(
         lower = tip.clone();
         rebased = Some(tip.clone());
     }
-    let from = match repo.merge_base(&target, &head) {
-        Some(mb) if repo.is_ancestor(&session.base_sha, &mb) => mb,
-        _ => lower,
+    // The base is ahead of the target when it moved to commits that were
+    // never pushed, e.g. by landing on the checkout, so the commits after
+    // it are still the session's own. A base that doesn't build on the
+    // target means the branch moved under the session, e.g. it was
+    // force-pushed: pushing to it would show the stale history's commits
+    // in the PR, so the agent rebases onto the new tip first.
+    let from = match session_lower(repo, &lower, &target, &head) {
+        Lower::MergeBase(mb) => mb,
+        Lower::Base if repo.is_ancestor(&target, &lower) => lower.clone(),
+        Lower::Target => {
+            rebased = Some(target.clone());
+            target.clone()
+        }
+        Lower::Base | Lower::Unrelated => {
+            return Ok(Step::Ask {
+                reason: format!(
+                    "the commits don't build on {trunk}'s tip {}",
+                    short(&target)
+                ),
+                prompt: format!(
+                    "Wrap up: rebase your commits onto {target} with `git rebase --onto {target} \
+                     {lower}`, resolve the conflicts, and check that the result still builds and \
+                     passes the relevant tests. Finish the rebase and leave nothing uncommitted."
+                ),
+            });
+        }
     };
     let commits = repo.commits(&from, &head)?;
     if commits.is_empty() {
         bail!("there are no commits to push");
+    }
+    // A commit the target already has a patch-equivalent of isn't
+    // pushed: its PR would be empty. A plain rebase against the target
+    // drops it, so the agent runs one.
+    let applied = repo.applied_upstream(&target, &head, &from)?;
+    if !applied.is_empty() {
+        let applied: std::collections::BTreeSet<&String> = applied.iter().collect();
+        let list = commits
+            .iter()
+            .filter(|(sha, _)| applied.contains(sha))
+            .map(|(sha, message)| {
+                format!(
+                    "{} {}",
+                    short(sha),
+                    message.lines().next().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(Step::Ask {
+            reason: format!("{} of the commits are already on {trunk}", applied.len()),
+            prompt: format!(
+                "Wrap up: these commits are already on {trunk}: {list}. Rebase onto it with `git \
+                 rebase {target}`, which drops them, resolve any conflicts, and check that the \
+                 result still builds and passes the relevant tests. Finish the rebase and leave \
+                 nothing uncommitted."
+            ),
+        });
     }
     let (planned, dropped) = plan_prs(
         &session.branch,
@@ -3922,6 +4026,86 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         session
     }
 
+    /// Records an open PR whose upstream head branch is at `head`, with
+    /// the head fetched into the clone as a sync would have it.
+    fn store_pr(
+        state: &Arc<State>,
+        fx: &crate::git::tests::Fixture,
+        number: u64,
+        branch: &str,
+        head: &str,
+    ) {
+        use grenadine_core::api::{Version, VersionKind};
+        crate::git::tests::run(
+            &fx.clone.path,
+            &[
+                "fetch",
+                "--quiet",
+                "https://github.com/owner/name.git",
+                branch,
+            ],
+        );
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: PrKey {
+                        repo: fx.clone.slug.clone(),
+                        number,
+                    },
+                    title: "t".into(),
+                    body: String::new(),
+                    author: "me".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "main".into(),
+                    head_ref: branch.into(),
+                    head_oid: head.into(),
+                    ci: None,
+                    review: None,
+                    review_error: None,
+                },
+                &[Version {
+                    number: 1,
+                    sha: head.into(),
+                    merge_base: None,
+                    kind: VersionKind::Initial,
+                    pushed_at: None,
+                    pushed_by: None,
+                    pushed_by_is_guess: false,
+                    missing: false,
+                }],
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Starts a session from PR `number`'s head and waits for its turn.
+    async fn start_from_pr(state: &Arc<State>, prompt: &str, number: u64) -> AgentSession {
+        let session = create(
+            state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: Some(number),
+                prompt: prompt.into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(state, &session.id, 1).await;
+        session
+    }
+
     /// Wraps up the session and returns how it ended.
     async fn wrap(state: &Arc<State>, id: &str, target: WrapUpTarget) -> AgentEventKind {
         let req = WrapUp {
@@ -4347,6 +4531,284 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             .await
             .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}-2", session.branch)
+                ],
+            ),
+            ""
+        );
+    }
+
+    /// A session started from a PR whose branch was force-pushed pushes
+    /// only its own commits once its worktree sits on the branch's new
+    /// tip, and the session's base moves to it.
+    #[tokio::test]
+    async fn update_prs_after_the_pr_branch_was_force_pushed() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+
+        // The PR's branch, then the session started from its head.
+        run(&fx.upstream, &["checkout", "-qb", "pr-branch"]);
+        let old = commit(&fx.upstream, "p", "1\n");
+        store_pr(&state, &fx, 5, "pr-branch", &old);
+        let session = start_from_pr(&state, "commit w agent", 5).await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        assert_eq!(session.base_sha, old);
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+
+        // The PR's branch is force-pushed a rewritten commit, and the
+        // worktree is rebased onto it.
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+        run(&fx.upstream, &["branch", "-f", "pr-branch", "main"]);
+        run(&fx.upstream, &["checkout", "-q", "pr-branch"]);
+        let new = commit(&fx.upstream, "p2", "2\n");
+        run(
+            worktree,
+            &[
+                "fetch",
+                "--quiet",
+                "https://github.com/owner/name.git",
+                "pr-branch",
+            ],
+        );
+        run(
+            worktree,
+            &["rebase", "--quiet", "--onto", "FETCH_HEAD", &old],
+        );
+
+        let (landed, _) = land_now(&state, id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap();
+        assert_eq!(landed, pr);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+        assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}-2", session.branch)
+                ],
+            ),
+            ""
+        );
+        assert_eq!(state.db.agent(id).unwrap().unwrap().base_sha, new);
+    }
+
+    /// A session still on the PR branch's old head after a force-push is
+    /// told to rebase onto the new tip, and nothing is pushed.
+    #[tokio::test]
+    async fn update_prs_asks_for_a_rebase_onto_a_force_pushed_pr_branch() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+
+        run(&fx.upstream, &["checkout", "-qb", "pr-branch"]);
+        let old = commit(&fx.upstream, "p", "1\n");
+        store_pr(&state, &fx, 5, "pr-branch", &old);
+        let session = start_from_pr(&state, "commit w agent", 5).await;
+        let id = &session.id;
+
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+        run(&fx.upstream, &["branch", "-f", "pr-branch", "main"]);
+        run(&fx.upstream, &["checkout", "-q", "pr-branch"]);
+        commit(&fx.upstream, "p2", "2\n");
+
+        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("git rebase --onto"), "{text}");
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}", session.branch)
+                ],
+            ),
+            ""
+        );
+        assert_eq!(state.db.agent(id).unwrap().unwrap().base_sha, old);
+    }
+
+    /// A commit the target already has a patch-equivalent of is called
+    /// out for the agent to rebase away instead of being pushed.
+    #[tokio::test]
+    async fn update_prs_asks_to_rebase_away_a_commit_already_on_the_target() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit w agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+
+        // The default branch gains a commit the worktree then picks up
+        // as a different sha.
+        let merged = commit(&fx.upstream, "m", "1\n");
+        run(
+            worktree,
+            &[
+                "fetch",
+                "--quiet",
+                "https://github.com/owner/name.git",
+                "main",
+            ],
+        );
+        run(worktree, &["cherry-pick", &merged]);
+        let picked = run(worktree, &["rev-parse", "HEAD"]);
+
+        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("already on main"), "{text}");
+        assert!(text.contains(&picked[..12]), "{text}");
+        assert!(text.contains("git rebase"), "{text}");
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}", session.branch)
+                ],
+            ),
+            ""
+        );
+    }
+
+    /// A checkout and a worktree that share no history with each other or
+    /// with the session's base can't say which commits are the session's,
+    /// so the agent is asked to rebase.
+    #[tokio::test]
+    async fn land_on_checkout_asks_when_histories_are_unrelated() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit w agent").await;
+        let worktree = Path::new(&session.worktree);
+
+        // The checkout moves to a root commit, and the worktree resets
+        // to another.
+        run(&clone, &["checkout", "--orphan", "unrelated"]);
+        run(&clone, &["commit", "-qm", "unrelated"]);
+        let onto = run(&clone, &["rev-parse", "HEAD"]);
+        run(worktree, &["checkout", "--orphan", "other"]);
+        run(worktree, &["commit", "-qm", "other"]);
+
+        let err = land_now(&state, &session.id, WrapUpTarget::Checkout, None)
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("don't build on the checkout"), "{text}");
+        assert!(text.contains("git rebase --onto"), "{text}");
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), onto);
+    }
+
+    /// A checkout behind the trunk with a commit of its own takes the
+    /// session's commits rebased onto it: the worktree still builds on
+    /// the session's base, so they start after it.
+    #[tokio::test]
+    async fn lands_on_a_checkout_behind_the_trunk() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        // The trunk moves on before the session starts, so the clone's
+        // checkout is behind it.
+        commit(&fx.upstream, "x", "1\n");
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit w agent").await;
+        commit(&clone, "l", "local\n");
+
+        let (Landed::Checkout { sha }, _) =
+            land_now(&state, &session.id, WrapUpTarget::Checkout, None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a checkout landing");
+        };
+        let worktree = Path::new(&session.worktree);
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(run(worktree, &["rev-parse", "HEAD"]), sha);
+        // The checkout's own commit is the landed head's parent, so only
+        // the session's commit was rebased onto it.
+        assert_eq!(run(&clone, &["log", "--format=%s", "-2"]), "Change w\nl");
+    }
+
+    /// Commits landed on the checkout aren't pushed again: the session's
+    /// base moved to them, so a follow-up lands in the PR alone.
+    #[tokio::test]
+    async fn update_prs_after_landing_on_the_checkout() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )
+        };
+
+        // The first commit lands on the checkout.
+        let (Landed::Checkout { sha }, _) = land_now(&state, id, WrapUpTarget::Checkout, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a checkout landing");
+        };
+        assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(state.db.agent(id).unwrap().unwrap().base_sha, sha);
+
+        // A follow-up commit goes to the session's branch on its own.
+        send(
+            &state,
+            id,
+            "commit c more".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, id, 2).await;
+
+        // The test state's GitHub is unreachable, so only the push works.
+        land_now(&state, id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap_err();
+        assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{}~1", session.branch)],
+            ),
+            sha
+        );
         assert_eq!(
             run(
                 &fx.upstream,
