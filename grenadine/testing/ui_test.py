@@ -2302,6 +2302,51 @@ class AgentTest(ServerTestCase):
             repo.commit("Seed", {"README": "hello\n"})
             repo.push("main")
 
+    def setUp(self) -> None:
+        super().setUp()
+        # Tests share the class's server, and which tests share one
+        # changes with the shard layout, so each test leaves it as it
+        # found it: sessions started by the test are deleted and
+        # repository settings restored.
+        with urllib.request.urlopen(f"{self.url}api/agents") as resp:
+            sessions = {a["id"] for a in json.load(resp)}
+        settings = {}
+        for slug in self.REPOS:
+            with urllib.request.urlopen(f"{self.url}api/repos/{slug}/settings") as resp:
+                settings[slug] = resp.read()
+
+        def restore() -> None:
+            origin = {"Origin": self.url.rstrip("/")}
+            with urllib.request.urlopen(f"{self.url}api/agents") as resp:
+                for a in json.load(resp):
+                    if a["id"] in sessions:
+                        continue
+                    req = urllib.request.Request(
+                        f"{self.url}api/agents/{a['id']}",
+                        method="DELETE",
+                        headers=origin,
+                    )
+                    try:
+                        urllib.request.urlopen(req).close()
+                    except urllib.error.HTTPError as e:
+                        if e.code != 404:
+                            raise
+            for slug, saved in settings.items():
+                with urllib.request.urlopen(
+                    f"{self.url}api/repos/{slug}/settings"
+                ) as resp:
+                    if resp.read() == saved:
+                        continue
+                req = urllib.request.Request(
+                    f"{self.url}api/repos/{slug}/settings",
+                    data=saved,
+                    method="PUT",
+                    headers={**origin, "Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req).close()
+
+        self.addCleanup(restore)
+
     def section(self, repo: str) -> Locator:
         return self.page.locator(".agent-repo").filter(
             has=self.page.locator(".agent-repo-name span", has_text=exactly(repo))
@@ -2445,13 +2490,13 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
         return self.page.locator(".transcript")
 
-    def delete_session(self, title: str, repo: str = "General") -> None:
+    def delete_session(self) -> None:
+        # The summary can relabel the session before the delete lands, so
+        # the wait is for its link to be gone, not for its title.
+        id = self.page.url.split("/")[-1]
         self.page.once("dialog", lambda dialog: dialog.accept())
         self.page.get_by_role("button", name="Delete", exact=True).click()
-        # Deleting scans the worktree for leftovers, which may leave a
-        # cleanup entry; the session's own entry is gone.
-        sessions = self.section(repo).locator(".agent-entry")
-        expect(sessions.filter(has_text=title)).to_have_count(0)
+        expect(self.page.locator(f'.agent-item[href="#/agents/{id}"]')).to_have_count(0)
 
     def test_backends_keep_their_own_models(self) -> None:
         self.page.goto(self.url + "#/agents")
@@ -2514,7 +2559,7 @@ class AgentTest(ServerTestCase):
         # Devin wrote the summary that labels the session.
         sessions = self.section("General").locator(".agent-entry")
         expect(sessions.filter(has_text="A Devin task")).to_have_count(1)
-        self.delete_session("A Devin task")
+        self.delete_session()
 
     def test_composer_wraps_long_model_names(self) -> None:
         # Long model names make the composer's button row wrap onto a
@@ -2560,7 +2605,7 @@ class AgentTest(ServerTestCase):
         send_box = self.page.get_by_role("button", name="Send").bounding_box()
         assert send_box
         self.assertGreater(meter_box["y"], send_box["y"] + send_box["height"])
-        self.delete_session("A Devin task")
+        self.delete_session()
 
     def test_agent_footer_flush_with_bottom_when_scrolled_down(self) -> None:
         # The sticky footer ends the transcript; scrolled to the bottom
@@ -2590,7 +2635,7 @@ class AgentTest(ServerTestCase):
             main_box["y"] + main_box["height"],
             delta=1,
         )
-        self.delete_session("long transcript 10", repo=scenarios.REPO)
+        self.delete_session()
 
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")
@@ -2602,7 +2647,7 @@ class AgentTest(ServerTestCase):
         self.devin_saw('"action":"accept"')
         self.devin_saw('"q0":"Tea"')
         expect(transcript.locator(".turn-end")).to_have_count(1)
-        self.delete_session("ask me a question")
+        self.delete_session()
 
     def test_devin_question_answers_on_enter(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question by enter")
@@ -2620,7 +2665,7 @@ class AgentTest(ServerTestCase):
         self.devin_saw('"q0":"Water"')
         expect(question).to_contain_text("Answered")
         expect(transcript.locator(".turn-end")).to_have_count(1)
-        self.delete_session("ask me a question by enter")
+        self.delete_session()
 
     def test_devin_multi_select(self) -> None:
         transcript = self.start_devin_session("Code", "ask me several drinks")
@@ -2635,7 +2680,7 @@ class AgentTest(ServerTestCase):
         self.devin_saw('"action":"accept"')
         self.devin_saw('"q0":["Tea","Coffee"]')
         expect(transcript.locator(".turn-end")).to_have_count(1)
-        self.delete_session("ask me several drinks")
+        self.delete_session()
 
     def test_devin_plan(self) -> None:
         transcript = self.start_devin_session("Plan first", "make a plan")
@@ -2670,7 +2715,7 @@ class AgentTest(ServerTestCase):
         # transcript already has.
         self.devin_saw('"method":"session/load"')
         expect(transcript).not_to_contain_text("Replayed.")
-        self.delete_session("make a plan")
+        self.delete_session()
 
     def test_general_session(self) -> None:
         self.page.set_viewport_size({"width": 1800, "height": 900})
@@ -2903,7 +2948,7 @@ class AgentTest(ServerTestCase):
         # Replayed from the stored transcript after a reload.
         self.page.reload()
         check()
-        self.delete_session(f"long transcript {count}", repo=scenarios.REPO)
+        self.delete_session()
 
     def test_activity_bar(self) -> None:
         # The activity bar waits with the agent for the approval and goes
@@ -4311,7 +4356,7 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_title("grenadine")
 
         # Deleting it clears the count.
-        self.delete_session("sleep 5")
+        self.delete_session()
         expect_tab_count(count, base)
 
 
