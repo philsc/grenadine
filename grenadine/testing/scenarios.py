@@ -368,6 +368,8 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     )
     repo.close(pr)
     pr = add(_simple_pr(repo, "merged", "Get merged"), [MERGED_BY_ME])
+    pr.submit_review(OTHER, APPROVED)
+    pr.check_runs = [CheckRun("test")]
     repo.merge(pr)
     pr = add(
         _simple_pr(repo, "merged-others", "Land the other's PR", author=OTHER),

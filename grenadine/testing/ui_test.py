@@ -1016,14 +1016,34 @@ class InboxTest(ServerTestCase):
         expect(description.locator("li code")).to_have_text("inline code")
         expect(description.locator("pre")).to_contain_text("fn main() {}")
 
+    def sidebar(self) -> Locator:
+        return self.page.locator(".pr-sidebar")
+
+    def check_group(self, label: str) -> Locator:
+        return self.page.locator(".check-group").filter(
+            has=self.page.locator(".check-group-header", has_text=label)
+        )
+
     def test_pr_page_shows_reviews_and_the_conversation(self) -> None:
         pr = self.cases.prs["Get changes requested"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
 
-        summary = self.page.locator(".pr-header .review-summary")
-        expect(summary.locator(".review-decision")).to_have_text("Changes requested")
-        expect(summary.locator(".review-state.changes")).to_have_text("Other Person")
-        expect(summary.locator(".muted")).to_have_text("Waiting on third")
+        sidebar = self.sidebar()
+        expect(sidebar.locator(".sidebar-review .review-decision")).to_have_text(
+            "Changes requested"
+        )
+        rows = sidebar.locator(".reviewers > span")
+        expect(rows).to_have_count(6)
+        expect(sidebar.locator(".reviewer-name")).to_have_text(
+            ["Other Person", "third"]
+        )
+        expect(sidebar.locator(".review-state")).to_have_text(
+            ["Changes requested", "Pending"]
+        )
+        # The header doesn't summarize the review anymore.
+        expect(self.page.locator(".pr-header .review-decision")).to_have_count(0)
+        expect(self.page.locator(".pr-header .review-summary")).to_have_count(0)
 
         conversation = self.page.locator("details.conversation")
         expect(conversation.locator("summary")).to_have_text("2 comments")
@@ -1043,37 +1063,52 @@ class InboxTest(ServerTestCase):
 
     def test_pr_page_shows_checks(self) -> None:
         pr = self.cases.prs["Ask my team for a review"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
 
-        checks = self.page.locator(".merge-box details.checks")
-        expect(checks.locator("summary")).to_have_text(
-            "Checks: 1 failing, 1 passing, 1 skipped"
+        # Failing checks show unfolded, the others folded.
+        failing = self.check_group("Failing (1)")
+        expect(failing.locator(".check-group-header")).to_have_attribute(
+            "aria-expanded", "true"
         )
-        # Failing checks show unfolded.
-        expect(checks).to_have_attribute("open", "")
-        expect(checks.locator(".check")).to_have_text(["lint", "test", "docs"])
-        expect(checks.locator(".check").nth(1).locator(".ci")).to_have_class(
-            re.compile(r"\bfailing\b")
+        expect(failing.locator(".check")).to_have_text(["test"])
+        expect(failing.locator(".check .ci")).to_have_class(re.compile(r"\bfailing\b"))
+        passed = self.check_group("Passed (1)")
+        expect(passed.locator(".check-group-header")).to_have_attribute(
+            "aria-expanded", "false"
         )
-        expect(checks.locator(".check a").nth(0)).to_have_attribute(
+        expect(passed.locator(".check")).to_have_count(0)
+        skipped = self.check_group("Skipped (1)")
+        expect(skipped.locator(".check-group-header")).to_have_attribute(
+            "aria-expanded", "false"
+        )
+        # Expanding a group shows its check.
+        passed.locator(".check-group-header").click()
+        expect(passed.locator(".check")).to_have_text(["lint"])
+        expect(passed.locator(".check a")).to_have_attribute(
             "href", f"{pr.url}/checks?name=lint"
         )
+
         expect(self.page.locator(".merge-status")).to_have_text(
             "Can be merged, but not every check passed."
         )
-        # Without reviews or comments, the conversation is empty.
+        expect(self.page.locator(".merge-box .checks")).to_have_count(0)
+        # Other tests may have commented on this PR meanwhile.
+        n = len(pr.issue_comments)
         expect(self.page.locator("details.conversation summary")).to_have_text(
-            "No comments"
+            f"{n} comment" + ("" if n == 1 else "s")
         )
-        # The request went to a team.
-        expect(self.page.locator(".pr-header .review-summary .muted")).to_have_text(
-            f"Waiting on {TEAM}"
-        )
+        # The request went to a team, marked with the team icon.
+        team = self.sidebar().locator(".reviewers > span.reviewer-icon")
+        expect(team.locator(".team-icon")).to_have_count(1)
+        expect(self.sidebar().locator(".reviewer-name")).to_have_text([TEAM])
+        expect(self.sidebar().locator(".review-state")).to_have_text(["Pending"])
 
     def test_pr_page_of_a_blocked_pr(self) -> None:
         pr = self.cases.prs["Ask me for a review"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
-        expect(self.page.locator(".pr-header .review-decision")).to_have_text(
+        expect(self.page.locator(".pr-sidebar .review-decision")).to_have_text(
             "Review required"
         )
         status = self.page.locator(".merge-box .merge-status")
@@ -1089,9 +1124,82 @@ class InboxTest(ServerTestCase):
 
     def test_pr_page_of_a_merged_pr_has_no_merge_box(self) -> None:
         pr = self.cases.prs["Get merged"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
         expect(self.page.locator(".pr-header .state")).to_have_text("merged")
         expect(self.page.locator(".merge-box")).to_have_count(0)
+        # The sidebar still shows the review and the checks.
+        expect(self.sidebar().locator(".review-decision")).to_have_text("Approved")
+        expect(self.sidebar().locator(".reviewer-name")).to_have_text(["Other Person"])
+        expect(self.check_group("Passed (1)").locator(".check")).to_have_count(0)
+        self.check_group("Passed (1)").locator(".check-group-header").click()
+        expect(self.check_group("Passed (1)").locator(".check")).to_have_text(["test"])
+
+    def test_pr_sidebar_collapses_and_stays_collapsed(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        toggle = self.page.locator(".sidebar-toggle")
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        toggle.click()
+        expect(self.sidebar()).to_have_count(0)
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        self.page.reload()
+        expect(self.sidebar()).to_have_count(0)
+        self.page.locator(".sidebar-toggle").click()
+        expect(self.sidebar()).to_have_count(1)
+
+    def test_pr_sidebar_overlays_on_narrow_windows(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.set_viewport_size({"width": 1280, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        toggle = self.page.locator(".sidebar-toggle")
+        expect(self.sidebar()).to_have_count(0)
+        toggle.click()
+        expect(self.sidebar()).to_have_count(1)
+        expect(self.sidebar()).to_have_class(re.compile(r"\boverlay\b"))
+
+        # Escape closes the overlay.
+        self.page.keyboard.press("Escape")
+        expect(self.sidebar()).to_have_count(0)
+
+        # So does a click outside it, but not one inside.
+        toggle.click()
+        expect(self.sidebar()).to_have_count(1)
+        self.sidebar().locator(".reviewers").click()
+        expect(self.sidebar()).to_have_count(1)
+        self.page.locator(".pr-header h1").click()
+        expect(self.sidebar()).to_have_count(0)
+
+        # A wide window shows the column again, and forgets the overlay.
+        toggle.click()
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        expect(self.sidebar()).to_have_count(1)
+        expect(self.sidebar()).not_to_have_class(re.compile(r"\boverlay\b"))
+
+    def test_check_group_folds_survive_a_sync(self) -> None:
+        pr = self.cases.prs["Ask my team for a review"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        passed = self.check_group("Passed (1)")
+        passed.locator(".check-group-header").click()
+        expect(passed.locator(".check")).to_have_text(["lint"])
+
+        # A comment from outside the page resyncs the PR.
+        resp = self.page.request.post(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
+            headers={"Origin": self.url.rstrip("/")},
+            data={"body": "Ping"},
+        )
+        self.assertEqual(resp.status, 204, resp.text())
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            "1 comment"
+        )
+        expect(self.check_group("Passed (1)").locator(".check")).to_have_text(["lint"])
 
     def test_pr_page_of_a_draft(self) -> None:
         pr = self.cases.prs["Stay a draft"]
@@ -1280,6 +1388,7 @@ class ReviewTest(ServerTestCase):
 
     def test_review_lines_then_request_changes(self) -> None:
         pr = self.prs[scenarios.LINE_REVIEW]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.open(scenarios.LINE_REVIEW)
         self.comment_on_line(4, "Typo here.")
         thread = self.file().locator(
@@ -1319,8 +1428,9 @@ class ReviewTest(ServerTestCase):
         panel.get_by_role("textbox", name="Review summary").fill("A few things.")
         submit.click()
 
-        header = self.page.locator(".pr-header .review-summary")
-        expect(header.locator(".review-decision")).to_have_text("Changes requested")
+        expect(self.page.locator(".pr-sidebar .review-decision")).to_have_text(
+            "Changes requested"
+        )
         expect(self.page.locator(".pending-badge")).to_have_count(0)
         expect(self.page.locator(".review-panel .pending-count")).to_have_count(0)
         self.assertIsNone(pr.pending)
@@ -1331,15 +1441,16 @@ class ReviewTest(ServerTestCase):
         self.assertEqual(pr.reviews[-1].body, "A few things.")
 
     def test_approve_without_comments(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
         self.open(scenarios.APPROVE)
         panel = self.review_panel()
         # A comment review needs a summary or comments.
         expect(panel.get_by_role("button", name="Submit review")).to_be_disabled()
         panel.get_by_label("Approve").check()
         panel.get_by_role("button", name="Submit review").click()
-        expect(
-            self.page.locator(".pr-header .review-summary .review-decision")
-        ).to_have_text("Approved")
+        expect(self.page.locator(".pr-sidebar .review-decision")).to_have_text(
+            "Approved"
+        )
         expect(self.page.locator("details.conversation .comment-meta")).to_contain_text(
             "approved"
         )

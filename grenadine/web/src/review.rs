@@ -1,8 +1,12 @@
 //! A PR's reviews, its conversation and whether it can be merged.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeMethod, MergeRequest, MergeState, PrKey, Review,
-    ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, SubmitReview, submit_blocker,
+    Check, CiStatus, IssueComment, MergeMethod, MergeRequest, MergeState, Person, PrDetail, PrKey,
+    RequestedReviewer, Review, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, SubmitReview,
+    submit_blocker,
 };
 use leptos::prelude::*;
 
@@ -90,23 +94,6 @@ pub fn merge_status(info: &ReviewInfo, unresolved: usize) -> (&'static str, Stri
     }
 }
 
-/// How many checks failed, are running and passed, e.g. "1 failing, 2
-/// passing".
-pub fn check_counts(checks: &[Check]) -> String {
-    let count = |s: Option<CiStatus>| checks.iter().filter(|c| c.status == s).count();
-    [
-        (count(Some(CiStatus::Failing)), "failing"),
-        (count(Some(CiStatus::Running)), "running"),
-        (count(Some(CiStatus::Passing)), "passing"),
-        (count(None), "skipped"),
-    ]
-    .into_iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, what)| format!("{n} {what}"))
-    .collect::<Vec<_>>()
-    .join(", ")
-}
-
 fn verb(state: ReviewState) -> &'static str {
     match state {
         ReviewState::Approved => "approved",
@@ -124,31 +111,294 @@ fn state_class(state: ReviewState) -> &'static str {
     }
 }
 
-/// The review decision and each reviewer's verdict, for the PR header.
-pub fn review_summary(info: &ReviewInfo, author: &str) -> impl IntoView + use<> {
+/// One row of the sidebar's reviewer list.
+enum Reviewer<'a> {
+    /// Reviewed; the verdict is their latest review's state.
+    Reviewed(&'a Review),
+    /// Asked to review; the verdict is "Pending".
+    Requested(&'a RequestedReviewer),
+}
+
+/// The sidebar's reviewers: everyone who reviewed, in first-review
+/// order, then everyone asked who hasn't. A person asked again after
+/// reviewing shows once, as pending, since a new verdict is awaited.
+fn reviewers<'a>(info: &'a ReviewInfo, author: &str) -> Vec<Reviewer<'a>> {
+    let mut out: Vec<Reviewer> = latest_reviews(&info.reviews, author)
+        .into_iter()
+        .map(Reviewer::Reviewed)
+        .collect();
+    for r in &info.requested {
+        if let RequestedReviewer::Person(p) = r
+            && let Some(login) = p.login.as_deref()
+            && let Some(i) = out.iter().position(
+                |o| matches!(o, Reviewer::Reviewed(v) if v.author.login.as_deref() == Some(login)),
+            )
+        {
+            out.remove(i);
+        }
+        out.push(Reviewer::Requested(r));
+    }
+    out
+}
+
+/// The verdict a review state shows in the sidebar.
+fn verdict(state: ReviewState) -> &'static str {
+    match state {
+        ReviewState::Approved => "Approved",
+        ReviewState::ChangesRequested => "Changes requested",
+        ReviewState::Commented => "Commented",
+        ReviewState::Dismissed => "Dismissed",
+    }
+}
+
+/// One of the groups the sidebar sorts the checks into, in show order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckGroup {
+    Failing,
+    Running,
+    Passed,
+    Skipped,
+}
+
+impl CheckGroup {
+    fn of(status: Option<CiStatus>) -> CheckGroup {
+        match status {
+            Some(CiStatus::Failing) => CheckGroup::Failing,
+            Some(CiStatus::Running) => CheckGroup::Running,
+            Some(CiStatus::Passing) => CheckGroup::Passed,
+            None => CheckGroup::Skipped,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            CheckGroup::Failing => "Failing",
+            CheckGroup::Running => "Running",
+            CheckGroup::Passed => "Passed",
+            CheckGroup::Skipped => "Skipped",
+        }
+    }
+
+    /// The icon the group's header shows, if the status has one.
+    fn icon(self) -> Option<CiStatus> {
+        match self {
+            CheckGroup::Failing => Some(CiStatus::Failing),
+            CheckGroup::Running => Some(CiStatus::Running),
+            CheckGroup::Passed => Some(CiStatus::Passing),
+            CheckGroup::Skipped => None,
+        }
+    }
+
+    /// Whether the group starts expanded: failing and running checks
+    /// are what needs attention.
+    fn expanded(self) -> bool {
+        matches!(self, CheckGroup::Failing | CheckGroup::Running)
+    }
+}
+
+/// The checks split into their groups, in group order, each sorted by
+/// name. Empty groups are left out.
+fn check_groups(checks: &[Check]) -> Vec<(CheckGroup, Vec<Check>)> {
+    [
+        CheckGroup::Failing,
+        CheckGroup::Running,
+        CheckGroup::Passed,
+        CheckGroup::Skipped,
+    ]
+    .into_iter()
+    .filter_map(|g| {
+        let mut group: Vec<Check> = checks
+            .iter()
+            .filter(|c| CheckGroup::of(c.status) == g)
+            .cloned()
+            .collect();
+        group.sort_by_key(|c| c.name.to_lowercase());
+        (!group.is_empty()).then_some((g, group))
+    })
+    .collect()
+}
+
+/// The check groups the user expanded or collapsed, keyed by group.
+/// Groups not in here use their default. Provided in `PrView` so it
+/// survives the rebuilds a sync causes.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckFolds(pub RwSignal<HashMap<CheckGroup, bool>>);
+
+fn avatar(person: &Person) -> AnyView {
+    match &person.avatar_url {
+        Some(url) => view! { <img class="avatar" src=url.clone() alt="" /> }.into_any(),
+        None => view! { <span class="avatar avatar-generic"></span> }.into_any(),
+    }
+}
+
+/// The icon that marks a team in the reviewer list.
+#[component]
+fn TeamIcon() -> impl IntoView {
+    view! {
+        <span class="team-icon" title="Team">
+            <svg
+                viewBox="0 0 16 16"
+                width="14"
+                height="14"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                <path d="M5.5 3.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM1.5 13.5v-.5c0-2 1.8-3.5 4-3.5s4 1.5 4 3.5v.5M11 3.7a2 2 0 1 1 0 3.8M14.5 13.5v-.5c0-1.8-1.4-3.2-3.3-3.5" />
+            </svg>
+        </span>
+    }
+}
+
+/// One reviewer row's three grid cells: the icon (avatar, team icon or
+/// nothing), the name and the verdict.
+fn reviewer_row(reviewer: &Reviewer) -> impl IntoView + use<> {
+    let (icon, name, text, class) = match reviewer {
+        Reviewer::Reviewed(r) => (
+            avatar(&r.author),
+            r.author.name.clone().or_else(|| r.author.login.clone()),
+            verdict(r.state),
+            state_class(r.state),
+        ),
+        Reviewer::Requested(RequestedReviewer::Person(p)) => (
+            avatar(p),
+            p.name.clone().or_else(|| p.login.clone()),
+            "Pending",
+            "review-state pending",
+        ),
+        Reviewer::Requested(RequestedReviewer::Team(name)) => (
+            view! { <TeamIcon /> }.into_any(),
+            Some(name.clone()),
+            "Pending",
+            "review-state pending",
+        ),
+        Reviewer::Requested(RequestedReviewer::Legacy(name)) => (
+            view! { <span></span> }.into_any(),
+            Some(name.clone()),
+            "Pending",
+            "review-state pending",
+        ),
+    };
+    view! {
+        <span class="reviewer-icon">{icon}</span>
+        <span class="reviewer-name">{name.unwrap_or_default()}</span>
+        <span class=class>{text}</span>
+    }
+}
+
+/// The review decision and the reviewers, the sidebar's top section.
+fn sidebar_review(info: &ReviewInfo, author: &str) -> impl IntoView + use<> {
     // A decision grenadine doesn't know says nothing useful.
     let decision = info
         .decision
         .filter(|d| *d != ReviewDecision::Unknown)
-        .map(|d| view! { <span class=format!("review-decision {}", d.class())>{d.label()}</span> });
-    let reviewers = latest_reviews(&info.reviews, author)
+        .map(|d| view! { <p class=format!("review-decision {}", d.class())>{d.label()}</p> });
+    let rows = reviewers(info, author);
+    let list = if rows.is_empty() {
+        view! { <p class="muted">"No reviewers"</p> }.into_any()
+    } else {
+        view! {
+            <div class="reviewers">
+                {rows.iter().map(reviewer_row).collect_view()}
+            </div>
+        }
+        .into_any()
+    };
+    view! {
+        <section class="sidebar-review">
+            {decision}
+            {list}
+        </section>
+    }
+}
+
+/// The checks on the PR's head, grouped by state. Each group's header
+/// collapses or expands it; what the user changed lives in `CheckFolds`.
+fn sidebar_checks(info: &ReviewInfo) -> AnyView {
+    let CheckFolds(folds) = expect_context::<CheckFolds>();
+    if info.checks.is_empty() {
+        return view! {
+            <section class="sidebar-checks">
+                <h2>"Checks"</h2>
+                <p class="muted">"No checks"</p>
+            </section>
+        }
+        .into_any();
+    }
+    let groups = check_groups(&info.checks)
         .into_iter()
-        .map(|r| {
+        .map(|(group, checks)| {
+            let open = move || {
+                folds.with(|f| {
+                    f.get(&group).copied().unwrap_or_else(|| group.expanded())
+                })
+            };
+            let count = checks.len();
+            let row = |c: &Check| {
+                let icon = c.status.map(|ci| view! { <CiIcon ci=ci /> });
+                let name = match &c.url {
+                    Some(url) => view! { <a href=url.clone() target="_blank" rel="noopener">{c.name.clone()}</a> }.into_any(),
+                    None => view! { <span>{c.name.clone()}</span> }.into_any(),
+                };
+                view! { <li class="check">{icon}{name}</li> }
+            };
             view! {
-                <span class=state_class(r.state) title=verb(r.state)>
-                    <PersonChip person=r.author.clone() guess=false />
-                </span>
+                <div class="check-group">
+                    <button type="button" class="check-group-header"
+                        aria-expanded=move || open().to_string()
+                        on:click=move |_| folds.update(|f| {
+                            let open = f.entry(group).or_insert_with(|| group.expanded());
+                            *open = !*open;
+                        })>
+                        {group.icon().map(|ci| view! { <CiIcon ci=ci /> })}
+                        {format!("{} ({count})", group.label())}
+                    </button>
+                    {move || open().then(|| view! {
+                        <ul class="check-list">
+                            {checks.iter().map(&row).collect_view()}
+                        </ul>
+                    })}
+                </div>
             }
         })
         .collect_view();
-    let requested = (!info.requested.is_empty())
-        .then(|| view! { <span class="muted">{format!("Waiting on {}", info.requested.join(", "))}</span> });
     view! {
-        <p class="review-summary">
-            {decision}
-            {reviewers}
-            {requested}
-        </p>
+        <section class="sidebar-checks">
+            <h2>"Checks"</h2>
+            <div class="check-groups">{groups}</div>
+        </section>
+    }
+    .into_any()
+}
+
+/// The PR page's right sidebar: the review decision, the reviewers and
+/// the checks, for open, closed and merged PRs alike. `overlay` floats
+/// it over the content on windows too narrow for a column. The sidebar
+/// toggle is passed as a child so it sits in the header row.
+#[component]
+pub fn PrSidebar(
+    pr: Arc<PrDetail>,
+    #[prop(into)] overlay: Signal<bool>,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <aside class="pr-sidebar" class:overlay=move || overlay.get()>
+            <div class="sidebar-head">
+                <h2>"Reviewers"</h2>
+                {children()}
+            </div>
+            {match &pr.review {
+                Some(info) => view! {
+                    {sidebar_review(info, &pr.summary.author)}
+                    {sidebar_checks(info)}
+                }
+                .into_any(),
+                None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
+            }}
+        </aside>
     }
 }
 
@@ -615,38 +865,12 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     }
 }
 
-/// The checks on the PR's head, whether it can be merged and merging it.
-/// Only for open PRs.
+/// Whether the PR can be merged and merging it. Only for open PRs; the
+/// checks are in the sidebar.
 pub fn merge_box(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
     let (class, text) = merge_status(info, target.unresolved_threads);
-    let checks = (!info.checks.is_empty()).then(|| {
-        let rows = info
-            .checks
-            .iter()
-            .map(|c| {
-                let icon = c.status.map(|ci| view! { <CiIcon ci=ci /> });
-                let name = match &c.url {
-                    Some(url) => view! { <a href=url.clone() target="_blank" rel="noopener">{c.name.clone()}</a> }.into_any(),
-                    None => view! { <span>{c.name.clone()}</span> }.into_any(),
-                };
-                view! { <li class="check">{icon}{name}</li> }
-            })
-            .collect_view();
-        // Failing checks are what needs attention, so they show unfolded.
-        let open = info.ci == Some(CiStatus::Failing);
-        view! {
-            <details class="checks" open=open>
-                <summary>
-                    {info.ci.map(|ci| view! { <CiIcon ci=ci /> })}
-                    {format!(" Checks: {}", check_counts(&info.checks))}
-                </summary>
-                <ul>{rows}</ul>
-            </details>
-        }
-    });
     view! {
         <section class="merge-box">
-            {checks}
             <p class=format!("merge-status {class}")>{text}</p>
             {merge_controls(info, target)}
         </section>
@@ -839,21 +1063,85 @@ mod tests {
     }
 
     #[test]
-    fn counts_checks() {
-        let check = |status| Check {
-            name: String::new(),
+    fn groups_the_checks() {
+        let check = |name: &str, status| Check {
+            name: name.into(),
             status,
             url: None,
         };
+        let groups: Vec<(CheckGroup, Vec<String>)> = check_groups(&[
+            check("beta", Some(CiStatus::Passing)),
+            check("e2e", Some(CiStatus::Failing)),
+            check("Alpha", Some(CiStatus::Passing)),
+            check("docs", None),
+            check("Build", Some(CiStatus::Failing)),
+        ])
+        .into_iter()
+        .map(|(g, c)| (g, c.into_iter().map(|c| c.name).collect()))
+        .collect();
+        // Groups come in a fixed order, sorted by name and without
+        // empty ones (none is running here).
         assert_eq!(
-            check_counts(&[
-                check(Some(CiStatus::Passing)),
-                check(Some(CiStatus::Failing)),
-                check(Some(CiStatus::Passing)),
-                check(None),
-            ]),
-            "1 failing, 2 passing, 1 skipped"
+            groups,
+            [
+                (
+                    CheckGroup::Failing,
+                    vec!["Build".to_owned(), "e2e".to_owned()]
+                ),
+                (
+                    CheckGroup::Passed,
+                    vec!["Alpha".to_owned(), "beta".to_owned()]
+                ),
+                (CheckGroup::Skipped, vec!["docs".to_owned()]),
+            ]
         );
+        assert!(check_groups(&[]).is_empty());
+    }
+
+    /// Who the sidebar lists: the reviewed in first-review order, then
+    /// the requested. A re-requested reviewer shows once, as pending.
+    #[test]
+    fn reviewer_order_and_rerequests() {
+        let mut i = info();
+        i.reviews = vec![
+            review("a", ReviewState::Approved, "1"),
+            review("b", ReviewState::ChangesRequested, "2"),
+        ];
+        let person = |login: &str| {
+            RequestedReviewer::Person(Person {
+                login: Some(login.into()),
+                name: None,
+                avatar_url: None,
+            })
+        };
+        i.requested = vec![
+            person("c"),
+            // Reviewed, then asked again: shows once, as pending.
+            person("a"),
+            RequestedReviewer::Team("team".into()),
+            RequestedReviewer::Legacy("old".into()),
+        ];
+        let rows: Vec<(Option<String>, &'static str)> = reviewers(&i, "author")
+            .into_iter()
+            .map(|r| match r {
+                Reviewer::Reviewed(v) => (v.author.login.clone(), verdict(v.state)),
+                Reviewer::Requested(RequestedReviewer::Person(p)) => (p.login.clone(), "Pending"),
+                Reviewer::Requested(RequestedReviewer::Team(n))
+                | Reviewer::Requested(RequestedReviewer::Legacy(n)) => (Some(n.clone()), "Pending"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some("b".into()), "Changes requested"),
+                (Some("c".into()), "Pending"),
+                (Some("a".into()), "Pending"),
+                (Some("team".into()), "Pending"),
+                (Some("old".into()), "Pending"),
+            ]
+        );
+        // With neither reviews nor requests the list is empty.
+        assert!(reviewers(&info(), "author").is_empty());
     }
 
     #[test]

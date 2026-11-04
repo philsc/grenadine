@@ -1894,7 +1894,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use grenadine_core::api::{
-        Check, MergeInfo, MergeMethod, MergeState, Review, ReviewState, Side,
+        Check, MergeInfo, MergeMethod, MergeState, RequestedReviewer, Review, ReviewState, Side,
     };
 
     use super::*;
@@ -2124,7 +2124,7 @@ mod tests {
                 url: "u".into(),
                 commit: None,
             }],
-            requested: vec!["team".into()],
+            requested: vec![RequestedReviewer::Team("team".into())],
             comments: vec![],
             checks: vec![Check {
                 name: "test".into(),

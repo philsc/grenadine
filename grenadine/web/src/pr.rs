@@ -15,8 +15,8 @@ use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag};
 use crate::review::{
-    MergeChoice, MergeTarget, ReviewChoice, ReviewPanel, conversation, merge_box, merge_warning,
-    review_summary,
+    CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, conversation,
+    merge_box, merge_warning,
 };
 use crate::{Updates, api, hash_for, highlight, markdown};
 
@@ -186,28 +186,147 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let github = format!("https://github.com/{}/pull/{}", key.repo, key.number);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
+    provide_context(CheckFolds(RwSignal::new(HashMap::new())));
     provide_context(OpenBoxes::new());
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
 
+    // The sidebar is a collapsible column on wide windows, which is
+    // remembered, and an overlay the button opens on narrow ones, which
+    // isn't.
+    let wide = sidebar_wide();
+    let collapsed = RwSignal::new(load_flag("pr-sidebar-collapsed", false));
+    let open = RwSignal::new(false);
+    Effect::new(move |_| {
+        if wide.get() {
+            open.set(false);
+        }
+    });
+    let shown = move || {
+        if wide.get() {
+            !collapsed.get()
+        } else {
+            open.get()
+        }
+    };
+    let toggle = move |_| {
+        if wide.get_untracked() {
+            collapsed.update(|c| *c = !*c);
+            save_flag("pr-sidebar-collapsed", collapsed.get_untracked());
+        } else {
+            open.update(|o| *o = !*o);
+        }
+    };
+    // Escape and clicks outside the overlay's sidebar close it.
+    let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            open.set(false);
+        }
+    });
+    let on_click = window_event_listener(leptos::ev::click, move |ev| {
+        if !open.get_untracked() || wide.get_untracked() {
+            return;
+        }
+        let inside = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|t| t.closest(".pr-sidebar, .sidebar-toggle").ok().flatten())
+            .is_some();
+        if !inside {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || {
+        on_key.remove();
+        on_click.remove();
+    });
+
     move || {
         match pr.get() {
-        None => view! { <div class="empty">"Loading…"</div> }.into_any(),
-        Some(Err(e)) => view! { <div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div> }.into_any(),
-        Some(Ok(api::PrResponse::Pending)) => view! { <div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div> }.into_any(),
+        None => view! { <main class="main"><div class="empty">"Loading…"</div></main> }.into_any(),
+        Some(Err(e)) => view! { <main class="main"><div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div></main> }.into_any(),
+        Some(Ok(api::PrResponse::Pending)) => view! { <main class="main"><div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div></main> }.into_any(),
         Some(Ok(api::PrResponse::NotConfigured)) => view! {
-            <div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+            <main class="main"><div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
         }.into_any(),
         Some(Ok(api::PrResponse::Failed(e))) => view! {
-            <div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+            <main class="main"><div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
         }.into_any(),
         Some(Ok(api::PrResponse::Ready(pr))) => {
             let pr = Arc::new(*pr);
             prefetch(&pr);
-            view! { <PrBody pr=pr chosen=chosen side_by_side=side_by_side inline_changes=inline_changes pr_links=pr_links /> }.into_any()
+            // While the sidebar shows, its toggle sits in the sidebar's
+            // header; while hidden, it floats clear of `.main`'s
+            // scrollbar at the page's top-right.
+            let button = move |floating: bool| {
+                view! {
+                    <button type="button" class="sidebar-toggle" class:floating=floating
+                        aria-label=move || if shown() { "Hide sidebar" } else { "Show sidebar" }
+                        aria-expanded=move || shown().to_string()
+                        on:click=toggle>
+                        <svg
+                            viewBox="0 0 16 16"
+                            width="14"
+                            height="14"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                        >
+                            <path d=move || if shown() { "M6 4l4 4-4 4" } else { "M10 4l-4 4 4 4" } />
+                        </svg>
+                    </button>
+                }
+            };
+            view! {
+                <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes pr_links=pr_links /></main>
+                {move || {
+                    let pr = pr.clone();
+                    if shown() {
+                        view! {
+                            <PrSidebar pr=pr overlay=Signal::derive(move || !wide.get())>
+                                {button(false)}
+                            </PrSidebar>
+                        }
+                        .into_any()
+                    } else {
+                        button(true).into_any()
+                    }
+                }}
+            }.into_any()
         }
     }
     }
+}
+
+/// The window width from which the sidebar fits next to the PR as a
+/// column; below it the sidebar floats over the content as an overlay.
+/// The switch is JS-side only; style.css has no matching media query.
+const PR_SIDEBAR_QUERY: &str = "(min-width: 1500px)";
+
+fn sidebar_fits() -> bool {
+    window()
+        .match_media(PR_SIDEBAR_QUERY)
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.matches())
+}
+
+/// Whether the window is wide enough for the sidebar's column, kept
+/// current. The PR page comes and goes, so the listener is removed on
+/// unmount.
+fn sidebar_wide() -> RwSignal<bool> {
+    let wide = RwSignal::new(sidebar_fits());
+    let on_resize = window_event_listener_untyped("resize", move |_| {
+        let w = sidebar_fits();
+        if wide.get_untracked() != w {
+            wide.set(w);
+        }
+    });
+    on_cleanup(move || on_resize.remove());
+    wide
 }
 
 /// Threads the user folded or unfolded, by root comment ID. Threads not in
@@ -428,7 +547,6 @@ fn PrBody(
                     {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
                     " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
                 </p>
-                {review.map(|info| review_summary(info, &s.author))}
                 {pr.approximate.then(|| view! {
                     <p class="banner warn">"GitHub has no push log for this PR, so its versions were reconstructed from force-push events and may not match every push."</p>
                 })}

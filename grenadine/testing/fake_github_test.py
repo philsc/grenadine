@@ -78,9 +78,12 @@ query($owner: String!, $name: String!, $number: Int!) {
       reviewRequests(first: 20) {
         nodes {
           requestedReviewer {
-            ... on User { login }
-            ... on Team { name }
-            ... on Bot { login }
+            __typename
+            ... on User { login name avatarUrl }
+            # Team's name isn't nullable while User's is; the same field
+            # can't be both, so the team's is aliased.
+            ... on Team { teamName: name }
+            ... on Bot { login avatarUrl }
             ... on Mannequin { login }
           }
         }
@@ -310,8 +313,15 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(
             data["reviewRequests"]["nodes"],
             [
-                {"requestedReviewer": {"login": "third"}},
-                {"requestedReviewer": {"name": TEAM}},
+                {
+                    "requestedReviewer": {
+                        "__typename": "User",
+                        "login": "third",
+                        "name": None,
+                        "avatarUrl": None,
+                    }
+                },
+                {"requestedReviewer": {"__typename": "Team", "teamName": TEAM}},
             ],
         )
         [comment] = data["comments"]["nodes"]
