@@ -835,6 +835,7 @@ fn limit_from_headers(headers: &header::HeaderMap) -> Option<LimitState> {
         remaining: get(headers, "x-ratelimit-remaining")?,
         used: get(headers, "x-ratelimit-used")?,
         reset: get(headers, "x-ratelimit-reset")?,
+        seen: 0,
     })
 }
 
@@ -910,10 +911,14 @@ impl GitHub {
         Ok(())
     }
 
-    /// Updates `resource`'s window from the response's headers.
-    fn saw_headers(&self, resource: ApiResource, headers: &header::HeaderMap) {
+    /// Updates `kind`'s window on `resource` from the response's headers.
+    fn saw_headers(&self, resource: ApiResource, kind: &'static str, headers: &header::HeaderMap) {
         if let Some(state) = limit_from_headers(headers) {
-            self.usage.lock().unwrap().saw(resource, state);
+            let state = LimitState {
+                seen: chrono::Utc::now().timestamp(),
+                ..state
+            };
+            self.usage.lock().unwrap().saw(resource, kind, state);
         }
     }
 
@@ -935,6 +940,7 @@ impl GitHub {
     fn check_exhausted(
         &self,
         resource: ApiResource,
+        kind: &'static str,
         resp: reqwest::Response,
     ) -> Result<reqwest::Response> {
         let status = resp.status();
@@ -943,7 +949,7 @@ impl GitHub {
         {
             return Ok(resp);
         }
-        let Some(state) = self.usage.lock().unwrap().state(resource) else {
+        let Some(state) = self.usage.lock().unwrap().state(resource, kind) else {
             return Ok(resp);
         };
         if state.remaining != 0 {
@@ -989,11 +995,11 @@ impl GitHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?;
-        self.saw_headers(ApiResource::GraphQl, resp.headers());
+        self.saw_headers(ApiResource::GraphQl, kind, resp.headers());
         // A refused or failed response still counts at GitHub, so it's
         // logged too.
         let resp = match self
-            .check_exhausted(ApiResource::GraphQl, resp)
+            .check_exhausted(ApiResource::GraphQl, kind, resp)
             .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
         {
             Ok(resp) => resp,
@@ -1021,7 +1027,7 @@ impl GitHub {
                 .usage
                 .lock()
                 .unwrap()
-                .state(ApiResource::GraphQl)
+                .state(ApiResource::GraphQl, kind)
                 .map(|s| s.reset)
                 .unwrap_or(at + 3600);
             return Err(RateLimited {
@@ -1678,8 +1684,8 @@ impl GitHub {
             .json(&json!({ "head": head, "base": base, "title": title, "body": body }))
             .send()
             .await?;
-        self.saw_headers(ApiResource::Rest, resp.headers());
-        let resp = match self.check_exhausted(ApiResource::Rest, resp) {
+        self.saw_headers(ApiResource::Rest, "create_pr", resp.headers());
+        let resp = match self.check_exhausted(ApiResource::Rest, "create_pr", resp) {
             Ok(resp) => resp,
             Err(e) => {
                 self.logged("create_pr", ApiResource::Rest, None, at);
@@ -1719,8 +1725,8 @@ impl GitHub {
         self.admit(kind, ApiResource::Rest)?;
         let at = chrono::Utc::now().timestamp();
         let resp = req.send().await?;
-        self.saw_headers(ApiResource::Rest, resp.headers());
-        let resp = match self.check_exhausted(ApiResource::Rest, resp) {
+        self.saw_headers(ApiResource::Rest, kind, resp.headers());
+        let resp = match self.check_exhausted(ApiResource::Rest, kind, resp) {
             Ok(resp) => resp,
             Err(e) => {
                 self.logged(kind, ApiResource::Rest, None, at);
@@ -1826,9 +1832,9 @@ impl GitHub {
             self.admit(kind, ApiResource::Rest)?;
             let at = chrono::Utc::now().timestamp();
             let resp = self.http.get(&url).send().await?;
-            self.saw_headers(ApiResource::Rest, resp.headers());
+            self.saw_headers(ApiResource::Rest, kind, resp.headers());
             let resp = match self
-                .check_exhausted(ApiResource::Rest, resp)
+                .check_exhausted(ApiResource::Rest, kind, resp)
                 .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
             {
                 Ok(resp) => resp,
@@ -2202,6 +2208,7 @@ mod tests {
                 remaining: 4999,
                 used: 1,
                 reset: 1767229200,
+                seen: 0,
             })
         );
         h.clear();

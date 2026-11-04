@@ -114,6 +114,9 @@ fn LimitView(info: RateLimitInfo, now: i64) -> impl IntoView {
                     thousands(info.ours), thousands(other))}
             </p>
             <p class="muted">
+                {format!("Used by: {}", info.kinds.iter().map(|k| kind_label(k)).collect::<Vec<_>>().join(", "))}
+            </p>
+            <p class="muted">
                 {format!("Background syncs pause below {} left; inbox searches below {}.",
                     thousands(info.limit / 5), thousands(info.limit / 10))}
             </p>

@@ -790,6 +790,8 @@ pub struct RateLimitInfo {
     pub used: u32,
     /// Unix seconds when the window resets.
     pub reset: i64,
+    /// The request kinds whose responses report this budget.
+    pub kinds: Vec<String>,
     /// What grenadine spent since this window started (reset - 3600):
     /// GraphQL points, or REST requests.
     pub ours: u32,

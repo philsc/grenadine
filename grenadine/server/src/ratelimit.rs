@@ -4,8 +4,9 @@
 //! Requests run under a priority from a task-local: the viewer's own
 //! actions always go, inbox searches pause below a tenth of the limit,
 //! background syncs below a fifth. Every response's `x-ratelimit-*`
-//! headers update the last known window, and every request lands in an
-//! hour-long log that the Debug tab reads.
+//! headers update the window tracked for that request's kind — GitHub
+//! reports different budgets to different requests — and every request
+//! lands in an hour-long log that the Debug tab reads.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -63,7 +64,7 @@ pub fn is_rate_limited(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<RateLimited>())
 }
 
-/// A resource's limit as the last response's headers reported it.
+/// A resource's limit as one response's headers reported it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LimitState {
     pub limit: u32,
@@ -71,6 +72,8 @@ pub struct LimitState {
     pub used: u32,
     /// Unix seconds when the window resets.
     pub reset: i64,
+    /// Unix seconds when this state was observed.
+    pub seen: i64,
 }
 
 /// One request the log records.
@@ -88,26 +91,40 @@ pub struct Entry {
     pub deferred: bool,
 }
 
-/// What a `GitHub` has seen of its limits and spent. In memory only; it
-/// starts over on a restart.
+/// What a `GitHub` has seen of its limits and spent, per request kind.
+/// In memory only; it starts over on a restart.
 #[derive(Default)]
 pub struct Usage {
-    states: BTreeMap<ApiResource, LimitState>,
+    /// GitHub reports different budgets to different requests, so the
+    /// state is kept per request kind.
+    states: States,
+    seq: u64,
     log: VecDeque<Entry>,
 }
 
 /// How long the log and the `ours` counts look back.
 const WINDOW: i64 = 3600;
 
+/// A state per (resource, request kind), the u64 ordering same-second
+/// reports.
+type States = BTreeMap<(ApiResource, &'static str), (LimitState, u64)>;
+
+/// The states of the kinds that report one window.
+type KindStates = Vec<(&'static str, LimitState, u64)>;
+
 impl Usage {
-    /// Records `state` for `resource`, from a response's headers.
-    pub fn saw(&mut self, resource: ApiResource, state: LimitState) {
-        self.states.insert(resource, state);
+    /// Records `state` for `resource`, from a `kind` response's headers.
+    pub fn saw(&mut self, resource: ApiResource, kind: &'static str, state: LimitState) {
+        self.seq += 1;
+        self.states.insert((resource, kind), (state, self.seq));
     }
 
-    /// The last known state of `resource`'s limit.
-    pub fn state(&self, resource: ApiResource) -> Option<LimitState> {
-        self.states.get(&resource).copied()
+    /// The last state `kind`'s responses on `resource` reported.
+    pub fn state(&self, resource: ApiResource, kind: &str) -> Option<LimitState> {
+        self.states
+            .iter()
+            .find(|&(&(r, k), _)| r == resource && k == kind)
+            .map(|(_, &(s, _))| s)
     }
 
     /// Logs a request that was sent.
@@ -135,7 +152,7 @@ impl Usage {
         priority: RequestPriority,
         now: i64,
     ) -> Result<(), RateLimited> {
-        if let Some(until) = self.denied(resource, priority, now) {
+        if let Some(until) = self.denied(resource, kind, priority, now) {
             self.log(Entry {
                 at: now,
                 kind,
@@ -149,10 +166,21 @@ impl Usage {
         Ok(())
     }
 
-    /// The reset time when `priority`'s request on `resource` would be
-    /// refused now, else `None`.
-    fn denied(&self, resource: ApiResource, priority: RequestPriority, now: i64) -> Option<i64> {
-        let s = self.states.get(&resource)?;
+    /// The reset time when `priority`'s `kind` request on `resource`
+    /// would be refused now, else `None`.
+    fn denied(
+        &self,
+        resource: ApiResource,
+        kind: &'static str,
+        priority: RequestPriority,
+        now: i64,
+    ) -> Option<i64> {
+        let &(s, _) = self.states.get(&(resource, kind))?;
+        Self::denied_state(&s, priority, now)
+    }
+
+    /// The reset time when `s` refuses `priority` now, else `None`.
+    fn denied_state(s: &LimitState, priority: RequestPriority, now: i64) -> Option<i64> {
         if now >= s.reset {
             return None;
         }
@@ -164,18 +192,20 @@ impl Usage {
         (s.remaining <= reserve).then_some(s.reset)
     }
 
-    /// The reset time when `priority` is paused on a resource it uses,
-    /// the latest if several are, else `None`. Searches only spend
-    /// GraphQL points, so a spent REST limit doesn't pause them.
+    /// The reset time when `priority` is paused on a window it uses, the
+    /// latest if several are, else `None`. Searches are only refused
+    /// where a kind they actually send is, read off the log.
     pub fn paused_until(&self, priority: RequestPriority, now: i64) -> Option<i64> {
-        const BOTH: [ApiResource; 2] = [ApiResource::GraphQl, ApiResource::Rest];
-        let resources: &[ApiResource] = match priority {
-            RequestPriority::Search => &[ApiResource::GraphQl],
-            _ => &BOTH,
-        };
-        resources
+        self.states
             .iter()
-            .filter_map(|&r| self.denied(r, priority, now))
+            .filter(|&(&(_, kind), _)| {
+                priority != RequestPriority::Search
+                    || self
+                        .log
+                        .iter()
+                        .any(|e| e.kind == kind && e.priority == RequestPriority::Search)
+            })
+            .filter_map(|(&(resource, kind), _)| self.denied(resource, kind, priority, now))
             .max()
     }
 
@@ -235,34 +265,63 @@ impl Usage {
             RequestPriority::Search,
             RequestPriority::User,
         ];
-        let limits = self
-            .states
-            .iter()
-            .map(|(&resource, s)| {
-                let since = s.reset - WINDOW;
+        // The states of one window, grouped into the budgets GitHub
+        // reports: a gap in `used` of over a twentieth of the limit
+        // means two budgets.
+        let mut windows: BTreeMap<(ApiResource, i64), KindStates> = BTreeMap::new();
+        for (&(resource, kind), &(s, seq)) in &self.states {
+            if now < s.reset {
+                windows
+                    .entry((resource, s.reset))
+                    .or_default()
+                    .push((kind, s, seq));
+            }
+        }
+        let mut limits = Vec::new();
+        for ((resource, reset), mut states) in windows {
+            states.sort_by_key(|(_, s, _)| s.used);
+            for group in states.chunk_by(|a, b| b.1.used - a.1.used <= b.1.limit / 20) {
+                let s = group
+                    .iter()
+                    .max_by_key(|(_, s, seq)| (s.seen, seq))
+                    .map(|(_, s, _)| s)
+                    .unwrap();
+                let kinds: Vec<&str> = {
+                    let mut k: Vec<&str> = group.iter().map(|(k, _, _)| *k).collect();
+                    k.sort_unstable();
+                    k
+                };
+                let since = reset - WINDOW;
                 let ours = self
                     .log
                     .iter()
-                    .filter(|e| e.resource == resource && !e.deferred && e.at >= since)
+                    .filter(|e| {
+                        e.resource == resource
+                            && kinds.contains(&e.kind)
+                            && !e.deferred
+                            && e.at >= since
+                    })
                     .map(|e| match resource {
                         ApiResource::GraphQl => e.points.unwrap_or(0),
                         ApiResource::Rest => 1,
                     })
                     .sum();
-                RateLimitInfo {
+                limits.push(RateLimitInfo {
                     resource,
                     limit: s.limit,
                     remaining: s.remaining,
                     used: s.used,
                     reset: s.reset,
+                    kinds: kinds.iter().map(|k| k.to_string()).collect(),
                     ours,
                     paused: TIERS
                         .into_iter()
-                        .filter(|&p| self.denied(resource, p, now).is_some())
+                        .filter(|&p| Self::denied_state(s, p, now).is_some())
                         .collect(),
-                }
-            })
-            .collect();
+                });
+            }
+        }
+        limits.sort_by_key(|l| (l.resource, l.remaining));
         GitHubUsage {
             now,
             limits,
@@ -276,17 +335,20 @@ impl Usage {
 mod tests {
     use super::*;
 
-    fn usage(limit: u32, remaining: u32, reset: i64) -> Usage {
+    fn state(limit: u32, remaining: u32, reset: i64) -> LimitState {
+        LimitState {
+            limit,
+            remaining,
+            used: limit - remaining,
+            reset,
+            seen: 0,
+        }
+    }
+
+    /// A `Usage` that saw one response of `kind` on GraphQL.
+    fn usage(kind: &'static str, limit: u32, remaining: u32, reset: i64) -> Usage {
         let mut u = Usage::default();
-        u.saw(
-            ApiResource::GraphQl,
-            LimitState {
-                limit,
-                remaining,
-                used: limit - remaining,
-                reset,
-            },
-        );
+        u.saw(ApiResource::GraphQl, kind, state(limit, remaining, reset));
         u
     }
 
@@ -314,7 +376,7 @@ mod tests {
         let reset = 3700;
         // Background pauses below a fifth, searches below a tenth, the
         // user's actions only at zero.
-        let mut u = usage(5000, 1001, reset);
+        let mut u = usage("pr", 5000, 1001, reset);
         for p in [
             RequestPriority::User,
             RequestPriority::Search,
@@ -322,17 +384,17 @@ mod tests {
         ] {
             admit(&mut u, p, now).unwrap();
         }
-        let mut u = usage(5000, 1000, reset);
+        let mut u = usage("pr", 5000, 1000, reset);
         admit(&mut u, RequestPriority::Background, now).unwrap_err();
         admit(&mut u, RequestPriority::Search, now).unwrap();
-        let mut u = usage(5000, 500, reset);
+        let mut u = usage("pr", 5000, 500, reset);
         admit(&mut u, RequestPriority::Search, now).unwrap_err();
         admit(&mut u, RequestPriority::User, now).unwrap();
-        let mut u = usage(5000, 0, reset);
+        let mut u = usage("pr", 5000, 0, reset);
         admit(&mut u, RequestPriority::User, now).unwrap_err();
 
         // Past the reset everything goes again.
-        let mut u = usage(5000, 0, reset);
+        let mut u = usage("pr", 5000, 0, reset);
         for p in [
             RequestPriority::User,
             RequestPriority::Search,
@@ -344,7 +406,7 @@ mod tests {
 
     #[test]
     fn refused_requests_are_logged_deferred() {
-        let mut u = usage(5000, 1000, 3700);
+        let mut u = usage("pr", 5000, 1000, 3700);
         admit(&mut u, RequestPriority::Background, 100).unwrap_err();
         let snap = u.snapshot(100);
         let entry = &snap.kinds[0];
@@ -356,23 +418,15 @@ mod tests {
 
     #[test]
     fn paused_until_reports_the_pause() {
-        let u = usage(5000, 700, 3700);
+        let u = usage("pr", 5000, 700, 3700);
         assert_eq!(u.paused_until(RequestPriority::Background, 100), Some(3700));
         assert_eq!(u.paused_until(RequestPriority::Search, 100), None);
         assert_eq!(u.paused_until(RequestPriority::Background, 3700), None);
 
-        // A spent REST limit doesn't pause searches: they only spend
-        // GraphQL points.
+        // A spent REST limit doesn't pause searches: no search kind
+        // sent a REST request yet.
         let mut u = Usage::default();
-        u.saw(
-            ApiResource::Rest,
-            LimitState {
-                limit: 60,
-                remaining: 0,
-                used: 60,
-                reset: 3700,
-            },
-        );
+        u.saw(ApiResource::Rest, "activity", state(60, 0, 3700));
         assert_eq!(u.paused_until(RequestPriority::Search, 100), None);
         assert_eq!(u.paused_until(RequestPriority::Background, 100), Some(3700));
     }
@@ -380,7 +434,7 @@ mod tests {
     #[test]
     fn snapshots_group_sort_and_prune() {
         let now = 10_000;
-        let mut u = usage(5000, 4500, now + 1800);
+        let mut u = usage("pr", 5000, 4500, now + 1800);
         // Older than an hour: gone.
         u.log(Entry {
             at: now - 3600,
@@ -411,15 +465,7 @@ mod tests {
                 deferred: false,
             });
         }
-        u.saw(
-            ApiResource::Rest,
-            LimitState {
-                limit: 60,
-                remaining: 55,
-                used: 5,
-                reset: now + 1800,
-            },
-        );
+        u.saw(ApiResource::Rest, "activity", state(60, 55, now + 1800));
         let snap = u.snapshot(now);
         assert_eq!(snap.kinds.len(), 3);
         // Sorted by points desc: pr (6) then search (3) then activity.
@@ -437,18 +483,128 @@ mod tests {
         assert_eq!(snap.minutes[i].graphql_points, 9);
         assert_eq!(snap.minutes[i].rest_requests, 1);
 
-        // `ours` counts this window only.
+        // `ours` counts only this window and this budget's kinds.
         let gql = snap
             .limits
             .iter()
             .find(|l| l.resource == ApiResource::GraphQl)
             .unwrap();
-        assert_eq!(gql.ours, 9);
+        assert_eq!(gql.ours, 6);
+        assert_eq!(gql.kinds, ["pr"]);
         let rest = snap
             .limits
             .iter()
             .find(|l| l.resource == ApiResource::Rest)
             .unwrap();
         assert_eq!(rest.ours, 1);
+        assert_eq!(rest.kinds, ["activity"]);
+    }
+
+    #[test]
+    fn kinds_have_their_own_windows() {
+        let now = 100;
+        let reset = 3700;
+        // GitHub reports different budgets to different kinds: "pr" is
+        // nearly out, "search" is fine.
+        let mut u = usage("search", 5000, 4000, reset);
+        u.saw(ApiResource::GraphQl, "pr", state(5000, 900, reset));
+        u.admit("pr", ApiResource::GraphQl, RequestPriority::Background, now)
+            .unwrap_err();
+        u.admit(
+            "search",
+            ApiResource::GraphQl,
+            RequestPriority::Background,
+            now,
+        )
+        .unwrap();
+        u.admit("search", ApiResource::GraphQl, RequestPriority::Search, now)
+            .unwrap();
+
+        // A low "search" window holds searches even after a kind with
+        // a healthy budget reported more recently; it goes once its
+        // own reset passes.
+        u.saw(ApiResource::GraphQl, "search", state(5000, 400, reset));
+        u.saw(ApiResource::GraphQl, "pr", state(5000, 4000, reset));
+        u.admit("search", ApiResource::GraphQl, RequestPriority::Search, now)
+            .unwrap_err();
+        u.admit(
+            "search",
+            ApiResource::GraphQl,
+            RequestPriority::Search,
+            reset,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn paused_until_uses_the_kinds_a_tier_sends() {
+        let now = 100;
+        let reset = 3700;
+        let mut u = usage("search", 5000, 4000, reset);
+        u.saw(ApiResource::GraphQl, "pr", state(5000, 900, reset));
+        // A Search-priority request ran under the "search" kind, so
+        // only its window counts for searches.
+        u.log(Entry {
+            at: now,
+            kind: "search",
+            resource: ApiResource::GraphQl,
+            priority: RequestPriority::Search,
+            points: Some(3),
+            deferred: false,
+        });
+        assert_eq!(u.paused_until(RequestPriority::Search, now), None);
+        assert_eq!(
+            u.paused_until(RequestPriority::Background, now),
+            Some(reset)
+        );
+        // Even "pr" fully spent doesn't pause searches: they don't send
+        // it.
+        u.saw(ApiResource::GraphQl, "pr", state(5000, 0, reset));
+        assert_eq!(u.paused_until(RequestPriority::Search, now), None);
+    }
+
+    #[test]
+    fn snapshots_group_states_into_budgets() {
+        let now = 10_000;
+        let reset = now + 1800;
+        let mut u = Usage::default();
+        for (kind, used, seen) in [
+            ("search", 1100, 2),
+            ("users", 1120, 1),
+            ("pr", 3000, 4),
+            ("review_threads", 3040, 3),
+        ] {
+            let mut s = state(5000, 5000 - used, reset);
+            s.seen = now - seen;
+            u.saw(ApiResource::GraphQl, kind, s);
+            u.log(Entry {
+                at: now - 100,
+                kind,
+                resource: ApiResource::GraphQl,
+                priority: RequestPriority::Background,
+                points: Some(10),
+                deferred: false,
+            });
+        }
+        let snap = u.snapshot(now);
+        assert_eq!(snap.limits.len(), 2);
+        // Sorted by remaining ascending: the spent budget first.
+        let spent = &snap.limits[0];
+        assert_eq!(spent.kinds, ["pr", "review_threads"]);
+        // Numbers come from the newest-seen member, "review_threads".
+        assert_eq!(spent.used, 3040);
+        assert_eq!(spent.ours, 20);
+        let fine = &snap.limits[1];
+        assert_eq!(fine.kinds, ["search", "users"]);
+        assert_eq!(fine.used, 1120);
+        assert_eq!(fine.ours, 20);
+    }
+
+    #[test]
+    fn snapshots_drop_expired_windows() {
+        let now = 10_000;
+        let mut u = usage("pr", 5000, 0, now - 1);
+        let snap = u.snapshot(now);
+        assert!(snap.limits.is_empty());
     }
 }
