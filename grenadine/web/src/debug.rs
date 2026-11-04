@@ -4,11 +4,15 @@
 use std::time::Duration;
 
 use grenadine_core::api::{
-    ApiResource, GitHubUsage, MinuteUsage, RateLimitInfo, RequestKindUsage, RequestPriority,
+    ApiResource, GitHubUsage, MinuteUsage, RateLimitInfo, RateLimitReport, RequestKindUsage,
+    RequestPriority,
 };
 use leptos::prelude::*;
 
-use crate::{Updates, api, topbar::hm};
+use crate::{
+    Updates, api,
+    topbar::{hm, hms},
+};
 
 /// `n` with thousands separators, e.g. "5,000".
 fn thousands(n: u32) -> String {
@@ -209,6 +213,47 @@ fn KindsView(kinds: Vec<RequestKindUsage>) -> impl IntoView {
     }
 }
 
+/// The last responses' rate-limit headers and the repos the requests
+/// named.
+#[component]
+fn ReportsView(reports: Vec<RateLimitReport>) -> impl IntoView {
+    view! {
+        <h2>"Recent rate-limit reports"</h2>
+        <p class="muted">"The last 100 responses, newest first."</p>
+        <table class="usage-table usage-reports">
+            <thead>
+                <tr>
+                    <th>"Time"</th>
+                    <th>"API"</th>
+                    <th>"Request"</th>
+                    <th>"Repos"</th>
+                    <th class="num">"Used"</th>
+                    <th class="num">"Remaining"</th>
+                    <th class="num">"Limit"</th>
+                    <th>"Resets"</th>
+                </tr>
+            </thead>
+            <tbody>
+                {reports.into_iter().map(|r| view! {
+                    <tr>
+                        <td>{hms(r.at)}</td>
+                        <td>{resource_name(r.resource)}</td>
+                        <td>{kind_label(&r.kind).to_owned()}</td>
+                        <td>{match r.repos.is_empty() {
+                            true => "—".to_owned(),
+                            false => r.repos.join(", "),
+                        }}</td>
+                        <td class="num">{thousands(r.used)}</td>
+                        <td class="num">{thousands(r.remaining)}</td>
+                        <td class="num">{thousands(r.limit)}</td>
+                        <td>{hm(r.reset)}</td>
+                    </tr>
+                }).collect_view()}
+            </tbody>
+        </table>
+    }
+}
+
 /// The tab's page.
 #[component]
 pub fn Debug() -> impl IntoView {
@@ -251,6 +296,7 @@ fn UsageView(usage: GitHubUsage) -> impl IntoView {
                 <KindsView kinds=usage.kinds />
             }.into_any()
         }}
+        {(!usage.reports.is_empty()).then(|| view! { <ReportsView reports=usage.reports /> })}
         <p class="muted">"Counts start over when the server restarts."</p>
     }
 }

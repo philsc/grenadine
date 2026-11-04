@@ -770,6 +770,37 @@ fn person_at(v: &Value) -> Option<Person> {
     })
 }
 
+/// The `owner/name` repos a search query names: `repo:o/n` gives
+/// `"o/n"`, `org:o` and `user:o` `"o/*"`, other qualifiers and terms
+/// none. Parentheses around a token don't hide it.
+fn search_repos(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter_map(|t| {
+            let (qualifier, value) = t.trim_matches(['(', ')']).split_once(':')?;
+            match qualifier {
+                "repo" => Some(value.to_owned()),
+                "org" | "user" => Some(format!("{value}/*")),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The `owner/name` repo a URL's `/repos/{o}/{n}` path names, if any.
+fn url_repos(url: &str) -> Vec<String> {
+    let Some(path) = url.split("/repos/").nth(1) else {
+        return Vec::new();
+    };
+    let parts: Vec<&str> = path.split(['/', '?']).take(2).collect();
+    match parts.as_slice() {
+        [owner, name] if !owner.is_empty() && !name.is_empty() => {
+            vec![format!("{owner}/{name}")]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn split_repo(repo: &str) -> Result<(&str, &str)> {
     repo.split_once('/')
         .ok_or_else(|| anyhow!("bad repo {repo}"))
@@ -912,13 +943,23 @@ impl GitHub {
     }
 
     /// Updates `kind`'s window on `resource` from the response's headers.
-    fn saw_headers(&self, resource: ApiResource, kind: &'static str, headers: &header::HeaderMap) {
+    /// `repos` are the `owner/name` repos the request named.
+    fn saw_headers(
+        &self,
+        resource: ApiResource,
+        kind: &'static str,
+        repos: &[String],
+        headers: &header::HeaderMap,
+    ) {
         if let Some(state) = limit_from_headers(headers) {
             let state = LimitState {
                 seen: chrono::Utc::now().timestamp(),
                 ..state
             };
-            self.usage.lock().unwrap().saw(resource, kind, state);
+            self.usage
+                .lock()
+                .unwrap()
+                .saw(resource, kind, repos.to_vec(), state);
         }
     }
 
@@ -967,10 +1008,11 @@ impl GitHub {
     async fn graphql(
         &self,
         kind: &'static str,
+        repos: &[String],
         query: &str,
         variables: Value,
     ) -> Result<(Value, Vec<Value>)> {
-        self.run_graphql(kind, query, variables, true).await
+        self.run_graphql(kind, repos, query, variables, true).await
     }
 
     /// Runs `query` with `rateLimit { cost }` added when `cost`, so
@@ -978,6 +1020,7 @@ impl GitHub {
     async fn run_graphql(
         &self,
         kind: &'static str,
+        repos: &[String],
         query: &str,
         variables: Value,
         cost: bool,
@@ -995,7 +1038,7 @@ impl GitHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?;
-        self.saw_headers(ApiResource::GraphQl, kind, resp.headers());
+        self.saw_headers(ApiResource::GraphQl, kind, repos, resp.headers());
         // A refused or failed response still counts at GitHub, so it's
         // logged too.
         let resp = match self
@@ -1041,9 +1084,9 @@ impl GitHub {
 
     /// Runs a GraphQL mutation. Unlike a query's, any error fails it: a
     /// change must not half succeed silently.
-    async fn mutate(&self, query: &str, variables: Value) -> Result<Value> {
+    async fn mutate(&self, repos: &[String], query: &str, variables: Value) -> Result<Value> {
         let (data, errors) = self
-            .run_graphql("mutation", query, variables, false)
+            .run_graphql("mutation", repos, query, variables, false)
             .await?;
         if let Some(e) = errors.first() {
             bail!(
@@ -1063,6 +1106,7 @@ impl GitHub {
         let (data, errors) = self
             .graphql(
                 "pr_node",
+                std::slice::from_ref(&key.repo),
                 &format!(
                     "query($owner: String!, $name: String!, $number: Int!) {{
                        repository(owner: $owner, name: $name) {{
@@ -1113,26 +1157,29 @@ impl GitHub {
     pub async fn add_to_review(&self, key: &PrKey, item: ReviewItem<'_>) -> Result<()> {
         let pending = self.pending_review(key).await?;
         if let Some(review) = &pending.review {
-            return self.add_to(review, item).await;
+            return self.add_to(review, item, &key.repo).await;
         }
         let started = match item {
             // A line comment starts the review itself, so that if GitHub
             // refuses it, there's no empty review left behind.
             ReviewItem::Thread(t) if t.line.is_some() => self
-                .start_review(&pending.pr_id, Some(t))
+                .start_review(&pending.pr_id, Some(t), &key.repo)
                 .await
                 .map(|_| None),
             // GitHub can't start a review with a file comment or a reply,
             // so these start an empty one, which is deleted again if the
             // comment fails.
-            _ => self.start_review(&pending.pr_id, None).await.map(Some),
+            _ => self
+                .start_review(&pending.pr_id, None, &key.repo)
+                .await
+                .map(Some),
         };
         match started {
             Ok(None) => Ok(()),
             Ok(Some(review)) => {
-                let added = self.add_to(&review, item).await;
+                let added = self.add_to(&review, item, &key.repo).await;
                 if added.is_err()
-                    && let Err(e) = self.delete_review(&review).await
+                    && let Err(e) = self.delete_review(&review, &key.repo).await
                 {
                     tracing::warn!("can't delete the review {review} again: {e:#}");
                 }
@@ -1141,7 +1188,7 @@ impl GitHub {
             // Started elsewhere in the meantime, e.g. on github.com.
             Err(e) if format!("{e:#}").contains("one pending review") => {
                 match self.pending_review(key).await?.review {
-                    Some(review) => self.add_to(&review, item).await,
+                    Some(review) => self.add_to(&review, item, &key.repo).await,
                     None => Err(e),
                 }
             }
@@ -1151,7 +1198,12 @@ impl GitHub {
 
     /// Starts a pending review on the PR `pr_id`, with `thread` as its
     /// first comment if given. Returns the review's ID.
-    async fn start_review(&self, pr_id: &str, thread: Option<&NewThread>) -> Result<String> {
+    async fn start_review(
+        &self,
+        pr_id: &str,
+        thread: Option<&NewThread>,
+        repo: &str,
+    ) -> Result<String> {
         let threads = thread.map(|t| {
             [json!({
                 "path": t.path,
@@ -1162,6 +1214,7 @@ impl GitHub {
         });
         let data = self
             .mutate(
+                std::slice::from_ref(&repo.to_owned()),
                 "mutation($pr: ID!, $threads: [DraftPullRequestReviewThread]) {
                    addPullRequestReview(input: { pullRequestId: $pr, threads: $threads }) {
                      pullRequestReview { id }
@@ -1177,9 +1230,9 @@ impl GitHub {
     }
 
     /// Adds `item` to the pending review `review`.
-    async fn add_to(&self, review: &str, item: ReviewItem<'_>) -> Result<()> {
+    async fn add_to(&self, review: &str, item: ReviewItem<'_>, repo: &str) -> Result<()> {
         match item {
-            ReviewItem::Thread(t) => self.add_review_thread(review, t).await,
+            ReviewItem::Thread(t) => self.add_review_thread(review, t, repo).await,
             ReviewItem::Reply { thread, body } => {
                 self.reply_to_thread(thread, body, Some(review)).await
             }
@@ -1195,6 +1248,7 @@ impl GitHub {
         review: Option<&str>,
     ) -> Result<()> {
         self.mutate(
+            &[],
             "mutation($thread: ID!, $body: String!, $review: ID) {
                addPullRequestReviewThreadReply(input: {
                  pullRequestReviewThreadId: $thread, body: $body, pullRequestReviewId: $review
@@ -1209,8 +1263,9 @@ impl GitHub {
     }
 
     /// Adds a thread to the pending review `review`.
-    async fn add_review_thread(&self, review: &str, t: &NewThread) -> Result<()> {
+    async fn add_review_thread(&self, review: &str, t: &NewThread, repo: &str) -> Result<()> {
         self.mutate(
+            std::slice::from_ref(&repo.to_owned()),
             "mutation($review: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide,
                       $subject: PullRequestReviewThreadSubjectType) {
                addPullRequestReviewThread(input: {
@@ -1236,6 +1291,7 @@ impl GitHub {
     /// Edits a pending review comment by its GraphQL ID.
     pub async fn edit_review_comment(&self, comment: &str, body: &str) -> Result<()> {
         self.mutate(
+            &[],
             "mutation($comment: ID!, $body: String!) {
                updatePullRequestReviewComment(input: { pullRequestReviewCommentId: $comment, body: $body }) {
                  clientMutationId
@@ -1250,6 +1306,7 @@ impl GitHub {
     /// Deletes a pending review comment by its GraphQL ID.
     pub async fn delete_review_comment(&self, comment: &str) -> Result<()> {
         self.mutate(
+            &[],
             "mutation($comment: ID!) {
                deletePullRequestReviewComment(input: { id: $comment }) { clientMutationId }
              }",
@@ -1270,6 +1327,7 @@ impl GitHub {
         match &pending.review {
             Some(review) => {
                 self.mutate(
+                    &[],
                     "mutation($review: ID!, $event: PullRequestReviewEvent!, $body: String) {
                        submitPullRequestReview(input: { pullRequestReviewId: $review, event: $event, body: $body }) {
                          clientMutationId
@@ -1281,6 +1339,7 @@ impl GitHub {
             }
             None => {
                 self.mutate(
+                    &[],
                     "mutation($pr: ID!, $event: PullRequestReviewEvent!, $body: String) {
                        addPullRequestReview(input: { pullRequestId: $pr, event: $event, body: $body }) {
                          clientMutationId
@@ -1299,6 +1358,7 @@ impl GitHub {
     pub async fn merge(&self, key: &PrKey, m: &MergeRequest) -> Result<Option<String>> {
         let pr = self.pr_node(key, "headRef { id }").await?;
         self.mutate(
+            std::slice::from_ref(&key.repo),
             "mutation($pr: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!,
                       $title: String, $body: String) {
                mergePullRequest(input: {
@@ -1323,6 +1383,7 @@ impl GitHub {
         }
         let deleted = self
             .mutate(
+                std::slice::from_ref(&key.repo),
                 "mutation($ref: ID!) { deleteRef(input: { refId: $ref }) { clientMutationId } }",
                 json!({ "ref": head_ref }),
             )
@@ -1335,6 +1396,7 @@ impl GitHub {
     /// Retargets the PR at the base branch `base`.
     pub async fn set_pr_base(&self, key: &PrKey, base: &str) -> Result<()> {
         self.mutate(
+            std::slice::from_ref(&key.repo),
             "mutation($pr: ID!, $base: String!) {
                updatePullRequest(input: { pullRequestId: $pr, baseRefName: $base }) {
                  clientMutationId
@@ -1349,6 +1411,7 @@ impl GitHub {
     /// Closes the PR without merging it.
     pub async fn close_pr(&self, key: &PrKey) -> Result<()> {
         self.mutate(
+            std::slice::from_ref(&key.repo),
             "mutation($pr: ID!) {
                closePullRequest(input: { pullRequestId: $pr }) { clientMutationId }
              }",
@@ -1361,14 +1424,15 @@ impl GitHub {
     /// Discards the viewer's pending review and its comments.
     pub async fn discard_review(&self, key: &PrKey) -> Result<()> {
         match self.pending_review(key).await?.review {
-            Some(review) => self.delete_review(&review).await,
+            Some(review) => self.delete_review(&review, &key.repo).await,
             None => Ok(()),
         }
     }
 
     /// Deletes the pending review `review` and its comments.
-    async fn delete_review(&self, review: &str) -> Result<()> {
+    async fn delete_review(&self, review: &str, repo: &str) -> Result<()> {
         self.mutate(
+            std::slice::from_ref(&repo.to_owned()),
             "mutation($review: ID!) {
                deletePullRequestReview(input: { pullRequestReviewId: $review }) { clientMutationId }
              }",
@@ -1386,6 +1450,7 @@ impl GitHub {
             "unresolveReviewThread"
         };
         self.mutate(
+            &[],
             &format!(
                 "mutation($thread: ID!) {{ {field}(input: {{ threadId: $thread }}) {{ clientMutationId }} }}"
             ),
@@ -1398,6 +1463,7 @@ impl GitHub {
     /// Comments on a PR (or an issue) by its GraphQL ID.
     pub async fn add_comment(&self, subject_id: &str, body: &str) -> Result<()> {
         self.mutate(
+            &[],
             "mutation($subject: ID!, $body: String!) {
                addComment(input: { subjectId: $subject, body: $body }) { clientMutationId }
              }",
@@ -1444,7 +1510,15 @@ impl GitHub {
             vars.insert(format!("a{i}"), json!(after));
         }
         gql += "}";
-        let (data, errors) = self.graphql("search", &gql, Value::Object(vars)).await?;
+        let mut repos: Vec<String> = queries
+            .iter()
+            .flat_map(|(q, _, _)| search_repos(q))
+            .collect();
+        repos.sort();
+        repos.dedup();
+        let (data, errors) = self
+            .graphql("search", &repos, &gql, Value::Object(vars))
+            .await?;
         let viewer = str_at(&data, "/viewer/login").to_owned();
         let mut error_for: BTreeMap<String, String> = BTreeMap::new();
         for e in &errors {
@@ -1533,7 +1607,12 @@ impl GitHub {
         }
         gql += "  }\n}";
         let (data, errors) = self
-            .graphql("prs_by_ref", &gql, Value::Object(vars))
+            .graphql(
+                "prs_by_ref",
+                std::slice::from_ref(&repo.to_owned()),
+                &gql,
+                Value::Object(vars),
+            )
             .await?;
         (0..refs.len())
             .map(|i| {
@@ -1580,6 +1659,7 @@ impl GitHub {
         let (data, errors) = self
             .graphql(
                 "pr",
+                std::slice::from_ref(&key.repo),
                 &format!("{PR_QUERY}{CHECKS_FRAGMENT}"),
                 json!({ "owner": owner, "name": name, "number": key.number }),
             )
@@ -1678,13 +1758,19 @@ impl GitHub {
     ) -> Result<(u64, String)> {
         self.admit("create_pr", ApiResource::Rest)?;
         let at = chrono::Utc::now().timestamp();
+        let url = format!("{}/repos/{repo}/pulls", self.api);
         let resp = self
             .http
-            .post(format!("{}/repos/{repo}/pulls", self.api))
+            .post(url.clone())
             .json(&json!({ "head": head, "base": base, "title": title, "body": body }))
             .send()
             .await?;
-        self.saw_headers(ApiResource::Rest, "create_pr", resp.headers());
+        self.saw_headers(
+            ApiResource::Rest,
+            "create_pr",
+            &url_repos(&url),
+            resp.headers(),
+        );
         let resp = match self.check_exhausted(ApiResource::Rest, "create_pr", resp) {
             Ok(resp) => resp,
             Err(e) => {
@@ -1720,12 +1806,18 @@ impl GitHub {
     async fn stacks_send(
         &self,
         kind: &'static str,
+        repo: &str,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
         self.admit(kind, ApiResource::Rest)?;
         let at = chrono::Utc::now().timestamp();
         let resp = req.send().await?;
-        self.saw_headers(ApiResource::Rest, kind, resp.headers());
+        self.saw_headers(
+            ApiResource::Rest,
+            kind,
+            std::slice::from_ref(&repo.to_owned()),
+            resp.headers(),
+        );
         let resp = match self.check_exhausted(ApiResource::Rest, kind, resp) {
             Ok(resp) => resp,
             Err(e) => {
@@ -1743,7 +1835,11 @@ impl GitHub {
     pub async fn stack_of(&self, repo: &str, pr: u64) -> Result<StackLookup> {
         let url = format!("{}/repos/{repo}/stacks?pull_request={pr}", self.api);
         let resp = self
-            .stacks_send("stack_of", self.stacks_request(reqwest::Method::GET, url))
+            .stacks_send(
+                "stack_of",
+                repo,
+                self.stacks_request(reqwest::Method::GET, url),
+            )
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(StackLookup::Off);
@@ -1786,6 +1882,7 @@ impl GitHub {
         let resp = self
             .stacks_send(
                 "create_stack",
+                repo,
                 self.stacks_request(reqwest::Method::POST, url)
                     .json(&json!({ "pull_requests": prs })),
             )
@@ -1801,6 +1898,7 @@ impl GitHub {
         let resp = self
             .stacks_send(
                 "add_to_stack",
+                repo,
                 self.stacks_request(reqwest::Method::POST, url)
                     .json(&json!({ "pull_requests": prs })),
             )
@@ -1814,7 +1912,11 @@ impl GitHub {
     pub async fn unstack(&self, repo: &str, stack: u64) -> Result<()> {
         let url = format!("{}/repos/{repo}/stacks/{stack}/unstack", self.api);
         let resp = self
-            .stacks_send("unstack", self.stacks_request(reqwest::Method::POST, url))
+            .stacks_send(
+                "unstack",
+                repo,
+                self.stacks_request(reqwest::Method::POST, url),
+            )
             .await?;
         self.stack_result(resp, "didn't unstack").await?;
         Ok(())
@@ -1832,7 +1934,7 @@ impl GitHub {
             self.admit(kind, ApiResource::Rest)?;
             let at = chrono::Utc::now().timestamp();
             let resp = self.http.get(&url).send().await?;
-            self.saw_headers(ApiResource::Rest, kind, resp.headers());
+            self.saw_headers(ApiResource::Rest, kind, &url_repos(&url), resp.headers());
             let resp = match self
                 .check_exhausted(ApiResource::Rest, kind, resp)
                 .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
@@ -1940,6 +2042,7 @@ impl GitHub {
             let (data, errors) = self
                 .graphql(
                     "review_threads",
+                    std::slice::from_ref(&key.repo),
                     THREADS_QUERY,
                     json!({ "owner": owner, "name": name, "number": key.number, "after": after }),
                 )
@@ -2009,6 +2112,7 @@ impl GitHub {
             let (data, _) = self
                 .graphql(
                     "users",
+                    &[],
                     &format!("query({params}) {{\n{fields}}}"),
                     Value::Object(vars),
                 )
@@ -2047,9 +2151,13 @@ impl GitHub {
                 vars.insert(format!("x{i}"), json!(key.number));
             }
             // A PR that can't be found is an error for its alias only.
+            let mut repos: Vec<String> = chunk.iter().map(|k| k.repo.clone()).collect();
+            repos.sort();
+            repos.dedup();
             let (data, _) = self
                 .graphql(
                     "pr_statuses",
+                    &repos,
                     &format!("query({params}) {{\n{fields}}}"),
                     Value::Object(vars),
                 )
@@ -2117,6 +2225,7 @@ impl GitHub {
             let (data, _) = self
                 .graphql(
                     "commit_authors",
+                    std::slice::from_ref(&repo.to_owned()),
                     &format!(
                         "query({}) {{\nrepository(owner: $owner, name: $name) {{\n{fields}}}\n}}",
                         params.join(", ")
@@ -2188,6 +2297,32 @@ mod tests {
         // operation's selection set, not the fragment's.
         let q = with_cost(&format!("{PR_QUERY}{CHECKS_FRAGMENT}"));
         assert!(q.find("rateLimit { cost }").unwrap() < q.find("fragment Checks").unwrap());
+    }
+
+    #[test]
+    fn search_repos_finds_the_named_repos() {
+        assert_eq!(
+            search_repos("is:pr repo:a/b (repo:c/d OR repo:e/f) author:@me"),
+            ["a/b", "c/d", "e/f"]
+        );
+        assert_eq!(
+            search_repos("org:my-org user:someone sort:updated-desc"),
+            ["my-org/*", "someone/*"]
+        );
+        assert_eq!(search_repos("is:open author:@me"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn url_repos_finds_the_named_repo() {
+        assert_eq!(
+            url_repos("https://api.github.com/repos/o/n/pulls/3/comments?per_page=100"),
+            ["o/n"]
+        );
+        assert_eq!(url_repos("https://api.github.com/repos/o/n"), ["o/n"]);
+        assert_eq!(
+            url_repos("https://api.github.com/user/issues?per_page=100"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

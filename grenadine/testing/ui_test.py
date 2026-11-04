@@ -1251,7 +1251,10 @@ class InboxTest(ServerTestCase):
         self.page.get_by_role("link", name="Debug", exact=True).click()
         expect(self.page.locator(".debug h1")).to_have_text("GitHub API usage")
         expect(self.page.locator(".debug")).to_contain_text("of 5,000 points left")
-        expect(self.page.locator(".usage-table")).to_contain_text("Inbox search")
+        expect(self.page.locator(".usage-table:not(.usage-reports)")).to_contain_text(
+            "Inbox search"
+        )
+        expect(self.page.locator(".usage-reports")).to_contain_text(scenarios.REPO)
 
     def test_pauses_near_the_rate_limit(self) -> None:
         self.page.goto(self.url)
