@@ -531,6 +531,15 @@ class FakeGitHub:
         )
         self._server: ThreadingHTTPServer | None = None
 
+    def __getstate__(self) -> dict[str, Any]:
+        assert self._server is None and self._hold is None
+        return {k: v for k, v in self.__dict__.items() if k != "lock"}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Locks can't be copied, so a copy starts with a fresh one.
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+
     def hold_next_mutation(self) -> tuple[threading.Event, threading.Event]:
         """Makes the next mutation wait before it's made, e.g. to change the
         PR while a change from the page is in flight. Returns two events:
