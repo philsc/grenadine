@@ -3154,10 +3154,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
         dir: &std::path::Path,
         script: &str,
     ) -> Arc<State> {
-        use std::os::unix::fs::PermissionsExt as _;
         let claude = dir.join("claude");
-        std::fs::write(&claude, script).unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_util::write_executable(&claude, script);
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
             git_lock: tokio::sync::Mutex::new(()),
@@ -5288,8 +5286,6 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
 #[cfg(test)]
 pub(crate) mod devin_tests {
-    use std::os::unix::fs::PermissionsExt as _;
-
     use grenadine_core::api::NewAgent;
     use serde_json::json;
 
@@ -5469,12 +5465,10 @@ pub(crate) mod devin_tests {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
         let devin = dir.path().join("devin");
-        std::fs::write(
+        crate::test_util::write_executable(
             &devin,
-            format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display()),
+        );
         let state = state_with_devin(&fx, dir.path(), devin);
         let backends: Vec<_> = state
             .agents
@@ -5754,7 +5748,6 @@ mod devin_job_tests {
     use super::*;
     use crate::devin::{fake, fake_log};
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt as _;
 
     /// A fake devin whose prompts that contain `matching` reply with
     /// `answer` as JSON; other prompts just end.
@@ -5828,8 +5821,7 @@ cat {dir}/answer
             dir = dir.path().display()
         );
         let claude = dir.path().join("claude");
-        std::fs::write(&claude, &claude_script).unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_util::write_executable(&claude, &claude_script);
         let devin = devin_job_fake(dir.path(), "", json!({"stale": []}));
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
@@ -6011,12 +6003,10 @@ cat {dir}/answer
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
         let devin = dir.path().join("devin");
-        std::fs::write(
+        crate::test_util::write_executable(
             &devin,
-            format!("#!/bin/sh\necho \"$*\" >> {}\nexit 1\n", runs.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho \"$*\" >> {}\nexit 1\n", runs.display()),
+        );
         let state = state_with_devin(&fx, dir.path(), devin);
         let session = AgentSession {
             backend: AgentBackend::Devin,
@@ -6040,8 +6030,7 @@ cat {dir}/answer
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
         let devin = dir.path().join("devin");
-        std::fs::write(&devin, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_util::write_executable(&devin, "#!/bin/sh\nexit 1\n");
         let state = state_with_devin(&fx, dir.path(), devin);
         state
             .agents

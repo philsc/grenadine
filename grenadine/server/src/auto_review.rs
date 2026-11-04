@@ -1135,12 +1135,10 @@ sleep 30
     /// recorded and stays due for a later poll.
     #[tokio::test]
     async fn a_review_waits_for_its_backend() {
-        use std::os::unix::fs::PermissionsExt as _;
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
         let devin = dir.path().join("devin");
-        std::fs::write(&devin, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_util::write_executable(&devin, "#!/bin/sh\nexit 1\n");
         let state = crate::agent::devin_tests::state_with_devin(&fx, dir.path(), devin);
         let s = RepoSettings {
             review_backend: AgentBackend::Devin,
