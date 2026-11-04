@@ -52,6 +52,16 @@ pub const NOTE: &str = "This is an unattended pull request review. Nobody reads 
     it a second time. If you find nothing worth raising, post a short comment that says so. \
     Don't commit, push, or change the pull request's branch, title or description.";
 
+/// The mode a review on `backend` runs in. An unattended review denies
+/// every approval request, so the mode itself has to let routine
+/// commands like `gh` through.
+fn review_mode(backend: AgentBackend) -> PermissionMode {
+    match backend {
+        AgentBackend::Claude => PermissionMode::new("auto"),
+        AgentBackend::Devin => PermissionMode::new("smart"),
+    }
+}
+
 /// The longest skill name a repository's settings take.
 const MAX_SKILL: usize = 100;
 
@@ -255,6 +265,15 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
 /// Starts the review of `hit`. Returns whether it's running.
 async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &PrDetail) -> bool {
     let key = &hit.key;
+    if !state.agents.offered(settings.review_backend).await {
+        tracing::warn!(
+            "{}#{}: {} isn't offered, the review waits",
+            key.repo,
+            key.number,
+            settings.review_backend.label()
+        );
+        return false;
+    }
     let id = match state.db.start_auto_review(
         key,
         &hit.head_oid,
@@ -276,11 +295,11 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
         hit.head_oid
     );
     let req = NewAgent {
-        backend: AgentBackend::Claude,
+        backend: settings.review_backend,
         repo: key.repo.clone(),
         pr: Some(key.number),
         prompt: prompt(settings.review_skill.as_deref(), detail),
-        permission_mode: PermissionMode::new("auto"),
+        permission_mode: review_mode(settings.review_backend),
         model: None,
         images: Vec::new(),
     };
@@ -672,6 +691,34 @@ mod tests {
     }
 
     #[test]
+    fn review_modes() {
+        assert_eq!(review_mode(AgentBackend::Claude).as_str(), "auto");
+        assert_eq!(review_mode(AgentBackend::Devin).as_str(), "smart");
+    }
+
+    #[test]
+    fn settings_from_before_the_review_backend() {
+        // Settings saved before `review_backend` existed review with
+        // Claude.
+        let old: RepoSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.review_backend, AgentBackend::Claude);
+    }
+
+    #[test]
+    fn saving_the_review_backend() {
+        let off = RepoSettings {
+            auto_review: AutoReview::Off,
+            ..RepoSettings::default()
+        };
+        let devin = RepoSettings {
+            review_backend: AgentBackend::Devin,
+            ..off.clone()
+        };
+        let saved = to_save(&off, devin, 0).unwrap();
+        assert_eq!(saved.review_backend, AgentBackend::Devin);
+    }
+
+    #[test]
     fn watching_starts_once() {
         let db = Db::in_memory();
         let repos = ["o/n".to_owned()];
@@ -909,6 +956,142 @@ sleep 30
             AgentStatus::AwaitingApproval
         );
         agent::delete(&state, &id).await.unwrap();
+    }
+
+    /// Starts a Devin review session built the way `start` builds one,
+    /// recorded as reviewing #2; the fake devin plays `steps` for the
+    /// review's prompt.
+    async fn devin_review_session(
+        steps: Vec<serde_json::Value>,
+    ) -> (
+        crate::git::tests::Fixture,
+        tempfile::TempDir,
+        Arc<State>,
+        String,
+    ) {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = crate::devin::fake(
+            dir.path(),
+            serde_json::json!({
+                "session_id": "review-devin",
+                "model": "swe-2",
+                "models": [{"value": "swe-2", "name": "SWE-2"}],
+                "prompts": [{"match": "Review pull request", "steps": steps}],
+            }),
+        );
+        let state = crate::agent::devin_tests::state_with_devin(&fx, dir.path(), devin);
+        let key = PrKey {
+            repo: fx.clone.slug.clone(),
+            number: 2,
+        };
+        let review = state
+            .db
+            .start_auto_review(&key, "abc", "t", "u", agent::now())
+            .unwrap()
+            .unwrap();
+        let req = NewAgent {
+            backend: AgentBackend::Devin,
+            repo: fx.clone.slug.clone(),
+            pr: None,
+            prompt: prompt(None, &detail(2, None)),
+            permission_mode: review_mode(AgentBackend::Devin),
+            model: None,
+            images: Vec::new(),
+        };
+        let title = Some("Review #2: t".to_owned());
+        let session = agent::create_session(&state, req, SessionKind::AutoReview, title)
+            .await
+            .unwrap();
+        state
+            .db
+            .set_auto_review_session(review, &session.id)
+            .unwrap();
+        (fx, dir, state, session.id)
+    }
+
+    /// A Devin review runs in smart mode and its cost is in ACUs.
+    #[tokio::test]
+    async fn a_devin_review() {
+        let steps = vec![
+            serde_json::json!({"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Reviewed."},
+            }}),
+            serde_json::json!({"update": {
+                "sessionUpdate": "usage_update",
+                "used": 100,
+                "size": 200000,
+                "_meta": {"cognition.ai/totalAcuCost": 0.25},
+            }}),
+            serde_json::json!({"end": "end_turn"}),
+        ];
+        let (_fx, dir, state, id) = devin_review_session(steps).await;
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Unposted);
+        assert_eq!(review.session.as_deref(), Some(id.as_str()));
+        assert_eq!(review.cost, 0.25);
+        assert_eq!(review.cost_unit, CostUnit::Acu);
+        let session = state.db.agent(&id).unwrap().unwrap();
+        assert_eq!(session.backend, AgentBackend::Devin);
+        let mode = crate::devin::fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["method"] == "session/set_mode")
+            .expect("the review's mode was set");
+        assert_eq!(mode["params"]["modeId"], "smart");
+    }
+
+    /// A request a Devin review is denied doesn't come back as another
+    /// turn: the review ends with the one prompt it ran.
+    #[tokio::test]
+    async fn a_devin_reviews_denial_isnt_queued() {
+        let steps = vec![
+            serde_json::json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec:0#t",
+                "rawInput": {"command": "gh pr review --comment"},
+                "_meta": {"cognition.ai/inferenceToolName": "exec"},
+            }}),
+            serde_json::json!({
+                "request": "session/request_permission",
+                "params": {
+                    "sessionId": "review-devin",
+                    "toolCall": {"toolCallId": "exec:0#t"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            }),
+            serde_json::json!({"end": "end_turn"}),
+        ];
+        let (_fx, dir, state, _id) = devin_review_session(steps).await;
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Unposted);
+        let prompts: Vec<_> = crate::devin::fake_log(dir.path())
+            .into_iter()
+            .filter(|m| m["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+    }
+
+    /// While the review's backend isn't offered, the review isn't
+    /// recorded and stays due for a later poll.
+    #[tokio::test]
+    async fn a_review_waits_for_its_backend() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = dir.path().join("devin");
+        std::fs::write(&devin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&devin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = crate::agent::devin_tests::state_with_devin(&fx, dir.path(), devin);
+        let s = RepoSettings {
+            review_backend: AgentBackend::Devin,
+            ..settings(AutoReview::NonDraft, false)
+        };
+        assert!(!start(&state, &hit(false, "a"), &s, &detail(2, None)).await);
+        assert!(state.db.auto_reviews().unwrap().is_empty());
     }
 
     #[test]
