@@ -402,15 +402,7 @@ async fn update_prs(state: &Arc<State>, id: &str, tool_use: &str) -> anyhow::Res
     Ok(landed
         .prs()
         .iter()
-        .enumerate()
-        .map(|(i, pr)| {
-            format!(
-                "#{} {} (branch `{}`)",
-                pr.number,
-                pr.url,
-                agent::stack_branch(&session.branch, i)
-            )
-        })
+        .map(|pr| format!("#{} {} (branch `{}`)", pr.number, pr.url, pr.branch))
         .collect::<Vec<_>>()
         .join("\n"))
 }

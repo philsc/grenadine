@@ -1355,17 +1355,17 @@ pub struct WrapUp {
 #[serde(rename_all = "snake_case")]
 pub enum Landed {
     /// The clone's checkout was fast-forwarded to `sha`.
-    Checkout {
-        sha: String,
-    },
+    Checkout { sha: String },
     PullRequest {
         number: u64,
         url: String,
+        /// The branch its commits are pushed to; empty when it was landed
+        /// before the branch was recorded.
+        #[serde(default)]
+        branch: String,
     },
     /// A stack of PRs, one per commit, bottom first.
-    Stack {
-        prs: Vec<LandedPr>,
-    },
+    Stack { prs: Vec<LandedPr> },
 }
 
 /// One PR of a `Landed::Stack`.
@@ -1373,6 +1373,10 @@ pub enum Landed {
 pub struct LandedPr {
     pub number: u64,
     pub url: String,
+    /// The branch its commits are pushed to; empty when it was landed
+    /// before the branch was recorded.
+    #[serde(default)]
+    pub branch: String,
 }
 
 impl Landed {
@@ -1380,9 +1384,14 @@ impl Landed {
     pub fn prs(&self) -> Vec<LandedPr> {
         match self {
             Landed::Checkout { .. } => Vec::new(),
-            Landed::PullRequest { number, url } => vec![LandedPr {
+            Landed::PullRequest {
+                number,
+                url,
+                branch,
+            } => vec![LandedPr {
                 number: *number,
                 url: url.clone(),
+                branch: branch.clone(),
             }],
             Landed::Stack { prs } => prs.clone(),
         }
@@ -1391,8 +1400,16 @@ impl Landed {
     /// `prs` as a `Landed`: a single PR stays a `PullRequest`.
     pub fn from_prs(mut prs: Vec<LandedPr>) -> Landed {
         if prs.len() == 1 {
-            let LandedPr { number, url } = prs.remove(0);
-            Landed::PullRequest { number, url }
+            let LandedPr {
+                number,
+                url,
+                branch,
+            } = prs.remove(0);
+            Landed::PullRequest {
+                number,
+                url,
+                branch,
+            }
         } else {
             Landed::Stack { prs }
         }
