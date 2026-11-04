@@ -1940,6 +1940,8 @@ mod tests {
             None,
             ["mcp__grenadine__show_image"].into_iter()
         ));
+        assert!(allowed(&["mcp__grenadine__update_prs"]));
+        assert!(allowed(&["mcp__grenadine__land_on_checkout"]));
     }
 
     /// A tool's output repeats across updates, so the result keeps the

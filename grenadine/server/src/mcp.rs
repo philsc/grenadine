@@ -7,7 +7,9 @@
 //!
 //! The terminal tools let Claude read the session's terminal tabs, e.g. to
 //! see what a command it asked the user to run printed. `show_image` puts
-//! an image, such as a screenshot, into the transcript.
+//! an image, such as a screenshot, into the transcript. `update_prs` and
+//! `land_on_checkout` land the session's work the way the page's wrap-up
+//! does, from inside the agent's own turn.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +20,7 @@ use axum::Json;
 use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use grenadine_core::api::{AgentEventKind, PermissionMode};
+use grenadine_core::api::{AgentEventKind, Landed, PermissionMode, PrKey, WrapUpTarget};
 use serde_json::{Value, json};
 
 use crate::agent::{self, Decision};
@@ -42,11 +44,13 @@ const MAX_IMAGE: u64 = 20 << 20;
 
 /// The tools agents may use without asking: all of this server's but
 /// `approve`, which answers for a permission request.
-pub const ALLOWED_TOOLS: [&str; 4] = [
+pub const ALLOWED_TOOLS: [&str; 6] = [
     "mcp__grenadine__list_terminals",
     "mcp__grenadine__read_terminal",
     "mcp__grenadine__wait_for_terminal",
     "mcp__grenadine__show_image",
+    "mcp__grenadine__update_prs",
+    "mcp__grenadine__land_on_checkout",
 ];
 
 fn reply(id: &Value, result: Value) -> Response {
@@ -230,6 +234,19 @@ pub async fn handle(
                     },
                     "required": ["path"],
                 },
+            }, {
+                "name": "update_prs",
+                "description": "Pushes each of this session's commits to its own branch, \
+                    updates this session's open pull requests and opens a pull request for \
+                    each new commit, stacked on the one before it, titled and described \
+                    from the commit messages. To change a pull request, amend its commit \
+                    and call this again.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }, {
+                "name": "land_on_checkout",
+                "description": "Rebases this session's commits onto the user's checkout \
+                    of the repository and fast-forwards the checkout to them.",
+                "inputSchema": {"type": "object", "properties": {}},
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -285,6 +302,8 @@ pub async fn handle(
             let args = &params["arguments"];
             let result = match name {
                 "show_image" => show_image(&state, &id, args).await,
+                "update_prs" => update_prs(&state, &id, &format!("update_prs-{rpc_id}")).await,
+                "land_on_checkout" => land_on_checkout(&state, &id).await,
                 _ => terminal_tool(&state, &id, name, args).await,
             };
             let (text, failed) = match result {
@@ -348,6 +367,53 @@ async fn show_image(state: &State, id: &str, args: &Value) -> anyhow::Result<Str
         .map(str::to_owned);
     agent::emit(state, id, AgentEventKind::Image { id: image, caption })?;
     Ok("The user sees the image in the transcript.".into())
+}
+
+/// Pushes the session's commits to their branches and opens or updates
+/// its pull requests, as the page's Open PR wrap-up does. A session that
+/// started from a PR stacks its pull requests on that PR's branch, so it
+/// asks the user first.
+async fn update_prs(state: &Arc<State>, id: &str, tool_use: &str) -> anyhow::Result<String> {
+    let session = state.db.agent(id)?.context("The session is gone.")?;
+    if let Some(number) = session.pr {
+        let key = PrKey {
+            repo: session.repo.clone(),
+            number,
+        };
+        let base = state.db.pr(&key).ok().flatten().map(|pr| pr.head_ref);
+        let input = json!({"pr": number, "branch": session.branch, "base": base});
+        let allowed = matches!(
+            agent::await_approval(state, id, tool_use, "update_prs", &input, Vec::new()).await,
+            Some(Decision { allow: true, .. })
+        );
+        if !allowed {
+            bail!("The user didn't allow opening or updating pull requests onto #{number}.");
+        }
+    }
+    let landed = agent::land_now(state, id, WrapUpTarget::PullRequest).await?;
+    Ok(landed
+        .prs()
+        .iter()
+        .enumerate()
+        .map(|(i, pr)| {
+            format!(
+                "#{} {} (branch `{}`)",
+                pr.number,
+                pr.url,
+                agent::stack_branch(&session.branch, i)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Rebases the session's commits onto the user's checkout and
+/// fast-forwards it, as the page's Land on checkout wrap-up does.
+async fn land_on_checkout(state: &Arc<State>, id: &str) -> anyhow::Result<String> {
+    match agent::land_now(state, id, WrapUpTarget::Checkout).await? {
+        Landed::Checkout { sha } => Ok(format!("Landed on the checkout at {sha}.")),
+        _ => bail!("the session didn't land on the checkout"),
+    }
 }
 
 /// Runs one of the tools that read the session's terminals.
@@ -415,7 +481,7 @@ async fn terminal_tool(
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{AgentSession, AgentStatus};
+    use grenadine_core::api::{AgentSession, AgentStatus, SessionKind};
 
     use super::*;
 
@@ -436,18 +502,22 @@ mod tests {
     }
 
     fn state() -> Arc<State> {
+        state_with(|_| {})
+    }
+
+    /// A state with the session `f` leaves of the fixture session.
+    fn state_with(f: impl FnOnce(&mut AgentSession)) -> Arc<State> {
         let state = crate::sync::test_state();
-        state
-            .db
-            .create_agent(&AgentSession {
-                title: "t".into(),
-                branch: "b".into(),
-                worktree: "/w".into(),
-                base_sha: "s".into(),
-                status: AgentStatus::Running,
-                ..AgentSession::fixture(ID, "o/n")
-            })
-            .unwrap();
+        let mut session = AgentSession {
+            title: "t".into(),
+            branch: "b".into(),
+            worktree: "/w".into(),
+            base_sha: "s".into(),
+            status: AgentStatus::Running,
+            ..AgentSession::fixture(ID, "o/n")
+        };
+        f(&mut session);
+        state.db.create_agent(&session).unwrap();
         state
     }
 
@@ -502,7 +572,9 @@ mod tests {
                 "list_terminals",
                 "read_terminal",
                 "wait_for_terminal",
-                "show_image"
+                "show_image",
+                "update_prs",
+                "land_on_checkout"
             ]
         );
         let (_, body) = call(
@@ -774,6 +846,80 @@ mod tests {
         assert_eq!(err.to_string(), format!("Terminal {id} isn't open."));
 
         state.agents.terminals.close_all(ID).await;
+    }
+
+    /// A session started from a PR asks before its pull requests stack on
+    /// that PR's branch; a denied answer stops the push.
+    #[tokio::test]
+    async fn update_prs_asks_before_stacking_on_a_pr() {
+        let state = state_with(|s| s.pr = Some(24));
+        let call_task = tokio::spawn({
+            let state = state.clone();
+            async move { tool(&state, "update_prs", json!({})).await }
+        });
+        let mut requested = None;
+        for _ in 0..100 {
+            requested = state
+                .db
+                .agent_events(ID)
+                .unwrap()
+                .iter()
+                .find_map(|e| match &e.kind {
+                    AgentEventKind::ApprovalRequested {
+                        id,
+                        tool_name,
+                        input,
+                        ..
+                    } => Some((id.clone(), tool_name.clone(), input.clone())),
+                    _ => None,
+                });
+            if requested.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (tool_use, tool_name, input) = requested.expect("no approval was requested");
+        assert_eq!(tool_name, "update_prs");
+        assert!(input.contains("\"branch\":\"b\""), "{input}");
+        assert!(input.contains("\"pr\":24"), "{input}");
+        // The PR isn't synced in this state, so its branch is unknown.
+        assert!(input.contains("\"base\":null"), "{input}");
+
+        let decision = Decision {
+            allow: false,
+            ..Decision::default()
+        };
+        assert!(agent::approve(&state, ID, &tool_use, decision).unwrap());
+        let (text, failed) = call_task.await.unwrap();
+        assert!(failed, "{text}");
+        assert_eq!(
+            text,
+            "The user didn't allow opening or updating pull requests onto #24."
+        );
+        assert_eq!(state.db.agent(ID).unwrap().unwrap().landed, None);
+    }
+
+    /// Without a PR to push onto, `update_prs` doesn't ask; it fails here
+    /// on the unconfigured repo, and reviews can't land either way.
+    #[tokio::test]
+    async fn landing_tools_fail_cleanly() {
+        let state = state();
+        let (text, failed) = tool(&state, "update_prs", json!({})).await;
+        assert!(failed, "{text}");
+        assert!(text.contains("is not a configured repository"), "{text}");
+        let asked = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::ApprovalRequested { .. }));
+        assert!(!asked);
+
+        let state = state_with(|s| s.kind = SessionKind::AutoReview);
+        for name in ["update_prs", "land_on_checkout"] {
+            let (text, failed) = tool(&state, name, json!({})).await;
+            assert!(failed && text.contains("review"), "{name}: {text}");
+        }
     }
 
     /// The answers Claude Code 2.1 takes, as tried with a real `claude -p`.
