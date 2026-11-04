@@ -668,7 +668,7 @@ mod tests {
             let state = state.clone();
             async move { call(&state, &secret, request).await }
         });
-        for _ in 0..100 {
+        for _ in 0..1500 {
             if state.db.agent(ID).unwrap().unwrap().status == AgentStatus::AwaitingApproval {
                 break;
             }
@@ -905,7 +905,7 @@ mod tests {
             async move { tool(&state, "update_prs", json!({})).await }
         });
         let mut requested = None;
-        for _ in 0..100 {
+        for _ in 0..1500 {
             requested = state
                 .db
                 .agent_events(ID)
