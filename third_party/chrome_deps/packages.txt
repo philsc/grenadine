@@ -1,0 +1,47 @@
+# The pinned .debs behind @chrome_deps: the shared libraries Chrome
+# loads from the host, plus their jammy dependencies, minus what the
+# ubuntu:24.04 base image already ships.
+# Regenerate with: bazel run //third_party/chrome_deps:update
+09367acdf59f28ffb71ba7bc36c516cff03b2765930cf9be7bb7ea7273e4c312  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libb/libbsd/libbsd0_0.11.5-1_amd64.deb
+0d1eb051047eb0c637c893f618f45e1d419863bfa3bc821897ee05ad418ba22e  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/p/pcre3/libpcre3_8.39-13ubuntu0.22.04.1_amd64.deb
+154bbc6b1bfbe4c2753ec15838896ecc16be62c4b42b31e35aa9551284791fc0  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libp/libpng1.6/libpng16-16_1.6.37-3build5_amd64.deb
+1e3d7e7b53149f6fff92e1fbf4203b61301ca4e251b2949a34bf788dd999621f  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxcomposite/libxcomposite1_0.4.5-1build2_amd64.deb
+26f74d6ac0caf3f7b2926d9c1fca85bc868531c8159f943fb78fbb4b6c5a8c80  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/x/xkeyboard-config/xkb-data_2.33-1_all.deb
+35a306712d8b15b30c42ecd73ec087813eb01c0b3125dc8f7ca2b5134e133522  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libd/libdrm/libdrm-common_2.4.113-2%7eubuntu0.22.04.1_all.deb
+39dc0f73fa3bd43f3f7755cb7d12bfd1cd59dd8966f747d66fba47dfc8652f62  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxcb/libxcb-randr0_1.14-3ubuntu3_amd64.deb
+451c2d8b3d715b21c5f29f3adaf8720e9851af03f6770705fd6c3c634dd8a8bb  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/s/sqlite3/libsqlite3-0_3.37.2-2ubuntu0.5_amd64.deb
+47662736cca4be456fd42a5f0a9d3bed8a5cfad4ee08b809a95dde6004daf275  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxi/libxi6_1.8-1build1_amd64.deb
+53298d54c1b904ae0d28ef7e734844abcf134b58096bb0d079870bba20410880  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/alsa-lib/libasound2-data_1.2.6.1-1ubuntu1_all.deb
+551fa4101394af894f5f401285eeca9756da94bb31ecb08ed36a549ec580cd10  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxau/libxau6_1.0.9-1build5_amd64.deb
+555925f1caedfd98d89bae3bc11b4fe3401c2c4817dbbafcab25e1144582e946  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libd/libdrm/libdrm2_2.4.113-2%7eubuntu0.22.04.1_amd64.deb
+598b522b64a20c9a3ea44fa816b539976c39d41bf2bccd104fed49954638f0f9  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/atk1.0/libatk1.0-0_2.36.0-3build1_amd64.deb
+5fbce1f1ec150c715fd83eeef5626363580218db09cedc8ac888b172476b0c82  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxrandr/libxrandr2_1.5.2-1build1_amd64.deb
+5fc4e14d522e89bdf02baa0385a69897252203109be4f0122fca92da23d76784  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/g/glib2.0/libglib2.0-0_2.72.4-0ubuntu2.6_amd64.deb
+6a5171696c3b05aca273d637d9c0501c8033fda64a971e09fd545bc1ab72ca1e  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/d/dbus/libdbus-1-3_1.12.20-2ubuntu4.1_amd64.deb
+6be0c141aed23d9eb801658d248fd667bea2b8a9ccab4db7b596a69ffe3393fd  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/fontconfig/libfontconfig1_2.13.1-4.2ubuntu5_amd64.deb
+6f6c869dcfc072fa77d24b72ba127bdf15d606bdffbeba4314fb39f4f324363d  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxdmcp/libxdmcp6_1.1.3-0ubuntu5_amd64.deb
+729f5a3a72069ddcef6a54f6825178667477625574925504594769665897afbc  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/freetype/libfreetype6_2.11.1%2bdfsg-1ubuntu0.3_amd64.deb
+787ae3c986eb6d61daa383aa7c3be2e55e4f9bf0f903047caeb4c066038ccaec  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/fonts-liberation2/fonts-liberation2_2.1.5-1_all.deb
+78cde0c63824cb8b9773fe9b36e27629fc6141ea1132d41fe6d9f9281a080f95  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/g/gcc-12/gcc-12-base_12.3.0-1ubuntu1%7e22.04.2_amd64.deb
+875ec849749511dff61c8cc5a775f6f93427b9c3f392fdcec6925f14428e89cd  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxext/libxext6_1.3.4-1build1_amd64.deb
+8e6aa2dfd44df287b9fb227862f3b6062ec074dd39a247874edfe12e1dcc3841  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/b/brotli/libbrotli1_1.0.9-2build6_amd64.deb
+9258f04136434e7a0ccd76041505421934284209693373cfa9c24acb3a641ec5  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxcb/libxcb1_1.14-3ubuntu3_amd64.deb
+93b243e9d8fb3de9ba78251cf3dec2c6b66836ea7329ae4026981ce8dda62de4  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/at-spi2-core/libatspi2.0-0_2.44.0-3_amd64.deb
+98924a5b376da9c075663ea61721fb0d91a55be3473c4643286491247f229b48  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/at-spi2-atk/libatk-bridge2.0-0_2.38.0-3_amd64.deb
+9a844b4e8c27b76f39a00dd36dc833b2c99bfa24959df9b6b0749659c31a5c1c  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/fontconfig/fontconfig_2.13.1-4.2ubuntu5_amd64.deb
+a023521fb4930ba6a1f0c5a72a0d1c575b881ce1e117893621cab74e4bd0a60e  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/atk1.0/libatk1.0-data_2.36.0-3build1_all.deb
+a0470edb237d52b71ad41f755c043164abed01423585ed5ea19525b3baaf84f7  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxkbcommon/libxkbcommon0_1.4.0-1_amd64.deb
+a3fad168a58304fa4c9838158440660419a584855e2b2b881f980287c31a4819  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/u/ucf/ucf_3.0043_all.deb
+a68f6db4320b5963dd499b83b6cc8c7b5cd39b05e84862d5945da9244e4c96d6  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxrender/libxrender1_0.9.10-1build4_amd64.deb
+a705af86334b9c219e5f50e21e5bc51bfbf8b8189ca88d4fcafff734de81a503  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxdamage/libxdamage1_1.1.5-2build2_amd64.deb
+ac2ccbd5cb1cb1630da8281e8b5af280b14ecd31a0b06f1e591864704565cc3e  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/m/mesa/libgbm1_23.2.1-1ubuntu3.1%7e22.04.3_amd64.deb
+b38f6df7ba3a7435fafc514bb2183de348716723f4594a59f4f27e421ebbe431  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/n/nss/libnss3_3.98-0ubuntu0.22.04.2_amd64.deb
+b3c96e4a61675c87f8d9655109346748847d859abc95f20493159d06b5aa30ef  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/n/nspr/libnspr4_4.35-0ubuntu0.22.04.1_amd64.deb
+b3f93e3fc3f15ca134fd02ba6c59df80a8673f41b04dec9f66c63ce7183fc046  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/e/expat/libexpat1_2.4.7-1ubuntu0.6_amd64.deb
+b5d514dc17edac6b93ba2476d90806337ca4afcc914952a7e78af2e5cd0c4a7b  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/w/wayland/libwayland-server0_1.20.0-1ubuntu0.1_amd64.deb
+c33fe8bf33b50d99d6448804a090123b1bbba37d7a8703c630695676d110a47d  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-2build1_all.deb
+c40405fa036d1732e269fabd4c5b40076b973a226da1df6921d4b7e7a1e2ff72  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/f/fontconfig/fontconfig-config_2.13.1-4.2ubuntu5_all.deb
+cb208a762817bde5b83d1d52b7b89c747e9b484c857ea114bf97bacc1b29ecae  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/a/alsa-lib/libasound2_1.2.6.1-1ubuntu1_amd64.deb
+d2510de2e1aee7c2bcb149c1d8fac53f73efcf33f08664f563612fc16d16d4d9  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libx11/libx11-data_1.7.5-1ubuntu0.3_all.deb
+d382a3064ecd7576f24661a6d234adc737b854a9a0ec1d9f42cb4d007e77d547  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libx11/libx11-6_1.7.5-1ubuntu0.3_amd64.deb
+f627555440060edf19801d77d369c99547cf47123fe4e30c5bdb8b664f0b4467  https://snapshot.ubuntu.com/ubuntu/20251201T000000Z/pool/main/libx/libxfixes/libxfixes3_6.0.0-1_amd64.deb
