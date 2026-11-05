@@ -12,6 +12,7 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "rules_rust_wasm_bindgen", version = "0.74.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "rules_uv", version = "0.89.2")
 
 # aspect_rules_lint, via rules_buf, asks for rules_go 0.42.0, which uses the
@@ -163,4 +164,13 @@ exports_files(["chrome-headless-shell"])
         "https://storage.googleapis.com/chrome-for-testing-public/153.0.8010.12/linux64/chrome-headless-shell-linux64.zip",
         "https://cdn.playwright.dev/builds/cft/153.0.8010.12/linux64/chrome-headless-shell-linux64.zip",
     ],
+)
+
+# Chrome loads these shared libraries from the host, but the stock images on
+# remote executors don't have them.
+chrome_deps = use_repo_rule("//third_party/chrome_deps:debs.bzl", "chrome_deps")
+
+chrome_deps(
+    name = "chrome_deps",
+    packages = "//third_party/chrome_deps:packages.txt",
 )

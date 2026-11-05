@@ -46,11 +46,14 @@ py_test(
     data = [
         ":fake_devin",
         "//grenadine/server",
+        "@chrome_deps//:lib_dir",
+        "@chrome_deps//:libs",
         "@chrome_headless_shell//:chrome-headless-shell",
         "@chrome_headless_shell//:files",
     ],
     env = {
         "CHROME": "$(rootpath @chrome_headless_shell//:chrome-headless-shell)",
+        "CHROME_LIB_DIR": "$(rootpath @chrome_deps//:lib_dir)",
         "FAKE_DEVIN": "$(rootpath :fake_devin)",
         "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
     },

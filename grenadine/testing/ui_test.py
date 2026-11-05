@@ -662,8 +662,27 @@ class ServerTestCase(unittest.TestCase):
 
         cls.playwright = sync_playwright().start()
         cls.addClassCleanup(cls.playwright.stop)
+        # Chrome's shared libraries and fonts come from @chrome_deps, not the
+        # host. fontconfig has no default config there, so it gets one that
+        # points at the fonts in the repository.
+        chrome_env = dict(os.environ)
+        lib_dir = os.path.dirname(os.path.abspath(chrome_env["CHROME_LIB_DIR"]))
+        ld_library_path = chrome_env.get("LD_LIBRARY_PATH")
+        chrome_env["LD_LIBRARY_PATH"] = (
+            lib_dir + os.pathsep + ld_library_path if ld_library_path else lib_dir
+        )
+        repo = Path(lib_dir).parents[2]
+        fonts_cache = tmp / "fonts_cache"
+        fonts_conf = tmp / "fonts.conf"
+        fonts_conf.write_text(
+            '<?xml version="1.0"?>\n<fontconfig>\n'
+            f"  <dir>{repo / 'usr' / 'share' / 'fonts'}</dir>\n"
+            f"  <cachedir>{fonts_cache}</cachedir>\n"
+            "</fontconfig>\n"
+        )
+        chrome_env["FONTCONFIG_FILE"] = str(fonts_conf)
         cls.browser = cls.playwright.chromium.launch(
-            executable_path=os.environ["CHROME"]
+            executable_path=os.environ["CHROME"], env=chrome_env
         )
         cls.addClassCleanup(cls.browser.close)
 
