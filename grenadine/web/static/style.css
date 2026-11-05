@@ -1150,6 +1150,11 @@ input[type="text"] {
   margin: 0 auto;
   padding: 16px 24px 48px;
 }
+/* The sticky footer ends the transcript, so padding below it would only
+   show once scrolled to the bottom. */
+.agent {
+  padding-bottom: 0;
+}
 .agents h2 {
   font-size: 16px;
   margin: 0 0 8px;

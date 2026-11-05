@@ -2531,6 +2531,36 @@ class AgentTest(ServerTestCase):
         self.assertGreater(meter_box["y"], send_box["y"] + send_box["height"])
         self.delete_session("A Devin task")
 
+    def test_agent_footer_flush_with_bottom_when_scrolled_down(self) -> None:
+        # The sticky footer ends the transcript; scrolled to the bottom
+        # it sits flush with the pane's edge, with no padding below it.
+        self.page.set_viewport_size({"width": 1000, "height": 400})
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("long transcript 10")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(
+            1, timeout=60_000
+        )
+
+        main = self.page.locator(".agent-panes > .main")
+        self.assertGreater(
+            main.evaluate("e => e.scrollHeight"),
+            main.evaluate("e => e.clientHeight"),
+        )
+        main.evaluate("e => e.scrollTop = e.scrollHeight")
+        footer_box = self.page.locator(".agent-footer").bounding_box()
+        main_box = main.bounding_box()
+        assert footer_box and main_box
+        self.assertAlmostEqual(
+            footer_box["y"] + footer_box["height"],
+            main_box["y"] + main_box["height"],
+            delta=1,
+        )
+        self.delete_session("long transcript 10", repo=scenarios.REPO)
+
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")
         question = transcript.locator(".approval")
