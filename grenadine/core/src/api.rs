@@ -449,6 +449,25 @@ pub struct Merged {
     pub warning: Option<String>,
 }
 
+/// The body of a request that adds a PR to its merge queue.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enqueue {
+    /// The head the viewer reviewed. GitHub refuses the enqueue when the
+    /// PR's head has moved on since.
+    pub head_oid: String,
+    /// Join ahead of the PRs already queued.
+    pub jump: bool,
+}
+
+/// The body of a request that makes a PR join its merge queue once its
+/// requirements are met.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoMerge {
+    /// The head the viewer reviewed. GitHub refuses the request when the
+    /// PR's head has moved on since.
+    pub head_oid: String,
+}
+
 /// What submitting a review says about the PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewEvent {
@@ -585,6 +604,45 @@ impl MergeMethod {
     }
 }
 
+/// GitHub's `MergeQueueEntryState`: where in the queue the PR is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueueState {
+    /// Waiting for the queue's checks to run.
+    AwaitingChecks,
+    /// The queue is locked while entries ahead are merged.
+    Locked,
+    /// The queue is ready to merge the PR.
+    Mergeable,
+    /// In line, waiting its turn.
+    Queued,
+    /// The queue can't merge the PR.
+    Unmergeable,
+    /// A value grenadine doesn't know yet.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The PR's place in its merge queue, when it's in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEntry {
+    /// Its 1-based place, the first to merge being 1.
+    pub position: u32,
+    pub state: QueueState,
+}
+
+/// How the PR relates to the merge queue its base branch requires.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeQueueInfo {
+    /// The method the queue merges with, when GitHub reports it.
+    pub method: Option<MergeMethod>,
+    pub entry: Option<QueueEntry>,
+    /// The PR joins the queue once its requirements are met.
+    pub auto_merge: bool,
+    /// The viewer may switch auto-merge on or off.
+    pub can_enable_auto_merge: bool,
+    pub can_disable_auto_merge: bool,
+}
+
 /// Whether and how the PR can be merged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeInfo {
@@ -604,6 +662,10 @@ pub struct MergeInfo {
     /// resolved before merging.
     #[serde(default)]
     pub requires_conversation_resolution: bool,
+    /// `Some` when the base branch requires merging through a merge
+    /// queue.
+    #[serde(default)]
+    pub queue: Option<MergeQueueInfo>,
 }
 
 /// Someone asked to review a PR who hasn't yet.

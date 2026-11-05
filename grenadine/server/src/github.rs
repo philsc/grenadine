@@ -7,10 +7,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
-    ApiResource, Check, CiStatus, GitHubUsage, IssueComment, MergeInfo, MergeMethod, MergeRequest,
-    MergeState, NewThread, Person, PrKey, RequestPriority, RequestedReviewer, Review,
-    ReviewComment, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, Side, StackPr,
-    SubmitReview, ThreadCounts,
+    ApiResource, AutoMerge, Check, CiStatus, Enqueue, GitHubUsage, IssueComment, MergeInfo,
+    MergeMethod, MergeQueueInfo, MergeRequest, MergeState, NewThread, Person, PrKey, QueueEntry,
+    QueueState, RequestPriority, RequestedReviewer, Review, ReviewComment, ReviewDecision,
+    ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -302,6 +302,42 @@ fn merge_state(s: &str) -> MergeState {
     }
 }
 
+/// Maps a `MergeQueueEntryState`.
+fn queue_state(s: &str) -> QueueState {
+    match s {
+        "AWAITING_CHECKS" => QueueState::AwaitingChecks,
+        "LOCKED" => QueueState::Locked,
+        "MERGEABLE" => QueueState::Mergeable,
+        "QUEUED" => QueueState::Queued,
+        "UNMERGEABLE" => QueueState::Unmergeable,
+        _ => {
+            tracing::warn!("unknown queue state {s:?}");
+            QueueState::Unknown
+        }
+    }
+}
+
+/// How the PR relates to the merge queue of its base branch in a
+/// `PR_QUERY` response; `None` when the branch has no queue.
+fn queue_info(pr: &Value) -> Option<MergeQueueInfo> {
+    if pr["isMergeQueueEnabled"].as_bool() != Some(true) {
+        return None;
+    }
+    let entry = pr.pointer("/mergeQueueEntry/position").and_then(|p| {
+        Some(QueueEntry {
+            position: p.as_u64()? as u32,
+            state: queue_state(str_at(pr, "/mergeQueueEntry/state")),
+        })
+    });
+    Some(MergeQueueInfo {
+        method: MergeMethod::from_github(str_at(pr, "/mergeQueue/configuration/mergeMethod")),
+        entry,
+        auto_merge: !pr["autoMergeRequest"].is_null(),
+        can_enable_auto_merge: pr["viewerCanEnableAutoMerge"].as_bool().unwrap_or(false),
+        can_disable_auto_merge: pr["viewerCanDisableAutoMerge"].as_bool().unwrap_or(false),
+    })
+}
+
 /// The extra fields a search selects when its inbox filter is evaluated
 /// locally, besides the review decision that every search has. They
 /// cost a lot — every review and review request counts
@@ -353,6 +389,11 @@ query($owner: String!, $name: String!, $number: Int!) {
         nodes { commit { oid checkSuites(first: 10) { nodes { createdAt } } } }
       }
       reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
+      isMergeQueueEnabled
+      mergeQueue { configuration { mergeMethod } }
+      mergeQueueEntry { position state jump }
+      autoMergeRequest { enabledAt }
+      viewerCanEnableAutoMerge viewerCanDisableAutoMerge
       reviews(last: 100) {
         nodes { state body submittedAt url commit { oid } author { ...Who } }
       }
@@ -457,6 +498,12 @@ const REVIEW_FIELDS: &[&[&str]] = &[
     &["repository", "pullRequest", "mergeable"],
     &["repository", "pullRequest", "mergeStateStatus"],
     &["repository", "pullRequest", "viewerCanMergeAsAdmin"],
+    &["repository", "pullRequest", "isMergeQueueEnabled"],
+    &["repository", "pullRequest", "mergeQueue"],
+    &["repository", "pullRequest", "mergeQueueEntry"],
+    &["repository", "pullRequest", "autoMergeRequest"],
+    &["repository", "pullRequest", "viewerCanEnableAutoMerge"],
+    &["repository", "pullRequest", "viewerCanDisableAutoMerge"],
     &["repository", "pullRequest", "reviews"],
     &["repository", "pullRequest", "pending"],
     &["repository", "pullRequest", "reviewRequests"],
@@ -691,6 +738,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
                         .and_then(Value::as_bool)
                         == Some(true)
                 }),
+            queue: queue_info(pr),
         },
         pending_review: None,
     }
@@ -1395,6 +1443,78 @@ impl GitHub {
         Ok(deleted
             .err()
             .map(|e| format!("Merged, but the branch wasn't deleted: {e:#}")))
+    }
+
+    /// Adds the PR to its merge queue, ahead of the queued PRs when
+    /// `e.jump`.
+    pub async fn enqueue(&self, key: &PrKey, e: &Enqueue) -> Result<()> {
+        self.mutate(
+            std::slice::from_ref(&key.repo),
+            "mutation($pr: ID!, $head: GitObjectID!, $jump: Boolean!) {
+               enqueuePullRequest(input: {
+                 pullRequestId: $pr, expectedHeadOid: $head, jump: $jump
+               }) {
+                 clientMutationId
+               }
+             }",
+            json!({
+                "pr": self.pr_id(key).await?,
+                "head": e.head_oid,
+                "jump": e.jump,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Takes the PR out of its merge queue.
+    pub async fn dequeue(&self, key: &PrKey) -> Result<()> {
+        self.mutate(
+            std::slice::from_ref(&key.repo),
+            "mutation($pr: ID!) {
+               dequeuePullRequest(input: { id: $pr }) { clientMutationId }
+             }",
+            json!({ "pr": self.pr_id(key).await? }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Makes the PR join its merge queue once its requirements are met.
+    /// The queue's configuration picks the method and the commit message,
+    /// so neither is sent.
+    pub async fn enable_auto_merge(&self, key: &PrKey, m: &AutoMerge) -> Result<()> {
+        self.mutate(
+            std::slice::from_ref(&key.repo),
+            "mutation($pr: ID!, $head: GitObjectID!) {
+               enablePullRequestAutoMerge(input: {
+                 pullRequestId: $pr, expectedHeadOid: $head
+               }) {
+                 clientMutationId
+               }
+             }",
+            json!({
+                "pr": self.pr_id(key).await?,
+                "head": m.head_oid,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Stops the PR joining its merge queue when ready.
+    pub async fn disable_auto_merge(&self, key: &PrKey) -> Result<()> {
+        self.mutate(
+            std::slice::from_ref(&key.repo),
+            "mutation($pr: ID!) {
+               disablePullRequestAutoMerge(input: { pullRequestId: $pr }) {
+                 clientMutationId
+               }
+             }",
+            json!({ "pr": self.pr_id(key).await? }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Retargets the PR at the base branch `base`.
@@ -2559,6 +2679,13 @@ mod tests {
                     "mergeable": "UNKNOWN",
                     "mergeStateStatus": "BLOCKED",
                     "viewerCanMergeAsAdmin": true,
+                    "isMergeQueueEnabled": true,
+                    "mergeQueue": { "configuration": { "mergeMethod": "SQUASH" } },
+                    "mergeQueueEntry": { "position": 3, "state": "AWAITING_CHECKS",
+                                       "jump": false },
+                    "autoMergeRequest": { "enabledAt": "t0" },
+                    "viewerCanEnableAutoMerge": false,
+                    "viewerCanDisableAutoMerge": true,
                     "baseRef": {
                         "refUpdateRule": { "requiresConversationResolution": true },
                         "rules": { "nodes": [] },
@@ -2642,6 +2769,16 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: true,
                 requires_conversation_resolution: true,
+                queue: Some(MergeQueueInfo {
+                    method: Some(MergeMethod::Squash),
+                    entry: Some(QueueEntry {
+                        position: 3,
+                        state: QueueState::AwaitingChecks,
+                    }),
+                    auto_merge: true,
+                    can_enable_auto_merge: false,
+                    can_disable_auto_merge: true,
+                }),
             }
         );
     }

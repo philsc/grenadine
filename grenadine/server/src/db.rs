@@ -2178,6 +2178,7 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                queue: None,
             },
         };
         let mut with_review = meta(&key);

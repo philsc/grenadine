@@ -2050,6 +2050,155 @@ class ReviewTest(ServerTestCase):
         expect(dialog.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
 
+class QueueTest(ServerTestCase):
+    """The merge box on a repository whose base branch requires a merge
+    queue."""
+
+    REPOS: ClassVar[list[str]] = [scenarios.REPO, scenarios.QUEUE_REPO]
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        gh.repo(scenarios.REPO)
+        cls.prs = scenarios.queue_cases(gh)
+
+    def open(self, title: str) -> None:
+        pr = self.prs[title]
+        self.page.goto(f"{self.url}#/{scenarios.QUEUE_REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+
+    def merge_box(self) -> Locator:
+        return self.page.locator(".merge-box")
+
+    def status(self) -> Locator:
+        return self.merge_box().locator(".merge-status")
+
+    def click(self, name: str) -> list[str]:
+        """Clicks the merge box's button `name`, accepting the dialog it
+        opens. Returns what the dialog said."""
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        self.merge_box().get_by_role("button", name=name).click()
+        return messages
+
+    def test_joining_the_queue(self) -> None:
+        pr = self.prs[scenarios.QUEUE_READY]
+        self.open(scenarios.QUEUE_READY)
+        box = self.merge_box()
+        expect(self.status()).to_have_text("Ready to join the merge queue.")
+        expect(box.locator(".queue-method")).to_have_text(
+            "The merge queue squashes and merges this PR."
+        )
+        # A queue branch offers no plain merge.
+        expect(box.get_by_label("Merge method")).to_have_count(0)
+        expect(box.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
+        expect(box.get_by_label("Delete the branch")).to_have_count(0)
+        expect(box.get_by_role("button", name="Edit the commit message")).to_have_count(
+            0
+        )
+
+        messages = self.click("Add to merge queue")
+        self.assertEqual(messages, [f"Add #{pr.number} to the merge queue for main?"])
+        expect(self.status()).to_have_text("In the merge queue: position 1 (queued).")
+        self.assertTrue(pr.queued)
+        expect(box.get_by_role("button", name="Remove from queue")).to_be_enabled()
+
+    def test_leaving_the_queue(self) -> None:
+        pr = self.prs[scenarios.QUEUED]
+        self.open(scenarios.QUEUED)
+        expect(self.status()).to_have_text("In the merge queue: position 1 (queued).")
+        messages = self.click("Remove from queue")
+        self.assertEqual(messages, [f"Remove #{pr.number} from the merge queue?"])
+        expect(self.status()).to_have_text("Ready to join the merge queue.")
+        self.assertFalse(pr.queued)
+        expect(
+            self.merge_box().get_by_role("button", name="Add to merge queue")
+        ).to_be_enabled()
+
+    def test_merging_when_ready(self) -> None:
+        pr = self.prs[scenarios.QUEUE_WAITING]
+        self.open(scenarios.QUEUE_WAITING)
+        blocked = "Merging is blocked: required checks or rules aren't satisfied."
+        expect(self.status()).to_have_text(blocked)
+        expect(
+            self.merge_box().get_by_role("button", name="Merge", exact=True)
+        ).to_have_count(0)
+
+        messages = self.click("Merge when ready")
+        self.assertEqual(
+            messages, [f"Merge #{pr.number} when its requirements are met?"]
+        )
+        expect(self.status()).to_have_text("Will join the merge queue when ready.")
+        self.assertIsNotNone(pr.auto_merge_at)
+
+        messages = self.click("Cancel")
+        self.assertEqual(
+            messages, [f"Stop #{pr.number} joining the merge queue when ready?"]
+        )
+        expect(self.status()).to_have_text(blocked)
+        self.assertIsNone(pr.auto_merge_at)
+
+    def test_blocked_without_auto_merge(self) -> None:
+        self.open(scenarios.QUEUE_NO_AUTO)
+        box = self.merge_box()
+        expect(box.locator(".merge-blocked")).to_have_text(
+            "The branch's rules block merging."
+        )
+        expect(box.get_by_role("button", name="Add to merge queue")).to_have_count(0)
+        expect(box.get_by_role("button", name="Merge when ready")).to_have_count(0)
+        expect(box.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
+
+    def test_add_to_front_of_queue(self) -> None:
+        pr = self.prs[scenarios.QUEUE_ADMIN]
+        self.open(scenarios.QUEUE_ADMIN)
+        box = self.merge_box()
+        expect(box.get_by_role("button", name="Add to front of queue")).to_be_enabled()
+        expect(
+            box.get_by_role("button", name="Merge now, bypassing the queue…")
+        ).to_be_enabled()
+
+        messages = self.click("Add to front of queue")
+        self.assertEqual(
+            messages,
+            [f"Add #{pr.number} to the front of the merge queue for main?"],
+        )
+        expect(self.status()).to_contain_text("In the merge queue")
+        self.assertTrue(pr.queued)
+        self.assertTrue(pr.queue_jump)
+        # Leave the queue again so later tests see fixed positions.
+        self.click("Remove from queue")
+        expect(self.status()).to_have_text("Ready to join the merge queue.")
+        self.assertFalse(pr.queued)
+
+    def test_merge_now_bypassing_the_queue(self) -> None:
+        pr = self.prs[scenarios.QUEUE_BYPASS]
+        self.open(scenarios.QUEUE_BYPASS)
+        box = self.merge_box()
+        box.get_by_role("button", name="Merge now, bypassing the queue…").click()
+        method = box.get_by_label("Merge method")
+        expect(method).to_have_value("MERGE")
+        expect(box.get_by_label("Delete the branch")).to_be_checked()
+
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        box.get_by_role("button", name="Merge, bypassing rules").click()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        self.assertEqual(pr.state, "MERGED")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("bypassing the branch's rules", messages[0])
+
+
 class VersionsTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:

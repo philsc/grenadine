@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grenadine_core::api::{
-    Check, CiStatus, IssueComment, MergeMethod, MergeRequest, MergeState, Person, PrDetail, PrKey,
-    RequestedReviewer, Review, ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, SubmitReview,
-    submit_blocker,
+    AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
+    Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision, ReviewEvent,
+    ReviewInfo, ReviewState, SubmitReview, submit_blocker,
 };
 use leptos::prelude::*;
 
@@ -61,10 +61,41 @@ fn block_reasons(info: &ReviewInfo, unresolved: usize) -> Vec<String> {
     reasons
 }
 
+/// The queue entry's state in words, for "In the merge queue".
+fn queue_state_words(state: QueueState) -> &'static str {
+    match state {
+        QueueState::AwaitingChecks => "waiting for checks",
+        QueueState::Locked => "locked",
+        QueueState::Mergeable => "mergeable",
+        QueueState::Queued => "queued",
+        QueueState::Unmergeable => "unmergeable",
+        QueueState::Unknown => "state unknown",
+    }
+}
+
 /// One line about whether the PR can be merged: a CSS class, `ok`,
 /// `warn` or `bad`, and the text. `unresolved` is how many review
 /// threads are unresolved.
 pub fn merge_status(info: &ReviewInfo, unresolved: usize) -> (&'static str, String) {
+    if let Some(entry) = info.merge.queue.as_ref().and_then(|q| q.entry) {
+        let class = match entry.state {
+            QueueState::Mergeable => "ok",
+            QueueState::Unmergeable => "bad",
+            _ => "warn",
+        };
+        return (
+            class,
+            format!(
+                "In the merge queue: position {} ({}).",
+                entry.position,
+                queue_state_words(entry.state)
+            ),
+        );
+    }
+    let queue = info.merge.queue.as_ref();
+    if queue.is_some_and(|q| q.auto_merge) {
+        return ("ok", "Will join the merge queue when ready.".into());
+    }
     if info.merge.conflicting == Some(true) {
         return (
             "bad",
@@ -72,7 +103,14 @@ pub fn merge_status(info: &ReviewInfo, unresolved: usize) -> (&'static str, Stri
         );
     }
     match info.merge.state {
+        MergeState::Clean | MergeState::HasHooks if queue.is_some() => {
+            ("ok", "Ready to join the merge queue.".into())
+        }
         MergeState::Clean | MergeState::HasHooks => ("ok", "Ready to merge.".into()),
+        MergeState::Unstable if queue.is_some() => (
+            "warn",
+            "Can join the merge queue, but not every check passed.".into(),
+        ),
         MergeState::Unstable => ("warn", "Can be merged, but not every check passed.".into()),
         MergeState::Behind => ("warn", "This branch is out of date with its base.".into()),
         MergeState::Draft => ("warn", "This PR is a draft.".into()),
@@ -687,6 +725,8 @@ pub struct MergeChoice {
     merged: RwSignal<bool>,
     /// What went wrong after merging, e.g. deleting the branch.
     warning: RwSignal<Option<String>>,
+    /// The direct-merge controls are revealed on a merge-queue branch.
+    bypass: RwSignal<bool>,
 }
 
 impl MergeChoice {
@@ -697,6 +737,7 @@ impl MergeChoice {
             delete_branch: RwSignal::new(None),
             merged: RwSignal::new(false),
             warning: RwSignal::new(None),
+            bypass: RwSignal::new(false),
         }
     }
 }
@@ -737,7 +778,9 @@ pub struct MergeTarget {
 }
 
 /// Merging the PR: the method, the squash message, deleting the branch.
-fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
+/// `admin` forces the bypass styling when the viewer may skip rules the
+/// state alone doesn't show, e.g. a merge queue.
+fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl IntoView + use<> {
     let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
     let boxes = expect_context::<OpenBoxes>();
     let MergeChoice {
@@ -746,6 +789,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
         delete_branch,
         merged,
         warning,
+        ..
     } = expect_context::<MergeChoice>();
     let name = StoredValue::new(merge_name(&key));
     let busy = move || name.with_value(|n| boxes.sending(n));
@@ -765,7 +809,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     let editing = Memo::new(move |_| message.with(Option::is_some));
     let editing = move || editing.get();
     let methods = info.merge.methods.clone();
-    let admin = allowed == Ok(true);
+    let admin = admin || allowed == Ok(true);
     let blocked = allowed.err();
     let key = StoredValue::new(key);
     let head = target.head_oid.clone();
@@ -865,21 +909,249 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     }
 }
 
+/// What a PR on a merge-queue branch offers next: joining the queue now,
+/// joining it once its requirements are met, or why neither is on.
+#[derive(Clone, Copy)]
+enum QueueAction {
+    Enqueue,
+    AutoMerge,
+    Blocked(&'static str),
+}
+
+/// The primary action on a merge-queue branch, or its refusal. Uses the
+/// same refusals as `can_merge`.
+fn queue_action(info: &ReviewInfo, is_draft: bool, unresolved: usize) -> QueueAction {
+    let m = &info.merge;
+    if is_draft || m.state == MergeState::Draft {
+        return QueueAction::Blocked("Drafts can't be merged.");
+    }
+    if m.conflicting == Some(true) || m.state == MergeState::Dirty {
+        return QueueAction::Blocked("Resolve the conflicts first.");
+    }
+    match m.state {
+        MergeState::Clean | MergeState::HasHooks | MergeState::Unstable => QueueAction::Enqueue,
+        MergeState::Behind => {
+            if m.queue.as_ref().is_some_and(|q| q.can_enable_auto_merge) {
+                QueueAction::AutoMerge
+            } else {
+                QueueAction::Blocked("Bring the branch up to date first.")
+            }
+        }
+        MergeState::Blocked => {
+            if m.queue.as_ref().is_some_and(|q| q.can_enable_auto_merge) {
+                QueueAction::AutoMerge
+            } else if m.requires_conversation_resolution && unresolved > 0 {
+                QueueAction::Blocked("Resolve the conversations first.")
+            } else {
+                QueueAction::Blocked("The branch's rules block merging.")
+            }
+        }
+        _ => QueueAction::Blocked("GitHub hasn't worked out yet whether this can be merged."),
+    }
+}
+
+/// The name of the queue change of `key` in `OpenBoxes`.
+fn queue_name(key: &PrKey) -> String {
+    format!("queue.{}#{}", key.repo, key.number)
+}
+
+/// The merge box of a PR on a merge-queue branch: joining or leaving the
+/// queue, and for admins jumping it or bypassing it, which reveals the
+/// usual merge controls.
+fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
+    let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
+    let boxes = expect_context::<OpenBoxes>();
+    let MergeChoice { bypass, .. } = expect_context::<MergeChoice>();
+    let queue = info
+        .merge
+        .queue
+        .clone()
+        .expect("queue controls need a merge-queue branch");
+    let name = StoredValue::new(queue_name(&key));
+    let busy = move || name.with_value(|n| boxes.sending(n));
+    let error = move || name.with_value(|n| boxes.error(n));
+    let key = StoredValue::new(key);
+    let base_ref = target.base_ref.clone();
+    let confirm = |what: String| window().confirm_with_message(&what).unwrap_or(false);
+    let enqueue = {
+        let head = target.head_oid.clone();
+        let base_ref = base_ref.clone();
+        move |jump: bool| {
+            let Some(head) = head.clone() else {
+                return;
+            };
+            let number = key.with_value(|k| k.number);
+            let what = match jump {
+                true => format!("Add #{number} to the front of the merge queue for {base_ref}?"),
+                false => format!("Add #{number} to the merge queue for {base_ref}?"),
+            };
+            if !confirm(what) {
+                return;
+            }
+            let request = Enqueue {
+                head_oid: head,
+                jump,
+            };
+            let key = key.get_value();
+            name.with_value(|n| {
+                boxes.send(n, async move { api::enqueue(&key, &request).await }, || {})
+            });
+        }
+    };
+    let merge_when_ready = {
+        let head = target.head_oid.clone();
+        move |_| {
+            let Some(head) = head.clone() else {
+                return;
+            };
+            let number = key.with_value(|k| k.number);
+            if !confirm(format!("Merge #{number} when its requirements are met?")) {
+                return;
+            }
+            let request = AutoMerge { head_oid: head };
+            let key = key.get_value();
+            name.with_value(|n| {
+                boxes.send(
+                    n,
+                    async move { api::enable_auto_merge(&key, &request).await },
+                    || {},
+                )
+            });
+        }
+    };
+    let cancel_auto_merge = move |_| {
+        let number = key.with_value(|k| k.number);
+        if !confirm(format!(
+            "Stop #{number} joining the merge queue when ready?"
+        )) {
+            return;
+        }
+        let key = key.get_value();
+        name.with_value(|n| {
+            boxes.send(n, async move { api::disable_auto_merge(&key).await }, || {})
+        });
+    };
+    let dequeue = move |_| {
+        let number = key.with_value(|k| k.number);
+        if !confirm(format!("Remove #{number} from the merge queue?")) {
+            return;
+        }
+        let key = key.get_value();
+        name.with_value(|n| boxes.send(n, async move { api::dequeue(&key).await }, || {}));
+    };
+    let method_line = queue.method.map(|m| match m {
+        MergeMethod::Squash => "The merge queue squashes and merges this PR.",
+        MergeMethod::Rebase => "The merge queue rebases and merges this PR.",
+        MergeMethod::Merge => "The merge queue merges this PR with a merge commit.",
+    });
+    let action = queue_action(info, target.is_draft, target.unresolved_threads);
+    let blocked = match action {
+        QueueAction::Blocked(why) => Some(why),
+        _ => None,
+    };
+    // GitHub decides whether a blocked PR may jump; the state only rules
+    // out drafts, conflicts and not-yet-known states.
+    let jumpable = info.merge.can_merge_as_admin
+        && !target.is_draft
+        && info.merge.conflicting != Some(true)
+        && matches!(
+            info.merge.state,
+            MergeState::Clean
+                | MergeState::HasHooks
+                | MergeState::Unstable
+                | MergeState::Blocked
+                | MergeState::Behind
+        );
+    let admin = info.merge.can_merge_as_admin;
+    let headless = target.head_oid.is_none();
+    let in_queue = queue.entry.is_some();
+    let auto_merge = queue.auto_merge && !in_queue;
+    let can_disable = queue.can_disable_auto_merge;
+    let info = info.clone();
+    let bypass_target = target.clone();
+    view! {
+        <div class="merge-controls">
+            {method_line.map(|line| view! { <p class="muted queue-method">{line}</p> })}
+            {blocked.map(|why| view! { <p class="muted merge-blocked">{why}</p> })}
+            <div class="form-buttons">
+                {in_queue.then(|| view! {
+                    <button type="button" class="danger" disabled=busy
+                        on:click=dequeue>
+                        {move || if busy() { "Removing…" } else { "Remove from queue" }}
+                    </button>
+                })}
+                {auto_merge.then(|| view! {
+                    <button type="button" disabled=move || busy() || !can_disable
+                        title=if can_disable { "" } else { "You can't disable auto-merge" }
+                        on:click=cancel_auto_merge>
+                        {move || if busy() { "Cancelling…" } else { "Cancel" }}
+                    </button>
+                })}
+                {(!in_queue && !auto_merge).then(|| {
+                    match action {
+                        QueueAction::Enqueue => {
+                            let enqueue = enqueue.clone();
+                            view! {
+                                <button type="button" class="primary"
+                                    disabled=move || busy() || headless
+                                    on:click=move |_| enqueue(false)>
+                                    {move || if busy() { "Adding…" } else { "Add to merge queue" }}
+                                </button>
+                            }.into_any()
+                        }
+                        QueueAction::AutoMerge => view! {
+                            <button type="button" class="primary"
+                                disabled=move || busy() || headless
+                                on:click=merge_when_ready>
+                                {move || if busy() { "Enabling…" } else { "Merge when ready" }}
+                            </button>
+                        }.into_any(),
+                        QueueAction::Blocked(_) => ().into_any(),
+                    }
+                })}
+                {(jumpable && !in_queue && !auto_merge).then(|| {
+                    let enqueue = enqueue.clone();
+                    view! {
+                        <button type="button" disabled=move || busy() || headless
+                            title="Jumps ahead of the PRs already queued"
+                            on:click=move |_| enqueue(true)>
+                            "Add to front of queue"
+                        </button>
+                    }
+                })}
+                {(admin && !in_queue && !auto_merge).then(|| view! {
+                    <button type="button" aria-expanded=move || bypass.get().to_string()
+                        on:click=move |_| bypass.update(|b| *b = !*b)>
+                        "Merge now, bypassing the queue…"
+                    </button>
+                })}
+            </div>
+            {move || bypass.get().then(|| merge_controls(&info, bypass_target.clone(), true).into_any())}
+            {move || error().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    }
+}
+
 /// Whether the PR can be merged and merging it. Only for open PRs; the
 /// checks are in the sidebar.
 pub fn merge_box(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
     let (class, text) = merge_status(info, target.unresolved_threads);
+    let controls = if info.merge.queue.is_some() {
+        queue_controls(info, target.clone()).into_any()
+    } else {
+        merge_controls(info, target, false).into_any()
+    };
     view! {
         <section class="merge-box">
             <p class=format!("merge-status {class}")>{text}</p>
-            {merge_controls(info, target)}
+            {controls}
         </section>
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{MergeInfo, Person};
+    use grenadine_core::api::{MergeInfo, MergeQueueInfo, Person, QueueEntry};
 
     use super::*;
 
@@ -916,6 +1188,7 @@ mod tests {
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                queue: None,
             },
         }
     }
@@ -1060,6 +1333,99 @@ mod tests {
         // A method the repository no longer allows isn't offered.
         i.merge.default_method = Some(Rebase);
         assert_eq!(pick_method(&i), Some(Merge));
+    }
+
+    fn queue() -> MergeQueueInfo {
+        MergeQueueInfo {
+            method: Some(MergeMethod::Squash),
+            entry: None,
+            auto_merge: false,
+            can_enable_auto_merge: false,
+            can_disable_auto_merge: false,
+        }
+    }
+
+    #[test]
+    fn merge_queue_statuses() {
+        let mut i = info();
+        i.merge.queue = Some(queue());
+        assert_eq!(
+            merge_status(&i, 0),
+            ("ok", "Ready to join the merge queue.".into())
+        );
+        i.merge.queue.as_mut().unwrap().auto_merge = true;
+        assert_eq!(
+            merge_status(&i, 0),
+            ("ok", "Will join the merge queue when ready.".into())
+        );
+        i.merge.queue.as_mut().unwrap().entry = Some(QueueEntry {
+            position: 3,
+            state: QueueState::AwaitingChecks,
+        });
+        assert_eq!(
+            merge_status(&i, 0),
+            (
+                "warn",
+                "In the merge queue: position 3 (waiting for checks).".into()
+            )
+        );
+        i.merge.queue.as_mut().unwrap().entry = Some(QueueEntry {
+            position: 1,
+            state: QueueState::Mergeable,
+        });
+        assert_eq!(merge_status(&i, 0).0, "ok");
+        i.merge.queue.as_mut().unwrap().entry = Some(QueueEntry {
+            position: 1,
+            state: QueueState::Unmergeable,
+        });
+        assert_eq!(merge_status(&i, 0).0, "bad");
+    }
+
+    #[test]
+    fn the_queue_action() {
+        let mut i = info();
+        i.merge.queue = Some(queue());
+        assert!(matches!(queue_action(&i, false, 0), QueueAction::Enqueue));
+        i.merge.state = MergeState::Unstable;
+        assert!(matches!(queue_action(&i, false, 0), QueueAction::Enqueue));
+        i.merge.state = MergeState::Blocked;
+        assert_eq!(
+            match queue_action(&i, false, 0) {
+                QueueAction::Blocked(why) => Some(why),
+                _ => None,
+            },
+            Some("The branch's rules block merging.")
+        );
+        i.merge.requires_conversation_resolution = true;
+        assert!(matches!(
+            queue_action(&i, false, 2),
+            QueueAction::Blocked("Resolve the conversations first.")
+        ));
+        i.merge.queue.as_mut().unwrap().can_enable_auto_merge = true;
+        assert!(matches!(queue_action(&i, false, 2), QueueAction::AutoMerge));
+        i.merge.state = MergeState::Behind;
+        assert!(matches!(queue_action(&i, false, 0), QueueAction::AutoMerge));
+        i.merge.queue.as_mut().unwrap().can_enable_auto_merge = false;
+        assert!(matches!(
+            queue_action(&i, false, 0),
+            QueueAction::Blocked("Bring the branch up to date first.")
+        ));
+        i.merge.state = MergeState::Clean;
+        i.merge.conflicting = Some(true);
+        assert!(matches!(
+            queue_action(&i, false, 0),
+            QueueAction::Blocked("Resolve the conflicts first.")
+        ));
+        i.merge.conflicting = Some(false);
+        assert!(matches!(
+            queue_action(&i, true, 0),
+            QueueAction::Blocked("Drafts can't be merged.")
+        ));
+        i.merge.state = MergeState::Unknown;
+        assert!(matches!(
+            queue_action(&i, false, 0),
+            QueueAction::Blocked(_)
+        ));
     }
 
     #[test]

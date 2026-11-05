@@ -1082,6 +1082,7 @@ mod tests {
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                queue: None,
             },
         };
         assert!(!settling(&review));

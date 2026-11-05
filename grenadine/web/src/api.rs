@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoReviewEntry, Blob,
-    BlobsRequest, BlobsResponse, Changes, CleanupState, GitHubUsage, InboxEdit, InboxWithPrs,
-    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
-    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview,
+    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewEntry,
+    Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GitHubUsage, InboxEdit,
+    InboxWithPrs, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
+    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview,
     SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
@@ -463,4 +463,42 @@ pub async fn merge(key: &PrKey, merge: &MergeRequest) -> Result<Merged> {
         .json()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Adds the PR to its merge queue, or to the front when `e.jump`.
+pub async fn enqueue(key: &PrKey, e: &Enqueue) -> Result<()> {
+    let req = Request::post(&format!("{}/queue", pr_url(key)))
+        .json(e)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Takes the PR out of its merge queue.
+pub async fn dequeue(key: &PrKey) -> Result<()> {
+    check(
+        Request::delete(&format!("{}/queue", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Makes the PR join its merge queue once its requirements are met.
+pub async fn enable_auto_merge(key: &PrKey, m: &AutoMerge) -> Result<()> {
+    let req = Request::post(&format!("{}/auto-merge", pr_url(key)))
+        .json(m)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Stops the PR joining its merge queue when ready.
+pub async fn disable_auto_merge(key: &PrKey) -> Result<()> {
+    check(
+        Request::delete(&format!("{}/auto-merge", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
 }

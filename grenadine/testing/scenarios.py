@@ -661,3 +661,51 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
             repo.undeletable_branches.add(branch)
         prs[title] = pr
     return prs
+
+
+QUEUE_REPO = "test/queue"
+QUEUE_READY = "Join the queue"
+QUEUE_WAITING = "Join it when ready"
+QUEUE_NO_AUTO = "Wait out the rules"
+QUEUE_ADMIN = "Jump the queue"
+QUEUE_BYPASS = "Merge past the queue"
+QUEUED = "Wait in the queue"
+QUEUE_CASES = [
+    QUEUE_READY,
+    QUEUE_WAITING,
+    QUEUE_NO_AUTO,
+    QUEUE_ADMIN,
+    QUEUE_BYPASS,
+    QUEUED,
+]
+
+
+def queue_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
+    """PRs on a repository whose main branch requires a squash merge
+    queue: a ready one, a blocked one that may auto-merge, a blocked one
+    that may not, two an admin may act on, and one already queued."""
+    repo = gh.repo(QUEUE_REPO)
+    repo.merge_queue = "SQUASH"
+    repo.checkout("main")
+    repo.commit("Seed the repo", {"README.md": "# queue\n"})
+    repo.push("main")
+    prs = {}
+    for i, title in enumerate(QUEUE_CASES):
+        branch = f"queue/{i}"
+        repo.checkout(branch, "main")
+        repo.commit(title, {f"queue/{i}.md": f"{title}\n"}, author=OTHER)
+        repo.push(branch, actor=OTHER)
+        pr = repo.open_pr(title, head=branch, base="main", author=OTHER)
+        if title == QUEUE_WAITING:
+            pr.merge_state = "BLOCKED"
+        if title == QUEUE_NO_AUTO:
+            pr.merge_state = "BLOCKED"
+            pr.can_auto_merge = False
+        if title in (QUEUE_ADMIN, QUEUE_BYPASS):
+            pr.can_merge_as_admin = True
+        if title == QUEUE_BYPASS:
+            pr.merge_state = "BLOCKED"
+        if title == QUEUED:
+            pr.queued = True
+        prs[title] = pr
+    return prs
