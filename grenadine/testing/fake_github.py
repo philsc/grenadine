@@ -155,8 +155,17 @@ class PullRequest:
     merged_at: int | None = None
     # Conflicts with its base.
     conflicting: bool = False
-    # In a merge queue.
+    # In a merge queue: its MergeQueueEntryState and whether it jumped
+    # the queue.
     queued: bool = False
+    queue_state: str = "QUEUED"
+    queue_jump: bool = False
+    # Joins the queue once its requirements are met, and when the viewer
+    # switched that on.
+    auto_merge_at: int | None = None
+    # The viewer may switch auto-merge on or off.
+    can_auto_merge: bool = True
+    can_disable_auto_merge: bool = True
     # Users asked to review.
     review_requests: set[str] = dataclasses.field(default_factory=set)
     # Members of the teams asked to review; a request goes to TEAM.
@@ -264,6 +273,9 @@ class FakeRepo:
         # being the viewer's default.
         self.merge_methods = ["MERGE", "SQUASH", "REBASE"]
         self.delete_branch_on_merge = False
+        # The base branch's merge queue, as the PullRequestMergeMethod it
+        # merges with; None when the branch has no queue.
+        self.merge_queue: str | None = None
         # Branches deleted through the API, and ones that deleting fails
         # for.
         self.deleted_branches: set[str] = set()
@@ -1075,6 +1087,11 @@ class FakeGitHub:
                 raise ValueError("Pull Request is still a draft")
             state = pr.merge_state_status()
             bypass = ("BLOCKED", "BEHIND") if pr.can_merge_as_admin else ()
+            if pr.repo.merge_queue and not pr.can_merge_as_admin:
+                raise ValueError(
+                    "Repository rule violations found\n\n"
+                    "Changes must be made through the merge queue"
+                )
             if state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE", *bypass):
                 raise ValueError("Pull Request is not mergeable")
             method = input.get("mergeMethod") or "MERGE"
@@ -1086,6 +1103,67 @@ class FakeGitHub:
                 input.get("commitBody"),
             )
             pr.repo.merge(pr)
+            return {"clientMutationId": None}
+
+        def mergeable(pr: PullRequest, jump: bool = False) -> None:
+            """Raises like GitHub when `pr` may not merge or queue."""
+            if pr.state != OPEN:
+                raise ValueError("Pull Request is not open")
+            if pr.draft:
+                raise ValueError("Pull Request is still a draft")
+            if jump and not pr.can_merge_as_admin:
+                raise ValueError("Only admins may jump the merge queue")
+            state = pr.merge_state_status()
+            bypass = ("BLOCKED", "BEHIND") if pr.can_merge_as_admin else ()
+            if state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE", *bypass):
+                raise ValueError("Pull Request is not mergeable")
+
+        def check_head(pr: PullRequest, input: dict[str, Any]) -> None:
+            expected = input.get("expectedHeadOid")
+            if expected and expected != pr.head_oid:
+                raise ValueError(
+                    "Head branch was modified. Review and try the merge again."
+                )
+
+        def enqueue_pr(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            check_head(pr, input)
+            jump = bool(input.get("jump"))
+            mergeable(pr, jump)
+            if pr.queued:
+                raise ValueError("Pull Request is already in the merge queue")
+            pr.queued = True
+            pr.queue_state = "QUEUED"
+            pr.queue_jump = jump
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def dequeue_pr(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["id"])
+            if not pr.queued:
+                raise ValueError("Pull Request is not in the merge queue")
+            pr.queued = False
+            pr.queue_jump = False
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def enable_auto_merge(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            if pr.state != OPEN:
+                raise ValueError("Pull Request is not open")
+            if pr.draft:
+                raise ValueError("Pull Request is still a draft")
+            if not pr.can_auto_merge:
+                raise ValueError("Auto-merge is not allowed on this pull request")
+            check_head(pr, input)
+            pr.auto_merge_at = self.tick()
+            pr.touch()
+            return {"clientMutationId": None}
+
+        def disable_auto_merge(info: Any, input: dict[str, Any]) -> Any:
+            pr = self._pr_by_id(input["pullRequestId"])
+            pr.auto_merge_at = None
+            pr.touch()
             return {"clientMutationId": None}
 
         def update_pr(info: Any, input: dict[str, Any]) -> Any:
@@ -1175,6 +1253,10 @@ class FakeGitHub:
             "submitPullRequestReview": mutation(submit_review),
             "deletePullRequestReview": mutation(delete_review),
             "mergePullRequest": mutation(merge_pr),
+            "enqueuePullRequest": mutation(enqueue_pr),
+            "dequeuePullRequest": mutation(dequeue_pr),
+            "enablePullRequestAutoMerge": mutation(enable_auto_merge),
+            "disablePullRequestAutoMerge": mutation(disable_auto_merge),
             "updatePullRequest": mutation(update_pr),
             "closePullRequest": mutation(close_pr),
             "deleteRef": mutation(delete_ref),
@@ -1534,6 +1616,23 @@ class FakeGitHub:
             "commits": commits,
             "reviewThreads": review_threads,
             "isInMergeQueue": pr.queued,
+            "isMergeQueueEnabled": repo.merge_queue is not None,
+            "mergeQueue": (
+                {"configuration": {"mergeMethod": repo.merge_queue}}
+                if repo.merge_queue
+                else None
+            ),
+            "mergeQueueEntry": self._queue_entry(pr),
+            "autoMergeRequest": (
+                {
+                    "enabledAt": iso(pr.auto_merge_at),
+                    "enabledBy": self._user_node(VIEWER),
+                }
+                if pr.auto_merge_at is not None
+                else None
+            ),
+            "viewerCanEnableAutoMerge": pr.can_auto_merge,
+            "viewerCanDisableAutoMerge": pr.can_disable_auto_merge,
             "reviewDecision": pr.review_decision(),
             "mergeStateStatus": pr.merge_state_status(),
             "viewerCanMergeAsAdmin": pr.can_merge_as_admin,
@@ -1550,6 +1649,26 @@ class FakeGitHub:
                 )
             },
             "comments": comments,
+        }
+
+    def _queue_entry(self, pr: PullRequest) -> dict[str, Any] | None:
+        """The PR's MergeQueueEntry, or None when it isn't queued. Jumped
+        PRs lead, then queued ones in PR-number order."""
+        if not pr.queued:
+            return None
+
+        def before(p: PullRequest) -> bool:
+            if p.queue_jump != pr.queue_jump:
+                return p.queue_jump
+            return p.number < pr.number
+
+        position = 1 + sum(
+            1 for p in pr.repo.prs.values() if p.queued and p is not pr and before(p)
+        )
+        return {
+            "position": position,
+            "state": pr.queue_state,
+            "jump": pr.queue_jump,
         }
 
 

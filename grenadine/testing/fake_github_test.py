@@ -650,6 +650,128 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertNotIn("errors", merge(pr))
         self.assertEqual(pr.state, "MERGED")
 
+    def test_merge_queue(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        repo = self.repo
+        repo.merge_queue = "SQUASH"
+
+        fields = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id isMergeQueueEnabled"
+            " mergeQueue { configuration { mergeMethod } } mergeQueueEntry"
+            " { position state jump } autoMergeRequest { enabledAt }"
+            " viewerCanEnableAutoMerge viewerCanDisableAutoMerge } } }"
+        )["data"]["repository"]["pullRequest"]
+        self.assertTrue(fields["isMergeQueueEnabled"])
+        self.assertEqual(
+            fields["mergeQueue"], {"configuration": {"mergeMethod": "SQUASH"}}
+        )
+        self.assertIsNone(fields["mergeQueueEntry"])
+        self.assertIsNone(fields["autoMergeRequest"])
+        self.assertTrue(fields["viewerCanEnableAutoMerge"])
+        self.assertTrue(fields["viewerCanDisableAutoMerge"])
+
+        # A direct merge is refused on a queue branch, but not for admins.
+        merge = (
+            "mutation($p: ID!) { mergePullRequest(input: {pullRequestId: $p})"
+            " { clientMutationId } }"
+        )
+        out = self.query(merge, p=fields["id"])
+        self.assertIn(
+            "Changes must be made through the merge queue",
+            out["errors"][0]["message"],
+        )
+        self.assertEqual(pr.state, "OPEN")
+        pr.can_merge_as_admin = True
+        out = self.query(merge, p=fields["id"])
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.state, "MERGED")
+
+    def test_enqueueing_and_dequeueing(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.merge_queue = "SQUASH"
+
+        def pr_fields() -> dict:
+            return self.query(
+                'query { repository(owner: "test", name: "test") {'
+                f" pullRequest(number: {pr.number}) {{ id isInMergeQueue"
+                " mergeQueueEntry { position state jump } } } }"
+            )["data"]["repository"]["pullRequest"]
+
+        enqueue = (
+            "mutation($p: ID!, $h: GitObjectID!, $j: Boolean) {"
+            " enqueuePullRequest(input: {pullRequestId: $p,"
+            " expectedHeadOid: $h, jump: $j}) { clientMutationId } }"
+        )
+        out = self.query(enqueue, p=pr_fields()["id"], h="0" * 40)
+        self.assertIn("Head branch was modified", out["errors"][0]["message"])
+        self.assertFalse(pr.queued)
+
+        out = self.query(enqueue, p=pr_fields()["id"], h=pr.head_oid, j=False)
+        self.assertNotIn("errors", out)
+        self.assertTrue(pr.queued)
+        entry = pr_fields()["mergeQueueEntry"]
+        self.assertEqual(entry, {"position": 1, "state": "QUEUED", "jump": False})
+        out = self.query(enqueue, p=pr_fields()["id"], h=pr.head_oid)
+        self.assertIn("already in the merge queue", out["errors"][0]["message"])
+
+        out = self.query(
+            "mutation($p: ID!) { dequeuePullRequest(input: {id: $p})"
+            " { clientMutationId } }",
+            p=pr_fields()["id"],
+        )
+        self.assertNotIn("errors", out)
+        self.assertFalse(pr.queued)
+        self.assertIsNone(pr_fields()["mergeQueueEntry"])
+        out = self.query(
+            "mutation($p: ID!) { dequeuePullRequest(input: {id: $p})"
+            " { clientMutationId } }",
+            p=pr_fields()["id"],
+        )
+        self.assertIn("not in the merge queue", out["errors"][0]["message"])
+
+    def test_auto_merge(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.merge_queue = "SQUASH"
+        pr.merge_state = "BLOCKED"
+        pr_id = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{ id"
+            " autoMergeRequest { enabledAt enabledBy { login } } } } }"
+        )["data"]["repository"]["pullRequest"]["id"]
+
+        out = self.query(
+            "mutation($p: ID!, $h: GitObjectID!) { enablePullRequestAutoMerge"
+            "(input: {pullRequestId: $p, expectedHeadOid: $h})"
+            " { clientMutationId } }",
+            p=pr_id,
+            h=pr.head_oid,
+        )
+        self.assertNotIn("errors", out)
+        request = self.query(
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {pr.number}) {{"
+            " autoMergeRequest { enabledAt enabledBy { login } } } } }"
+        )["data"]["repository"]["pullRequest"]["autoMergeRequest"]
+        self.assertIsNotNone(request["enabledAt"])
+        self.assertEqual(request["enabledBy"]["login"], "me")
+
+        out = self.query(
+            "mutation($p: ID!) { disablePullRequestAutoMerge"
+            "(input: {pullRequestId: $p}) { clientMutationId } }",
+            p=pr_id,
+        )
+        self.assertNotIn("errors", out)
+        self.assertIsNone(pr.auto_merge_at)
+
+        pr.can_auto_merge = False
+        out = self.query(
+            "mutation($p: ID!) { enablePullRequestAutoMerge"
+            "(input: {pullRequestId: $p}) { clientMutationId } }",
+            p=pr_id,
+        )
+        self.assertIn("not allowed", out["errors"][0]["message"])
+
     def test_retargeting_and_closing_a_pr(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]
         pr_id = self.query(

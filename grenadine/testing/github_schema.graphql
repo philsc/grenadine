@@ -46,6 +46,14 @@ type Mutation {
   submitPullRequestReview(input: SubmitPullRequestReviewInput!): MutationPayload
   deletePullRequestReview(input: DeletePullRequestReviewInput!): MutationPayload
   mergePullRequest(input: MergePullRequestInput!): MutationPayload
+  enqueuePullRequest(input: EnqueuePullRequestInput!): MutationPayload
+  dequeuePullRequest(input: DequeuePullRequestInput!): MutationPayload
+  enablePullRequestAutoMerge(
+    input: EnablePullRequestAutoMergeInput!
+  ): MutationPayload
+  disablePullRequestAutoMerge(
+    input: DisablePullRequestAutoMergeInput!
+  ): MutationPayload
   updatePullRequest(input: UpdatePullRequestInput!): MutationPayload
   closePullRequest(input: ClosePullRequestInput!): MutationPayload
   deleteRef(input: DeleteRefInput!): MutationPayload
@@ -69,6 +77,56 @@ input MergePullRequestInput {
   commitHeadline: String
   commitBody: String
   clientMutationId: String
+}
+
+input EnqueuePullRequestInput {
+  pullRequestId: ID!
+  expectedHeadOid: GitObjectID
+  jump: Boolean
+  clientMutationId: String
+}
+
+input DequeuePullRequestInput {
+  id: ID!
+  clientMutationId: String
+}
+
+input EnablePullRequestAutoMergeInput {
+  pullRequestId: ID!
+  expectedHeadOid: GitObjectID
+  clientMutationId: String
+}
+
+input DisablePullRequestAutoMergeInput {
+  pullRequestId: ID!
+  clientMutationId: String
+}
+
+type MergeQueue {
+  configuration: MergeQueueConfiguration
+}
+
+type MergeQueueConfiguration {
+  mergeMethod: PullRequestMergeMethod
+}
+
+enum MergeQueueEntryState {
+  AWAITING_CHECKS
+  LOCKED
+  MERGEABLE
+  QUEUED
+  UNMERGEABLE
+}
+
+type MergeQueueEntry {
+  position: Int!
+  state: MergeQueueEntryState!
+  jump: Boolean!
+}
+
+type AutoMergeRequest {
+  enabledAt: DateTime
+  enabledBy: Actor
 }
 
 input DeleteRefInput {
@@ -307,6 +365,12 @@ type PullRequest {
   commits(first: Int, after: String, last: Int): PullRequestCommitConnection!
   reviewThreads(first: Int, after: String): PullRequestReviewThreadConnection!
   isInMergeQueue: Boolean!
+  isMergeQueueEnabled: Boolean!
+  mergeQueue: MergeQueue
+  mergeQueueEntry: MergeQueueEntry
+  autoMergeRequest: AutoMergeRequest
+  viewerCanEnableAutoMerge: Boolean!
+  viewerCanDisableAutoMerge: Boolean!
   reviewDecision: PullRequestReviewDecision
   mergeStateStatus: MergeStateStatus!
   viewerCanMergeAsAdmin: Boolean!
