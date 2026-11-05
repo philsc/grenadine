@@ -784,7 +784,8 @@ pub struct GitHubUsage {
     pub reports: Vec<RateLimitReport>,
 }
 
-/// A resource's limit as the last response's headers reported it.
+/// One of GitHub's counters for a resource, as its most-spent report
+/// this window described it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimitInfo {
     pub resource: ApiResource,
@@ -793,10 +794,14 @@ pub struct RateLimitInfo {
     pub used: u32,
     /// Unix seconds when the window resets.
     pub reset: i64,
-    /// The request kinds whose responses report this budget.
-    pub kinds: Vec<String>,
-    /// What grenadine spent since this window started (reset - 3600):
-    /// GraphQL points, or REST requests.
+    /// How many of the recent responses on this API this counter
+    /// answered.
+    pub answered: u32,
+    /// How many recent responses on this API the reports hold.
+    pub responses: u32,
+    /// What grenadine's requests that this counter answered spent since
+    /// this window started (reset - 3600): GraphQL points, or REST
+    /// requests.
     pub ours: u32,
     /// The tiers that are paused right now.
     pub paused: Vec<RequestPriority>,
