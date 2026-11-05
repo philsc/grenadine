@@ -528,6 +528,9 @@ if review and "Quiet" not in review[1]:
         headers={"content-type": "application/json", "authorization": "Bearer " + os.environ["FAKE_GITHUB_TOKEN"]},
     )
     urllib.request.urlopen(request).close()
+# `sleep N` stalls the turn for N seconds, holding the session running.
+if prompt.startswith("sleep "):
+    time.sleep(float(prompt.removeprefix("sleep ")))
 # `long transcript N` runs N Bash calls; the results pad made-up output
 # from ~1 KB to ~30 KB and start with "result i:" so which call each
 # answers is checkable.
@@ -551,6 +554,14 @@ def free_port() -> int:
 
 def exactly(text: str) -> re.Pattern[str]:
     return re.compile(f"^{re.escape(text)}$")
+
+
+def expect_tab_count(count: Locator, n: int) -> None:
+    # The count's span isn't rendered at zero.
+    if n:
+        expect(count).to_have_text(str(n))
+    else:
+        expect(count).to_have_count(0)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -4201,6 +4212,40 @@ class AgentTest(ServerTestCase):
         expect(plan).to_contain_text("Unanswered plan")
         expect(plan.get_by_role("button", name="Approve plan")).to_have_count(0)
 
+    def test_tab_counts_waiting_sessions(self) -> None:
+        tab = self.page.locator(".topbar-tabs a").filter(has_text="Agents")
+        count = tab.locator(".count")
+        # Sessions left waiting by earlier tests may already count.
+        with urllib.request.urlopen(f"{self.url}api/agents") as resp:
+            base = sum(
+                1
+                for s in json.load(resp)
+                if s["kind"] == "interactive"
+                and s["status"]
+                in {"idle", "awaiting_approval", "interrupted", "failed"}
+            )
+        self.page.goto(self.url + "#/agents")
+        expect_tab_count(count, base)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("sleep 5")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        # A session still working doesn't count.
+        entry = self.section("General").locator(".agent-entry")
+        status = entry.locator(".agent-status")
+        expect(status).to_have_text("working…")
+        expect_tab_count(count, base)
+        # Idle once its turn ends, it does — without joining the title's
+        # inbox total.
+        expect(status).to_have_text("idle", timeout=30_000)
+        expect(count).to_have_text(str(base + 1))
+        expect(self.page).to_have_title("grenadine")
+
+        # Deleting it clears the count.
+        self.delete_session("sleep 5")
+        expect_tab_count(count, base)
+
 
 class AutoReviewTest(ServerTestCase):
     QUIET_REPO = "test/quiet"
@@ -4356,6 +4401,40 @@ class AutoReviewTest(ServerTestCase):
         expect(self.page.locator(".agent-sidebar")).not_to_contain_text(
             "Unreviewed change"
         )
+
+    def test_tab_counts_kept_reviews(self) -> None:
+        tab = self.page.locator(".topbar-tabs a").filter(has_text="Auto-reviews")
+        count = tab.locator(".count")
+        # Reviews left over by earlier tests may already count.
+        with urllib.request.urlopen(f"{self.url}api/auto-reviews") as resp:
+            base = sum(
+                1
+                for r in json.load(resp)
+                if r["state"] in {"unposted", "failed"} and r["session"] is not None
+            )
+        self.page.goto(self.url + "#/auto-reviews")
+        expect_tab_count(count, base)
+
+        # A review whose session posts and is deleted doesn't count.
+        self.open_pr(scenarios.REPO, "Counted posted")
+        posted = self.review_entry("Counted posted")
+        expect(posted.locator(".agent-status")).to_have_text("posted", timeout=60_000)
+        expect_tab_count(count, base)
+
+        # One that ends without posting keeps its session, and counts.
+        self.open_pr(self.QUIET_REPO, "Quiet recount")
+        unposted = self.review_entry("Quiet recount")
+        expect(unposted.locator(".agent-status")).to_have_text(
+            "didn't post", timeout=90_000
+        )
+        expect(count).to_have_text(str(base + 1))
+
+        # Deleting the session clears it.
+        unposted.locator("a.agent-item").click()
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
+        expect_tab_count(count, base)
 
 
 class CleanupTest(ServerTestCase):
