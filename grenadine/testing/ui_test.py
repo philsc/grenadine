@@ -4241,10 +4241,18 @@ class AgentTest(ServerTestCase):
         plans = transcript.locator(".approval.plan")
         expect(plans.locator(".plan-text strong")).to_have_text("todo.txt")
         # The feedback box leaves its focus ring room above the buttons.
-        box = plans.get_by_label("Feedback").bounding_box()
-        buttons = plans.locator(".form-buttons").bounding_box()
-        assert box is not None and buttons is not None
-        self.assertGreaterEqual(buttons["y"] - (box["y"] + box["height"]), 6)
+        # Measured in one go so that both rects come from the same
+        # layout; the card can still move between two round trips.
+        gap = plans.evaluate(
+            """(plans) => {
+                const box = plans.querySelector('textarea.plan-feedback')
+                    .getBoundingClientRect();
+                const buttons = plans.querySelector('.form-buttons')
+                    .getBoundingClientRect();
+                return buttons.y - (box.y + box.height);
+            }"""
+        )
+        self.assertGreaterEqual(gap, 6)
         plans.get_by_label("Feedback").fill("Add a title")
         plans.get_by_role("button", name="Keep planning").click()
         expect(plans).to_have_count(2)
