@@ -1,7 +1,9 @@
 """Tests for the fake GitHub that the UI tests run against."""
 
+import copy
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -164,9 +166,23 @@ query($q0: String!, $q1: String!) {
 
 
 class FakeGitHubTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        tmp = Path(tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR")))
+        cls.root = tmp / "github"
+        cls.template = tmp / "template"
+        gh = FakeGitHub(cls.root)
+        inboxes = scenarios.inbox_cases(gh)
+        # The repos move aside to become the template; each test restores a
+        # copy at `root` so the absolute paths baked into them stay valid.
+        shutil.move(cls.root, cls.template)
+        cls.template_state = (gh, inboxes)
+
     def setUp(self) -> None:
-        self.gh = FakeGitHub(Path(tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))))
-        self.inboxes = scenarios.inbox_cases(self.gh)
+        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.copytree(self.template, self.root, symlinks=True)
+        # Copied together so `inboxes.prs` point at the copy's PRs.
+        self.gh, self.inboxes = copy.deepcopy(self.template_state)
         self.repo = self.gh.repo(scenarios.REPO)
 
     def query(self, query: str, **variables: object) -> dict:
