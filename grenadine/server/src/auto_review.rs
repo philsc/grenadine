@@ -1308,6 +1308,7 @@ sleep 30
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                queue: None,
             },
         };
         // Someone else's review, or the viewer's from before, don't count.

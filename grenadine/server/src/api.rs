@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoReviewEntry,
-    BlobsRequest, BlobsResponse, Changes, CleanupState, GENERAL, InboxEdit, InboxWithPrs,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoMerge, AutoReviewEntry,
+    BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GENERAL, InboxEdit, InboxWithPrs,
     MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
     PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ServerEvent, SubmitReview,
     WorktreeChanges, WrapUp, submit_blocker,
@@ -90,6 +90,14 @@ fn api_routes() -> Router<Arc<State>> {
             post(submit_review).delete(discard_review),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/queue",
+            post(enqueue).delete(dequeue),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/auto-merge",
+            post(enable_auto_merge).delete(disable_auto_merge),
+        )
         .route(
             "/api/pr/{owner}/{name}/{number}/review/comments",
             post(add_review_thread),
@@ -448,6 +456,58 @@ async fn merge(
     // such as a push to the head.
     state.resync(key);
     Ok(Json(Merged { warning: merged? }))
+}
+
+async fn enqueue(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(e): Json<Enqueue>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    if !is_sha(&e.head_oid) {
+        return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
+    }
+    let done = state.github.enqueue(&key, &e).await;
+    state.resync(key);
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn dequeue(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let done = state.github.dequeue(&key).await;
+    state.resync(key);
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn enable_auto_merge(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(m): Json<AutoMerge>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    if !is_sha(&m.head_oid) {
+        return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
+    }
+    let done = state.github.enable_auto_merge(&key, &m).await;
+    state.resync(key);
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn disable_auto_merge(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let done = state.github.disable_auto_merge(&key).await;
+    state.resync(key);
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn discard_review(
