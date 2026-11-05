@@ -5,6 +5,7 @@
 //! the backend asks about the tool uses that the mode doesn't decide on
 //! its own, and the user answers on the page.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -2653,6 +2654,15 @@ fn prs_note(session: &AgentSession) -> Option<String> {
     )
 }
 
+/// What agents are told about showing the user images: a Markdown image
+/// pointing at a local file doesn't load in the user's page, so they go
+/// through the MCP tool.
+fn images_note() -> String {
+    "To show the user an image, such as a screenshot, call the grenadine MCP server's \
+     show_image tool. Markdown image links to local files don't load in the user's page."
+        .into()
+}
+
 /// What Claude is told about the session's terminal tabs, when it has any.
 fn terminals_note(state: &State, id: &str) -> Option<String> {
     let open = state.agents.terminals.list(id);
@@ -2722,6 +2732,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         prs_note(&session),
         landed_note(&session),
         terminals_note(state, id),
+        Some(images_note()),
     ]
     .into_iter()
     .flatten()
@@ -2754,6 +2765,9 @@ pub struct TurnSink<'a> {
     billed: f64,
     /// Whether the last event shown ended the turn.
     last_was_end: bool,
+    /// The session's worktree, looked up when text first needs it; `None`
+    /// inside when the session's row is gone.
+    worktree: OnceCell<Option<String>>,
     prs: OpenedPrs,
 }
 
@@ -2766,8 +2780,24 @@ impl<'a> TurnSink<'a> {
             ended: None,
             billed: 0.0,
             last_was_end: false,
+            worktree: OnceCell::new(),
             prs: OpenedPrs::default(),
         }
+    }
+
+    /// The session's worktree, where assistant text's relative paths
+    /// resolve.
+    fn worktree(&self) -> Option<&str> {
+        self.worktree
+            .get_or_init(|| {
+                self.state
+                    .db
+                    .agent(self.id)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.worktree)
+            })
+            .as_deref()
     }
 
     /// The backend created (or resumed) its session, which later turns
@@ -2790,7 +2820,11 @@ impl<'a> TurnSink<'a> {
     /// images into the database, usage into the session's row, costs
     /// billed and repeated turn ends suppressed.
     pub fn event(&mut self, mut kind: AgentEventKind) -> Result<()> {
-        store_images(self.state, self.id, &mut kind)?;
+        let worktree = match kind {
+            AgentEventKind::Text(_) => self.worktree(),
+            _ => None,
+        };
+        store_images(self.state, self.id, worktree, &mut kind)?;
         if let AgentEventKind::Usage { tokens, window } = kind {
             return record_usage(self.state, self.id, tokens, window);
         }
@@ -2939,27 +2973,170 @@ pub fn store_image(state: &State, id: &str, mime: &str, data: &[u8]) -> Result<S
     Ok(image)
 }
 
-/// Moves the images of a tool result from its `data:` URLs into the
-/// database, so that the transcript only carries their ids. Images that
-/// don't decode are dropped.
-fn store_images(state: &State, id: &str, kind: &mut AgentEventKind) -> Result<()> {
-    let AgentEventKind::ToolResult { images, .. } = kind else {
-        return Ok(());
+/// The largest image `read_image` reads.
+const MAX_IMAGE: u64 = 20 << 20;
+
+/// The MIME type of an image in a format browsers show, from its first
+/// bytes.
+pub fn image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Reads the image at `path`, relative to `worktree` unless `path` is
+/// absolute, as `show_image` does: at most `MAX_IMAGE` bytes and a PNG,
+/// JPEG, GIF or WebP.
+pub fn read_image(worktree: &str, path: &str) -> Result<(&'static str, Vec<u8>)> {
+    let path = Path::new(worktree).join(path);
+    let size = std::fs::metadata(&path)
+        .with_context(|| format!("Can't read {}", path.display()))?
+        .len();
+    if size > MAX_IMAGE {
+        bail!("{} is larger than {} MB.", path.display(), MAX_IMAGE >> 20);
+    }
+    let data = std::fs::read(&path).with_context(|| format!("Can't read {}", path.display()))?;
+    let mime = image_mime(&data)
+        .with_context(|| format!("{} isn't a PNG, JPEG, GIF or WebP image.", path.display()))?;
+    Ok((mime, data))
+}
+
+/// Whether `dest` names a URL rather than a local file, by having a
+/// `scheme:` prefix.
+fn has_url_scheme(dest: &str) -> bool {
+    let Some(colon) = dest.find(':') else {
+        return false;
     };
-    let mut stored = Vec::new();
-    for url in images.drain(..) {
-        let Some((mime, data)) = url
-            .strip_prefix("data:")
-            .and_then(|u| u.split_once(";base64,"))
+    let scheme = &dest[..colon];
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// The byte range of `dest` itself within `slice`, the source of one
+/// image, when `dest` appears there literally after a `](`, bare or
+/// inside `<>`. Escaped or reference-style destinations don't appear
+/// literally, so they aren't found and the image is left alone.
+fn image_dest_span(slice: &str, dest: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(open) = slice[from..].find("](") {
+        let mut start = from + open + 2;
+        while matches!(slice.as_bytes().get(start), Some(b' ' | b'\t' | b'\n')) {
+            start += 1;
+        }
+        if let Some(after) = slice[start..]
+            .strip_prefix('<')
+            .and_then(|s| s.strip_prefix(dest))
+            && after.starts_with('>')
+        {
+            return Some((start + 1, start + 1 + dest.len()));
+        }
+        if slice[start..].starts_with(dest)
+            && matches!(
+                slice.as_bytes().get(start + dest.len()),
+                None | Some(b')' | b' ' | b'\t' | b'\n' | b'"' | b'\'')
+            )
+        {
+            return Some((start, start + dest.len()));
+        }
+        from = start;
+    }
+    None
+}
+
+/// `text` with its Markdown images' local-file destinations replaced by
+/// the URLs `store` gives them. A destination is a candidate when it
+/// isn't empty, has no URL scheme and doesn't already point at
+/// `/api/`; it's rewritten only when it appears in `text` literally and
+/// `store` accepts it. Everything else stays byte-identical.
+fn capture_markdown_images(text: &str, mut store: impl FnMut(&str) -> Option<String>) -> String {
+    let options = pulldown_cmark::Options::ENABLE_TABLES
+        | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
+        | pulldown_cmark::Options::ENABLE_TASKLISTS
+        | pulldown_cmark::Options::ENABLE_FOOTNOTES
+        | pulldown_cmark::Options::ENABLE_GFM;
+    let mut edits = Vec::new();
+    for (event, range) in pulldown_cmark::Parser::new_ext(text, options).into_offset_iter() {
+        let pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) = event
         else {
             continue;
         };
-        let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        let dest: &str = dest_url.as_ref();
+        if dest.is_empty() || dest.starts_with("/api/") || has_url_scheme(dest) {
+            continue;
+        }
+        let Some((start, end)) = image_dest_span(&text[range.clone()], dest) else {
             continue;
         };
-        stored.push(store_image(state, id, mime, &data)?);
+        if let Some(url) = store(dest) {
+            edits.push((range.start + start..range.start + end, url));
+        }
     }
-    *images = stored;
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, url) in edits {
+        out += &text[at..range.start];
+        out += &url;
+        at = range.end;
+    }
+    out += &text[at..];
+    out
+}
+
+/// Keeps an event's images out of the transcript's text. A tool result's
+/// `data:` URLs are moved into the database, which the event then lists
+/// by id; ones that don't decode are dropped. Assistant text's Markdown
+/// images whose destinations are files readable by `read_image` — under
+/// `worktree` or absolute — are stored the same way and their
+/// destinations rewritten to the `/api/images/` URLs the page loads;
+/// anything else stays as written.
+fn store_images(
+    state: &State,
+    id: &str,
+    worktree: Option<&str>,
+    kind: &mut AgentEventKind,
+) -> Result<()> {
+    match kind {
+        AgentEventKind::ToolResult { images, .. } => {
+            let mut stored = Vec::new();
+            for url in images.drain(..) {
+                let Some((mime, data)) = url
+                    .strip_prefix("data:")
+                    .and_then(|u| u.split_once(";base64,"))
+                else {
+                    continue;
+                };
+                let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    continue;
+                };
+                stored.push(store_image(state, id, mime, &data)?);
+            }
+            *images = stored;
+        }
+        AgentEventKind::Text(text) => {
+            if let Some(worktree) = worktree {
+                *text = capture_markdown_images(text, |dest| {
+                    let (mime, data) = read_image(worktree, dest).ok()?;
+                    let image = store_image(state, id, mime, &data).ok()?;
+                    Some(format!("/api/images/{image}"))
+                });
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -3357,7 +3534,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
 
         let log = std::fs::read_to_string(&log).unwrap();
-        let (args, input) = log.split_once('\n').unwrap();
+        // The notes in --append-system-prompt carry newlines of their
+        // own; the input message is the log's last line.
+        let args = log.lines().next().unwrap();
+        let input = log.lines().last().unwrap();
         assert!(args.contains("--input-format stream-json"), "{args}");
         let message: Value = serde_json::from_str(input).unwrap();
         assert_eq!(
@@ -3455,28 +3635,35 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
         // in the worktree.
         let id = &session.id;
         let log = std::fs::read_to_string(&log).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2, "{log}");
+        // The notes in --append-system-prompt carry newlines of their
+        // own, so each logged call runs past one line; calls start with
+        // "-p ".
+        let mut calls = log.split("\n-p ");
+        let first = calls.next().unwrap();
+        let calls: Vec<String> = calls.map(|c| format!("-p {c}")).collect();
+        let [second] = calls.as_slice() else {
+            panic!("{log}")
+        };
         assert!(
-            lines[0].starts_with(&format!("-p --session-id {id} ")),
+            first.starts_with(&format!("-p --session-id {id} ")),
             "{log}"
         );
-        assert!(lines[0].contains(" --permission-mode auto "), "{log}");
-        assert!(lines[0].contains(" --model sonnet "), "{log}");
-        assert!(lines[0].ends_with(" | -first | 1"), "{log}");
-        assert!(lines[1].starts_with(&format!("-p --resume {id} ")), "{log}");
-        assert!(lines[1].contains(" --permission-mode manual "), "{log}");
-        assert!(!lines[1].contains("--model"), "{log}");
-        assert!(lines[1].contains("--permission-prompt-tool mcp__grenadine__approve"));
+        assert!(first.contains(" --permission-mode auto "), "{log}");
+        assert!(first.contains(" --model sonnet "), "{log}");
+        assert!(first.ends_with(" | -first | 1"), "{log}");
+        assert!(second.starts_with(&format!("-p --resume {id} ")), "{log}");
+        assert!(second.contains(" --permission-mode manual "), "{log}");
+        assert!(!second.contains("--model"), "{log}");
+        assert!(second.contains("--permission-prompt-tool mcp__grenadine__approve"));
         assert!(
-            lines[1].contains(
+            second.contains(
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
                  mcp__grenadine__wait_for_terminal mcp__grenadine__show_image \
                  mcp__grenadine__update_prs mcp__grenadine__land_on_checkout --mcp-config "
             ),
             "{log}"
         );
-        assert!(lines[1].ends_with(" | second | 1"), "{log}");
+        assert!(second.trim_end().ends_with(" | second | 1"), "{log}");
 
         // Pages get the stored events and the streamed text.
         let mut live = Vec::new();
@@ -3846,7 +4033,9 @@ esac
         );
         wait_for_turns(&state, &cleaner.id, 1).await;
         let turns = std::fs::read_to_string(dir.path().join("turn_args")).unwrap();
-        let last = turns.lines().last().unwrap();
+        // The notes in --append-system-prompt carry newlines of their
+        // own; a call's arguments are on its "-p " line.
+        let last = turns.lines().rfind(|l| l.starts_with("-p ")).unwrap();
         assert!(
             last.contains(&format!("--session-id {}", cleaner.id)),
             "{last}"
@@ -5321,6 +5510,126 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(note.contains("land_on_checkout"), "{note}");
         assert_eq!(prs_note(&session(GENERAL, SessionKind::Interactive)), None);
         assert_eq!(prs_note(&session("o/n", SessionKind::AutoReview)), None);
+    }
+
+    /// Sessions are told to show images through the MCP tool, not
+    /// Markdown links to files.
+    #[test]
+    fn tells_agents_about_showing_images() {
+        let note = images_note();
+        assert!(note.contains("show_image"), "{note}");
+    }
+
+    /// `capture_markdown_images` with a store that takes every
+    /// destination; returns the rewritten text and what it was asked
+    /// for.
+    fn rewrite(text: &str) -> (String, Vec<String>) {
+        let mut seen = Vec::new();
+        let out = capture_markdown_images(text, |dest| {
+            seen.push(dest.to_owned());
+            Some(format!("/api/images/{}", seen.len()))
+        });
+        (out, seen)
+    }
+
+    /// Relative and absolute local destinations are rewritten; `<>`-
+    /// wrapped ones keep their brackets.
+    #[test]
+    fn captures_local_markdown_images() {
+        let (out, seen) = rewrite("a ![i](shot.png) b");
+        assert_eq!(out, "a ![i](/api/images/1) b");
+        assert_eq!(seen, ["shot.png"]);
+
+        let (out, _) = rewrite("![a](/abs/x.png)");
+        assert_eq!(out, "![a](/api/images/1)");
+
+        let (out, _) = rewrite("![a](<path with space.png>)");
+        assert_eq!(out, "![a](</api/images/1>)");
+
+        let (out, _) = rewrite("![a](x.png \"a title\")");
+        assert_eq!(out, "![a](/api/images/1 \"a title\")");
+    }
+
+    /// URLs, stored images, declined destinations and images that don't
+    /// parse as inline images stay byte-identical.
+    #[test]
+    fn leaves_other_markdown_images_alone() {
+        for text in [
+            "![a](https://e.com/x.png)",
+            "![a](data:image/png;base64,AAAA)",
+            "![a](file:///x.png)",
+            "![a](/api/images/abc)",
+            "```\n![a](x.png)\n```",
+            "`![a](x.png)`",
+            "![a][r]\n\n[r]: /x.png",
+        ] {
+            let (out, _) = rewrite(text);
+            assert_eq!(out, text, "{text}");
+        }
+        let out = capture_markdown_images("![a](x.png)", |_| None);
+        assert_eq!(out, "![a](x.png)");
+    }
+
+    /// In text with several images only the captured ones are rewritten;
+    /// the rest of the text is untouched.
+    #[test]
+    fn captures_only_some_markdown_images() {
+        let out = capture_markdown_images(
+            "pre ![a](have.png) mid ![b](https://e.com/x.png) and ![c](two.png) post",
+            |dest| (dest != "two.png").then(|| format!("/u/{dest}")),
+        );
+        assert_eq!(
+            out,
+            "pre ![a](/u/have.png) mid ![b](https://e.com/x.png) and ![c](two.png) post"
+        );
+    }
+
+    /// Text events' Markdown images of local files are stored and
+    /// rewritten to `/api/images/` URLs; missing and non-image files
+    /// stay as written.
+    #[test]
+    fn captures_text_events_local_images() {
+        let state = crate::sync::test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("shot.png"), b"\x89PNG\r\n\x1a\nrel").unwrap();
+        let abs = dir.path().join("abs.png");
+        std::fs::write(&abs, b"\x89PNG\r\n\x1a\nabs").unwrap();
+        std::fs::write(work.join("notes.txt"), "hi").unwrap();
+
+        let session = session_row(&uuid(), "o/n", &work);
+        state.db.create_agent(&session).unwrap();
+        let mut sink = TurnSink::new(&state, &session.id, "o/n");
+        sink.event(AgentEventKind::Text(format!(
+            "rel ![s](shot.png) abs ![a]({}) miss ![m](gone.png) txt ![t](notes.txt)",
+            abs.display()
+        )))
+        .unwrap();
+
+        let events = state.db.agent_events(&session.id).unwrap();
+        let [event] = &events[..] else {
+            panic!("{events:?}")
+        };
+        let AgentEventKind::Text(text) = &event.kind else {
+            panic!("{event:?}")
+        };
+        let image_at = |marker: &str| {
+            let at = text.find(marker).unwrap() + marker.len();
+            text[at..at + 36].to_owned()
+        };
+        let rel = image_at("![s](/api/images/");
+        let abs = image_at("![a](/api/images/");
+        assert!(text.contains("![m](gone.png)"), "{text}");
+        assert!(text.contains("![t](notes.txt)"), "{text}");
+        assert_eq!(
+            state.db.agent_image(&rel).unwrap(),
+            Some(("image/png".into(), b"\x89PNG\r\n\x1a\nrel".to_vec()))
+        );
+        assert_eq!(
+            state.db.agent_image(&abs).unwrap(),
+            Some(("image/png".into(), b"\x89PNG\r\n\x1a\nabs".to_vec()))
+        );
     }
 
     #[test]

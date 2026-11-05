@@ -1,5 +1,5 @@
 {
-  "checksum": "84ee166dbf6745a41f902933fdd9e500db2d397f9eb62491d7f7e884366d8021",
+  "checksum": "c86e39d6e3e3f906550261ef8a6f5ab375ef64d6e8a063ac65e09465f1836495",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4730,6 +4730,10 @@
           {
             "id": "pty-process 0.5.4",
             "target": "pty_process"
+          },
+          {
+            "id": "pulldown-cmark 0.13.4",
+            "target": "pulldown_cmark"
           },
           {
             "id": "reqwest 0.13.5",
