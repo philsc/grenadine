@@ -1698,8 +1698,40 @@ fn strip_cd<'a>(command: &'a str, worktree: &str) -> &'a str {
     if rest.is_empty() { command } else { rest }
 }
 
+/// `path` relative to `worktree` when it is inside it, or the path unchanged.
+/// `worktree` may end in a `/`. A `path` equal to `worktree` becomes "."; a
+/// path outside `worktree`, including a sibling sharing a prefix like
+/// "<worktree>-other", stays absolute. The result never has `..` or a `./`.
+fn relative_to<'a>(path: &'a str, worktree: &str) -> &'a str {
+    let worktree = worktree.trim_end_matches('/');
+    if worktree.is_empty() {
+        return path;
+    }
+    if path == worktree {
+        return ".";
+    }
+    match path
+        .strip_prefix(worktree)
+        .and_then(|r| r.strip_prefix('/'))
+    {
+        Some(rest) if !rest.is_empty() => rest,
+        Some(_) => ".",
+        None => path,
+    }
+}
+
+/// The full path for a summary that `relative_to` shortened, so a tooltip can
+/// show it; `None` when the summary is the path or the input has no path.
+fn summary_title(input: &serde_json::Value, summary: &str) -> Option<String> {
+    input["file_path"]
+        .as_str()
+        .filter(|path| *path != summary)
+        .map(str::to_owned)
+}
+
 /// A one-line summary of a tool call's input, e.g. the command or the path.
-/// `worktree` hides a redundant leading `cd` into it in a `Bash` command.
+/// `worktree` hides a redundant leading `cd` into it in a `Bash` command and
+/// shortens a file tool's path inside it.
 fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -> String {
     let field = match name {
         "Bash" => "command",
@@ -1721,6 +1753,7 @@ fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -
         Some(s) => {
             let s = match worktree {
                 Some(worktree) if name == "Bash" => strip_cd(s, worktree),
+                Some(worktree) if field == "file_path" => relative_to(s, worktree),
                 _ => s,
             };
             s.lines().next().unwrap_or_default().to_owned()
@@ -2736,6 +2769,7 @@ fn Transcript(
                         AgentEventKind::ToolUse { id: tool, name, input, .. } => {
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
                             let summary = tool_summary(name, &value, Some(&worktree));
+                            let title = summary_title(&value, &summary);
                             let tool = tool.clone();
                             let result = Memo::new_with_compare(
                                 move |_| results.with(|r| r.get(&tool).cloned()),
@@ -2765,7 +2799,7 @@ fn Transcript(
                                 <details class="tool">
                                     <summary>
                                         <span class="tool-name">{name.clone()}</span>
-                                        " " <code>{summary}</code>
+                                        " " <code title=title>{summary}</code>
                                         {move || {
                                             let done = result.with(|r| {
                                                 r.as_ref().map(|e| {
@@ -2875,7 +2909,8 @@ fn Transcript(
                         }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, options } => {
                             let value = serde_json::from_str(input).unwrap_or_default();
-                            let summary = tool_summary(tool_name, &value, None);
+                            let summary = tool_summary(tool_name, &value, Some(&worktree));
+                            let title = summary_title(&value, &summary);
                             let diff = edit_fragments(tool_name, &value, &[]);
                             view! {
                                 <ApprovalCard
@@ -2884,6 +2919,7 @@ fn Transcript(
                                     backend=backend
                                     tool_name=tool_name.clone()
                                     summary=summary
+                                    title=title
                                     input=input.clone()
                                     diff=diff
                                     options=options.clone()
@@ -3290,6 +3326,8 @@ fn ApprovalCard(
     backend: AgentBackend,
     tool_name: String,
     summary: String,
+    /// The full path a shortened `summary` stands for, shown as a tooltip.
+    title: Option<String>,
     input: String,
     /// What a file tool would change, shown instead of `input`.
     diff: Option<(String, Vec<Fragment>)>,
@@ -3328,7 +3366,7 @@ fn ApprovalCard(
                     None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
                     None => "Unanswered: ".to_owned(),
                 }}
-                <span class="tool-name">{tool_name.clone()}</span> " " <code>{summary}</code>
+                <span class="tool-name">{tool_name.clone()}</span> " " <code title=title>{summary}</code>
             </p>
             {move || (state.get().is_none() && waiting.get()).then(|| {
                 let (answer, deny) = (answer.clone(), deny.clone());
@@ -3804,6 +3842,37 @@ mod tests {
         assert_eq!(tool_summary("ExitPlanMode", &input, None), "# Plan");
         let input = serde_json::json!({"questions": [{"question": "Tea?"}]});
         assert_eq!(tool_summary("AskUserQuestion", &input, None), "Tea?");
+    }
+
+    #[test]
+    fn paths_relative_to_the_worktree() {
+        assert_eq!(relative_to("/w/t/a/b.rs", "/w/t"), "a/b.rs");
+        assert_eq!(relative_to("/w/t/a.rs", "/w/t/"), "a.rs");
+        assert_eq!(relative_to("/w/t", "/w/t"), ".");
+        assert_eq!(relative_to("/w/t/", "/w/t"), ".");
+        assert_eq!(relative_to("/etc/hosts", "/w/t"), "/etc/hosts");
+        assert_eq!(relative_to("/w/t-other/x", "/w/t"), "/w/t-other/x");
+        assert_eq!(relative_to("/w/t/a.rs", ""), "/w/t/a.rs");
+    }
+
+    #[test]
+    fn tool_summaries_make_paths_relative() {
+        for name in ["Read", "Edit"] {
+            let input = serde_json::json!({"file_path": "/w/t/a.rs"});
+            assert_eq!(tool_summary(name, &input, Some("/w/t")), "a.rs", "{name}");
+            assert_eq!(tool_summary(name, &input, None), "/w/t/a.rs", "{name}");
+        }
+        let input = serde_json::json!({"file_path": "/etc/hosts"});
+        assert_eq!(tool_summary("Read", &input, Some("/w/t")), "/etc/hosts");
+    }
+
+    #[test]
+    fn summary_titles() {
+        let input = serde_json::json!({"file_path": "/w/t/a.rs"});
+        assert_eq!(summary_title(&input, "a.rs"), Some("/w/t/a.rs".to_owned()));
+        assert_eq!(summary_title(&input, "/w/t/a.rs"), None);
+        let input = serde_json::json!({"command": "ls"});
+        assert_eq!(summary_title(&input, "ls"), None);
     }
 
     #[test]
