@@ -1736,10 +1736,12 @@ fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -
     let field = match name {
         "Bash" => "command",
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "file_path",
-        "Grep" | "Glob" => "pattern",
-        "WebFetch" => "url",
-        "WebSearch" => "query",
+        "Grep" | "Glob" | "find_file_by_name" => "pattern",
+        "WebFetch" | "webfetch" => "url",
+        "WebSearch" | "web_search" => "query",
         "Task" | "Agent" => "description",
+        "run_subagent" => "title",
+        "Skill" | "skill" => "skill",
         "ExitPlanMode" => "plan",
         "AskUserQuestion" => {
             return input["questions"][0]["question"]
@@ -3842,6 +3844,21 @@ mod tests {
         assert_eq!(tool_summary("ExitPlanMode", &input, None), "# Plan");
         let input = serde_json::json!({"questions": [{"question": "Tea?"}]});
         assert_eq!(tool_summary("AskUserQuestion", &input, None), "Tea?");
+        let input = serde_json::json!({"skill": "pr-title"});
+        assert_eq!(tool_summary("Skill", &input, None), "pr-title");
+        assert_eq!(tool_summary("skill", &input, None), "pr-title");
+        assert_eq!(tool_summary("skill", &serde_json::json!({}), None), "");
+        let input = serde_json::json!({"query": "rust leptos"});
+        assert_eq!(tool_summary("web_search", &input, None), "rust leptos");
+        let input = serde_json::json!({"url": "https://example.com"});
+        assert_eq!(
+            tool_summary("webfetch", &input, None),
+            "https://example.com"
+        );
+        let input = serde_json::json!({"pattern": "**/*.rs"});
+        assert_eq!(tool_summary("find_file_by_name", &input, None), "**/*.rs");
+        let input = serde_json::json!({"title": "Explore auth", "task": "Find it"});
+        assert_eq!(tool_summary("run_subagent", &input, None), "Explore auth");
     }
 
     #[test]
