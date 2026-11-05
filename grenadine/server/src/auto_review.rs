@@ -577,6 +577,7 @@ mod tests {
             author: "me".into(),
             state: "OPEN".into(),
             is_draft: draft,
+            queued: false,
             url: "u".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             head_oid: head.into(),
@@ -791,6 +792,7 @@ mod tests {
             updated_at: String::new(),
             head_oid: String::new(),
             parent,
+            queued: false,
         }
     }
 
@@ -814,6 +816,7 @@ mod tests {
                 threads: None,
                 ci: None,
                 review_decision: None,
+                queued: false,
             },
             body: String::new(),
             base_ref: "main".into(),
@@ -1170,6 +1173,7 @@ sleep 30
                     author: "me".into(),
                     state: "OPEN".into(),
                     is_draft: false,
+                    queued: false,
                     url: "u".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                     updated_at: "2026-01-01T00:00:00Z".into(),

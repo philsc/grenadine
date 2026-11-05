@@ -508,7 +508,7 @@ fn PrBody(
             <header class="pr-header">
                 <h1>{s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() /></h1>
                 <p class="muted">
-                    <span class=format!("state state-{}", s.state.to_lowercase())>{s.state.to_lowercase()}</span>
+                    <span class=format!("state state-{}", state_label(&s.state, s.queued))>{state_label(&s.state, s.queued)}</span>
                     {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
                     {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
                     " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
@@ -561,6 +561,15 @@ fn PrBody(
             </div>
             {diff}
         </article>
+    }
+}
+
+/// The badge text and class of a PR's state: an open PR in a merge queue
+/// shows as queued, since GitHub has no QUEUED state.
+fn state_label(state: &str, queued: bool) -> String {
+    match state == "OPEN" && queued {
+        true => "queued".to_owned(),
+        false => state.to_lowercase(),
     }
 }
 
@@ -650,7 +659,7 @@ fn StackList(stack: Stack, repo: String, current: u64) -> impl IntoView {
                 let p = &stack.prs[i];
                 let text = format!("#{} {}", p.number, p.title);
                 let hash = hash_for(&PrKey { repo: repo.clone(), number: p.number });
-                let state = p.state.to_lowercase();
+                let state = state_label(&p.state, p.queued);
                 view! {
                     {if p.number == current {
                         view! { <strong>{text}</strong> }.into_any()
@@ -1383,5 +1392,14 @@ mod tests {
             review("me", "2026-01-02T00:00:00Z", None),
         ]);
         assert_eq!(last_reviewed(&versions, Some(&info)), None);
+    }
+
+    #[test]
+    fn queued_prs_show_as_queued() {
+        assert_eq!(state_label("OPEN", true), "queued");
+        assert_eq!(state_label("OPEN", false), "open");
+        // A queued flag on a merged PR means nothing.
+        assert_eq!(state_label("MERGED", true), "merged");
+        assert_eq!(state_label("CLOSED", false), "closed");
     }
 }

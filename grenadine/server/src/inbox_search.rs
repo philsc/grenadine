@@ -269,6 +269,7 @@ mod tests {
             author: "a".into(),
             state: "OPEN".into(),
             is_draft: false,
+            queued: false,
             url: "u".into(),
             updated_at: "u".into(),
             head_oid: "h".into(),

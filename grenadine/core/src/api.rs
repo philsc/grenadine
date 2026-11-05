@@ -152,6 +152,9 @@ pub struct PrSummary {
     /// inbox search before the first sync. `None` when there's none.
     #[serde(default)]
     pub review_decision: Option<ReviewDecision>,
+    /// In a merge queue; GitHub's `state` stays OPEN while one is.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +239,9 @@ pub struct StackPr {
     /// The PR whose head branch this PR targets. `None` for the bottom PR,
     /// which targets `Stack::base_ref`.
     pub parent: Option<u64>,
+    /// In a merge queue.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 /// A PR's ancestors down to the branch the bottom one targets, the PR
@@ -1082,6 +1088,9 @@ pub struct AgentPr {
     /// Whether it conflicted with its base at the last poll that could
     /// tell.
     pub conflicting: bool,
+    /// In a merge queue.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 /// How far the PRs an agent session opened have come. PRs closed without

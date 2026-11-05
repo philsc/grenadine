@@ -1209,6 +1209,13 @@ class InboxTest(ServerTestCase):
         self.check_group("Passed (1)").locator(".check-group-header").click()
         expect(self.check_group("Passed (1)").locator(".check")).to_have_text(["test"])
 
+    def test_pr_page_of_a_queued_pr(self) -> None:
+        pr = self.cases.prs["Sit in the merge queue"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        header = self.page.locator(".pr-header")
+        expect(header.locator(".state")).to_have_text("queued")
+        expect(header.locator(".state")).to_have_class(re.compile(r"\bstate-queued\b"))
+
     def test_pr_sidebar_collapses_and_stays_collapsed(self) -> None:
         pr = self.cases.prs["Get approved"]
         self.page.set_viewport_size({"width": 1800, "height": 900})

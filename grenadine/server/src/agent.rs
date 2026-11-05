@@ -4447,6 +4447,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                     author: "me".into(),
                     state: "OPEN".into(),
                     is_draft: false,
+                    queued: false,
                     url: "u".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                     updated_at: "2026-01-01T00:00:00Z".into(),

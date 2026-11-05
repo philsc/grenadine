@@ -142,6 +142,7 @@ mod tests {
             updated_at: String::new(),
             head_oid: String::new(),
             parent: None,
+            queued: false,
         }
     }
 

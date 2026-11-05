@@ -489,11 +489,14 @@ fn short(versions: &[Version]) -> String {
 /// that changed since. So does one whose checks were running at its last
 /// sync, until they aren't: GitHub's state, which the search reports,
 /// stays failing while a superseded run failed, so it doesn't change when
-/// they finish.
+/// they finish. Joining a merge queue doesn't change `updated_at`, so
+/// `queued` must be compared too; a mark that predates it (`None`) counts
+/// as changed.
 fn needs_sync(mark: Option<SyncMark>, hit: &github::Hit) -> bool {
     mark.is_none_or(|m| {
         m.checks_running
             || (&m.updated_at, &m.head_oid, m.ci) != (&hit.updated_at, &hit.head_oid, hit.ci)
+            || m.queued != Some(hit.queued)
     })
 }
 
@@ -604,6 +607,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
         title: data.title.clone(),
         state: data.state.clone(),
         is_draft: data.is_draft,
+        queued: data.queued,
         url: data.url.clone(),
         updated_at: data.updated_at.clone(),
         head_oid: data.head_oid.clone(),
@@ -631,6 +635,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
         author: data.author,
         state: data.state,
         is_draft: data.is_draft,
+        queued: data.queued,
         url: data.url,
         created_at: data.created_at,
         updated_at: data.updated_at,
@@ -1033,6 +1038,7 @@ mod tests {
             author: "a".into(),
             state: "OPEN".into(),
             is_draft: false,
+            queued: true,
             url: "u".into(),
             updated_at: "t1".into(),
             head_oid: "h".into(),
@@ -1047,6 +1053,7 @@ mod tests {
             head_oid: "h".into(),
             ci: Some(CiStatus::Failing),
             checks_running: false,
+            queued: Some(true),
         };
         assert!(needs_sync(None, &hit));
         assert!(!needs_sync(Some(synced.clone()), &hit));
@@ -1057,9 +1064,22 @@ mod tests {
         assert!(needs_sync(Some(pushed), &hit));
         let running = SyncMark {
             checks_running: true,
-            ..synced
+            ..synced.clone()
         };
         assert!(needs_sync(Some(running), &hit));
+        // Joining a queue doesn't change `updated_at`, so it's the flag
+        // alone that asks for a sync; a mark from before it was recorded
+        // asks for one too.
+        let unqueued = SyncMark {
+            queued: Some(false),
+            ..synced.clone()
+        };
+        assert!(needs_sync(Some(unqueued), &hit));
+        let old = SyncMark {
+            queued: None,
+            ..synced
+        };
+        assert!(needs_sync(Some(old), &hit));
     }
 
     #[test]
