@@ -35,6 +35,7 @@ from grenadine.testing.fake_github import (
     TOKEN,
     CheckRun,
     FakeGitHub,
+    PullRequest,
     Review,
 )
 
@@ -830,6 +831,12 @@ class ChromeTest(ServerTestCase):
         )
 
 
+# The default inboxes that sync in background.
+BACKGROUND_INBOXES = {
+    name for name, _, _, background in scenarios.default_inboxes() if background
+}
+
+
 class InboxTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -849,7 +856,8 @@ class InboxTest(ServerTestCase):
 
     def expect_titles(self, inbox: Locator, titles: list[str]) -> None:
         """Checks that `inbox` lists exactly `titles`, in any order, each
-        synced without errors."""
+        without errors. A row shows its synced details or its search
+        data, never a stuck "syncing…"."""
         expect(inbox.locator(".count")).to_have_text(str(len(titles)))
         rows = inbox.locator(".pr-list li")
         expect(rows).to_have_count(len(titles))
@@ -860,11 +868,17 @@ class InboxTest(ServerTestCase):
                 )
             )
             expect(row).to_have_count(1)
-            expect(row.locator(".pr-meta")).to_have_text(re.compile(r"· 1 versions$"))
+            # A PR in a background inbox is synced by the polls; other
+            # rows show the search's date, unless a test synced the PR.
+            if set(self.cases.expected[title]) & BACKGROUND_INBOXES:
+                meta = r"· 1 versions$"
+            else:
+                meta = r"· (1 versions|\d{4}-\d{2}-\d{2})$"
+            expect(row.locator(".pr-meta")).to_have_text(re.compile(meta))
 
     def test_prs_land_in_their_inboxes(self) -> None:
         self.page.goto(self.url)
-        for name, _, _ in scenarios.default_inboxes():
+        for name, *_ in scenarios.default_inboxes():
             with self.subTest(inbox=name):
                 self.expect_titles(self.inbox(name), self.cases.titles_in(name))
 
@@ -883,6 +897,8 @@ class InboxTest(ServerTestCase):
         expect(self.inbox(scenarios.DRAFTS).locator(".pr-title .badge")).to_have_text(
             "draft"
         )
+        # The stack badges need the sync's stack data; the stack's PRs
+        # are the viewer's, so the auto-review search syncs them.
         expect(
             self.inbox(scenarios.WAITING_FOR_REVIEWERS).locator(".pr-title .badge")
         ).to_have_count(2)
@@ -1455,6 +1471,133 @@ class InboxPagingTest(ServerTestCase):
 
         self.page.reload()
         expect(rows).to_have_count(15)
+
+
+class BackgroundSyncTest(ServerTestCase):
+    """Inboxes without "sync in background" list their PRs from the
+    search's data; the PRs sync when a page watches them."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.cases = scenarios.inbox_cases(gh)
+
+    def inbox(self, name: str) -> Locator:
+        return self.page.locator("section.inbox").filter(
+            has=self.page.locator(".inbox-name", has_text=exactly(name))
+        )
+
+    def pr_requests(self, pr: PullRequest) -> list[str]:
+        """The requests that fetched `pr`'s details."""
+        return [
+            r
+            for r in self.gh.requests
+            if r == f"graphql pr {scenarios.REPO}#{pr.number}"
+            or r.startswith(
+                (
+                    f"GET /repos/{scenarios.REPO}/pulls/{pr.number}/",
+                    f"GET /repos/{scenarios.REPO}/activity?ref=refs/heads/{pr.head}",
+                )
+            )
+        ]
+
+    def wait_for_requests(self, pr: PullRequest, count: int) -> list[str]:
+        """Waits until `pr`'s detail requests reach `count` and returns them."""
+        deadline = time.monotonic() + 15
+        while len(self.pr_requests(pr)) < count and time.monotonic() < deadline:
+            time.sleep(0.1)
+        return self.pr_requests(pr)
+
+    def set_background(self, name: str, on: bool) -> None:
+        """Sets inbox `name`'s "sync in background" flag through the API."""
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            [inbox] = [
+                i["inbox"] for i in json.load(resp) if i["inbox"]["name"] == name
+            ]
+        inbox["sync_in_background"] = on
+        req = urllib.request.Request(
+            f"{self.url}api/inboxes/{inbox['id']}",
+            data=json.dumps(inbox).encode(),
+            method="PUT",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": self.url.rstrip("/"),
+            },
+        )
+        urllib.request.urlopen(req).close()
+
+    def test_a_direct_link_syncs_a_pr_in_no_inbox(self) -> None:
+        # "Get closed" is in no inbox; opening its page syncs it.
+        pr = self.cases.prs["Get closed"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.assertNotEqual(self.pr_requests(pr), [])
+
+    def test_off_inbox_rows_show_search_data_only(self) -> None:
+        # "Leave me out of it" is only in inboxes that don't sync in
+        # background, and isn't the viewer's to review. No other test in
+        # the class opens it, so it's never fetched.
+        pr = self.cases.prs["Leave me out of it"]
+        self.page.goto(self.url)
+        row = (
+            self.inbox(scenarios.ALL_OPEN)
+            .locator(".pr-list li")
+            .filter(has_text=pr.title)
+        )
+        # The row's data is the search's: title, author, the updatedAt
+        # date — no "syncing…", no error.
+        expect(row.locator(".pr-meta")).to_have_text(
+            re.compile(
+                rf"{re.escape(scenarios.REPO)}#{pr.number} · {re.escape(pr.author)} "
+                rf"· \d{{4}}-\d{{2}}-\d{{2}}$"
+            )
+        )
+        # And its details were never fetched: the polls skip it.
+        self.assertEqual(self.pr_requests(pr), [])
+
+    def test_opening_an_off_inbox_pr_syncs_it(self) -> None:
+        pr = self.cases.prs["Ask my team for a review"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.assertNotEqual(self.pr_requests(pr), [])
+
+    def test_reopening_syncs_again(self) -> None:
+        pr = self.cases.prs["Wait for the author after my review"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        first = len(self.wait_for_requests(pr, 1))
+        self.assertGreater(first, 0)
+
+        # Back to the inboxes and in again: a new watch means a new sync.
+        self.page.goto(self.url)
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        again = self.wait_for_requests(pr, first + 1)
+        self.assertGreater(len(again), first)
+
+    def test_turning_on_background_syncs_the_inbox(self) -> None:
+        # "Ask me to look at a draft" is only in inboxes that don't sync
+        # in background, and isn't the viewer's to review. No other test
+        # in the class opens it.
+        pr = self.cases.prs["Ask me to look at a draft"]
+        # The flag change is a class-wide one; undo it for later tests.
+        self.addCleanup(self.set_background, scenarios.DRAFTS_FROM_OTHERS, False)
+        self.page.goto(self.url)
+        self.assertEqual(self.pr_requests(pr), [])
+
+        inbox = self.inbox(scenarios.DRAFTS_FROM_OTHERS)
+        inbox.locator(".inbox-header").hover()
+        inbox.get_by_title("Edit").click()
+        form = self.page.locator("form.inbox-form")
+        form.get_by_label("Sync in background").check()
+        form.get_by_role("button", name="Save").click()
+        # The save pokes the poller; its next poll syncs the inbox's PRs.
+        self.assertNotEqual(self.wait_for_requests(pr, 1), [])
+        expect(inbox.locator(".pr-meta")).to_have_text(re.compile(r"· 1 versions$"))
 
 
 class ReviewTest(ServerTestCase):

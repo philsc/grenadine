@@ -53,7 +53,7 @@ pub fn Inboxes(
             {move || if adding.get() {
                 view! {
                     <InboxForm
-                        initial=InboxEdit { name: String::new(), filter: "state:open archived:false draft:false ".into(), position: None, count_in_total: false }
+                        initial=InboxEdit { name: String::new(), filter: "state:open archived:false draft:false ".into(), position: None, count_in_total: false, sync_in_background: false }
                         on_done=Callback::new(move |_| adding.set(false))
                         id=None
                     />
@@ -81,6 +81,7 @@ async fn swap(a: Inbox, b: Inbox) -> api::Result<()> {
             filter: a.filter,
             position: Some(pa),
             count_in_total: a.count_in_total,
+            sync_in_background: a.sync_in_background,
         },
     )
     .await?;
@@ -91,6 +92,7 @@ async fn swap(a: Inbox, b: Inbox) -> api::Result<()> {
             filter: b.filter,
             position: Some(pb),
             count_in_total: b.count_in_total,
+            sync_in_background: b.sync_in_background,
         },
     )
     .await
@@ -117,6 +119,10 @@ fn InboxSection(
     } = inbox;
     let count = prs.len();
     let id = inbox.id;
+    // Rows of an inbox without background sync show their search data
+    // until a page watches the PR; only a syncing inbox's rows say
+    // "syncing…".
+    let background = inbox.sync_in_background;
     let rows = group_inbox(&prs);
     let total = rows.len();
     let limit = move || shown.with(|m| m.get(&id).copied().unwrap_or(INITIAL_ROWS));
@@ -162,7 +168,7 @@ fn InboxSection(
                 let i = inbox.clone();
                 view! {
                     <InboxForm
-                        initial=InboxEdit { name: i.name.clone(), filter: i.filter.clone(), position: Some(i.position), count_in_total: i.count_in_total }
+                        initial=InboxEdit { name: i.name.clone(), filter: i.filter.clone(), position: Some(i.position), count_in_total: i.count_in_total, sync_in_background: i.sync_in_background }
                         on_done=Callback::new(move |_| editing.set(false))
                         id=Some(i.id)
                     />
@@ -238,8 +244,10 @@ fn InboxSection(
                                                             format!("{} versions", pr.version_count).into_any()
                                                         } else if pr.sync_error.is_some() {
                                                             view! { <span class="error">"sync failed"</span> }.into_any()
-                                                        } else {
+                                                        } else if background {
                                                             view! { <span>"syncing…"</span> }.into_any()
+                                                        } else {
+                                                            pr.updated_at.get(..10).unwrap_or_default().to_owned().into_any()
                                                         }}
                                                     </span>
                                                 </span>
@@ -367,6 +375,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
     let name = RwSignal::new(initial.name);
     let filter = RwSignal::new(initial.filter);
     let count_in_total = RwSignal::new(initial.count_in_total);
+    let sync_in_background = RwSignal::new(initial.sync_in_background);
     let error = RwSignal::new(None::<String>);
     let position = initial.position;
     let updates = expect_context::<Updates>();
@@ -378,6 +387,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             filter: filter.get_untracked(),
             position,
             count_in_total: count_in_total.get_untracked(),
+            sync_in_background: sync_in_background.get_untracked(),
         };
         spawn_local(async move {
             let result = match id {
@@ -422,6 +432,9 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             </label>
             <label class="checkbox">"Count in total"
                 <input type="checkbox" prop:checked=move || count_in_total.get() on:change=move |ev| count_in_total.set(event_target_checked(&ev)) />
+            </label>
+            <label class="checkbox">"Sync in background"
+                <input type="checkbox" prop:checked=move || sync_in_background.get() on:change=move |ev| sync_in_background.set(event_target_checked(&ev)) />
             </label>
             <p class="hint muted">"is:pr and repo: qualifiers for the configured repositories are added automatically. gr: qualifiers, described in the README, are evaluated by grenadine."</p>
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}

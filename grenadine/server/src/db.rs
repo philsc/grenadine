@@ -21,6 +21,11 @@ enum Migration {
     /// Records the PRs that the sessions' transcripts show they opened, as
     /// open; the next poll looks up their states.
     BackfillAgentPrs,
+    /// Adds `inboxes.sync_in_background` and sets it on the inboxes that
+    /// still match a default that has it, name and filter, so that an
+    /// edited default keeps it off. Reads DEFAULT_INBOXES so the names
+    /// and filters aren't duplicated here.
+    BackgroundDefaults,
 }
 
 /// Each entry upgrades the schema by one version.
@@ -396,6 +401,7 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agent_prs ADD COLUMN queued INTEGER NOT NULL DEFAULT 0;
 "#,
     ),
+    Migration::BackgroundDefaults,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -413,36 +419,54 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
             Migration::Sql(sql) => tx.execute_batch(sql)?,
             Migration::ResetInboxes => {
                 tx.execute("DELETE FROM inboxes", [])?;
-                // count_in_total only exists once its migration has run;
-                // on a fresh database this runs at the older position
-                // where the column doesn't exist yet.
-                let has_count: bool = tx.query_row(
-                    "SELECT COUNT(*) > 0 FROM pragma_table_info('inboxes')
-                     WHERE name = 'count_in_total'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                for (position, inbox) in crate::inboxes::DEFAULT_INBOXES.iter().enumerate() {
-                    if has_count {
-                        tx.execute(
-                            "INSERT INTO inboxes (name, filter, position, count_in_total)
-                             VALUES (?, ?, ?, ?)",
-                            params![
-                                inbox.name,
-                                inbox.filter,
-                                position as i64,
-                                inbox.count_in_total
-                            ],
-                        )?;
-                    } else {
-                        tx.execute(
-                            "INSERT INTO inboxes (name, filter, position) VALUES (?, ?, ?)",
-                            params![inbox.name, inbox.filter, position as i64],
-                        )?;
+                // The optional columns only exist once their migrations
+                // have run; on a fresh database this runs at an older
+                // position where they don't exist yet.
+                let existing: Vec<String> = tx
+                    .prepare("SELECT name FROM pragma_table_info('inboxes')")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let mut columns = vec!["name", "filter", "position"];
+                for optional in ["count_in_total", "sync_in_background"] {
+                    if existing.iter().any(|c| c == optional) {
+                        columns.push(optional);
                     }
+                }
+                let insert = format!(
+                    "INSERT INTO inboxes ({}) VALUES ({})",
+                    columns.join(", "),
+                    vec!["?"; columns.len()].join(", ")
+                );
+                let mut stmt = tx.prepare(&insert)?;
+                for (position, inbox) in crate::inboxes::DEFAULT_INBOXES.iter().enumerate() {
+                    let position = position as i64;
+                    let mut values: Vec<&dyn rusqlite::types::ToSql> =
+                        vec![&inbox.name, &inbox.filter, &position];
+                    if columns.contains(&"count_in_total") {
+                        values.push(&inbox.count_in_total);
+                    }
+                    if columns.contains(&"sync_in_background") {
+                        values.push(&inbox.sync_in_background);
+                    }
+                    stmt.execute(values.as_slice())?;
                 }
             }
             Migration::BackfillAgentPrs => backfill_agent_prs(&tx)?,
+            Migration::BackgroundDefaults => {
+                tx.execute_batch(
+                    "ALTER TABLE inboxes ADD COLUMN sync_in_background INTEGER NOT NULL DEFAULT 0;",
+                )?;
+                for default in crate::inboxes::DEFAULT_INBOXES
+                    .iter()
+                    .filter(|d| d.sync_in_background)
+                {
+                    tx.execute(
+                        "UPDATE inboxes SET sync_in_background = 1
+                         WHERE name = ? AND filter = ?",
+                        params![default.name, default.filter],
+                    )?;
+                }
+            }
         }
         tx.pragma_update(None, "user_version", i + 1)?;
         tx.commit()?;
@@ -631,7 +655,7 @@ impl Db {
     pub fn inboxes(&self) -> Result<Vec<Inbox>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, filter, position, count_in_total FROM inboxes
+            "SELECT id, name, filter, position, count_in_total, sync_in_background FROM inboxes
              ORDER BY position, id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -641,6 +665,7 @@ impl Db {
                 filter: r.get(2)?,
                 position: r.get(3)?,
                 count_in_total: r.get(4)?,
+                sync_in_background: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -706,8 +731,15 @@ impl Db {
             )?,
         };
         conn.execute(
-            "INSERT INTO inboxes (name, filter, position, count_in_total) VALUES (?, ?, ?, ?)",
-            params![edit.name, edit.filter, position, edit.count_in_total],
+            "INSERT INTO inboxes (name, filter, position, count_in_total, sync_in_background)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                edit.name,
+                edit.filter,
+                position,
+                edit.count_in_total,
+                edit.sync_in_background
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -716,12 +748,13 @@ impl Db {
     pub fn update_inbox(&self, id: i64, edit: &InboxEdit) -> Result<bool> {
         let n = self.conn().execute(
             "UPDATE inboxes SET name = ?, filter = ?, position = COALESCE(?, position),
-                count_in_total = ?, error = NULL WHERE id = ?",
+                count_in_total = ?, sync_in_background = ?, error = NULL WHERE id = ?",
             params![
                 edit.name,
                 edit.filter,
                 edit.position,
                 edit.count_in_total,
+                edit.sync_in_background,
                 id
             ],
         )?;
@@ -1140,11 +1173,14 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Whether a PR is in some inbox's latest results.
-    pub fn in_any_inbox(&self, key: &PrKey) -> Result<bool> {
+    /// Whether a PR is in the latest results of an inbox that syncs in
+    /// background.
+    pub fn in_background_inbox(&self, key: &PrKey) -> Result<bool> {
         self.conn()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM inbox_prs WHERE repo = ? AND number = ?)",
+                "SELECT EXISTS(SELECT 1 FROM inbox_prs p
+                               JOIN inboxes i ON i.id = p.inbox_id
+                               WHERE p.repo = ? AND p.number = ? AND i.sync_in_background)",
                 params![key.repo, key.number],
                 |r| r.get(0),
             )
@@ -2063,9 +2099,15 @@ mod tests {
                 (
                     inbox.name.as_str(),
                     inbox.filter.as_str(),
-                    inbox.count_in_total
+                    inbox.count_in_total,
+                    inbox.sync_in_background
                 ),
-                (default.name, default.filter, default.count_in_total)
+                (
+                    default.name,
+                    default.filter,
+                    default.count_in_total,
+                    default.sync_in_background
+                )
             );
             assert_eq!(inbox.position, position as i64);
         }
@@ -2079,22 +2121,26 @@ mod tests {
             filter: "label:x".into(),
             position: None,
             count_in_total: true,
+            sync_in_background: true,
         };
         let id = db.create_inbox(&edit).unwrap();
         let inbox = db.inboxes().unwrap().pop().unwrap();
         assert_eq!((inbox.id, inbox.position), (id, 14));
         assert!(inbox.count_in_total);
+        assert!(inbox.sync_in_background);
         assert!(
             db.update_inbox(
                 id,
                 &InboxEdit {
                     position: Some(-1),
+                    sync_in_background: false,
                     ..edit
                 }
             )
             .unwrap()
         );
         assert_eq!(db.inboxes().unwrap()[0].id, id);
+        assert!(!db.inboxes().unwrap()[0].sync_in_background);
         assert!(db.delete_inbox(id).unwrap());
         assert!(!db.delete_inbox(id).unwrap());
     }
@@ -2392,19 +2438,23 @@ mod tests {
     }
 
     #[test]
-    fn in_any_inbox_covers_all_inboxes() {
+    fn in_background_inbox_respects_the_flag() {
         let db = Db::in_memory();
         let key = PrKey {
             repo: "o/n".into(),
             number: 7,
         };
-        assert!(!db.in_any_inbox(&key).unwrap());
+        assert!(!db.in_background_inbox(&key).unwrap());
+        // Inbox 2 doesn't sync in background; inbox 1 does.
         db.set_inbox_results(2, Ok(std::slice::from_ref(&hit(&key))), None)
             .unwrap();
-        assert!(db.in_any_inbox(&key).unwrap());
+        assert!(!db.in_background_inbox(&key).unwrap());
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
+            .unwrap();
+        assert!(db.in_background_inbox(&key).unwrap());
         // A search that no longer reports the PR uncovers it again.
-        db.set_inbox_results(2, Ok(&[]), None).unwrap();
-        assert!(!db.in_any_inbox(&key).unwrap());
+        db.set_inbox_results(1, Ok(&[]), None).unwrap();
+        assert!(!db.in_background_inbox(&key).unwrap());
     }
 
     #[test]
@@ -2587,10 +2637,40 @@ mod tests {
                 (
                     inbox.name.as_str(),
                     inbox.filter.as_str(),
-                    inbox.count_in_total
+                    inbox.count_in_total,
+                    inbox.sync_in_background
                 ),
-                (default.name, default.filter, default.count_in_total)
+                (
+                    default.name,
+                    default.filter,
+                    default.count_in_total,
+                    default.sync_in_background
+                )
             );
+        }
+    }
+
+    /// The sync_in_background migration sets the flag on the defaults
+    /// that have it and still match one, name and filter; an edited
+    /// default keeps it off.
+    #[test]
+    fn background_defaults_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        conn.execute(
+            "UPDATE inboxes SET filter = 'custom' WHERE name = 'Approved'",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn, None).unwrap();
+        for inbox in db.inboxes().unwrap() {
+            let default = crate::inboxes::DEFAULT_INBOXES
+                .iter()
+                .find(|d| d.name == inbox.name)
+                .unwrap();
+            let expected = default.sync_in_background && inbox.filter == default.filter;
+            assert_eq!(inbox.sync_in_background, expected, "{}", inbox.name);
         }
     }
 
@@ -2617,9 +2697,15 @@ mod tests {
                 (
                     inbox.name.as_str(),
                     inbox.filter.as_str(),
-                    inbox.count_in_total
+                    inbox.count_in_total,
+                    inbox.sync_in_background
                 ),
-                (default.name, default.filter, default.count_in_total)
+                (
+                    default.name,
+                    default.filter,
+                    default.count_in_total,
+                    default.sync_in_background
+                )
             );
         }
         let listed: i64 = db

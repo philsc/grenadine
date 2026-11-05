@@ -191,7 +191,7 @@ class FakeGitHubTest(unittest.TestCase):
     def test_default_inboxes_hold_the_expected_prs(self) -> None:
         inboxes = scenarios.default_inboxes()
         self.assertEqual(len(inboxes), 14)
-        for name, filter, _ in inboxes:
+        for name, filter, *_ in inboxes:
             with self.subTest(inbox=name):
                 found = search_prs(
                     self.gh.prs(), scenarios.server_query(filter, [scenarios.REPO])
@@ -204,7 +204,7 @@ class FakeGitHubTest(unittest.TestCase):
                 got = [pr.title for pr in found]
                 self.assertEqual(got, self.inboxes.titles_in(name))
         # Every expected inbox exists.
-        names = {name for name, _, _ in inboxes}
+        names = {name for name, *_ in inboxes}
         self.assertLessEqual(
             {i for inboxes in self.inboxes.expected.values() for i in inboxes},
             names,

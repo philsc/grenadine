@@ -17,6 +17,11 @@ pub struct Inbox {
     /// Whether the inbox's PRs count in the top bar's total.
     #[serde(default)]
     pub count_in_total: bool,
+    /// Whether the polls sync the inbox's PRs. One without it is listed
+    /// from its search results, and its PRs sync when a page watches
+    /// them.
+    #[serde(default)]
+    pub sync_in_background: bool,
 }
 
 /// The body of a request that creates or edits an inbox.
@@ -27,6 +32,8 @@ pub struct InboxEdit {
     pub position: Option<i64>,
     #[serde(default)]
     pub count_in_total: bool,
+    #[serde(default)]
+    pub sync_in_background: bool,
 }
 
 /// A configured repository's settings. Every field has a default, so

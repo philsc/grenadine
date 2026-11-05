@@ -1,8 +1,13 @@
 //! Keeps the database and the clones' refs in step with GitHub.
 //!
-//! Every poll runs all inbox searches in one request and then syncs each PR
-//! that changed since its last sync. On the first poll after startup every
-//! PR is synced, which recomputes all versions and so detects drift.
+//! Every poll runs all inbox searches in one request and then syncs each
+//! covered PR that changed since its last sync. Covered means: the hits
+//! of the inboxes that sync in background, the auto-review hits, and the
+//! PRs a page is watching. The other inboxes' PRs are listed from their
+//! search results and sync when a page watches them, so polls don't
+//! spend the rate limit on PRs nobody looks at. On the first poll after
+//! startup every covered PR is synced, which recomputes all versions and
+//! so detects drift.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -43,6 +48,26 @@ const FOLLOW_UPS: [Duration; 3] = [
 const RESYNC_WAIT: Duration = Duration::from_secs(120);
 const RESYNC_POLL: Duration = Duration::from_millis(200);
 
+/// A watch's guard: dropping it unwatches its keys, see `State::watch`.
+pub struct Watch {
+    state: Arc<State>,
+    keys: Vec<PrKey>,
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let mut watched = self.state.watched.lock().unwrap();
+        for key in &self.keys {
+            match watched.get_mut(key) {
+                Some(n) if *n > 1 => *n -= 1,
+                _ => {
+                    watched.remove(key);
+                }
+            }
+        }
+    }
+}
+
 /// A configured clone and the lock that serializes sync's writes to it.
 pub struct ClonedRepo {
     pub repo: Repo,
@@ -68,6 +93,11 @@ pub struct State {
     /// PRs a page requested a sync for that are being synced on demand
     /// right now, so a second request doesn't start the same sync again.
     pub on_demand: std::sync::Mutex<BTreeSet<PrKey>>,
+    /// The PRs pages are watching through their event streams, by how
+    /// many streams watch each. A watched PR the background inboxes
+    /// don't cover syncs when a watch on it starts, and the polls pick
+    /// its hits up while it's watched.
+    pub watched: std::sync::Mutex<BTreeMap<PrKey, usize>>,
     /// PRs that `follow_up` will sync again.
     pub following_up: std::sync::Mutex<BTreeSet<PrKey>>,
     /// A lock per PR that changes to the viewer's pending review on it
@@ -89,6 +119,27 @@ impl State {
     /// The clone for `owner/name`, for callers that only read from it.
     pub fn repo(&self, slug: &str) -> Option<Repo> {
         Some(self.repos.get(slug)?.repo.clone())
+    }
+
+    /// Registers a watch on `keys` and returns its guard: they stay
+    /// watched until it's dropped. Several watchers share a key by
+    /// count.
+    pub fn watch(self: &Arc<State>, keys: Vec<PrKey>) -> Watch {
+        {
+            let mut watched = self.watched.lock().unwrap();
+            for key in &keys {
+                *watched.entry(key.clone()).or_default() += 1;
+            }
+        }
+        Watch {
+            state: self.clone(),
+            keys,
+        }
+    }
+
+    /// The PRs at least one watch covers.
+    pub fn watched(&self) -> BTreeSet<PrKey> {
+        self.watched.lock().unwrap().keys().cloned().collect()
     }
 
     /// Waits until no other change to the viewer's pending review on `key`
@@ -369,6 +420,9 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     .1;
 
     let mut hits = BTreeMap::new();
+    // The keys the polls sync: hits of the inboxes that sync in
+    // background, plus the auto-review hits below.
+    let mut background = BTreeSet::new();
     for (inbox, result) in searched.iter().zip(results) {
         match result {
             Ok(InboxResult {
@@ -378,6 +432,9 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                 state
                     .db
                     .set_inbox_results(inbox.id, Ok(&found), truncated)?;
+                if inbox.sync_in_background {
+                    background.extend(found.iter().map(|h| h.key.clone()));
+                }
                 hits.extend(found.into_iter().map(|h| (h.key.clone(), h)));
             }
             Err(e) => {
@@ -407,13 +464,12 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         };
     for hit in &mine {
         hits.entry(hit.key.clone()).or_insert_with(|| hit.clone());
+        background.insert(hit.key.clone());
     }
 
-    let stale: Vec<PrKey> = hits
-        .into_values()
-        .filter(|h| sync_all || needs_sync(state.db.sync_mark(&h.key).ok().flatten(), h))
-        .map(|h| h.key)
-        .collect();
+    let stale = to_sync(&hits, &background, &state.watched(), sync_all, |key| {
+        state.db.sync_mark(key).ok().flatten()
+    });
     state.status_stale(stale.len());
     if !stale.is_empty() {
         tracing::info!("syncing {} PRs", stale.len());
@@ -482,6 +538,26 @@ fn short(versions: &[Version]) -> String {
         .map(|v| format!("v{}={}", v.number, &v.sha[..v.sha.len().min(10)]))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The PRs to sync this poll: the hits a background inbox, the
+/// auto-review search or a watch covers, that `needs_sync` marks stale
+/// — or all of them when `sync_all`. The other inboxes' hits are
+/// listed from their search data and sync when a page watches them.
+fn to_sync(
+    hits: &BTreeMap<PrKey, github::Hit>,
+    background: &BTreeSet<PrKey>,
+    watched: &BTreeSet<PrKey>,
+    sync_all: bool,
+    mark: impl Fn(&PrKey) -> Option<SyncMark>,
+) -> Vec<PrKey> {
+    hits.iter()
+        .filter(|(key, hit)| {
+            (background.contains(*key) || watched.contains(*key))
+                && (sync_all || needs_sync(mark(key), hit))
+        })
+        .map(|(key, _)| (*key).clone())
+        .collect()
 }
 
 /// Whether a PR that a search found as `hit` needs a sync, given the
@@ -873,6 +949,7 @@ pub fn test_state_with_agents(
         sync_status: std::sync::Mutex::new(SyncStatus::default()),
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
+        watched: std::sync::Mutex::new(BTreeMap::new()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         shutdown: tokio_util::sync::CancellationToken::new(),
@@ -890,6 +967,71 @@ mod tests {
             repo: "o/n".into(),
             number: 1,
         }
+    }
+
+    fn hit(number: u64) -> github::Hit {
+        github::Hit {
+            key: PrKey {
+                repo: "o/n".into(),
+                number,
+            },
+            title: "t".into(),
+            author: "a".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            queued: false,
+            url: "u".into(),
+            updated_at: "u".into(),
+            head_oid: "h".into(),
+            threads: Default::default(),
+            ci: None,
+            review_decision: None,
+            facts: Default::default(),
+        }
+    }
+
+    #[test]
+    fn to_sync_covers_background_and_watched() {
+        let hits: BTreeMap<_, _> = (1..=4).map(|n| (hit(n).key.clone(), hit(n))).collect();
+        let key = |n: u64| PrKey {
+            repo: "o/n".into(),
+            number: n,
+        };
+        let background = BTreeSet::from([key(1), key(2)]);
+        let watched = BTreeSet::from([key(3)]);
+        // An unsynced PR needs a sync, so coverage decides alone.
+        assert_eq!(
+            to_sync(&hits, &background, &watched, false, |_| None),
+            vec![key(1), key(2), key(3)]
+        );
+        // A covered hit whose mark matches isn't synced again.
+        let mark = SyncMark {
+            updated_at: "u".into(),
+            head_oid: "h".into(),
+            ci: None,
+            checks_running: false,
+            queued: Some(false),
+        };
+        assert!(to_sync(&hits, &background, &watched, false, |_| Some(mark.clone())).is_empty());
+        // sync_all syncs every covered hit, mark or not, but still not
+        // the uncovered one.
+        assert_eq!(
+            to_sync(&hits, &background, &watched, true, |_| Some(mark.clone())),
+            vec![key(1), key(2), key(3)]
+        );
+        // A changed hit is synced only while covered.
+        let hits = BTreeMap::from([(key(4), {
+            let mut h = hit(4);
+            h.head_oid = "new".into();
+            h
+        })]);
+        assert!(to_sync(&hits, &background, &watched, false, |_| Some(mark.clone())).is_empty());
+        assert_eq!(
+            to_sync(&hits, &background, &BTreeSet::from([key(4)]), false, |_| {
+                Some(mark.clone())
+            }),
+            vec![key(4)]
+        );
     }
 
     fn poll_syncs(state: &State, key: &PrKey) {
