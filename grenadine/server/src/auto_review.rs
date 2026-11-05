@@ -909,7 +909,7 @@ mod tests {
 
     /// Waits for the only review to end.
     async fn ended(state: &State) -> AutoReviewEntry {
-        for _ in 0..200 {
+        for _ in 0..300 {
             let review = state.db.auto_reviews().unwrap().remove(0);
             if review.state != AutoReviewState::Running {
                 return review;

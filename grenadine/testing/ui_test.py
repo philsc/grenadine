@@ -43,6 +43,9 @@ STARTUP_TIMEOUT = 30
 # The first poll searches and syncs every PR of the class's scenario,
 # which takes a while on a loaded machine.
 FIRST_POLL_TIMEOUT = 120
+# Playwright's 5s default is too tight for the server's work (agent
+# turns, wrap-ups, polls) when many test shards share a machine.
+expect.set_options(timeout=15_000)
 
 
 def devin_scenario(tmp: Path) -> dict:

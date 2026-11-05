@@ -3171,7 +3171,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
     /// Waits until the session has finished `turns` turns and is no longer
     /// running.
     async fn wait_for_turns(state: &State, id: &str, turns: usize) -> Vec<AgentEventKind> {
-        for _ in 0..100 {
+        for _ in 0..300 {
             let events: Vec<_> = state
                 .db
                 .agent_events(id)
@@ -3574,7 +3574,7 @@ esac
         assert_eq!(session.summary, None);
 
         let mut summary = None;
-        for _ in 0..100 {
+        for _ in 0..300 {
             summary = state.db.agent(&session.id).unwrap().unwrap().summary;
             if summary.is_some() {
                 break;
@@ -3659,7 +3659,7 @@ esac
 
     /// Waits for the scans to end and returns the cleanup items.
     async fn wait_for_scans(state: &State) -> Vec<grenadine_core::api::CleanupItem> {
-        for _ in 0..200 {
+        for _ in 0..300 {
             let c = crate::cleanup::cleanup_state(state).unwrap();
             if c.scanning.is_empty() {
                 return c.items;
@@ -4129,7 +4129,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             PermissionMode::from("auto"),
             None,
         );
-        for _ in 0..100 {
+        for _ in 0..750 {
             if state.agents.with_live(&session.id, |l| l.stopper.is_some()) {
                 break;
             }
@@ -4381,7 +4381,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
     /// Waits for the session's wrap-up and returns how it ended.
     async fn wrapped(state: &Arc<State>, id: &str) -> AgentEventKind {
-        for _ in 0..100 {
+        for _ in 0..300 {
             let done = state
                 .agents
                 .with_live(id, |l| l.wrap_up.is_none() && !l.running);
@@ -5385,7 +5385,7 @@ pub(crate) mod devin_tests {
 
     /// Waits until the session has finished `turns` turns.
     pub(crate) async fn wait_for_turns(state: &State, id: &str, turns: usize) {
-        for _ in 0..200 {
+        for _ in 0..300 {
             let ended = state
                 .db
                 .agent_events(id)
@@ -5409,7 +5409,7 @@ pub(crate) mod devin_tests {
 
     /// Waits until the session's status is `AwaitingApproval`.
     async fn wait_for_approval(state: &State, id: &str) {
-        for _ in 0..500 {
+        for _ in 0..1500 {
             if state.db.agent(id).unwrap().unwrap().status == AgentStatus::AwaitingApproval {
                 return;
             }
@@ -5420,7 +5420,7 @@ pub(crate) mod devin_tests {
 
     /// Waits until the fake devin in `dir` was sent `method`.
     async fn wait_for_method(dir: &Path, method: &str) {
-        for _ in 0..500 {
+        for _ in 0..1500 {
             if fake_log(dir).iter().any(|m| m["method"] == method) {
                 return;
             }
@@ -5729,7 +5729,7 @@ pub(crate) mod devin_tests {
             })
             .unwrap();
         assert!(error.contains("Not logged in"), "{error}");
-        for _ in 0..100 {
+        for _ in 0..1500 {
             if state
                 .agents
                 .with_live(&session.id, |l| l.pending.is_empty())
@@ -5795,7 +5795,7 @@ mod devin_job_tests {
         .await
         .unwrap();
         let mut summary = None;
-        for _ in 0..100 {
+        for _ in 0..300 {
             summary = state.db.agent(&session.id).unwrap().unwrap().summary;
             if summary.is_some() {
                 break;
@@ -5946,7 +5946,7 @@ cat {dir}/answer
             wait_for_turns(&state, &session.id, 1).await;
             assert!(delete(&state, &session.id).await.unwrap());
             let mut found = Vec::new();
-            for _ in 0..200 {
+            for _ in 0..300 {
                 let c = crate::cleanup::cleanup_state(&state).unwrap();
                 if c.scanning.is_empty() {
                     found = c.items;
@@ -6044,7 +6044,7 @@ cat {dir}/answer
         };
         crate::cleanup::scan(&state, session, Vec::new());
         let mut found = Vec::new();
-        for _ in 0..200 {
+        for _ in 0..300 {
             let c = crate::cleanup::cleanup_state(&state).unwrap();
             if c.scanning.is_empty() {
                 found = c.items;
