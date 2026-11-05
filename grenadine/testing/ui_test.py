@@ -2584,6 +2584,24 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_count(1)
         self.delete_session("ask me a question")
 
+    def test_devin_question_answers_on_enter(self) -> None:
+        transcript = self.start_devin_session("Code", "ask me a question by enter")
+        question = transcript.locator(".approval")
+        expect(question).to_contain_text("Devin asks")
+        # Enter in the empty text field submits nothing: the answer is
+        # incomplete and the submit button stays disabled.
+        other = question.get_by_label("Something else")
+        other.focus()
+        self.page.keyboard.press("Enter")
+        expect(question).to_contain_text("Devin asks")
+        other.fill("Water")
+        self.page.keyboard.press("Enter")
+        # The answer goes back to Devin as the elicitation's q0.
+        self.devin_saw('"q0":"Water"')
+        expect(question).to_contain_text("Answered")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        self.delete_session("ask me a question by enter")
+
     def test_devin_multi_select(self) -> None:
         transcript = self.start_devin_session("Code", "ask me several drinks")
         question = transcript.locator(".approval")
