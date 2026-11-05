@@ -415,10 +415,12 @@ input[type="text"] {
   color: var(--fg-muted);
 }
 .count {
-  margin-left: auto;
   font-weight: 400;
   color: var(--fg-muted);
   font-size: 12px;
+}
+.inbox-toggle .count {
+  margin-left: 4px;
 }
 .inbox-error {
   margin: 0 16px 8px;
