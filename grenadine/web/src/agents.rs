@@ -431,6 +431,7 @@ pub fn Sidebar(
                 continue;
             }
             let open = route.with_untracked(|r| matches!(r, Route::Draft(x) if *x == *d));
+            adopt_start_mode(d, &s.id);
             drafts.remove(d);
             if open {
                 go(&agent_hash(&s.id));
@@ -889,6 +890,25 @@ fn mode_key(id: &str) -> String {
     format!("grenadine.agent-permission-mode.{id}")
 }
 
+/// The mode a draft's session starts in, kept until the session's page
+/// can take it over: the server shows the session before the start's
+/// answer reaches the page, which would otherwise lose the mode.
+fn start_mode_key(draft: &str) -> String {
+    format!("grenadine.agent-start-mode.{draft}")
+}
+
+/// Moves a draft's start mode onto the session it became, once: a
+/// second call finds no start key and leaves what the page has stored
+/// since alone.
+fn adopt_start_mode(draft: &str, session: &str) {
+    if let Some(s) = storage()
+        && let Ok(Some(mode)) = s.get_item(&start_mode_key(draft))
+    {
+        let _ = s.set_item(&mode_key(session), &mode);
+        let _ = s.remove_item(&start_mode_key(draft));
+    }
+}
+
 /// The mode a prompt to `backend` goes with when `stored` was picked
 /// last: `stored` if the backend offers it, or else its default.
 fn offered_mode(backend: AgentBackend, stored: Option<&str>) -> PermissionMode {
@@ -1336,22 +1356,30 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 images,
                 draft: Some(id.clone()),
             };
+            // The session shows before this answer arrives, and its page
+            // would lose the mode it starts in without the start key.
+            if let Some(s) = storage() {
+                let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
+            }
             // The form may be unmounted by the time the start answers, so
             // only what outlives it is touched here.
             match api::create_agent(&req).await {
                 Ok(session) => {
                     drafts.remove(&id);
                     // Its follow-ups go on in the mode it started in.
-                    if let Some(s) = storage() {
-                        let _ = s.set_item(&mode_key(&session.id), req.permission_mode.as_str());
-                    }
+                    adopt_start_mode(&id, &session.id);
                     // Go to the session only while its draft is still
                     // open; the user may have moved on while it started.
                     if crate::current_hash() == drafts::hash(&id) {
                         go(&agent_hash(&session.id));
                     }
                 }
-                Err(e) => drafts.set_start_error(&id, Some(e)),
+                Err(e) => {
+                    if let Some(s) = storage() {
+                        let _ = s.remove_item(&start_mode_key(&id));
+                    }
+                    drafts.set_start_error(&id, Some(e));
+                }
             }
             drafts.set_starting(&id, false);
         });

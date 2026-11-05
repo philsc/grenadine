@@ -3282,6 +3282,21 @@ class AgentTest(ServerTestCase):
         self.page.route("**/api/agents", hold)
         return held
 
+    def hold_agent_answers(self) -> list:
+        """Stashes the server's answers to POSTs to /api/agents, so the
+        session exists before the page learns of it; the test releases
+        each answer with `route.fulfill(response=response)`."""
+        held = []
+
+        def hold(route) -> None:
+            if route.request.method == "POST":
+                held.append((route, route.fetch()))
+            else:
+                route.continue_()
+
+        self.page.route("**/api/agents", hold)
+        return held
+
     def wait_held(self, held: list) -> None:
         for _ in range(100):
             if held:
@@ -3309,16 +3324,13 @@ class AgentTest(ServerTestCase):
             ".agent-item", has_text="say first"
         ).click()
         self.wait_held(held)
-        held[0].continue_()
         # The row can appear before the start's answer reaches the page,
-        # so wait for the success handler, which writes the new session's
-        # mode key before checking where to go.
-        first_id = first_url.rsplit("/", 1)[-1]
-        self.page.wait_for_function(
-            "() => Object.keys(localStorage).some(k => "
-            "k.startsWith('grenadine.agent-permission-mode.') "
-            f"&& !k.endsWith('{first_id}'))"
-        )
+        # so wait for the answer itself.
+        with self.page.expect_response(
+            lambda r: r.request.method == "POST" and r.url.endswith("/api/agents")
+        ) as answer:
+            held[0].continue_()
+        answer.value.finished()
         entries = self.section(scenarios.REPO).locator(".agent-entry")
         expect(entries.filter(has_text="say second")).to_have_count(1)
         self.assertEqual(self.page.url, first_url)
@@ -3354,6 +3366,24 @@ class AgentTest(ServerTestCase):
         entries = self.section(scenarios.REPO).locator(".agent-entry")
         expect(entries.filter(has_text="say held")).to_have_count(1)
         expect(draft).to_have_count(0)
+
+    def test_a_session_opened_before_its_start_answers_keeps_its_mode(self) -> None:
+        held = self.hold_agent_answers()
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Accept edits")
+        self.page.get_by_label("Prompt").fill("say held")
+        self.page.get_by_role("button", name="Start").click()
+
+        # The sidebar can open the session before its start answers.
+        permissions = self.page.get_by_label("Permissions")
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(permissions).to_have_value("acceptEdits")
+        self.wait_held(held)
+        route, response = held[0]
+        route.fulfill(response=response)
+        expect(permissions).to_have_value("acceptEdits")
+        self.page.reload()
+        expect(permissions).to_have_value("acceptEdits")
 
     def test_a_draft_whose_session_started_is_cleaned_up(self) -> None:
         # The server can start a draft's session without the page seeing
