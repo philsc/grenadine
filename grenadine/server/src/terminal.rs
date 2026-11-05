@@ -243,10 +243,18 @@ impl Terminal {
         group == self.pid as libc::pid_t
     }
 
+    /// Whether the shell is blocked waiting for terminal input, or None
+    /// where its syscall can't be read.
+    fn waiting_for_input(&self) -> Option<bool> {
+        std::fs::read_to_string(format!("/proc/{}/syscall", self.pid))
+            .ok()
+            .map(|s| waiting_for_input(&s))
+    }
+
     /// Waits for the first of these, and returns which it was:
     /// - the output since the wait began matches `until`;
-    /// - a command that ran during the wait finished, and the shell is back
-    ///   at its prompt;
+    /// - a command that ran during the wait finished: the shell is back
+    ///   at its prompt and blocked reading the terminal's input;
     /// - the shell is at its prompt and has been quiet for `idle` since a
     ///   line of output came, which catches commands too quick to see run
     ///   but not a pause while typing one;
@@ -298,9 +306,16 @@ impl Terminal {
                     if !self.at_prompt() {
                         ran = true;
                     } else if ran {
-                        // The prompt has been printed once the output
-                        // stopped.
-                        if quiet {
+                        // The shell also has the terminal between a
+                        // list's commands and while it runs builtins, so
+                        // the wait ends once it's blocked reading the
+                        // terminal, which happens only after it printed
+                        // its prompt; the quiet tick covers the reader
+                        // task's latency in pushing that output. Without
+                        // /proc, a quiet tick alone has to do.
+                        if quiet
+                            && self.waiting_for_input() != Some(false)
+                        {
                             return WaitEnd::Finished;
                         }
                     } else if let (Some(idle), Some(last)) = (idle, last_output)
@@ -394,6 +409,24 @@ fn passwd_shell() -> Option<PathBuf> {
     // SAFETY: on success pw_shell points to a C string in buf.
     let shell = unsafe { CStr::from_ptr(pwd.pw_shell) };
     Some(PathBuf::from(OsStr::from_bytes(shell.to_bytes())))
+}
+
+/// Whether a `/proc/<pid>/syscall` line shows a process blocked waiting
+/// for input: a read on stdin, or a select/poll family call (whose fds
+/// the file doesn't show). Anything else, `running`, or an unreadable
+/// line counts as not waiting.
+fn waiting_for_input(syscall: &str) -> bool {
+    let mut fields = syscall.split_whitespace();
+    let Some(nr) = fields.next().and_then(|f| f.parse::<i64>().ok()) else {
+        return false;
+    };
+    match nr {
+        libc::SYS_read | libc::SYS_readv => fields.next() == Some("0x0"),
+        libc::SYS_pselect6 | libc::SYS_ppoll => true,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_select | libc::SYS_poll => true,
+        _ => false,
+    }
 }
 
 /// Sends `signal` to the shell's process group; the shell leads it.
@@ -566,6 +599,25 @@ mod tests {
     #[test]
     fn login_shell_is_absolute() {
         assert!(login_shell().is_absolute());
+    }
+
+    #[test]
+    fn reads_whether_the_shell_waits_for_input() {
+        let line = |nr, args: &str| format!("{nr} {args} 0x7f 0x7f 0x7f 0x7f 0x7f 0x7f 0x7f 0x7f");
+        assert!(waiting_for_input(&line(libc::SYS_read, "0x0")));
+        assert!(waiting_for_input(&line(libc::SYS_readv, "0x0")));
+        assert!(!waiting_for_input(&line(libc::SYS_read, "0x3")));
+        assert!(!waiting_for_input(&line(libc::SYS_readv, "0x3")));
+        assert!(waiting_for_input(&line(libc::SYS_pselect6, "0x0")));
+        assert!(waiting_for_input(&line(libc::SYS_ppoll, "0x0")));
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(waiting_for_input(&line(libc::SYS_select, "0x0")));
+            assert!(waiting_for_input(&line(libc::SYS_poll, "0x0")));
+        }
+        assert!(!waiting_for_input(&line(libc::SYS_wait4, "0x0")));
+        assert!(!waiting_for_input("running"));
+        assert!(!waiting_for_input(""));
     }
 
     #[tokio::test]
