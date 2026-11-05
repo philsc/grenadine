@@ -1568,8 +1568,49 @@ fn follow(
     crate::events::subscribe(format!("/api/agents/{id}/events"), on_message, on_open);
 }
 
+/// `command` without a leading `cd` into `worktree`, which changes nothing
+/// because commands already run there.
+fn strip_cd<'a>(command: &'a str, worktree: &str) -> &'a str {
+    if worktree.is_empty() {
+        return command;
+    }
+    let Some(rest) = command.trim_start().strip_prefix("cd") else {
+        return command;
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return command;
+    }
+    let rest = rest.trim_start();
+    let (dir, rest) = if let Some(r) = rest.strip_prefix('"') {
+        match r.split_once('"') {
+            Some(parts) => parts,
+            None => return command,
+        }
+    } else if let Some(r) = rest.strip_prefix('\'') {
+        match r.split_once('\'') {
+            Some(parts) => parts,
+            None => return command,
+        }
+    } else {
+        match rest.find(char::is_whitespace) {
+            Some(i) => rest.split_at(i),
+            None => (rest, ""),
+        }
+    };
+    if dir != worktree && dir.strip_suffix('/') != Some(worktree) {
+        return command;
+    }
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix("&&").or_else(|| rest.strip_prefix(';')) else {
+        return command;
+    };
+    let rest = rest.trim_start();
+    if rest.is_empty() { command } else { rest }
+}
+
 /// A one-line summary of a tool call's input, e.g. the command or the path.
-fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+/// `worktree` hides a redundant leading `cd` into it in a `Bash` command.
+fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -> String {
     let field = match name {
         "Bash" => "command",
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "file_path",
@@ -1587,7 +1628,13 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
         _ => "",
     };
     match input.get(field).and_then(|v| v.as_str()) {
-        Some(s) => s.lines().next().unwrap_or_default().to_owned(),
+        Some(s) => {
+            let s = match worktree {
+                Some(worktree) if name == "Bash" => strip_cd(s, worktree),
+                _ => s,
+            };
+            s.lines().next().unwrap_or_default().to_owned()
+        }
         None => String::new(),
     }
 }
@@ -2188,13 +2235,15 @@ enum Activity {
 }
 
 /// Picks what the agent is doing from its transcript. `last_event` is the
-/// newest stored event's time. Only calls since the latest prompt count
+/// newest stored event's time. `worktree` hides a redundant leading `cd`
+/// into it in `Bash` summaries. Only calls since the latest prompt count
 /// as the turn's; a subagent's calls never get results, so they can't be
 /// unfinished `Tool`s.
 fn current_activity(
     events: &[Arc<AgentEvent>],
     streaming: bool,
     last_event: Option<i64>,
+    worktree: &str,
 ) -> Activity {
     let turn = events
         .iter()
@@ -2216,7 +2265,11 @@ fn current_activity(
         })
         .collect();
     let summary = |name: &str, input: &str| {
-        tool_summary(name, &serde_json::from_str(input).unwrap_or_default())
+        tool_summary(
+            name,
+            &serde_json::from_str(input).unwrap_or_default(),
+            Some(worktree),
+        )
     };
     if let Some(e) = unfinished.last() {
         let AgentEventKind::ToolUse { name, input, .. } = &e.kind else {
@@ -2269,7 +2322,8 @@ fn ActivityBar(
     let streaming_text = Memo::new(move |_| streaming.with(|s| !s.is_empty()));
     let stored_at = Memo::new(move |_| events.with(|e| e.last().and_then(|e| e.at)));
     let activity = Memo::new(move |_| {
-        events.with(|e| current_activity(e, streaming_text.get(), stored_at.get()))
+        let worktree = session.with(|s| s.worktree.clone());
+        events.with(|e| current_activity(e, streaming_text.get(), stored_at.get(), &worktree))
     });
     let approval_at = Memo::new(move |_| {
         events.with(|events| {
@@ -2435,8 +2489,15 @@ fn Transcript(
             )
         })
     });
-    let (repo, id, unit, backend) =
-        session.with_untracked(|s| (s.repo.clone(), s.id.clone(), s.cost_unit, s.backend));
+    let (repo, id, unit, backend, worktree) = session.with_untracked(|s| {
+        (
+            s.repo.clone(),
+            s.id.clone(),
+            s.cost_unit,
+            s.backend,
+            s.worktree.clone(),
+        )
+    });
 
     // Keeps the newest output in view, starting with the bottom of the
     // transcript, until the user scrolls up. Scrolling back down follows
@@ -2518,7 +2579,7 @@ fn Transcript(
                         AgentEventKind::ToolUse { parent: Some(_), .. } => ().into_any(),
                         AgentEventKind::ToolUse { id: tool, name, input, .. } => {
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
-                            let summary = tool_summary(name, &value);
+                            let summary = tool_summary(name, &value, Some(&worktree));
                             let tool = tool.clone();
                             let result = Memo::new_with_compare(
                                 move |_| results.with(|r| r.get(&tool).cloned()),
@@ -2658,7 +2719,7 @@ fn Transcript(
                         }
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, options } => {
                             let value = serde_json::from_str(input).unwrap_or_default();
-                            let summary = tool_summary(tool_name, &value);
+                            let summary = tool_summary(tool_name, &value, None);
                             let diff = edit_fragments(tool_name, &value, &[]);
                             view! {
                                 <ApprovalCard
@@ -3516,16 +3577,43 @@ mod tests {
     }
 
     #[test]
+    fn strips_the_cd_into_the_worktree() {
+        for command in [
+            "cd /w/t && x",
+            r#"cd "/w/t" && x"#,
+            "cd '/w/t'; x",
+            "cd /w/t/ && x",
+            "  cd /w/t   &&   x",
+        ] {
+            assert_eq!(strip_cd(command, "/w/t"), "x", "{command}");
+        }
+        for command in [
+            "cd /w/t/sub && x",
+            "cd /other && x",
+            "cd /w/t",
+            "cd /w/t && ",
+            "x && cd /w/t",
+            "cd /w/tt && x",
+        ] {
+            assert_eq!(strip_cd(command, "/w/t"), command, "{command}");
+        }
+        assert_eq!(strip_cd("cd /w/t && x", ""), "cd /w/t && x");
+    }
+
+    #[test]
     fn tool_summaries() {
         let input = serde_json::json!({"command": "ls -la\nmore", "description": "List"});
-        assert_eq!(tool_summary("Bash", &input), "ls -la");
+        assert_eq!(tool_summary("Bash", &input, None), "ls -la");
+        let input = serde_json::json!({"command": "cd /w/t && ls\nmore"});
+        assert_eq!(tool_summary("Bash", &input, Some("/w/t")), "ls");
+        assert_eq!(tool_summary("Bash", &input, None), "cd /w/t && ls");
         let input = serde_json::json!({"file_path": "/w/a.rs"});
-        assert_eq!(tool_summary("Edit", &input), "/w/a.rs");
-        assert_eq!(tool_summary("mcp__x__y", &input), "");
+        assert_eq!(tool_summary("Edit", &input, None), "/w/a.rs");
+        assert_eq!(tool_summary("mcp__x__y", &input, None), "");
         let input = serde_json::json!({"plan": "# Plan\n\nSteps"});
-        assert_eq!(tool_summary("ExitPlanMode", &input), "# Plan");
+        assert_eq!(tool_summary("ExitPlanMode", &input, None), "# Plan");
         let input = serde_json::json!({"questions": [{"question": "Tea?"}]});
-        assert_eq!(tool_summary("AskUserQuestion", &input), "Tea?");
+        assert_eq!(tool_summary("AskUserQuestion", &input, None), "Tea?");
     }
 
     #[test]
@@ -3651,16 +3739,17 @@ mod tests {
             at: Some(1_000),
             kind: AgentEventKind::Prompt("do it".into()),
         };
-        let call = |seq, id: &str, parent| AgentEvent {
+        let call_with = |seq, id: &str, parent, command: &str| AgentEvent {
             seq: Some(seq),
             at: Some(seq as i64 * 1_000),
             kind: AgentEventKind::ToolUse {
                 id: id.into(),
                 name: "Bash".into(),
-                input: format!(r#"{{"command":"cmd {id}"}}"#),
+                input: format!(r#"{{"command":"{command}"}}"#),
                 parent,
             },
         };
+        let call = |seq, id: &str, parent| call_with(seq, id, parent, &format!("cmd {id}"));
         let result = |seq, id: &str| AgentEvent {
             seq: Some(seq),
             at: Some(seq as i64 * 1_000),
@@ -3676,7 +3765,19 @@ mod tests {
         // A single unfinished call.
         let events = [prompt(), call(2, "a", None)];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            current_activity(&events.map(Arc::new), false, Some(2_000), ""),
+            Activity::Tool {
+                name: "Bash".into(),
+                summary: "cmd a".into(),
+                since: Some(2_000),
+                more: 0,
+            }
+        );
+
+        // A `cd` into the worktree prefixing the command isn't shown.
+        let events = [prompt(), call_with(2, "a", None, "cd /w/t && cmd a")];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000), "/w/t"),
             Activity::Tool {
                 name: "Bash".into(),
                 summary: "cmd a".into(),
@@ -3688,7 +3789,7 @@ mod tests {
         // Two parallel calls: the newest shows, the other is counted.
         let events = [prompt(), call(2, "a", None), call(3, "b", None)];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(3_000)),
+            current_activity(&events.map(Arc::new), false, Some(3_000), ""),
             Activity::Tool {
                 name: "Bash".into(),
                 summary: "cmd b".into(),
@@ -3700,7 +3801,7 @@ mod tests {
         // A finished call leaves streaming text: writing.
         let events = [prompt(), call(2, "a", None), result(3, "a")];
         assert_eq!(
-            current_activity(&events.map(Arc::new), true, Some(3_000)),
+            current_activity(&events.map(Arc::new), true, Some(3_000), ""),
             Activity::Writing { since: Some(3_000) }
         );
 
@@ -3713,7 +3814,7 @@ mod tests {
             call(4, "sub", Some("task".into())),
         ];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(4_000)),
+            current_activity(&events.map(Arc::new), false, Some(4_000), ""),
             Activity::Subagent {
                 name: "Bash".into(),
                 summary: "cmd sub".into(),
@@ -3724,7 +3825,7 @@ mod tests {
         // top-level calls are.
         let events = [prompt(), call(2, "sub", Some("task".into()))];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            current_activity(&events.map(Arc::new), false, Some(2_000), ""),
             Activity::Subagent {
                 name: "Bash".into(),
                 summary: "cmd sub".into(),
@@ -3735,7 +3836,7 @@ mod tests {
         // Nothing going on: thinking since the newest timed event.
         let events = [prompt(), result(3, "a")];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(3_000)),
+            current_activity(&events.map(Arc::new), false, Some(3_000), ""),
             Activity::Thinking { since: Some(3_000) }
         );
 
@@ -3749,7 +3850,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            current_activity(&events.map(Arc::new), false, Some(2_000)),
+            current_activity(&events.map(Arc::new), false, Some(2_000), ""),
             Activity::Thinking { since: Some(2_000) }
         );
     }
