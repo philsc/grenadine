@@ -3044,11 +3044,16 @@ fn QuestionCard(
                     }
                 }).collect_view();
                 view! {
-                    {fields}
-                    <div class="form-buttons">
-                        <button class="primary" disabled=move || busy.get() || !complete() on:click=move |_| answer(true)>"Answer"</button>
-                        <button disabled=move || busy.get() on:click=move |_| skip(false)>"Skip"</button>
-                    </div>
+                    <form on:submit=move |ev| {
+                        ev.prevent_default();
+                        answer(true);
+                    }>
+                        {fields}
+                        <div class="form-buttons">
+                            <button type="submit" class="primary" disabled=move || busy.get() || !complete()>"Answer"</button>
+                            <button type="button" disabled=move || busy.get() on:click=move |_| skip(false)>"Skip"</button>
+                        </div>
+                    </form>
                 }.into_any()
             } else {
                 questions.with_value(|qs| qs.iter().map(|q| view! {
