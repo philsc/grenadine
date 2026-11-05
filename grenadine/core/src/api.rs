@@ -1232,6 +1232,7 @@ impl AgentBackend {
         AgentBackendInfo {
             backend: self,
             models,
+            error: None,
         }
     }
 }
@@ -1274,6 +1275,9 @@ pub struct AgentBackendInfo {
     pub backend: AgentBackend,
     /// The models; empty when they can't be listed.
     pub models: Vec<AgentModelInfo>,
+    /// Why the models couldn't be listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// How an agent decides about tool uses during a turn; the user picks it

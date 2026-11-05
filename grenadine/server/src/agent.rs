@@ -243,6 +243,27 @@ impl std::fmt::Display for NotOffered {
 
 impl std::error::Error for NotOffered {}
 
+/// The error of listing a backend's models when its executable isn't
+/// there, with what the listing said.
+#[derive(Debug)]
+pub struct NotInstalled(pub String);
+
+impl std::fmt::Display for NotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NotInstalled {}
+
+/// Whether `e` came from trying to spawn an executable that isn't
+/// there.
+fn is_missing(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|s| s.downcast_ref::<std::io::Error>())
+        .any(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// A fresh directory, gone again once it's dropped, for a background
 /// process to run in. The backends load instructions, settings and hooks
 /// from where they run and from its parents, so it's in a parent only
@@ -297,7 +318,12 @@ pub struct ModelList(tokio::sync::Mutex<Option<Listing>>);
 
 enum Listing {
     Listed(Vec<AgentModelInfo>),
-    Failed { at: Instant, error: String },
+    /// A failure; `missing` marks the executable not being there.
+    Failed {
+        at: Instant,
+        error: String,
+        missing: bool,
+    },
 }
 
 impl ModelList {
@@ -310,7 +336,10 @@ impl ModelList {
         let mut listing = self.0.lock().await;
         match &*listing {
             Some(Listing::Listed(models)) => return Ok(models.clone()),
-            Some(Listing::Failed { at, error }) if at.elapsed() < LISTING_RETRY => {
+            Some(Listing::Failed { at, error, missing }) if at.elapsed() < LISTING_RETRY => {
+                if *missing {
+                    return Err(NotInstalled(error.clone()).into());
+                }
                 bail!("{error}")
             }
             _ => {}
@@ -328,12 +357,17 @@ impl ModelList {
                 Ok(models)
             }
             Err(e) => {
+                let missing = is_missing(&e);
                 let error = format!("{e:#}");
                 tracing::warn!("listing {name}'s models: {error}");
                 *listing = Some(Listing::Failed {
                     at: Instant::now(),
                     error: error.clone(),
+                    missing,
                 });
+                if missing {
+                    return Err(NotInstalled(error).into());
+                }
                 bail!("{error}")
             }
         }
@@ -960,9 +994,9 @@ impl Agents {
         self.with_live(id, |l| l.events.subscribe())
     }
 
-    /// The backends sessions can pick, with their models: the default
-    /// one always, its models empty when they can't be listed, and the
-    /// others when they can list theirs.
+    /// The backends sessions can pick, with their models: each backend
+    /// whose executable is there, its models empty and `error` saying
+    /// why when they can't be listed.
     pub async fn backends(&self) -> Vec<AgentBackendInfo> {
         let listed =
             futures::future::join_all(AgentBackend::ALL.map(|b| self.backend(b).models())).await;
@@ -971,15 +1005,22 @@ impl Agents {
             .zip(listed)
             .filter_map(|(backend, listed)| match listed {
                 Ok(models) => Some(backend.info(models)),
-                Err(_) if backend == AgentBackend::default() => Some(backend.info(Vec::new())),
-                Err(_) => None,
+                Err(e) if e.is::<NotInstalled>() => None,
+                Err(e) => {
+                    let mut info = backend.info(Vec::new());
+                    info.error = Some(format!("{e:#}"));
+                    Some(info)
+                }
             })
             .collect()
     }
 
     /// Whether sessions can pick `backend`, as `backends` has it.
     pub async fn offered(&self, backend: AgentBackend) -> bool {
-        backend == AgentBackend::default() || self.backend(backend).models().await.is_ok()
+        match self.backend(backend).models().await {
+            Err(e) => !e.is::<NotInstalled>(),
+            Ok(_) => true,
+        }
     }
 
     /// Runs `job` on `backend` and returns its answer, in the shape of its
@@ -3615,6 +3656,10 @@ case " $* " in
   cat > {dir}/summary_input
   echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
   ;;
+*" --no-session-persistence "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
+  ;;
 *)
   cat > /dev/null
   echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
@@ -3693,6 +3738,10 @@ case " $* " in
   echo "$*" > {dir}/scan_args
   cat > {dir}/scan_input
   {scan}
+  ;;
+*" --no-session-persistence "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
   ;;
 *)
   echo "$*" >> {dir}/turn_args
@@ -3836,10 +3885,18 @@ esac
         let fx = crate::git::tests::fixture();
         let script = format!(
             r#"#!/bin/sh
-echo "$*" > {dir}/prune_args
-pwd > {dir}/prune_cwd
-cat > {dir}/prune_input
-cat {dir}/answer
+case " $* " in
+*" --input-format "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
+  ;;
+*)
+  echo "$*" > {dir}/prune_args
+  pwd > {dir}/prune_cwd
+  cat > {dir}/prune_input
+  cat {dir}/answer
+  ;;
+esac
 "#,
             dir = dir.path().display()
         );
@@ -5528,9 +5585,9 @@ pub(crate) mod devin_tests {
         assert_eq!(calls.into_inner(), 1);
     }
 
-    /// A devin that can't list its models leaves Devin out of the
-    /// backends, but prompts with its default or any model that can't
-    /// pass for a flag still go, and devin isn't asked again for a while.
+    /// A devin that can't list its models stays offered, its error with
+    /// it, and prompts with its default or any model that can't pass for
+    /// a flag still go; devin isn't asked again for a while.
     #[tokio::test]
     async fn a_failed_listing_is_kept() {
         let fx = crate::git::tests::fixture();
@@ -5542,14 +5599,14 @@ pub(crate) mod devin_tests {
             &format!("#!/bin/sh\necho run >> {}\nexit 1\n", runs.display()),
         );
         let state = state_with_devin(&fx, dir.path(), devin);
-        let backends: Vec<_> = state
-            .agents
-            .backends()
-            .await
-            .into_iter()
-            .map(|i| i.backend)
-            .collect();
-        assert_eq!(backends, [AgentBackend::Claude]);
+        let backends = state.agents.backends().await;
+        // Only Devin is there: claude's executable isn't.
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].backend, AgentBackend::Devin);
+        assert!(backends[0].models.is_empty());
+        assert!(backends[0].error.is_some());
+        assert!(state.agents.offered(AgentBackend::Devin).await);
+        assert!(!state.agents.offered(AgentBackend::Claude).await);
         assert!(state.agents.offers(AgentBackend::Devin, None).await);
         assert!(
             state
@@ -5564,6 +5621,43 @@ pub(crate) mod devin_tests {
                 .await
         );
         assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
+    }
+
+    /// A backend whose executable isn't there isn't offered, on a
+    /// repeated ask either.
+    #[tokio::test]
+    async fn a_missing_backend_isnt_offered() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = fake(
+            dir.path(),
+            json!({"models": [{"value": "swe-2", "name": "SWE-2"}]}),
+        );
+        // claude's path doesn't exist.
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let backends = state.agents.backends().await;
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].backend, AgentBackend::Devin);
+        assert!(!state.agents.offered(AgentBackend::Claude).await);
+        let backends = state.agents.backends().await;
+        assert_eq!(backends.len(), 1);
+        assert!(!state.agents.offered(AgentBackend::Claude).await);
+    }
+
+    /// A claude that can't list its models stays offered, its error
+    /// with it.
+    #[tokio::test]
+    async fn a_failed_listing_offers_claude() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = tests::state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
+        let backends = state.agents.backends().await;
+        // Only Claude is there: devin's executable isn't.
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].backend, AgentBackend::Claude);
+        assert!(backends[0].models.is_empty());
+        assert!(backends[0].error.is_some());
+        assert!(state.agents.offered(AgentBackend::Claude).await);
     }
 
     /// A turn with a subagent costs what `agent_stopped` reports, which
@@ -5886,9 +5980,17 @@ mod devin_job_tests {
         let fx = crate::git::tests::fixture();
         let claude_script = format!(
             r#"#!/bin/sh
-echo "$*" >> {dir}/prune_args
-cat >> {dir}/prune_input
-cat {dir}/answer
+case " $* " in
+*" --input-format "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
+  ;;
+*)
+  echo "$*" >> {dir}/prune_args
+  cat >> {dir}/prune_input
+  cat {dir}/answer
+  ;;
+esac
 "#,
             dir = dir.path().display()
         );
@@ -6068,18 +6170,13 @@ cat {dir}/answer
     }
 
     /// While Devin isn't offered, prune leaves its items alone and doesn't
-    /// ask it anything beyond its models.
+    /// ask it anything.
     #[tokio::test]
     async fn prune_skips_devin_while_it_isnt_offered() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let runs = dir.path().join("runs");
-        let devin = dir.path().join("devin");
-        crate::test_util::write_executable(
-            &devin,
-            &format!("#!/bin/sh\necho \"$*\" >> {}\nexit 1\n", runs.display()),
-        );
-        let state = state_with_devin(&fx, dir.path(), devin);
+        // devin's path doesn't exist, so Devin isn't offered.
+        let state = state_with_devin(&fx, dir.path(), dir.path().join("devin"));
         let session = AgentSession {
             backend: AgentBackend::Devin,
             ..AgentSession::fixture("devin-s", &fx.clone.slug)
@@ -6091,8 +6188,6 @@ cat {dir}/answer
         assert_eq!(crate::cleanup::prune(&state).await.unwrap(), 0);
         let left = crate::cleanup::cleanup_state(&state).unwrap().items;
         assert_eq!(left.len(), 1);
-        // Only the one listing, which failed.
-        assert_eq!(std::fs::read_to_string(&runs).unwrap(), "acp\n");
     }
 
     /// A scan of a Devin session tries again while Devin isn't offered,
@@ -6101,9 +6196,8 @@ cat {dir}/answer
     async fn a_devin_scan_waits_for_devin() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let devin = dir.path().join("devin");
-        crate::test_util::write_executable(&devin, "#!/bin/sh\nexit 1\n");
-        let state = state_with_devin(&fx, dir.path(), devin);
+        // devin's path doesn't exist, so Devin isn't offered.
+        let state = state_with_devin(&fx, dir.path(), dir.path().join("devin"));
         state
             .agents
             .scans

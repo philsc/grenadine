@@ -700,6 +700,10 @@ async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResul
     if !can_start_in(&state, &req.repo) {
         return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
     }
+    if !state.agents.offered(req.backend).await {
+        let message = format!("{} isn't installed on the server", req.backend.label());
+        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+    }
     Ok(Json(agent::create(&state, req).await?).into_response())
 }
 
@@ -1729,7 +1733,10 @@ mod tests {
     /// unknown model.
     #[tokio::test]
     async fn an_unknown_permission_mode_is_rejected() {
-        let state = crate::sync::test_state();
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // The listing failing keeps Claude Code offered.
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), "#!/bin/sh\nexit 1\n");
         let req = |mode: &str| NewAgent {
             backend: grenadine_core::api::AgentBackend::Claude,
             repo: GENERAL.into(),
@@ -1751,6 +1758,31 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A session on a backend that isn't installed is a 400.
+    #[tokio::test]
+    async fn a_missing_backend_is_rejected() {
+        let state = crate::sync::test_state();
+        let req = NewAgent {
+            backend: grenadine_core::api::AgentBackend::Claude,
+            repo: GENERAL.into(),
+            pr: None,
+            prompt: "hi".into(),
+            permission_mode: "auto".into(),
+            model: None,
+            images: Vec::new(),
+            draft: None,
+        };
+        let response = create_agent(AxState(state), Json(req))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await,
+            "Claude Code isn't installed on the server"
+        );
     }
 
     /// An inbox PR is the poller's: no on-demand sync starts for it.

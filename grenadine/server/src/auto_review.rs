@@ -1137,9 +1137,9 @@ sleep 30
     async fn a_review_waits_for_its_backend() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let devin = dir.path().join("devin");
-        crate::test_util::write_executable(&devin, "#!/bin/sh\nexit 1\n");
-        let state = crate::agent::devin_tests::state_with_devin(&fx, dir.path(), devin);
+        // devin's path doesn't exist, so Devin isn't offered.
+        let state =
+            crate::agent::devin_tests::state_with_devin(&fx, dir.path(), dir.path().join("devin"));
         let s = RepoSettings {
             review_backend: AgentBackend::Devin,
             ..settings(AutoReview::NonDraft, false)
