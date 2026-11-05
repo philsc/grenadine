@@ -1300,9 +1300,12 @@ pub fn NewSession(draft: String) -> impl IntoView {
 
     let general = Memo::new(move |_| repo.with(|r| r == GENERAL));
 
+    // Whether the backends are known to be none: a start without one
+    // fails, so the form says so instead.
+    let none_installed = move || matches!(backends().get(), Some(Ok(list)) if list.is_empty());
+
     let start = move || {
-        save_backend(backend.get_untracked());
-        if busy() || prompt.with_untracked(|p| p.trim().is_empty()) {
+        if busy() || none_installed() || prompt.with_untracked(|p| p.trim().is_empty()) {
             return;
         }
         let pr = match number.get_untracked().trim() {
@@ -1418,7 +1421,9 @@ pub fn NewSession(draft: String) -> impl IntoView {
                                 <select
                                     prop:value=move || backend.get().as_str()
                                     on:change=move |ev| {
-                                        picked.set(AgentBackend::parse(&event_target_value(&ev)).unwrap_or_default());
+                                        let b = AgentBackend::parse(&event_target_value(&ev)).unwrap_or_default();
+                                        save_backend(b);
+                                        picked.set(b);
                                     }
                                 >
                                     {list.into_iter().map(|i| {
@@ -1463,17 +1468,33 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 ></textarea>
                 <Attachments images=images />
                 <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
+                {move || {
+                    let list = backends().get().and_then(Result::ok).unwrap_or_default();
+                    let b = backend.get();
+                    list.into_iter()
+                        .find(|i| i.backend == b)
+                        .and_then(|i| i.error)
+                        .map(|e| {
+                            let first = e.lines().next().unwrap_or_default().to_owned();
+                            view! {
+                                <p class="hint" title=e>
+                                    {format!("{} couldn't list its models: {first}", b.agent_name())}
+                                </p>
+                            }
+                        })
+                }}
                 {move || default_skill.get().map(|skill| view! {
                     <p class="hint muted">
                         {format!("Starts as /{skill} …, unless the prompt starts with a /skill of its own.")}
                     </p>
                 })}
                 {move || error.get().or_else(|| drafts.start_error(&id.get_value())).map(|e| view! { <p class="error">{e}</p> })}
+                {move || none_installed().then(|| view! { <p class="error">"No agent backend is installed on the server."</p> })}
                 <div class="form-buttons">
                     <button
                         type="submit"
                         class="primary"
-                        disabled=move || busy() || prompt.with(|p| p.trim().is_empty())
+                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty())
                     >
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>

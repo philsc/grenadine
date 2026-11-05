@@ -2546,6 +2546,78 @@ class AgentTest(ServerTestCase):
         expect(self.page.get_by_label("Prompt")).to_have_value("later")
         expect(self.page.get_by_label("Backend")).to_have_value("devin")
 
+    def test_a_fallback_backend_isnt_saved(self) -> None:
+        # The stored backend is Devin's, but the server offers Claude
+        # Code alone, so the form goes with it. Starting that session
+        # doesn't make the fallback the stored backend.
+        self.page.add_init_script(
+            "localStorage.setItem('grenadine.agent-backend', 'devin')"
+        )
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(json=[{"backend": "claude", "models": []}]),
+        )
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Prompt").fill("hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        backend = self.page.evaluate(
+            "() => localStorage.getItem('grenadine.agent-backend')"
+        )
+        self.assertEqual(backend, "devin")
+        self.delete_session()
+
+        # Picking a backend by hand does store it.
+        self.page.unroute("**/api/agents/backends")
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Backend").select_option(label="Devin")
+        backend = self.page.evaluate(
+            "() => localStorage.getItem('grenadine.agent-backend')"
+        )
+        self.assertEqual(backend, "devin")
+        self.page.get_by_label("Backend").select_option(label="Claude Code")
+        backend = self.page.evaluate(
+            "() => localStorage.getItem('grenadine.agent-backend')"
+        )
+        self.assertEqual(backend, "claude")
+
+    def test_a_backend_listing_error_is_shown(self) -> None:
+        # A backend whose models can't be listed says why, with the whole
+        # error in the hint's title.
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(
+                json=[
+                    {
+                        "backend": "claude",
+                        "models": [],
+                        "error": "claude exited 1\nout of credit",
+                    },
+                    {"backend": "devin", "models": []},
+                ]
+            ),
+        )
+        self.page.goto(self.url + "#/agents")
+        hint = self.page.locator(
+            ".agent-form .hint", has_text="couldn't list its models"
+        )
+        expect(hint).to_have_text("Claude couldn't list its models: claude exited 1")
+        expect(hint).to_have_attribute("title", "claude exited 1\nout of credit")
+
+    def test_no_backend_is_an_error(self) -> None:
+        # With no backend installed on the server, the form says so and
+        # a session can't be started.
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(json=[]),
+        )
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.locator(".agent-form .error")).to_have_text(
+            "No agent backend is installed on the server."
+        )
+        self.page.get_by_label("Prompt").fill("hi")
+        expect(self.page.get_by_role("button", name="Start")).to_be_disabled()
+
     def test_devin_session(self) -> None:
         transcript = self.start_devin_session("Code", "write a note")
         expect(transcript.locator(".turn-text")).to_contain_text("On it.")
