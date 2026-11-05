@@ -247,6 +247,10 @@ fn App() -> impl IntoView {
     provide_context(drafts);
     provide_context(global_settings::provide());
     provide_context(LocalResource::new(api::agent_backends));
+    provide_context(LocalResource::new(move || {
+        updates.agents.track();
+        api::agents()
+    }));
     let route = RwSignal::new(open_draft(initial, drafts));
     // The PR shown most recently, highlighted when going back to the inboxes.
     let last = RwSignal::new(route.with_untracked(pr_of));

@@ -486,6 +486,8 @@ pub fn open(state: &Arc<State>, session: &AgentSession) -> Result<TerminalInfo> 
             }
         }
         state.agents.terminals.remove(&session, id);
+        // A shell may have changed the worktree's files.
+        state.agents.unstaged.queue(&session);
         // Dropping the sender disconnects the pages.
         terminal.output.lock().unwrap().tx = None;
         terminal.exited.cancel();

@@ -475,6 +475,8 @@ pub struct Agents {
     pub summaries: std::sync::atomic::AtomicBool,
     /// The shells opened from the sessions' pages.
     pub terminals: crate::terminal::Terminals,
+    /// The sessions' cached unstaged-change counts.
+    pub unstaged: crate::unstaged::Unstaged,
 }
 
 /// A permission request waiting for the user's answer.
@@ -903,6 +905,7 @@ impl Agents {
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
             terminals: crate::terminal::Terminals::default(),
+            unstaged: crate::unstaged::Unstaged::default(),
         })
     }
 
@@ -1039,6 +1042,7 @@ pub fn set_status(state: &State, id: &str, status: AgentStatus) {
     if let Err(e) = state.db.set_agent_status(id, status) {
         tracing::warn!("agent {id}: {e:#}");
     }
+    state.agents.unstaged.queue(id);
     state.send(ServerEvent::AgentsChanged);
 }
 
@@ -1643,6 +1647,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
     state.agents.terminals.forget(id);
+    state.agents.unstaged.forget(id);
     state.send(ServerEvent::AgentsChanged);
     if reviewing {
         state.send(ServerEvent::AutoReviewsChanged);
