@@ -1,11 +1,15 @@
-//! The top bar: the wordmark and the Inboxes and Agents tabs on the left, the
-//! poller's sync status and the settings' gear on the right. Hovering the
-//! status shows what is syncing or what went wrong.
+//! The top bar: the wordmark and the tabs on the left, the poller's sync
+//! status and the settings' gear on the right. The Inboxes, Agents and
+//! Auto-reviews tabs count what needs the user; hovering the status shows
+//! what is syncing or what went wrong.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use grenadine_core::api::{PrKey, SyncPhase, SyncStatus, SyncingPr};
+use grenadine_core::api::{
+    AgentSession, AgentStatus, AutoReviewEntry, AutoReviewState, PrKey, SessionKind, SyncPhase,
+    SyncStatus, SyncingPr,
+};
 use leptos::prelude::*;
 
 use crate::global_settings::{GlobalSettingsButton, GlobalSettingsDialog};
@@ -82,6 +86,41 @@ fn label(status: &SyncStatus, now: i64) -> String {
     }
 }
 
+/// Interactive sessions waiting on the user, including ones they already
+/// looked at.
+fn agents_waiting(sessions: &[AgentSession]) -> usize {
+    sessions
+        .iter()
+        .filter(|s| {
+            s.kind == SessionKind::Interactive
+                && match s.status {
+                    AgentStatus::Idle
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Interrupted
+                    | AgentStatus::Failed => true,
+                    AgentStatus::Creating | AgentStatus::Running => false,
+                }
+        })
+        .count()
+}
+
+/// Reviews whose session the user can still look at or clean up; deleting
+/// the session clears the entry.
+fn reviews_waiting(reviews: &[AutoReviewEntry]) -> usize {
+    reviews
+        .iter()
+        .filter(|r| {
+            r.session.is_some()
+                && match r.state {
+                    AutoReviewState::Unposted | AutoReviewState::Failed => true,
+                    AutoReviewState::Running
+                    | AutoReviewState::Posted
+                    | AutoReviewState::Cancelled => false,
+                }
+        })
+        .count()
+}
+
 fn pr_line(pr: &SyncingPr) -> String {
     match &pr.title {
         Some(title) => format!("{}#{} {title}", pr.key.repo, pr.key.number),
@@ -116,6 +155,31 @@ pub fn Topbar(
             .unwrap_or(0)
     };
 
+    // Sessions waiting on the user, and reviews whose session is kept.
+    let sessions = LocalResource::new(move || {
+        updates.agents.track();
+        api::agents()
+    });
+    let waiting = move || {
+        sessions
+            .get()
+            .and_then(|r| r.ok())
+            .map(|list| agents_waiting(&list))
+            .unwrap_or(0)
+    };
+    let reviews = LocalResource::new(move || {
+        updates.agents.track();
+        updates.auto_reviews.track();
+        api::auto_reviews()
+    });
+    let pending = move || {
+        reviews
+            .get()
+            .and_then(|r| r.ok())
+            .map(|list| reviews_waiting(&list))
+            .unwrap_or(0)
+    };
+
     let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
     let handle = set_interval_with_handle(
         move || now.set((js_sys::Date::now() / 1000.0) as i64),
@@ -145,8 +209,14 @@ pub fn Topbar(
                         "Inboxes"
                         {move || (total() > 0).then(|| view! { <span class="count">{total()}</span> })}
                     </a>
-                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup))>"Agents"</a>
-                    <a href="#/auto-reviews" class:active=move || route.with(|r| matches!(r, Route::AutoReviews | Route::AutoReview(_)))>"Auto-reviews"</a>
+                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup))>
+                        "Agents"
+                        {move || (waiting() > 0).then(|| view! { <span class="count">{waiting()}</span> })}
+                    </a>
+                    <a href="#/auto-reviews" class:active=move || route.with(|r| matches!(r, Route::AutoReviews | Route::AutoReview(_)))>
+                        "Auto-reviews"
+                        {move || (pending() > 0).then(|| view! { <span class="count">{pending()}</span> })}
+                    </a>
                     <a href="#/debug" class:active=move || route.with(|r| matches!(r, Route::Debug))>"Debug"</a>
                 </nav>
             </span>
@@ -197,7 +267,7 @@ pub fn Topbar(
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{PrKey, SyncPhase, SyncStatus, SyncingPr};
+    use grenadine_core::api::{CostUnit, PrKey, SyncPhase, SyncStatus, SyncingPr};
 
     use super::*;
 
@@ -260,5 +330,72 @@ mod tests {
         };
         assert_eq!(pr_line(&pr), "o/n#123 Fix it");
         assert_eq!(pr_line(&SyncingPr { title: None, ..pr }), "o/n#123");
+    }
+
+    fn session(status: AgentStatus) -> AgentSession {
+        AgentSession {
+            status,
+            ..AgentSession::fixture("s", "o/n")
+        }
+    }
+
+    #[test]
+    fn agents_waiting_counts() {
+        for status in [
+            AgentStatus::Idle,
+            AgentStatus::AwaitingApproval,
+            AgentStatus::Interrupted,
+            AgentStatus::Failed,
+        ] {
+            assert_eq!(agents_waiting(&[session(status)]), 1, "{status:?}");
+        }
+        for status in [AgentStatus::Creating, AgentStatus::Running] {
+            assert_eq!(agents_waiting(&[session(status)]), 0, "{status:?}");
+        }
+        // Auto-review sessions are counted under Auto-reviews instead.
+        let mut s = session(AgentStatus::Idle);
+        s.kind = SessionKind::AutoReview;
+        assert_eq!(agents_waiting(&[s]), 0);
+    }
+
+    fn review(state: AutoReviewState) -> AutoReviewEntry {
+        AutoReviewEntry {
+            id: 1,
+            key: PrKey {
+                repo: "o/n".into(),
+                number: 1,
+            },
+            title: "T".into(),
+            url: "u".into(),
+            head_oid: "h".into(),
+            state,
+            session: Some("s".into()),
+            status: None,
+            started_at: 0,
+            finished_at: None,
+            cost: 0.0,
+            cost_unit: CostUnit::Usd,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn reviews_waiting_counts() {
+        for state in [AutoReviewState::Unposted, AutoReviewState::Failed] {
+            assert_eq!(reviews_waiting(&[review(state)]), 1, "{state:?}");
+        }
+        for state in [
+            AutoReviewState::Running,
+            AutoReviewState::Posted,
+            AutoReviewState::Cancelled,
+        ] {
+            assert_eq!(reviews_waiting(&[review(state)]), 0, "{state:?}");
+        }
+        // Without its session there's nothing left to look at.
+        for state in [AutoReviewState::Unposted, AutoReviewState::Failed] {
+            let mut r = review(state);
+            r.session = None;
+            assert_eq!(reviews_waiting(&[r]), 0, "{state:?}");
+        }
     }
 }
