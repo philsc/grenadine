@@ -1243,6 +1243,7 @@ mod tests {
                 &key,
                 &crate::github::PrStatus {
                     state: "OPEN".into(),
+                    queued: false,
                     conflicting: Some(false),
                     title: "Fix it".into(),
                     base_ref: "main".into(),
@@ -1255,7 +1256,7 @@ mod tests {
         let response = get(id).await.map_err(|e| e.0).unwrap();
         assert_eq!(
             body(response).await,
-            r#"[{"key":{"repo":"o/n","number":7},"title":"Fix it","state":"OPEN","ci":"Passing","conflicting":false}]"#
+            r#"[{"key":{"repo":"o/n","number":7},"title":"Fix it","state":"OPEN","ci":"Passing","conflicting":false,"queued":false}]"#
         );
 
         let response = get("00000000-0000-0000-0000-000000000001")
@@ -1464,6 +1465,7 @@ mod tests {
                     author: "a".into(),
                     state: "OPEN".into(),
                     is_draft: false,
+                    queued: false,
                     url: "u".into(),
                     created_at: "c".into(),
                     updated_at: "u".into(),
@@ -1522,6 +1524,7 @@ mod tests {
             updated_at: "u".into(),
             head_oid: "h".into(),
             parent,
+            queued: false,
         };
         let stack = grenadine_core::api::Stack {
             base_ref: "main".into(),
@@ -1540,6 +1543,7 @@ mod tests {
                         author: "a".into(),
                         state: "OPEN".into(),
                         is_draft: false,
+                        queued: false,
                         url: "u".into(),
                         updated_at: "u".into(),
                         head_oid: "h".into(),
@@ -1554,6 +1558,7 @@ mod tests {
                         author: "a".into(),
                         state: "OPEN".into(),
                         is_draft: false,
+                        queued: false,
                         url: "u".into(),
                         updated_at: "u".into(),
                         head_oid: "h".into(),
@@ -1576,6 +1581,7 @@ mod tests {
                     author: "a".into(),
                     state: "OPEN".into(),
                     is_draft: false,
+                    queued: false,
                     url: "u".into(),
                     created_at: "c".into(),
                     updated_at: "u".into(),
@@ -1809,6 +1815,7 @@ mod tests {
                     author: "a".into(),
                     state: "OPEN".into(),
                     is_draft: false,
+                    queued: false,
                     url: "u".into(),
                     updated_at: "u".into(),
                     head_oid: "h".into(),

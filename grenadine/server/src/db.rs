@@ -385,6 +385,17 @@ const MIGRATIONS: &[Migration] = &[
     CREATE UNIQUE INDEX agents_draft_id ON agents (draft_id);
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Whether the PR sits in a merge queue, as of the last sync;
+    -- GitHub's state stays OPEN while one is, and joining a queue
+    -- doesn't change updated_at. synced_queued is what the last sync
+    -- reported, NULL for PRs synced before it existed.
+    ALTER TABLE prs ADD COLUMN queued INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE prs ADD COLUMN synced_queued INTEGER;
+    ALTER TABLE agent_prs ADD COLUMN queued INTEGER NOT NULL DEFAULT 0;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -483,6 +494,8 @@ pub struct PrMeta {
     pub author: String,
     pub state: String,
     pub is_draft: bool,
+    /// In a merge queue.
+    pub queued: bool,
     pub url: String,
     pub created_at: String,
     pub updated_at: String,
@@ -508,6 +521,9 @@ pub struct SyncMark {
     /// runs, said checks were running. GitHub's `ci` stays failing while
     /// a superseded run failed, so it doesn't change when they finish.
     pub checks_running: bool,
+    /// Whether the PR was in a merge queue at the last sync; `None` for
+    /// rows synced before it was recorded.
+    pub queued: Option<bool>,
 }
 
 fn kind_str(k: VersionKind) -> &'static str {
@@ -819,13 +835,15 @@ impl Db {
                     CASE WHEN p.review IS NOT NULL AND p.synced_ci IS i.ci
                          THEN lower(json_extract(p.review, '$.ci')) ELSE i.ci END,
                     CASE WHEN p.review IS NULL THEN i.review_decision
-                         ELSE json_extract(p.review, '$.decision') END
+                         ELSE json_extract(p.review, '$.decision') END,
+                    COALESCE(p.queued, 0)
              FROM inbox_prs i LEFT JOIN prs p ON p.repo = i.repo AND p.number = i.number
              WHERE i.inbox_id = ? ORDER BY i.rank",
         )?;
         let rows = stmt.query_map([id], |r| {
             let stack = parse_stack(r.get(11)?);
-            let mut summary = summary_from_row(r, r.get(9)?, r.get(10)?, stack.as_ref())?;
+            let mut summary =
+                summary_from_row(r, r.get(9)?, r.get(10)?, stack.as_ref(), r.get(16)?)?;
             let (resolved, total): (Option<u32>, Option<u32>) = (r.get(12)?, r.get(13)?);
             summary.threads = resolved
                 .zip(total)
@@ -841,24 +859,34 @@ impl Db {
     }
 
     pub fn sync_mark(&self, key: &PrKey) -> Result<Option<SyncMark>> {
-        type Row = (Option<String>, Option<String>, Option<String>, bool);
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<bool>,
+        );
         let row: Option<Row> = self
             .conn()
             .query_row(
                 "SELECT synced_updated_at, synced_head_oid, synced_ci,
-                        COALESCE(json_extract(review, '$.ci') = 'Running', 0)
+                        COALESCE(json_extract(review, '$.ci') = 'Running', 0),
+                        synced_queued
                  FROM prs WHERE repo = ? AND number = ?",
                 params![key.repo, key.number],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         Ok(match row {
-            Some((Some(updated_at), Some(head_oid), ci, checks_running)) => Some(SyncMark {
-                updated_at,
-                head_oid,
-                ci: ci.as_deref().and_then(parse_ci),
-                checks_running,
-            }),
+            Some((Some(updated_at), Some(head_oid), ci, checks_running, queued)) => {
+                Some(SyncMark {
+                    updated_at,
+                    head_oid,
+                    ci: ci.as_deref().and_then(parse_ci),
+                    checks_running,
+                    queued,
+                })
+            }
             _ => None,
         })
     }
@@ -971,14 +999,17 @@ impl Db {
         tx.execute(
             "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url, created_at, updated_at,
                               base_ref, head_ref, head_oid, approximate, drift, sync_error,
-                              synced_updated_at, synced_head_oid, stack, review, synced_ci)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?19, ?10, ?13, ?16, ?17, ?18)
+                              synced_updated_at, synced_head_oid, stack, review, synced_ci,
+                              queued, synced_queued)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?19, ?10, ?13, ?16, ?17, ?18,
+                     ?20, ?20)
              ON CONFLICT (repo, number) DO UPDATE SET
                 title = ?3, body = ?4, author = ?5, state = ?6, is_draft = ?7, url = ?8, created_at = ?9,
                 updated_at = ?10, base_ref = ?11, head_ref = ?12, head_oid = ?13, approximate = ?14,
                 drift = COALESCE(?15, drift), sync_error = ?19,
                 synced_updated_at = ?10, synced_head_oid = ?13, stack = COALESCE(?16, stack),
-                review = COALESCE(?17, review), synced_ci = ?18",
+                review = COALESCE(?17, review), synced_ci = ?18,
+                queued = ?20, synced_queued = ?20",
             params![
                 key.repo,
                 key.number,
@@ -999,6 +1030,7 @@ impl Db {
                 review_json,
                 meta.ci.map(ci_str),
                 meta.review_error,
+                meta.queued,
             ],
         )?;
         // The error a not-yet-synced listing carried is now obsolete.
@@ -1126,13 +1158,13 @@ impl Db {
                 "SELECT p.repo, p.number, p.title, p.author, p.state, p.is_draft, p.updated_at, p.url,
                         (SELECT COUNT(*) FROM versions v WHERE v.repo = p.repo AND v.number = p.number),
                         p.body, p.base_ref, p.head_ref, p.approximate, p.drift, p.sync_error, p.stack,
-                        p.review
+                        p.review, p.queued
                  FROM prs p WHERE p.repo = ? AND p.number = ?",
                 params![key.repo, key.number],
                 |r| {
                     let stack = parse_stack(r.get(15)?);
                     Ok((
-                        summary_from_row(r, true, None, stack.as_ref())?,
+                        summary_from_row(r, true, None, stack.as_ref(), r.get(17)?)?,
                         r.get::<_, String>(9)?,
                         r.get::<_, String>(10)?,
                         r.get::<_, String>(11)?,
@@ -1439,7 +1471,7 @@ impl Db {
     pub fn agent_pr_list(&self, id: &str) -> Result<Vec<AgentPr>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT repo, number, title, state, ci, conflicting FROM agent_prs
+            "SELECT repo, number, title, state, ci, conflicting, queued FROM agent_prs
              WHERE agent_id = ? ORDER BY repo, number",
         )?;
         let rows = stmt.query_map([id], |r| {
@@ -1453,15 +1485,17 @@ impl Db {
                 state: r.get(3)?,
                 ci: ci.as_deref().and_then(parse_ci),
                 conflicting: r.get(5)?,
+                queued: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Records what a poll found for a PR that sessions opened: its
-    /// state, title and the checks on its head, and whether it conflicts
-    /// with its base; a `None` conflicting keeps what's recorded.
-    /// Returns whether anything changed.
+    /// state, title and the checks on its head, whether it sits in a
+    /// merge queue, and whether it conflicts with its base; a `None`
+    /// conflicting keeps what's recorded. Returns whether anything
+    /// changed.
     pub fn set_agent_pr_state(
         &self,
         key: &PrKey,
@@ -1469,17 +1503,18 @@ impl Db {
     ) -> Result<bool> {
         Ok(self.conn().execute(
             "UPDATE agent_prs SET state = ?1, title = ?4, ci = ?5,
-                 conflicting = COALESCE(?6, conflicting)
+                 conflicting = COALESCE(?6, conflicting), queued = ?7
              WHERE repo = ?2 AND number = ?3
                AND (state != ?1 OR title IS NOT ?4 OR ci IS NOT ?5
-                    OR conflicting != COALESCE(?6, conflicting))",
+                    OR conflicting != COALESCE(?6, conflicting) OR queued != ?7)",
             params![
                 status.state,
                 key.repo,
                 key.number,
                 status.title,
                 status.ci.map(ci_str),
-                status.conflicting
+                status.conflicting,
+                status.queued,
             ],
         )? > 0)
     }
@@ -1903,6 +1938,7 @@ fn summary_from_row(
     synced: bool,
     sync_error: Option<String>,
     stack: Option<&Stack>,
+    queued: bool,
 ) -> rusqlite::Result<PrSummary> {
     let number = r.get(1)?;
     Ok(PrSummary {
@@ -1923,6 +1959,7 @@ fn summary_from_row(
         threads: None,
         ci: None,
         review_decision: None,
+        queued,
     })
 }
 
@@ -1977,6 +2014,7 @@ mod tests {
             author: "ha".into(),
             state: "OPEN".into(),
             is_draft: false,
+            queued: false,
             url: "hu".into(),
             updated_at: "2026-01-02T00:00:00Z".into(),
             head_oid: "h".into(),
@@ -1998,6 +2036,7 @@ mod tests {
             author: "a".into(),
             state: "OPEN".into(),
             is_draft: false,
+            queued: false,
             url: "u".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-02T00:00:00Z".into(),
@@ -2208,6 +2247,7 @@ mod tests {
                 head_oid: "h".into(),
                 ci: Some(CiStatus::Running),
                 checks_running: false,
+                queued: Some(false),
             })
         );
         // The search reports something other than what GitHub said at the
@@ -2324,6 +2364,7 @@ mod tests {
             updated_at: "u".into(),
             head_oid: "h".into(),
             parent,
+            queued: false,
         };
         let stack = Stack {
             base_ref: "main".into(),
@@ -2838,6 +2879,7 @@ mod tests {
 
         let status = |state: &str, conflicting: Option<bool>| crate::github::PrStatus {
             state: state.into(),
+            queued: false,
             conflicting,
             title: "t".into(),
             base_ref: "main".into(),
@@ -2910,6 +2952,55 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM agent_prs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn agent_pr_queue_state_round_trip() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        db.add_agent_pr("a", &key, "OPEN").unwrap();
+        let status = |queued| crate::github::PrStatus {
+            state: "OPEN".into(),
+            queued,
+            conflicting: Some(false),
+            title: "t".into(),
+            base_ref: "main".into(),
+            head_oid: "h".into(),
+            ci: None,
+        };
+        // A poll that reports the same values changes nothing.
+        assert!(db.set_agent_pr_state(&key, &status(false)).unwrap());
+        assert!(!db.set_agent_pr_state(&key, &status(false)).unwrap());
+        assert!(!db.agent_pr_list("a").unwrap()[0].queued);
+        // Joining the queue alone is a change.
+        assert!(db.set_agent_pr_state(&key, &status(true)).unwrap());
+        assert!(!db.set_agent_pr_state(&key, &status(true)).unwrap());
+        assert!(db.agent_pr_list("a").unwrap()[0].queued);
+    }
+
+    #[test]
+    fn queued_round_trips() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        db.set_inbox_results(1, Ok(std::slice::from_ref(&hit(&key))), None)
+            .unwrap();
+        // Before a sync, the PR isn't known to be queued.
+        assert!(!db.inbox_prs(1).unwrap()[0].queued);
+        assert_eq!(db.sync_mark(&key).unwrap(), None);
+
+        let mut meta = meta(&key);
+        meta.queued = true;
+        db.store_sync(&meta, &[], &[], None, false, None).unwrap();
+        assert!(db.pr(&key).unwrap().unwrap().summary.queued);
+        assert!(db.inbox_prs(1).unwrap()[0].queued);
+        assert_eq!(db.sync_mark(&key).unwrap().unwrap().queued, Some(true));
     }
 
     #[test]

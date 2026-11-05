@@ -618,6 +618,9 @@ input[type="text"] {
 .state-open {
   background: #1f883d;
 }
+.state-queued {
+  background: #9a6700;
+}
 .state-merged {
   background: #8250df;
 }
@@ -2004,6 +2007,9 @@ textarea {
   }
   .associated-prs .pr-state.merged {
     color: #8250df;
+  }
+  .associated-prs .pr-state.queued {
+    color: #9a6700;
   }
   .associated-prs .pr-state.passing {
     color: var(--add-fg);

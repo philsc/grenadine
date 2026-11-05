@@ -2090,12 +2090,14 @@ fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<Arc<AgentEvent>>>)
     }
 }
 
-/// The icon class and tooltip of a PR a session opened. A conflict
-/// outranks the checks, and a closed PR shows neither.
+/// The icon class and tooltip of a PR a session opened. A queued PR
+/// shows as queued before a conflict does, and a conflict outranks the
+/// checks; a closed PR shows none of them.
 fn pr_state(pr: &AgentPr) -> (&'static str, &'static str) {
     match pr.state.as_str() {
         "MERGED" => ("merged", "Merged"),
         "CLOSED" => ("closed", "Closed without merging"),
+        _ if pr.queued => ("queued", "In the merge queue"),
         _ if pr.conflicting => ("conflict", "Conflicts with its base"),
         _ => match pr.ci {
             Some(CiStatus::Failing) => ("failing", "Checks failing"),
@@ -4078,5 +4080,29 @@ mod tests {
             current_activity(&events.map(Arc::new), false, Some(2_000), ""),
             Activity::Thinking { since: Some(2_000) }
         );
+    }
+
+    #[test]
+    fn queued_outranks_a_conflict_and_the_checks() {
+        let pr = |queued| AgentPr {
+            key: PrKey {
+                repo: "o/n".into(),
+                number: 7,
+            },
+            title: None,
+            state: "OPEN".into(),
+            ci: Some(CiStatus::Failing),
+            conflicting: true,
+            queued,
+        };
+        assert_eq!(pr_state(&pr(true)), ("queued", "In the merge queue"));
+        assert_eq!(
+            pr_state(&pr(false)),
+            ("conflict", "Conflicts with its base")
+        );
+        // Closed and merged PRs don't show the queue flag.
+        let mut merged = pr(true);
+        merged.state = "MERGED".into();
+        assert_eq!(pr_state(&merged), ("merged", "Merged"));
     }
 }

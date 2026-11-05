@@ -265,6 +265,7 @@ mod tests {
             updated_at: String::new(),
             head_oid: String::new(),
             parent,
+            queued: false,
         }
     }
 
@@ -410,6 +411,7 @@ mod tests {
             threads: None,
             ci: None,
             review_decision: None,
+            queued: false,
         }
     }
 

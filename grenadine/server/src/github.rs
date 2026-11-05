@@ -55,6 +55,8 @@ pub struct Hit {
     /// OPEN, CLOSED or MERGED.
     pub state: String,
     pub is_draft: bool,
+    /// In a merge queue; `state` stays OPEN while one is.
+    pub queued: bool,
     pub url: String,
     pub updated_at: String,
     pub head_oid: String,
@@ -86,6 +88,8 @@ pub struct PrData {
     pub author: String,
     pub state: String,
     pub is_draft: bool,
+    /// In a merge queue.
+    pub queued: bool,
     pub url: String,
     pub created_at: String,
     pub updated_at: String,
@@ -185,6 +189,8 @@ pub enum StackLookup {
 pub struct PrStatus {
     /// OPEN, CLOSED or MERGED.
     pub state: String,
+    /// In a merge queue.
+    pub queued: bool,
     /// Whether it conflicts with its base; `None` while GitHub is still
     /// working that out.
     pub conflicting: Option<bool>,
@@ -233,8 +239,10 @@ pub fn search_query(filter: &str, repos: &[String]) -> String {
 pub const SEARCH_LIMIT: usize = 100;
 
 /// What a search's PR fields are, beyond the PR's metadata: its review
-/// decision, its review threads and the checks on its head.
-const SEARCH_STATUS_FIELDS: &str = "reviewDecision
+/// decision, whether it's in a merge queue, its review threads and the
+/// checks on its head. Joining a queue doesn't change `updatedAt`, so
+/// `isInMergeQueue` must be fetched for the resync check to see it.
+const SEARCH_STATUS_FIELDS: &str = "reviewDecision isInMergeQueue
     reviewThreads(first: 100) { totalCount nodes { isResolved } }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
 
@@ -303,11 +311,11 @@ fn merge_state(s: &str) -> MergeState {
 }
 
 /// The extra fields a search selects when its inbox filter is evaluated
-/// locally, besides the review decision that every search has. They
-/// cost a lot — every review and review request counts
+/// locally, besides the review decision and merge queue flag that every
+/// search has. They cost a lot — every review and review request counts
 /// towards the request's node limit — so searches that never read them
 /// don't ask.
-const SEARCH_FACT_FIELDS: &str = "isInMergeQueue
+const SEARCH_FACT_FIELDS: &str = "
     reviews(first: 100) { nodes { author { login } state } }
     reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } }";
 
@@ -325,7 +333,7 @@ const PR_QUERY: &str = r#"
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      title body url state isDraft createdAt updatedAt
+      title body url state isDraft isInMergeQueue createdAt updatedAt
       author { login }
       baseRefName headRefName headRefOid
       baseRef {
@@ -558,6 +566,7 @@ fn hit_from_node(n: &Value) -> Hit {
         author: author_login(n).to_owned(),
         state: str_at(n, "/state").to_owned(),
         is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+        queued: n["isInMergeQueue"].as_bool().unwrap_or_default(),
         url: str_at(n, "/url").to_owned(),
         updated_at: str_at(n, "/updatedAt").to_owned(),
         head_oid: str_at(n, "/headRefOid").to_owned(),
@@ -1603,7 +1612,7 @@ impl GitHub {
         for (i, r) in refs.iter().enumerate() {
             gql += &format!(
                 "    p{i}: pullRequests({arg}: $r{i}, states: [OPEN, MERGED], first: 100) {{
-                       nodes {{ number title state isDraft url updatedAt mergedAt headRefOid
+                       nodes {{ number title state isDraft isInMergeQueue url updatedAt mergedAt headRefOid
                                 headRefName baseRefName isCrossRepository }}
                      }}\n"
             );
@@ -1641,6 +1650,7 @@ impl GitHub {
                             title: str_at(n, "/title").to_owned(),
                             state: str_at(n, "/state").to_owned(),
                             is_draft: n["isDraft"].as_bool().unwrap_or_default(),
+                            queued: n["isInMergeQueue"].as_bool().unwrap_or_default(),
                             url: str_at(n, "/url").to_owned(),
                             updated_at: str_at(n, "/updatedAt").to_owned(),
                             head_oid: str_at(n, "/headRefOid").to_owned(),
@@ -1732,6 +1742,7 @@ impl GitHub {
             author: author_login(pr).to_owned(),
             state: str_at(pr, "/state").to_owned(),
             is_draft: pr["isDraft"].as_bool().unwrap_or(false),
+            queued: pr["isInMergeQueue"].as_bool().unwrap_or(false),
             url: str_at(pr, "/url").to_owned(),
             created_at: str_at(pr, "/createdAt").to_owned(),
             updated_at: str_at(pr, "/updatedAt").to_owned(),
@@ -2147,7 +2158,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state isInMergeQueue mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
                     )
                 })
                 .collect();
@@ -2185,6 +2196,10 @@ impl GitHub {
                     key.clone(),
                     PrStatus {
                         state: state.to_owned(),
+                        queued: data
+                            .pointer(&format!("/p{i}/pullRequest/isInMergeQueue"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or_default(),
                         conflicting,
                         title: str_at(&data, &format!("/p{i}/pullRequest/title")).to_owned(),
                         base_ref: str_at(&data, &format!("/p{i}/pullRequest/baseRefName"))
@@ -2413,6 +2428,7 @@ mod tests {
             "author": { "login": "alice" },
             "state": "OPEN",
             "isDraft": false,
+            "isInMergeQueue": true,
             "url": "https://github.com/o/r/pull/7",
             "updatedAt": "2026-01-01T00:00:00Z",
             "headRefOid": "abc",
@@ -2442,6 +2458,8 @@ mod tests {
         );
         assert_eq!(hit.ci, Some(CiStatus::Passing));
         assert_eq!(hit.review_decision, Some(ReviewDecision::ChangesRequested));
+        assert!(hit.queued);
+        assert!(hit.facts.queued);
 
         // GitHub has no decision for a PR nobody needs to review.
         let mut node = node;
@@ -2450,6 +2468,17 @@ mod tests {
         let hit = hit_from_node(&node);
         assert_eq!(hit.review_decision, None);
         assert_eq!(hit.ci, None);
+    }
+
+    /// Every query that reads a PR's state fetches `isInMergeQueue` too:
+    /// joining a queue doesn't change `updatedAt`, so a sync that never
+    /// fetched it would call a queued PR open.
+    #[test]
+    fn every_pr_query_fetches_the_merge_queue_flag() {
+        assert!(PR_QUERY.contains("isInMergeQueue"));
+        assert!(SEARCH_STATUS_FIELDS.contains("isInMergeQueue"));
+        // It would be selected twice in a search with local facts.
+        assert!(!SEARCH_FACT_FIELDS.contains("isInMergeQueue"));
     }
 
     #[test]
@@ -2555,6 +2584,7 @@ mod tests {
                 "viewerDefaultMergeMethod": "REBASE",
                 "deleteBranchOnMerge": true,
                 "pullRequest": {
+                    "isInMergeQueue": true,
                     "reviewDecision": "REVIEW_REQUIRED",
                     "mergeable": "UNKNOWN",
                     "mergeStateStatus": "BLOCKED",
