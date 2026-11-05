@@ -10,7 +10,7 @@ use grenadine_core::stack::{Link, group_inbox};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::{Updates, api, hash_for};
+use crate::{GithubLink, Updates, api, github_url, hash_for};
 
 /// Rows shown when an inbox section first renders, and added per click of
 /// its "Show more" button.
@@ -218,7 +218,12 @@ fn InboxSection(
                                                 class="pr-item"
                                                 class:selected=is_selected
                                                 href=hash_for(&key)
-                                            >
+                                            ></a>
+                                            // Links can't nest, so the row's
+                                            // link is an overlay over the li;
+                                            // the body sits next to it so the
+                                            // GitHub icon can be clicked.
+                                            <div class="pr-item-body">
                                                 <span class="pr-text">
                                                     <span class="pr-title">
                                                         {badge}
@@ -226,7 +231,9 @@ fn InboxSection(
                                                         {pr.title.clone()}
                                                     </span>
                                                     <span class="pr-meta muted" title=pr.sync_error.clone()>
-                                                        {format!("{}#{} · {} · ", pr.key.repo, pr.key.number, pr.author)}
+                                                        {format!("{}#{}", pr.key.repo, pr.key.number)}
+                                                        <GithubLink url=github_url(&key) />
+                                                        {format!(" · {} · ", pr.author)}
                                                         {if pr.synced {
                                                             format!("{} versions", pr.version_count).into_any()
                                                         } else if pr.sync_error.is_some() {
@@ -241,7 +248,7 @@ fn InboxSection(
                                                     {pr.review_decision.map(|d| view! { <ReviewIcon decision=d /> })}
                                                     {pr.ci.map(|ci| view! { <CiIcon ci=ci /> })}
                                                 </span>
-                                            </a>
+                                            </div>
                                         </li>
                                     }
                                 })

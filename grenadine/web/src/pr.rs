@@ -13,13 +13,12 @@ use wasm_bindgen::JsCast;
 use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
 use crate::diffview::Commenting;
 use crate::diffview::DiffView;
-use crate::global_settings::GlobalSettings;
 use crate::inboxes::{load_flag, save_flag};
 use crate::review::{
     CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, conversation,
     merge_box, merge_warning,
 };
-use crate::{Updates, api, github_url, hash_for, highlight, markdown};
+use crate::{GithubLink, Updates, api, github_url, hash_for, highlight, markdown};
 
 /// A review comment and its replies.
 #[derive(Clone, Debug, PartialEq)]
@@ -183,7 +182,6 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
-    let pr_links = expect_context::<GlobalSettings>().pr_links;
     let github = github_url(&key);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
@@ -282,7 +280,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                 }
             };
             view! {
-                <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes pr_links=pr_links /></main>
+                <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /></main>
                 {move || {
                     let pr = pr.clone();
                     if shown() {
@@ -335,12 +333,10 @@ fn sidebar_wide() -> RwSignal<bool> {
 #[derive(Clone, Copy)]
 struct Folded(RwSignal<HashMap<u64, bool>>);
 
-/// What the markdown of one PR needs: its repo for links, and whether PR
-/// links open in grenadine (inverting Shift+click's meaning).
+/// What the markdown of one PR needs: its repo for links.
 #[derive(Clone)]
 pub(crate) struct PrLinks {
     pub(crate) repo: String,
-    pub(crate) invert: RwSignal<bool>,
 }
 
 /// The PR whose page this is, for the comments and actions that change it
@@ -350,35 +346,6 @@ pub(crate) struct ReviewTarget {
     pub(crate) key: PrKey,
     /// The viewer has a pending review on the PR.
     pub(crate) reviewing: bool,
-}
-
-/// Routes clicks on the `data-grenadine` links that markdown rendering put
-/// on PR references and that the stack list has. Shift+click — or a plain
-/// click when the invert flag is on — navigates in-app; anything else
-/// opens GitHub in a tab.
-pub(crate) fn markdown_click(ev: web_sys::MouseEvent, invert: bool) {
-    if ev.button() != 0 || ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
-        return;
-    }
-    let Some(a) = ev
-        .target()
-        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        .and_then(|t| t.closest("a[data-grenadine]").ok().flatten())
-    else {
-        return;
-    };
-    if ev.shift_key() != invert {
-        ev.prevent_default();
-        if let Some(hash) = a.get_attribute("data-grenadine") {
-            let _ = window().location().set_hash(&hash);
-        }
-    } else if ev.shift_key() {
-        // Shift+click alone would open a window; open a tab instead.
-        ev.prevent_default();
-        if let Some(href) = a.get_attribute("href") {
-            let _ = window().open_with_url_and_target(&href, "_blank");
-        }
-    }
 }
 
 /// Warms the caches for the diffs most likely to be looked at next, down
@@ -426,11 +393,9 @@ fn PrBody(
     chosen: RwSignal<Option<Selection>>,
     side_by_side: RwSignal<bool>,
     inline_changes: RwSignal<bool>,
-    pr_links: RwSignal<bool>,
 ) -> impl IntoView {
     provide_context(PrLinks {
         repo: pr.summary.key.repo.clone(),
-        invert: pr_links,
     });
     provide_context(ReviewTarget {
         key: pr.summary.key.clone(),
@@ -541,7 +506,7 @@ fn PrBody(
     view! {
         <article class="pr">
             <header class="pr-header">
-                <h1>{s.title.clone()} " " <a class="muted pr-number" href=s.url.clone() target="_blank" rel="noopener">{format!("#{}", s.key.number)}</a></h1>
+                <h1>{s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() /></h1>
                 <p class="muted">
                     <span class=format!("state state-{}", s.state.to_lowercase())>{s.state.to_lowercase()}</span>
                     {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
@@ -555,10 +520,9 @@ fn PrBody(
                 {pr.sync_error.clone().map(|e| view! { <p class="banner error">{format!("The last sync failed: {e}")}</p> })}
             </header>
             {pr.stack.clone().filter(|st| st.prs.len() > 1).map(|st| view! {
-                <StackList stack=st repo=s.key.repo.clone() current=s.key.number pr_links=pr_links />
+                <StackList stack=st repo=s.key.repo.clone() current=s.key.number />
             })}
-            <section class="description markdown" inner_html=body_html
-                on:click=move |ev| markdown_click(ev, pr_links.get_untracked())></section>
+            <section class="description markdown" inner_html=body_html></section>
             {review.map(conversation)}
             {review.filter(|_| s.state == "OPEN").map(|info| merge_box(info, merge_target(&pr)))}
             {merge_warning()}
@@ -644,7 +608,7 @@ fn lane_x(lane: usize) -> usize {
 
 /// The PR's stack, top first, drawn like `git log --graph`.
 #[component]
-fn StackList(stack: Stack, repo: String, current: u64, pr_links: RwSignal<bool>) -> impl IntoView {
+fn StackList(stack: Stack, repo: String, current: u64) -> impl IntoView {
     let rows = stack.graph();
     let lanes = rows
         .iter()
@@ -691,7 +655,7 @@ fn StackList(stack: Stack, repo: String, current: u64, pr_links: RwSignal<bool>)
                     {if p.number == current {
                         view! { <strong>{text}</strong> }.into_any()
                     } else {
-                        view! { <a href=p.url.clone() target="_blank" data-grenadine=hash>{text}</a> }.into_any()
+                        view! { <a href=hash>{text}</a><GithubLink url=p.url.clone() /> }.into_any()
                     }}
                     " "
                     <span class=format!("state state-{state}")>{state.clone()}</span>
@@ -704,7 +668,7 @@ fn StackList(stack: Stack, repo: String, current: u64, pr_links: RwSignal<bool>)
     }).collect_view();
 
     view! {
-        <section class="stack" on:click=move |ev| markdown_click(ev, pr_links.get_untracked())>
+        <section class="stack">
             {stack.more_descendants.then(|| more("… more not shown"))}
             {rows}
         </section>
@@ -928,8 +892,7 @@ pub(crate) fn CommentFrame(
         Some((_, view)) => Some(view.run()),
         None => html.clone().map(|html| {
             view! {
-                <div class="markdown" inner_html=html
-                    on:click=move |ev| markdown_click(ev, links.invert.get_untracked())></div>
+                <div class="markdown" inner_html=html></div>
             }
             .into_any()
         }),

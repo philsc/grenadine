@@ -21,12 +21,11 @@ use wasm_bindgen::prelude::*;
 use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
-use crate::global_settings::GlobalSettings;
 use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
 use crate::settings::{Settings, SettingsButton};
-use crate::{Route, Updates, api, github_url, hash_for, markdown};
+use crate::{GithubLink, Route, Updates, api, github_url, hash_for, markdown};
 
 fn agent_hash(id: &str) -> String {
     format!("#/agents/{id}")
@@ -150,12 +149,19 @@ fn LandedBadge(landed: Landed, repo: String) -> impl IntoView {
                     number: top.number,
                 })
             });
-            view! {
-                <a class="agent-landed" href=top.url target="_blank" data-grenadine=hash>
-                    {label}
-                </a>
+            match hash {
+                Some(hash) => view! {
+                    <a class="agent-landed" href=hash>{label}</a>
+                    <GithubLink url=top.url.clone() />
+                }
+                .into_any(),
+                None => view! {
+                    <a class="agent-landed" href=top.url target="_blank" rel="noopener noreferrer">
+                        {label}
+                    </a>
+                }
+                .into_any(),
             }
-            .into_any()
         }
     }
 }
@@ -1904,7 +1910,6 @@ fn pr_state(pr: &AgentPr) -> (&'static str, &'static str) {
 #[component]
 fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
     let updates = expect_context::<Updates>();
-    let settings = expect_context::<GlobalSettings>();
     let prs = LocalResource::new(move || {
         updates.agents.track();
         let id = id.clone();
@@ -1923,8 +1928,7 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
         let list = loaded.get();
         (!list.is_empty()).then(|| {
             view! {
-                <section class="associated-prs"
-                    on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
+                <section class="associated-prs">
                     <h2>"Associated PRs"</h2>
                     <ul>
                         {list
@@ -1937,13 +1941,13 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
                                 };
                                 view! {
                                     <li>
-                                        <a href=github_url(&pr.key) target="_blank" rel="noopener"
-                                            data-grenadine=hash_for(&pr.key)>
+                                        <a href=hash_for(&pr.key)>
                                             <span class=format!("pr-state {class}") title=tooltip>
                                                 <PrIcon />
                                             </span>
                                             {label} " " {pr.title.clone().unwrap_or_default()}
                                         </a>
+                                        <GithubLink url=github_url(&pr.key) />
                                     </li>
                                 }
                             })
@@ -1957,10 +1961,8 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
 
 #[component]
 fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
-    let settings = expect_context::<GlobalSettings>();
     view! {
-        <header class="agent-header"
-            on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
+        <header class="agent-header">
             {move || {
                 let s = session.get();
                 if s.repo == GENERAL {
@@ -1982,10 +1984,8 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                             number: n,
                         };
                         view! {
-                            <a href=github_url(&key) target="_blank" rel="noopener"
-                                data-grenadine=hash_for(&key)>
-                                {format!("{}#{n}", s.repo)}
-                            </a>
+                            <a href=hash_for(&key)>{format!("{}#{n}", s.repo)}</a>
+                            <GithubLink url=github_url(&key) />
                         }.into_any()
                     }
                     None => view! { <span>{format!("{} trunk", s.repo)}</span> }.into_any(),
@@ -2483,10 +2483,8 @@ fn Transcript(
         });
     });
 
-    let settings = expect_context::<GlobalSettings>();
     view! {
-        <div class="transcript"
-            on:click=move |ev| crate::pr::markdown_click(ev, settings.pr_links.get_untracked())>
+        <div class="transcript">
             <For
                 each=move || events.with(|events| shown(events))
                 key=|e| e.seq
@@ -2706,9 +2704,19 @@ fn Transcript(
                                     });
                                     view! {
                                         {(i > 0).then_some(", ")}
-                                        <a href=pr.url target="_blank" data-grenadine=hash>
-                                            {format!("PR #{}", pr.number)}
-                                        </a>
+                                        {match hash {
+                                            Some(hash) => view! {
+                                                <a href=hash>{format!("PR #{}", pr.number)}</a>
+                                                <GithubLink url=pr.url.clone() />
+                                            }
+                                            .into_any(),
+                                            None => view! {
+                                                <a href=pr.url.clone() target="_blank" rel="noopener noreferrer">
+                                                    {format!("PR #{}", pr.number)}
+                                                </a>
+                                            }
+                                            .into_any(),
+                                        }}
                                     }
                                 })
                                 .collect_view();

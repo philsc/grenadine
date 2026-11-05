@@ -111,9 +111,8 @@ badge (open or merged) and a draft badge for drafts.
 **STACK-PAGE-7.** The current PR must be shown in bold, must not be a
 link, and must have its graph dot highlighted.
 
-**STACK-PAGE-8.** Every other PR must link to its PR. A click must behave
-like a PR link in the description: it follows the "Open PR links in
-grenadine" toggle, and Shift reverses it.
+**STACK-PAGE-8.** Every other PR must link to its page in grenadine,
+followed by an icon that opens it on GitHub.
 _Why:_ PR links behave the same everywhere on the page.
 
 **STACK-PAGE-9.** When the walk stopped at the descendant limit, a muted

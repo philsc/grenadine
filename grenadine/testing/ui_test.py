@@ -1017,13 +1017,36 @@ class InboxTest(ServerTestCase):
 
     def test_pr_page(self) -> None:
         pr = self.cases.prs["Get approved"]
+        self.page.context.route(
+            "https://github.com/**",
+            lambda route: route.fulfill(body="<p>github</p>"),
+        )
         self.page.goto(self.url)
-        self.row(pr.title).locator("a").click()
+
+        # The row's link covers the whole row; the icon after `repo#n`
+        # opens the PR on GitHub without navigating the page.
+        row = self.row(pr.title)
+        expect(row.locator("a.pr-item")).to_have_attribute(
+            "href", f"#/{scenarios.REPO}/{pr.number}"
+        )
+        icon = row.get_by_role("link", name="Open on GitHub")
+        expect(icon).to_have_attribute("href", pr.url)
+        with self.page.expect_popup() as popup:
+            icon.click()
+        popup.value.wait_for_load_state()
+        expect(self.page).to_have_url(self.url)
+
+        row.locator("a.pr-item").click()
         expect(self.page).to_have_url(re.compile(f"#/{scenarios.REPO}/{pr.number}$"))
 
         header = self.page.locator(".pr-header")
         expect(header.locator("h1")).to_have_text(f"{pr.title} #{pr.number}")
-        expect(header.locator(".pr-number")).to_have_attribute("href", pr.url)
+        # The number is plain text; the icon after it opens the PR on GitHub.
+        expect(header.locator(".pr-number")).to_have_text(f"#{pr.number}")
+        expect(header.locator("a.pr-number")).to_have_count(0)
+        expect(header.get_by_role("link", name="Open on GitHub")).to_have_attribute(
+            "href", pr.url
+        )
         expect(header.locator(".state")).to_have_text("open")
         expect(header.locator(".badge")).to_have_count(0)
 
@@ -1238,9 +1261,15 @@ class InboxTest(ServerTestCase):
                 "main",
             ]
         )
-        # The PR itself is bold; the others link to GitHub.
+        # The PR itself is bold; the others link to their page in
+        # grenadine, with an icon that opens them on GitHub.
         expect(rows.locator("strong")).to_have_text(f"#{top.number} {top.title}")
-        expect(rows.locator("a")).to_have_attribute("href", base.url)
+        links = rows.nth(1).locator("a")
+        expect(links.nth(0)).to_have_attribute(
+            "href", f"#/{scenarios.REPO}/{base.number}"
+        )
+        expect(links.nth(1)).to_have_attribute("href", base.url)
+        expect(links.nth(1)).to_have_class("gh-link")
 
     def test_debug_tab_shows_github_usage(self) -> None:
         self.page.goto(self.url)
@@ -1977,21 +2006,14 @@ class ReviewTest(ServerTestCase):
         # The box closes once the comment is sent.
         expect(conversation.get_by_role("textbox")).to_have_count(0)
 
-    def test_pr_links_setting_lives_in_the_settings_dialog(self) -> None:
+    def test_settings_dialog_only_has_the_theme(self) -> None:
         self.open(scenarios.CONVERSE)
-        # The setting isn't on the PR page's toolbar.
         expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
         self.page.get_by_role("button", name="Settings", exact=True).click()
-        checkbox = self.page.get_by_label("Open PR links in grenadine")
-        expect(checkbox).to_be_checked()
-        checkbox.uncheck()
-
-        self.page.reload()
-        self.open(scenarios.CONVERSE)
-        expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
-        self.page.get_by_role("button", name="Settings", exact=True).click()
-        expect(self.page.get_by_label("Open PR links in grenadine")).not_to_be_checked()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        expect(dialog.get_by_label("Theme")).to_have_count(1)
+        expect(dialog.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
 
 class VersionsTest(ServerTestCase):
@@ -3472,7 +3494,9 @@ class AgentTest(ServerTestCase):
             for pr in self.gh.repo(self.OTHER_REPO).prs.values()
             if pr.title == "Write notes"
         )
-        expect(opened.get_by_role("link")).to_have_attribute("href", pr.url)
+        expect(opened.get_by_role("link", name="Open on GitHub")).to_have_attribute(
+            "href", pr.url
+        )
         expect(header.get_by_role("link", name=f"PR #{pr.number}")).to_be_visible()
         # The sidebar counts the PR, which isn't merged yet.
         entry = (
@@ -3504,7 +3528,8 @@ class AgentTest(ServerTestCase):
         actions = self.page.locator(".agent-actions")
         actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up")
-        expect(opened.get_by_role("link")).to_have_count(2)
+        links = opened.get_by_role("link", name=re.compile(r"^PR #"))
+        expect(links).to_have_count(2)
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
@@ -3517,11 +3542,18 @@ class AgentTest(ServerTestCase):
         self.assertEqual(a.base, "main")
         self.assertTrue(a.head.startswith("grenadine/agent/"))
         self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
-        expect(opened.get_by_role("link").nth(0)).to_have_attribute("href", a.url)
-        expect(opened.get_by_role("link").nth(1)).to_have_attribute("href", b.url)
+        expect(links.nth(0)).to_have_attribute(
+            "href", f"#/{self.OTHER_REPO}/{a.number}"
+        )
+        expect(links.nth(1)).to_have_attribute(
+            "href", f"#/{self.OTHER_REPO}/{b.number}"
+        )
+        icons = opened.get_by_role("link", name="Open on GitHub")
+        expect(icons.nth(0)).to_have_attribute("href", a.url)
+        expect(icons.nth(1)).to_have_attribute("href", b.url)
         header = self.page.locator(".agent-header")
         badge = header.get_by_role("link", name=f"PRs #{a.number}–#{b.number}")
-        expect(badge).to_have_attribute("href", b.url)
+        expect(badge).to_have_attribute("href", f"#/{self.OTHER_REPO}/{b.number}")
         entry = (
             self.section(self.OTHER_REPO)
             .locator(".agent-entry")
@@ -3538,7 +3570,9 @@ class AgentTest(ServerTestCase):
         follow_up.press("Enter")
         expect(done).to_have_count(3)
         actions.get_by_role("button", name="Open PR").click()
-        expect(opened.nth(1).get_by_role("link")).to_have_count(3)
+        expect(
+            opened.nth(1).get_by_role("link", name=re.compile(r"^PR #"))
+        ).to_have_count(3)
         c = pr("Add stack-c")
         self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
         self.assertEqual(sum(pr.head.startswith(a.head) for pr in repo.prs.values()), 3)
@@ -3567,7 +3601,7 @@ class AgentTest(ServerTestCase):
         actions = self.page.locator(".agent-actions")
         actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up")
-        expect(opened.get_by_role("link")).to_have_count(3)
+        expect(opened.get_by_role("link", name=re.compile(r"^PR #"))).to_have_count(3)
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
@@ -3664,7 +3698,7 @@ class AgentTest(ServerTestCase):
             "button", name="Open PR"
         ).click()
         opened = transcript.locator(".wrapped-up")
-        expect(opened.get_by_role("link")).to_have_count(2)
+        expect(opened.get_by_role("link", name=re.compile(r"^PR #"))).to_have_count(2)
         a, b = (
             max(
                 (pr for pr in repo.prs.values() if pr.title == title),
@@ -3704,7 +3738,7 @@ class AgentTest(ServerTestCase):
             "button", name="Open PR"
         ).click()
         opened = transcript.locator(".wrapped-up")
-        expect(opened.get_by_role("link")).to_have_count(2)
+        expect(opened.get_by_role("link", name=re.compile(r"^PR #"))).to_have_count(2)
         repo = self.gh.repo(self.OTHER_REPO)
 
         def pr(title: str):
@@ -3972,19 +4006,16 @@ class AgentTest(ServerTestCase):
         expect(items).to_have_text(
             [f"#{a.number} title-a", f"#{b.number} title-b"], timeout=15_000
         )
-        links = items.locator("a")
-        expect(links.nth(0)).to_have_attribute(
-            "href", f"https://github.com/{self.OTHER_REPO}/pull/{a.number}"
-        )
-        expect(links.nth(0)).to_have_attribute(
-            "data-grenadine", f"#/{self.OTHER_REPO}/{a.number}"
-        )
-        expect(links.nth(1)).to_have_attribute(
-            "href", f"https://github.com/{self.OTHER_REPO}/pull/{b.number}"
-        )
-        expect(links.nth(1)).to_have_attribute(
-            "data-grenadine", f"#/{self.OTHER_REPO}/{b.number}"
-        )
+        for i, pr in enumerate(prs):
+            # Each PR links to its page in grenadine, with an icon that
+            # opens it on GitHub.
+            item = items.nth(i)
+            expect(item.locator("a").first).to_have_attribute(
+                "href", f"#/{self.OTHER_REPO}/{pr.number}"
+            )
+            expect(item.get_by_role("link", name="Open on GitHub")).to_have_attribute(
+                "href", f"https://github.com/{self.OTHER_REPO}/pull/{pr.number}"
+            )
 
         # Neither head has checks.
         expect(icons.nth(0)).to_have_class(re.compile(r"\bopen\b"), timeout=15_000)
@@ -4005,7 +4036,8 @@ class AgentTest(ServerTestCase):
         repo.close(b)
         expect(icons.nth(1)).to_have_class(re.compile(r"\bclosed\b"), timeout=15_000)
 
-        # A plain click opens a PR link in grenadine while the setting is on.
+        # A plain click opens a PR link in grenadine; the icon opens
+        # GitHub in a new tab.
         session = self.page.url
         # GitHub itself is stubbed so that a click that slips through hits
         # nothing real.
@@ -4013,23 +4045,14 @@ class AgentTest(ServerTestCase):
             "https://github.com/**",
             lambda route: route.fulfill(body="<p>github</p>"),
         )
-        links.nth(0).click()
+        items.nth(0).locator("a").first.click()
         expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/{a.number}$"))
         self.page.goto(session)
         expect(items).to_have_count(2)
-
-        # Turned off, a plain click goes to GitHub and Shift+click stays.
-        self.page.get_by_role("button", name="Settings", exact=True).click()
-        self.page.get_by_label("Open PR links in grenadine").uncheck()
-        self.page.keyboard.press("Escape")
         with self.page.expect_popup() as popup:
-            links.nth(0).click()
+            items.nth(0).get_by_role("link", name="Open on GitHub").click()
         popup.value.wait_for_load_state()
         expect(self.page).to_have_url(session)
-        links.nth(0).click(modifiers=["Shift"])
-        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/{a.number}$"))
-        self.page.goto(session)
-        expect(items).to_have_count(2)
 
         # The session goes too, so later tests' counts aren't off.
         entry = self.section(self.OTHER_REPO).locator(".agent-entry")
@@ -4037,7 +4060,7 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
-    def test_transcript_pr_links_follow_the_setting(self) -> None:
+    def test_transcript_pr_links_open_in_grenadine(self) -> None:
         self.page.context.route(
             "https://github.com/**",
             lambda route: route.fulfill(body="<p>github</p>"),
@@ -4047,18 +4070,23 @@ class AgentTest(ServerTestCase):
         self.page.get_by_label("Prompt").fill(f"look at {url}")
         self.page.get_by_role("button", name="Start").click()
 
-        # The echoed prompt's PR URL is marked with its in-app hash.
+        # The echoed prompt's PR URL links to the PR in grenadine, with an
+        # icon that opens it on GitHub.
         link = self.page.locator(".transcript .turn-text a").filter(has_text=url)
-        expect(link).to_have_attribute("data-grenadine", f"#/{self.OTHER_REPO}/1")
+        expect(link).to_have_attribute("href", f"#/{self.OTHER_REPO}/1")
+        icon = self.page.locator(".transcript .turn-text").get_by_role(
+            "link", name="Open on GitHub"
+        )
+        expect(icon).to_have_attribute("href", url)
 
-        # With the setting on, a plain click opens the PR in grenadine and
-        # Shift+click goes to GitHub.
+        # A plain click opens the PR in grenadine; the icon opens GitHub
+        # in a new tab.
         session = self.page.url
         link.click()
         expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/1$"))
         self.page.goto(session)
         with self.page.expect_popup() as popup:
-            link.click(modifiers=["Shift"])
+            icon.click()
         popup.value.wait_for_load_state()
         expect(self.page).to_have_url(session)
 
@@ -4212,9 +4240,13 @@ class AutoReviewTest(ServerTestCase):
         entry = self.review_entry("Add the feature")
         expect(entry.locator(".agent-status")).to_have_text("posted", timeout=30_000)
         self.assertEqual([c.body for c in pr.issue_comments], ["Looks good."])
-        # Its session is gone, and the entry links to the PR instead.
-        expect(entry.locator("a")).to_have_attribute(
+        # Its session is gone, and the entry links to the PR instead,
+        # with an icon that opens it on GitHub.
+        expect(entry.locator("a.agent-item")).to_have_attribute(
             "href", f"#/{scenarios.REPO}/{pr.number}"
+        )
+        expect(entry.get_by_role("link", name="Open on GitHub")).to_have_attribute(
+            "href", pr.url
         )
         self.page.get_by_role("link", name="Agents").click()
         expect(self.page.locator(".agent-sidebar")).not_to_contain_text("Review #")
@@ -4258,7 +4290,7 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("link", name="Auto-reviews").click()
 
         # Its page shows the prompt, with the skill, and takes none.
-        entry.locator("a").click()
+        entry.locator("a.agent-item").click()
         expect(self.page).to_have_url(re.compile(r"#/auto-reviews/[0-9a-f-]{36}$"))
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"/code-review Review pull request {pr.url}")
@@ -4304,7 +4336,7 @@ class AutoReviewTest(ServerTestCase):
         self.devin_saw('"value":"swe-2-high"')
 
         # Its page shows the review's prompt and its cost in ACUs.
-        entry.locator("a").click()
+        entry.locator("a.agent-item").click()
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"Review pull request {pr.url}")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])

@@ -1,10 +1,9 @@
 //! The settings that apply everywhere rather than to one repository:
-//! the theme and where PR links open. They live in the browser's local
-//! storage, so they carry over between sessions on the same machine.
+//! the theme. They live in the browser's local storage, so they carry
+//! over between sessions on the same machine.
 
 use leptos::prelude::*;
 
-use crate::inboxes::{load_flag, save_flag};
 use crate::settings::GearIcon;
 use crate::theme::{self, Theme};
 
@@ -12,18 +11,13 @@ use crate::theme::{self, Theme};
 #[derive(Clone, Copy)]
 pub(crate) struct GlobalSettings {
     pub(crate) theme: RwSignal<Theme>,
-    /// Whether a plain click on a PR link opens it in grenadine.
-    pub(crate) pr_links: RwSignal<bool>,
 }
 
 /// Loads the persisted settings into signals; writes to them apply at
 /// once and are saved.
 pub(crate) fn provide() -> GlobalSettings {
-    let pr_links = RwSignal::new(load_flag("pr-links-in-app", true));
-    Effect::new(move |_| save_flag("pr-links-in-app", pr_links.get()));
     GlobalSettings {
         theme: theme::signal(),
-        pr_links,
     }
 }
 
@@ -98,20 +92,6 @@ fn Dialog(open: RwSignal<bool>) -> impl IntoView {
                                 <option value="dark">"Dark"</option>
                             </select>
                         </label>
-                        <label class="checkbox">
-                            <input
-                                type="checkbox"
-                                prop:checked=move || settings.pr_links.get()
-                                on:change=move |ev| {
-                                    settings.pr_links.set(event_target_checked(&ev))
-                                }
-                            />
-                            "Open PR links in grenadine"
-                        </label>
-                        <p class="hint muted">
-                            "A plain click on a PR link opens it in grenadine and Shift+click "
-                            "opens it on GitHub. Turned off, it's the other way round."
-                        </p>
                     </fieldset>
                 </div>
             </div>
