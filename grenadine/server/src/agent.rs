@@ -1598,14 +1598,20 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             .status()
             .await;
     }
+    // The server's own git runs under this lock, e.g. a worktree add,
+    // and stopping its processes halfway leaves its ref locks behind.
+    let guard = match &cloned {
+        Some(c) => Some(c.git_lock.lock().await),
+        None => None,
+    };
     let worktree = PathBuf::from(&session.worktree);
     let worktree = worktree.canonicalize().unwrap_or(worktree);
     let stopped = {
         let worktree = worktree.clone();
         tokio::task::spawn_blocking(move || stop_processes_in(&worktree)).await?
     };
-    if let Some(cloned) = cloned {
-        let _guard = cloned.git_lock.lock().await;
+    if let Some(cloned) = &cloned {
+        let _guard = guard;
         let repo = cloned.repo.clone();
         let worktree = PathBuf::from(&session.worktree);
         tokio::task::spawn_blocking(move || repo.worktree_remove(&worktree, &session.branch))
@@ -3073,6 +3079,72 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
             crate::git::tests::run(&fx.clone.path, &["branch", "--list", &branch]),
             ""
         );
+    }
+
+    /// A delete that lands while `git worktree add` is running waits for
+    /// it to finish rather than stopping it halfway, which would leave
+    /// its ref locks behind.
+    #[tokio::test]
+    async fn delete_during_worktree_add_lets_it_finish() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), CLAUDE_OK);
+        // `git worktree add` checks files out with a `reset` child whose
+        // cwd is the new worktree; a smudge filter on one file marks
+        // that it started and then sleeps, so the delete lands while the
+        // add is in flight.
+        let started = dir.path().join("started");
+        let done = dir.path().join("done");
+        let smudge = format!(
+            "touch {}; sleep 1; touch {}",
+            started.display(),
+            done.display()
+        );
+        crate::git::tests::run(&fx.upstream, &["config", "filter.slow.smudge", &smudge]);
+        crate::git::tests::run(&fx.upstream, &["config", "filter.slow.clean", "cat"]);
+        crate::git::tests::commit(&fx.upstream, ".gitattributes", "*.big filter=slow\n");
+        crate::git::tests::commit(&fx.upstream, "f.big", "data\n");
+        crate::git::tests::run(
+            &fx.clone.path,
+            &["fetch", "-q", fx.upstream.to_str().unwrap(), "main"],
+        );
+        crate::git::tests::run(&fx.clone.path, &["config", "filter.slow.smudge", &smudge]);
+        crate::git::tests::run(&fx.clone.path, &["config", "filter.slow.clean", "cat"]);
+        let session = create(&state, new_repo_session()).await.unwrap();
+        let worktree = session.worktree.clone();
+        let branch = session.branch.clone();
+        for _ in 0..500 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "the smudge filter never ran");
+        assert!(delete(&state, &session.id).await.unwrap());
+        assert!(done.exists(), "the worktree add was stopped halfway");
+        assert!(state.db.agent(&session.id).unwrap().is_none());
+        assert!(!Path::new(&worktree).exists());
+        assert_eq!(
+            crate::git::tests::run(&fx.clone.path, &["branch", "--list", &branch]),
+            ""
+        );
+        fn find_locks(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    find_locks(&p, out);
+                } else if e.file_name().to_string_lossy().ends_with(".lock") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut locks = Vec::new();
+        find_locks(&fx.clone.path.join(".git/refs"), &mut locks);
+        let packed = fx.clone.path.join(".git/packed-refs.lock");
+        if packed.exists() {
+            locks.push(packed);
+        }
+        assert!(locks.is_empty(), "stale ref locks: {locks:?}");
     }
 
     /// A worktree creation that fails fails the turn; the next prompt
