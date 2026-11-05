@@ -10,7 +10,7 @@ use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
     AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CiStatus, CleanupState,
     CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    RepoSettings, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -1149,6 +1149,15 @@ fn with_skill(prompt: &str, skill: Option<&str>) -> String {
     }
 }
 
+/// The mode the repository starts a session of `backend` with; `plan`
+/// until its settings say otherwise.
+fn repo_default_mode(settings: Option<&RepoSettings>, backend: AgentBackend) -> PermissionMode {
+    settings
+        .and_then(|s| s.session_modes.get(&backend).cloned())
+        .filter(|m| backend.has_mode(m.as_str()))
+        .unwrap_or_else(PermissionMode::plan)
+}
+
 /// The form that starts a session, filled in from the draft with id
 /// `draft` and kept in it as it changes.
 #[component]
@@ -1184,33 +1193,40 @@ pub fn NewSession(draft: String) -> impl IntoView {
     // Whether the user picked the mode; until then it follows the
     // repository's default for the backend.
     let mode_picked = RwSignal::new(saved.mode_picked);
-    // The repository's session defaults, refetched when they change; a
-    // session in no repository has none, and a failed fetch counts as
-    // none.
+    // The repository's session defaults, refetched when they change and
+    // tagged with the repository they were fetched for; a session in no
+    // repository has none, and a failed fetch counts as none.
     let settings = LocalResource::new(move || {
         updates.repo_settings.track();
         let repo = repo.get();
         async move {
             if repo == GENERAL {
-                None
+                (GENERAL.to_owned(), None)
             } else {
-                api::repo_settings(&repo).await.ok()
+                (repo.clone(), api::repo_settings(&repo).await.ok())
             }
         }
+    });
+    // The fetched repository's settings while they are the current
+    // repository's; `None` while the fetch for a newly picked repository
+    // is still in flight, so nothing reads the previous repository's.
+    let current_settings = Memo::new(move |_| {
+        settings
+            .get()
+            .and_then(|(fetched, s)| (fetched == repo.get()).then_some(s))
     });
     // The mode the repository starts a session of this backend with;
     // `plan` until it says otherwise.
     let default_mode = Memo::new(move |_| {
-        let backend = backend.get();
-        settings
-            .get()
-            .flatten()
-            .and_then(|s| s.session_modes.get(&backend).cloned())
-            .filter(|m| backend.has_mode(m.as_str()))
-            .unwrap_or_else(PermissionMode::plan)
+        repo_default_mode(current_settings.get().flatten().as_ref(), backend.get())
     });
     // The skill the repository starts a session's first prompt with.
-    let default_skill = Memo::new(move |_| settings.get().flatten().and_then(|s| s.session_skill));
+    let default_skill = Memo::new(move |_| {
+        current_settings
+            .get()
+            .flatten()
+            .and_then(|s| s.session_skill)
+    });
     // An unpicked mode follows the repository's default for the backend;
     // a picked one the backend doesn't offer goes back to its default.
     Effect::new(move |_| {
@@ -1280,25 +1296,46 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 }
             },
         };
-        let req = NewAgent {
-            backend: backend.get_untracked(),
-            repo: repo.get_untracked(),
-            pr,
-            prompt: with_skill(
-                &prompt.get_untracked(),
-                default_skill.get_untracked().as_deref(),
-            ),
-            permission_mode: mode.get_untracked(),
-            model: model_arg(model),
-            images: images.get_untracked(),
-            draft: Some(id.get_value()),
-        };
+        let known = current_settings.get_untracked();
+        let repo = repo.get_untracked();
+        let backend = backend.get_untracked();
+        let mode = mode.get_untracked();
+        let mode_picked = mode_picked.get_untracked();
+        let raw_prompt = prompt.get_untracked();
+        let model = model_arg(model);
+        let images = images.get_untracked();
         let id = id.get_value();
         drafts.set_starting(&id, true);
         // The last attempt's error doesn't carry into this one.
         drafts.set_start_error(&id, None);
         error.set(None);
         spawn_local(async move {
+            // A start asked for before the repository's settings arrived
+            // fetches them itself, so the session gets the repository's
+            // skill and mode. It lives in the task because the start
+            // outlives the form.
+            let settings = match known {
+                Some(s) => s,
+                None if repo == GENERAL => None,
+                None => api::repo_settings(&repo).await.ok(),
+            };
+            let req = NewAgent {
+                backend,
+                repo,
+                pr,
+                prompt: with_skill(
+                    &raw_prompt,
+                    settings.as_ref().and_then(|s| s.session_skill.as_deref()),
+                ),
+                permission_mode: if mode_picked {
+                    mode
+                } else {
+                    repo_default_mode(settings.as_ref(), backend)
+                },
+                model,
+                images,
+                draft: Some(id.clone()),
+            };
             // The form may be unmounted by the time the start answers, so
             // only what outlives it is touched here.
             match api::create_agent(&req).await {
@@ -3713,6 +3750,43 @@ mod tests {
         assert_eq!(with_skill("  /baz bar", Some("foo")), "  /baz bar");
         assert_eq!(with_skill("bar", None), "bar");
         assert_eq!(with_skill("bar\nbaz", Some("foo")), "/foo bar\nbaz");
+    }
+
+    #[test]
+    fn repo_default_modes() {
+        let settings = RepoSettings {
+            session_modes: [
+                (AgentBackend::Claude, PermissionMode::from("auto")),
+                (AgentBackend::Devin, PermissionMode::from("accept-edits")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            repo_default_mode(Some(&settings), AgentBackend::Claude).as_str(),
+            "auto"
+        );
+        assert_eq!(
+            repo_default_mode(Some(&settings), AgentBackend::Devin).as_str(),
+            "accept-edits"
+        );
+        // A mode the backend doesn't have, or none at all, falls back to
+        // plan.
+        let other = RepoSettings {
+            session_modes: [(AgentBackend::Devin, PermissionMode::from("auto"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            repo_default_mode(Some(&other), AgentBackend::Devin).as_str(),
+            "plan"
+        );
+        assert_eq!(
+            repo_default_mode(None, AgentBackend::Claude).as_str(),
+            "plan"
+        );
     }
 
     #[test]
