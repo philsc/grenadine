@@ -25,7 +25,7 @@ use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::storage;
 use crate::settings::{Settings, SettingsButton};
-use crate::{GithubLink, Route, Updates, api, github_url, hash_for, markdown};
+use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
 fn agent_hash(id: &str) -> String {
     format!("#/agents/{id}")
@@ -1762,6 +1762,70 @@ fn pretty(json: &str) -> String {
         .unwrap_or_else(|_| json.to_owned())
 }
 
+/// A Bash call's command and, when the call carries other inputs, a line
+/// naming them, `key: value` pairs joined by " · ". Strings are bare;
+/// other values are compact JSON.
+fn bash_view(input: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let object = input.as_object()?;
+    let command = object.get("command")?.as_str()?.to_owned();
+    let fields: Vec<String> = object
+        .iter()
+        .filter(|(key, _)| key.as_str() != "command")
+        .map(|(key, value)| match value.as_str() {
+            Some(s) => format!("{key}: {s}"),
+            None => format!(
+                "{key}: {}",
+                serde_json::to_string(value).unwrap_or_default()
+            ),
+        })
+        .collect();
+    let fields = (!fields.is_empty()).then(|| fields.join(" · "));
+    Some((command, fields))
+}
+
+/// A tool call's input. A Bash command is highlighted as bash, with a
+/// toggle for the raw input; anything else is the input pretty-printed
+/// and highlighted as JSON.
+#[component]
+fn ToolInput(name: String, input: String) -> impl IntoView {
+    let json = {
+        let text = pretty(&input);
+        highlight::highlight_code("json", &text).unwrap_or_else(|| highlight::escape(&text))
+    };
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+    let view = (name == "Bash").then(|| bash_view(&value)).flatten();
+    let Some((command, fields)) = view else {
+        return view! { <pre class="tool-input" inner_html=json></pre> }.into_any();
+    };
+    let raw = RwSignal::new(false);
+    let command =
+        highlight::highlight_code("bash", &command).unwrap_or_else(|| highlight::escape(&command));
+    view! {
+        <div class="tool-input-wrap">
+            <button
+                type="button"
+                class="tool-input-toggle"
+                aria-pressed=move || raw.get().to_string()
+                on:click=move |_| raw.update(|r| *r = !*r)
+            >
+                "JSON"
+            </button>
+            {move || {
+                if raw.get() {
+                    view! { <pre class="tool-input" inner_html=json.clone()></pre> }.into_any()
+                } else {
+                    view! {
+                        <pre class="tool-input" inner_html=command.clone()></pre>
+                        {fields.clone().map(|f| view! { <p class="tool-fields muted">{f}</p> })}
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+    .into_any()
+}
+
 /// Where loading the session stands.
 #[derive(Clone, Debug, PartialEq)]
 enum Load {
@@ -2691,7 +2755,7 @@ fn Transcript(
                                     });
                                     match edit_fragments(&name, &value, &patch.unwrap_or_default()) {
                                         Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
-                                        None => view! { <pre class="tool-input">{pretty(&input)}</pre> }.into_any(),
+                                        None => view! { <ToolInput name=name.clone() input=input.clone() /> }.into_any(),
                                     }
                                 }
                             };
@@ -2818,7 +2882,7 @@ fn Transcript(
                                     backend=backend
                                     tool_name=tool_name.clone()
                                     summary=summary
-                                    input=pretty(input)
+                                    input=input.clone()
                                     diff=diff
                                     options=options.clone()
                                     resolved=resolved
@@ -3262,14 +3326,14 @@ fn ApprovalCard(
                     None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
                     None => "Unanswered: ".to_owned(),
                 }}
-                <span class="tool-name">{tool_name}</span> " " <code>{summary}</code>
+                <span class="tool-name">{tool_name.clone()}</span> " " <code>{summary}</code>
             </p>
             {move || (state.get().is_none() && waiting.get()).then(|| {
                 let (answer, deny) = (answer.clone(), deny.clone());
                 view! {
                     {match diff.clone() {
                         Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
-                        None => view! { <pre class="tool-input">{input.clone()}</pre> }.into_any(),
+                        None => view! { <ToolInput name=tool_name.clone() input=input.clone() /> }.into_any(),
                     }}
                     {move || {
                         let options = options.get_value();
@@ -3450,6 +3514,35 @@ fn ContextMeter(usage: Signal<(Option<u64>, Option<u64>)>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_view_splits_command_from_other_fields() {
+        let input = serde_json::json!({
+            "command": "make test",
+            "description": "run the tests",
+            "timeout": 5000,
+        });
+        assert_eq!(
+            bash_view(&input),
+            Some((
+                "make test".to_owned(),
+                Some("description: run the tests · timeout: 5000".to_owned()),
+            )),
+        );
+    }
+
+    #[test]
+    fn bash_view_has_no_fields_with_only_a_command() {
+        let input = serde_json::json!({"command": "ls"});
+        assert_eq!(bash_view(&input), Some(("ls".to_owned(), None)));
+    }
+
+    #[test]
+    fn bash_view_rejects_a_missing_or_non_string_command() {
+        assert_eq!(bash_view(&serde_json::json!({"timeout": 5000})), None);
+        assert_eq!(bash_view(&serde_json::json!({"command": 42})), None);
+        assert_eq!(bash_view(&serde_json::json!("ls")), None);
+    }
 
     #[test]
     fn shows_a_turn_end_once() {

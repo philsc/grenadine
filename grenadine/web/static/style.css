@@ -1608,6 +1608,17 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A long summary keeps to one line so the spinner and duration after it
+   stay visible. */
+.approval p code,
+.tool summary code {
+  display: inline-block;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
 .tool-name {
   font-weight: 600;
 }
@@ -1623,6 +1634,39 @@ textarea {
   overflow-wrap: anywhere;
   max-height: 400px;
   overflow-y: auto;
+}
+.tool-input-wrap {
+  position: relative;
+}
+/* The wrap carries the separator; a wrapped pre is flush with it. */
+.tool > .tool-input-wrap {
+  border-top: 1px solid var(--border);
+}
+.tool-input-wrap > .tool-input {
+  border-top: none;
+  padding-right: 44px;
+}
+.tool-input-toggle {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: 1;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.tool-fields {
+  margin: 0;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .tool-result.error {
   color: var(--error-fg);
@@ -1666,11 +1710,15 @@ textarea {
   border-color: var(--warn-border);
   background: var(--warn-bg);
 }
-.approval .tool-input,
+.approval > .tool-input,
+.approval > .tool-input-wrap,
 .approval .edit-diff {
   margin: 6px 0;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+.approval > .tool-input-wrap {
+  overflow: hidden;
 }
 .approval .plan-text {
   margin: 6px 0;
