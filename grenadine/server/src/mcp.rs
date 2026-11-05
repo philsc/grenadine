@@ -830,6 +830,16 @@ mod tests {
 
         let id = crate::terminal::open(&state, &session).unwrap().id;
         let terminal = state.agents.terminals.get(ID, id).unwrap();
+        // The login shell is still starting up when the terminal opens,
+        // and a command typed before its first prompt shares that
+        // prompt's line.
+        for _ in 0..1500 {
+            if terminal.waiting_at_prompt() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(terminal.waiting_at_prompt(), "the shell never prompted");
         let (text, failed) = tool(&state, "read_terminal", json!({"terminal": id + 1})).await;
         assert!(
             failed && text == format!("Terminal {} isn't open.", id + 1),

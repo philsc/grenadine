@@ -243,6 +243,12 @@ impl Terminal {
         group == self.pid as libc::pid_t
     }
 
+    /// Whether the shell is at its prompt waiting for a command.
+    #[cfg(test)]
+    pub(crate) fn waiting_at_prompt(&self) -> bool {
+        self.at_prompt() && self.waiting_for_input() != Some(false)
+    }
+
     /// Whether the shell is blocked waiting for terminal input, or None
     /// where its syscall can't be read.
     fn waiting_for_input(&self) -> Option<bool> {
