@@ -637,30 +637,11 @@ async fn auto_reviews(AxState(state): St) -> ApiResult<Json<Vec<AutoReviewEntry>
 }
 
 async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
-    Ok(Json(with_unstaged(&state, state.db.agents()?).await?))
-}
-
-/// Counts the unstaged changes in the sessions' worktrees. A worktree git
-/// can't look at counts none, since the count isn't worth failing over.
-async fn with_unstaged(state: &State, sessions: Vec<AgentSession>) -> ApiResult<Vec<AgentSession>> {
-    let repos: Vec<_> = sessions.iter().map(|s| state.repo(&s.repo)).collect();
-    Ok(tokio::task::spawn_blocking(move || {
-        sessions
-            .into_iter()
-            .zip(repos)
-            .map(|(mut session, repo)| {
-                let worktree = std::path::Path::new(&session.worktree);
-                if let Some(repo) = repo.filter(|_| worktree.is_dir()) {
-                    match repo.worktree_unstaged_count(worktree) {
-                        Ok(n) => session.unstaged = n.try_into().unwrap_or(u32::MAX),
-                        Err(e) => tracing::warn!("agent {}: {e:#}", session.id),
-                    }
-                }
-                session
-            })
-            .collect()
-    })
-    .await?)
+    let mut sessions = state.db.agents()?;
+    for s in &mut sessions {
+        s.unstaged = state.agents.unstaged.get(&s.id);
+    }
+    Ok(Json(sessions))
 }
 
 /// The backends, with the models each offers.
@@ -769,7 +750,10 @@ fn find_agent(state: &State, id: &str) -> ApiResult<Option<AgentSession>> {
 
 async fn agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     Ok(match find_agent(&state, &id)? {
-        Some(a) => Json(with_unstaged(&state, vec![a]).await?.remove(0)).into_response(),
+        Some(mut a) => {
+            a.unstaged = state.agents.unstaged.get(&a.id);
+            Json(a).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     })
 }
@@ -1208,11 +1192,14 @@ mod tests {
                 .unwrap();
             list[0].unstaged
         };
+        assert!(crate::unstaged::recount(&state, id).await);
         assert_eq!(unstaged().await, 1);
+        assert!(!crate::unstaged::recount(&state, id).await);
 
         std::fs::remove_dir_all(&worktree).unwrap();
         let response = get(id).await.map_err(|e| e.0).unwrap();
         assert_eq!(body(response).await, r#"{"files":[]}"#);
+        assert!(crate::unstaged::recount(&state, id).await);
         assert_eq!(unstaged().await, 0);
 
         let response = get("00000000-0000-0000-0000-000000000001")

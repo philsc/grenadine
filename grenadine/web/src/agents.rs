@@ -79,6 +79,11 @@ pub(crate) fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
     expect_context()
 }
 
+/// The sessions, refetched when they change.
+pub(crate) fn sessions() -> LocalResource<api::Result<Vec<AgentSession>>> {
+    expect_context()
+}
+
 /// The models `backend` offers: `None` until the backends are in, an
 /// empty list when they can't be.
 pub(crate) fn listed_models(backend: Signal<AgentBackend>) -> Memo<Option<Vec<AgentModelInfo>>> {
@@ -386,18 +391,17 @@ pub fn Sidebar(
     /// The page shown, to highlight its session.
     route: Signal<Route>,
 ) -> impl IntoView {
-    let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
+    let all = sessions();
     // Reviews have a tab of their own.
-    let sessions = LocalResource::new(move || {
-        updates.agents.track();
-        async {
-            api::agents().await.map(|list| {
+    let sessions = Memo::new(move |_| {
+        all.get().map(|r| {
+            r.map(|list| {
                 list.into_iter()
                     .filter(|s| s.kind == SessionKind::Interactive)
                     .collect::<Vec<_>>()
             })
-        }
+        })
     });
     let drafts = expect_context::<Drafts>();
     // Only changes when a draft is added, removed or moved, so typing in

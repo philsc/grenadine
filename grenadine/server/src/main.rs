@@ -20,6 +20,7 @@ mod stack;
 mod summary;
 mod sync;
 mod terminal;
+mod unstaged;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -264,6 +265,8 @@ async fn main() -> Result<()> {
     ));
     // Shutting down doesn't wait for it; dropping it kills its claude.
     tokio::spawn(cleanup::prune_loop(state.clone()));
+    // Counts the sessions' unstaged changes off the request path.
+    tokio::spawn(unstaged::run(state.clone()));
     // Listing the backends' models can take a while, so it starts now
     // rather than with the first page or prompt.
     tokio::spawn({

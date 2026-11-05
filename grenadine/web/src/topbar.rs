@@ -156,10 +156,7 @@ pub fn Topbar(
     };
 
     // Sessions waiting on the user, and reviews whose session is kept.
-    let sessions = LocalResource::new(move || {
-        updates.agents.track();
-        api::agents()
-    });
+    let sessions = crate::agents::sessions();
     let waiting = move || {
         sessions
             .get()
