@@ -249,8 +249,10 @@ pub async fn handle(
                     updates, one entry per commit in commit order, bottom first; pull \
                     requests left out are closed and their branches deleted. Without \
                     `prs`, the commits map to the open pull requests by position, which \
-                    only works when commits were added on top. The pull requests are \
-                    kept as a GitHub stack where the repository has them turned on.",
+                    only works when commits were added on top. New pull requests should \
+                    be given a `branch` in `prs`, named following this repository's \
+                    branch naming conventions. The pull requests are kept as a GitHub \
+                    stack where the repository has them turned on.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -265,6 +267,14 @@ pub async fn handle(
                                             commit; `pr` omitted opens a new pull request.",
                                     },
                                     "pr": {"type": "integer"},
+                                    "branch": {
+                                        "type": "string",
+                                        "description": "The branch a new pull request is \
+                                            pushed from; only with `pr` omitted. Name it \
+                                            following this repository's branch naming \
+                                            conventions. Without it the branch is \
+                                            grenadine/agent/<session>.",
+                                    },
                                 },
                                 "required": ["commit"],
                             },
@@ -407,7 +417,7 @@ async fn update_prs(
         None => None,
         Some(prs) => Some(
             serde_json::from_value::<Vec<crate::pr_plan::PrSpec>>(prs.clone())
-                .context("`prs` must be a list of {commit, pr} objects")?,
+                .context("`prs` must be a list of {commit, pr, branch} objects")?,
         ),
     };
     let (landed, notes) = agent::land_now(state, id, WrapUpTarget::PullRequest, specs).await?;

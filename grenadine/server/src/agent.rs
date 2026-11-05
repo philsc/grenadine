@@ -98,6 +98,9 @@ enum Step {
     },
     /// Claude has to fix the worktree first, as `prompt` tells it.
     Ask { reason: String, prompt: String },
+    /// The agent picks the new pull requests' branch names first, as
+    /// `prompt` asks it to.
+    NameBranches { prompt: String },
     /// Each commit is on GitHub on its branch; the PRs that aren't open
     /// yet are opened next, the bottom one into `trunk`.
     Pushed {
@@ -1801,7 +1804,8 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
     let Some(pending) = state.agents.with_live(id, |l| l.wrap_up.clone()) else {
         return;
     };
-    let outcome = match land(state, id, pending.target, None).await {
+    let name_branches = pending.target == WrapUpTarget::PullRequest;
+    let outcome = match land(state, id, pending.target, None, name_branches).await {
         Ok(Step::Landed { landed, notes }) => {
             for note in &notes {
                 tracing::info!("agent {id}: {note}");
@@ -1814,6 +1818,13 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
                     w.asked = true;
                 }
             });
+            send(state, id, prompt, pending.mode, pending.model);
+            return;
+        }
+        // The agent names the new pull requests' branches itself: its
+        // update_prs call lands them, so the wrap-up is done here.
+        Ok(Step::NameBranches { prompt }) => {
+            state.agents.with_live(id, |l| l.wrap_up = None);
             send(state, id, prompt, pending.mode, pending.model);
             return;
         }
@@ -1887,14 +1898,14 @@ pub async fn land_now(
         WrapUpTarget::PullRequest => "update_prs",
         WrapUpTarget::Checkout => "land_on_checkout",
     };
-    match land(state, id, target, prs).await? {
+    match land(state, id, target, prs, false).await? {
         Step::Landed { landed, notes } => {
             record_landed(state, id, &landed)?;
             emit(state, id, AgentEventKind::Landed(landed.clone()))?;
             Ok((landed, notes))
         }
         Step::Ask { reason, prompt } => Err(ask_again(&reason, &prompt, tool)),
-        Step::Pushed { .. } => Err(pushed_unopened()),
+        Step::NameBranches { .. } | Step::Pushed { .. } => Err(pushed_unopened()),
     }
 }
 
@@ -1923,11 +1934,14 @@ fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
 
 /// One try at landing the session's work on `target`. `prs` maps the
 /// session's commits to its pull requests, as `update_prs` takes it.
+/// With `name_branches`, a plan that opens pull requests asks the agent
+/// to name their branches first.
 async fn land(
     state: &Arc<State>,
     id: &str,
     target: WrapUpTarget,
     prs: Option<Vec<PrSpec>>,
+    name_branches: bool,
 ) -> Result<Step> {
     let session = state
         .db
@@ -2010,7 +2024,16 @@ async fn land(
         tokio::task::spawn_blocking(move || match target {
             WrapUpTarget::Checkout => land_on_checkout(&repo, &session),
             WrapUpTarget::PullRequest => push_stack(
-                &repo, &session, pr_branch, &open, &merged, &heads, &taken, &closed, prs,
+                &repo,
+                &session,
+                pr_branch,
+                &open,
+                &merged,
+                &heads,
+                &taken,
+                &closed,
+                prs,
+                name_branches,
             ),
         })
         .await??
@@ -2463,7 +2486,9 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
 /// already on the target branch aren't the session's own and don't get
 /// pushed. `open` is the session's PRs still open on GitHub, bottom
 /// first; `merged` the ones that merged, with their head commits in
-/// `heads`. `specs` maps commits to PRs as `update_prs` takes it.
+/// `heads`. `specs` maps commits to PRs as `update_prs` takes it. When
+/// `name_branches`, a plan with a new pull request isn't pushed: the
+/// agent picks the new pull requests' branches first.
 #[allow(clippy::too_many_arguments)]
 fn push_stack(
     repo: &Repo,
@@ -2475,6 +2500,7 @@ fn push_stack(
     taken: &[String],
     closed: &[u64],
     specs: Option<Vec<PrSpec>>,
+    name_branches: bool,
 ) -> Result<Step> {
     let worktree = Path::new(&session.worktree);
     if let Some(reason) = repo.worktree_unfinished(worktree)? {
@@ -2597,6 +2623,65 @@ fn push_stack(
         closed,
         specs.as_deref(),
     )?;
+    let new: Vec<&Planned> = planned.iter().filter(|p| p.pr.is_none()).collect();
+    if name_branches && !new.is_empty() {
+        let json = serde_json::to_string(
+            &planned
+                .iter()
+                .map(|p| match &p.pr {
+                    Some(pr) => serde_json::json!({"commit": p.sha, "pr": pr.number}),
+                    None => serde_json::json!({"commit": p.sha}),
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let list = new
+            .iter()
+            .map(|p| {
+                format!(
+                    "- {} {}",
+                    short(&p.sha),
+                    p.message.lines().next().unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(Step::NameBranches {
+            prompt: format!(
+                "Wrap up: call the grenadine MCP server's update_prs tool with `prs` set to \
+                 `{json}`, giving each new pull request a `branch` that follows this \
+                 repository's branch naming conventions. The commits that need new pull \
+                 requests are:\n{list}"
+            ),
+        });
+    }
+    let branches: Vec<String> = new.iter().map(|p| p.branch.clone()).collect();
+    for branch in &branches {
+        if !repo.valid_branch_name(branch) {
+            bail!("`{branch}` isn't a valid branch name; pick another one for the `branch`");
+        }
+    }
+    // A branch may exist on GitHub without any PR of this session using
+    // it; pushing to it would move someone else's branch.
+    let existing: Vec<String> = repo
+        .remote_branches(&branches)?
+        .into_iter()
+        .filter(|b| !taken.contains(b))
+        .collect();
+    match existing.as_slice() {
+        [] => {}
+        [one] => bail!(
+            "the branch `{one}` already exists on GitHub and isn't one this session opened; \
+             pass `prs` with a different `branch` for the new pull request"
+        ),
+        many => bail!(
+            "the branches {} already exist on GitHub and aren't ones this session opened; \
+             pass `prs` with different `branch` names for the new pull requests",
+            many.iter()
+                .map(|b| format!("`{b}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
     let refs: Vec<(String, String)> = planned
         .iter()
         .map(|p| (p.sha.clone(), p.branch.clone()))
@@ -2649,7 +2734,9 @@ fn prs_note(session: &AgentSession) -> Option<String> {
         "Grenadine, the app running this session, keeps track of this session's pull \
          requests. To open them or update them, call the grenadine MCP server's update_prs \
          tool; to land this session's commits on the user's checkout of the repository, call \
-         its land_on_checkout tool. Don't `git push` or open pull requests any other way."
+         its land_on_checkout tool. When opening new pull requests, pass `prs` and give each \
+         new one a `branch` that follows this repository's branch naming conventions. Don't \
+         `git push` or open pull requests any other way."
             .into(),
     )
 }
@@ -3560,9 +3647,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     }
 
     /// Reads the prompt's text from the stream-json message on stdin into
-    /// `$prompt`, for fake claudes in shell. Only for text without quotes,
-    /// backslashes or newlines, which JSON would escape.
-    const READ_PROMPT: &str = r#"prompt=$(sed -n 's/.*"text":"\([^"]*\)".*/\1/p')"#;
+    /// `$prompt`, for fake claudes in shell. Escaped quotes are
+    /// unescaped; newlines stay escaped, so match single-line text.
+    const READ_PROMPT: &str =
+        r#"prompt=$(sed -n 's/.*"text":"\(\(\\.\|[^\\"]\)*\)".*/\1/p' | sed 's/\\"/"/g')"#;
 
     #[tokio::test]
     async fn runs_turns_in_a_worktree_and_resumes() {
@@ -3788,7 +3876,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
         let cwd = worktree.canonicalize().unwrap();
         assert_eq!(log.trim(), format!("{} 0 none", cwd.display()));
 
-        let err = land(&state, &session.id, WrapUpTarget::Checkout, None)
+        let err = land(&state, &session.id, WrapUpTarget::Checkout, None, false)
             .await
             .unwrap_err()
             .to_string();
@@ -4858,11 +4946,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit b agent").await;
 
         // The test state's GitHub is unreachable, so only the push works.
-        let event = wrap(&state, &session.id, WrapUpTarget::PullRequest).await;
-        let AgentEventKind::WrapUpFailed(e) = event else {
-            panic!("{event:?}");
-        };
-        assert!(!e.contains("no commits"), "{e}");
+        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("no commits"), "{err:#}");
         let worktree = Path::new(&session.worktree);
         assert_eq!(
             run(
@@ -4888,7 +4975,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             PermissionMode::from("auto"),
             None,
         );
-        // What's left uncommitted becomes a third commit.
+        // What's left uncommitted becomes a third commit once the
+        // wrap-up asks the agent to commit it; the retried wrap-up then
+        // asks it to name the new pull requests' branches instead of
+        // pushing.
         send(
             &state,
             id,
@@ -4898,15 +4988,37 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
         wait_for_turns(&state, id, 3).await;
 
-        // The test state's GitHub is unreachable, so only the push works.
-        let event = wrap(&state, id, WrapUpTarget::PullRequest).await;
-        assert!(
-            matches!(event, AgentEventKind::WrapUpFailed(_)),
-            "{event:?}"
-        );
+        wrap(&state, id, WrapUpTarget::PullRequest).await;
         let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
-        assert!(log.contains(PR_COMMIT_PROMPT), "{log}");
+        let commit_at = log
+            .find(PR_COMMIT_PROMPT)
+            .unwrap_or_else(|| panic!("{log}"));
+        let naming_at = log
+            .find("giving each new pull request a `branch`")
+            .unwrap_or_else(|| panic!("{log}"));
+        assert!(commit_at < naming_at, "{log}");
+        // The naming handoff ends the wrap-up without a failure, and
+        // nothing was pushed yet.
+        assert!(state.agents.with_live(id, |l| l.wrap_up.is_none()));
+        assert!(
+            state
+                .db
+                .agent_events(id)
+                .unwrap()
+                .iter()
+                .all(|e| !matches!(e.kind, AgentEventKind::WrapUpFailed(_)))
+        );
+        assert_eq!(
+            run(&fx.upstream, &["for-each-ref", "--format=%(refname)"]),
+            "refs/heads/main"
+        );
+
+        // The agent's update_prs then pushes. The test state's GitHub is
+        // unreachable, so only the push works.
         let worktree = Path::new(&session.worktree);
+        land_now(&state, id, WrapUpTarget::PullRequest, None)
+            .await
+            .unwrap_err();
         let tip = |branch: &str| {
             run(
                 &fx.upstream,
@@ -4922,6 +5034,195 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(
             tip(&format!("{branch}-3")),
             run(worktree, &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// A `prs` entry's `branch` names the remote branch a new pull
+    /// request's commit is pushed to.
+    #[tokio::test]
+    async fn pushes_to_the_branch_the_agent_picked() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let worktree = Path::new(&session.worktree);
+        let sha = run(worktree, &["rev-parse", "HEAD"]);
+        let specs = vec![PrSpec {
+            commit: sha.clone(),
+            pr: None,
+            branch: Some("dev/someone/topic".into()),
+        }];
+
+        // The test state's GitHub is unreachable, so only the push works.
+        land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            run(&fx.upstream, &["rev-parse", "refs/heads/dev/someone/topic"]),
+            sha
+        );
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/heads/{}", session.branch)
+                ],
+            ),
+            ""
+        );
+    }
+
+    /// A `branch` that already exists on GitHub without being one of the
+    /// session's is refused: pushing to it would move someone else's
+    /// branch.
+    #[tokio::test]
+    async fn refuses_a_branch_already_on_github() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let worktree = Path::new(&session.worktree);
+        run(&fx.upstream, &["branch", "dev/someone/taken"]);
+        let specs = vec![PrSpec {
+            commit: run(worktree, &["rev-parse", "HEAD"]),
+            pr: None,
+            branch: Some("dev/someone/taken".into()),
+        }];
+
+        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("already exists on GitHub"), "{text}");
+        assert!(text.contains("dev/someone/taken"), "{text}");
+    }
+
+    /// A `branch` that isn't a valid ref name is refused before anything
+    /// is pushed.
+    #[tokio::test]
+    async fn refuses_an_invalid_branch_name() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let worktree = Path::new(&session.worktree);
+        let specs = vec![PrSpec {
+            commit: run(worktree, &["rev-parse", "HEAD"]),
+            pr: None,
+            branch: Some("bad..name".into()),
+        }];
+
+        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("isn't a valid branch name"),
+            "{err:#}"
+        );
+        assert_eq!(
+            run(&fx.upstream, &["for-each-ref", "--format=%(refname)"]),
+            "refs/heads/main"
+        );
+    }
+
+    /// The page's wrap-up hands the naming of the new pull requests'
+    /// branches to the agent instead of pushing.
+    #[tokio::test]
+    async fn wrap_up_asks_the_agent_to_name_branches() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+
+        wrap(&state, &session.id, WrapUpTarget::PullRequest).await;
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(
+            log.contains("giving each new pull request a `branch`"),
+            "{log}"
+        );
+        assert!(log.contains("update_prs"), "{log}");
+        // Nothing was pushed; the agent's update_prs call lands the PRs.
+        assert_eq!(
+            run(&fx.upstream, &["for-each-ref", "--format=%(refname)"]),
+            "refs/heads/main"
+        );
+        assert!(state.agents.with_live(&session.id, |l| l.wrap_up.is_none()));
+    }
+
+    /// A wrap-up whose plan only updates open pull requests pushes as
+    /// before, without asking the agent for branch names.
+    #[tokio::test]
+    async fn wrap_up_updates_open_prs_without_naming() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+
+        let event = wrap(&state, id, WrapUpTarget::PullRequest).await;
+        assert_eq!(event, AgentEventKind::Landed(pr));
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        assert!(!log.contains("update_prs tool with `prs`"), "{log}");
+        let worktree = Path::new(&session.worktree);
+        assert_eq!(
+            run(
+                &fx.upstream,
+                &["rev-parse", &format!("refs/heads/{}", session.branch)]
+            ),
+            run(worktree, &["rev-parse", "HEAD"])
+        );
+    }
+
+    /// The naming prompt carries the `prs` mapping to pass: each commit
+    /// bottom first, with `pr` where it updates an open pull request.
+    #[tokio::test]
+    async fn wrap_up_names_branches_with_an_open_pr() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+        send(
+            &state,
+            id,
+            "commit c more".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, id, 2).await;
+
+        wrap(&state, id, WrapUpTarget::PullRequest).await;
+        let log = std::fs::read_to_string(dir.path().join("log")).unwrap();
+        let bottom = run(worktree, &["rev-parse", "HEAD~"]);
+        let top = run(worktree, &["rev-parse", "HEAD"]);
+        let json = format!("[{{\"commit\":\"{bottom}\",\"pr\":24}},{{\"commit\":\"{top}\"}}]");
+        assert!(log.contains(&format!("`prs` set to `{json}`")), "{log}");
+        // The agent's update_prs call hasn't happened yet, so nothing
+        // was pushed.
+        assert_eq!(
+            run(&fx.upstream, &["for-each-ref", "--format=%(refname)"]),
+            "refs/heads/main"
         );
     }
 

@@ -19,6 +19,10 @@ pub struct PrSpec {
     pub commit: String,
     #[serde(default)]
     pub pr: Option<u64>,
+    /// The branch a new pull request's commit is pushed to; only with
+    /// `pr` omitted.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// One commit of the stack and the PR it goes into: an open one of the
@@ -117,6 +121,12 @@ pub fn plan_prs(
                         i + 1
                     );
                 }
+                if let (Some(number), Some(_)) = (spec.pr, &spec.branch) {
+                    bail!(
+                        "a pull request's branch can't change; drop `branch` from the entry \
+                         for #{number}"
+                    );
+                }
             }
             Some(specs)
         }
@@ -131,12 +141,30 @@ pub fn plan_prs(
                 dropped[open.iter().position(|o| o.number == pr.number).unwrap()] = false;
                 pr.branch.clone()
             }
-            // A fresh branch: any branch a PR of the session ever used
-            // may still be that PR's head.
-            None => (0..)
-                .map(|k| stack_branch(session_branch, k))
-                .find(|b| !taken.contains(b) && !branches.contains(b))
-                .unwrap(),
+            None => match specs.and_then(|s| s[i].branch.clone()) {
+                // A branch the agent picked: it must be new, like a
+                // generated one.
+                Some(branch) => {
+                    if branches.contains(&branch) {
+                        bail!("two pull requests can't share the branch `{branch}`");
+                    }
+                    // Any branch a PR of the session ever used may still
+                    // be that PR's head.
+                    if taken.contains(&branch) {
+                        bail!(
+                            "a pull request of this session already uses the branch `{branch}`; \
+                             pick another one"
+                        );
+                    }
+                    branch
+                }
+                // A fresh branch: any branch a PR of the session ever used
+                // may still be that PR's head.
+                None => (0..)
+                    .map(|k| stack_branch(session_branch, k))
+                    .find(|b| !taken.contains(b) && !branches.contains(b))
+                    .unwrap(),
+            },
         };
         branches.push(branch.clone());
         planned.push(Planned {
@@ -280,6 +308,14 @@ mod tests {
         PrSpec {
             commit: sha.into(),
             pr,
+            branch: None,
+        }
+    }
+
+    fn spec_branch(sha: &str, branch: &str) -> PrSpec {
+        PrSpec {
+            branch: Some(branch.into()),
+            ..spec(sha, None)
         }
     }
 
@@ -512,6 +548,91 @@ mod tests {
         let specs = [spec(&commits[0].0, Some(24)), spec(&commits[1].0, Some(24))];
         let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap_err();
         assert!(format!("{e:#}").contains("#24"), "{e:#}");
+    }
+
+    /// A new PR's `branch` names the branch its commit is pushed to;
+    /// without it the stack's next branch name is generated.
+    #[test]
+    fn custom_branches() {
+        let commits = commits(3);
+        let open = [pr(24, "b")];
+        let specs = [
+            spec(&commits[0].0, Some(24)),
+            spec_branch(&commits[1].0, "dev/me/topic"),
+            spec(&commits[2].0, None),
+        ];
+        assert_eq!(
+            plan(plan_prs(
+                "b",
+                &commits,
+                &open,
+                &taken(&open),
+                &[],
+                Some(&specs)
+            )),
+            (
+                vec![
+                    ("b".into(), Some(24)),
+                    ("dev/me/topic".into(), None),
+                    ("b-2".into(), None),
+                ],
+                vec![]
+            )
+        );
+    }
+
+    /// `branch` only goes with a new PR, since an open one's branch is
+    /// already set.
+    #[test]
+    fn branch_with_a_pr_errors() {
+        let commits = commits(2);
+        let open = [pr(24, "b"), pr(25, "b-2")];
+        let specs = [
+            PrSpec {
+                branch: Some("dev/me/topic".into()),
+                ..spec(&commits[0].0, Some(24))
+            },
+            spec(&commits[1].0, Some(25)),
+        ];
+        let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(text.contains("branch can't change"), "{text}");
+        assert!(text.contains("#24"), "{text}");
+    }
+
+    /// Two new PRs can't get the same branch, whether two entries name
+    /// it or one names a branch the plan already generated.
+    #[test]
+    fn duplicate_branches_error() {
+        let commits = commits(2);
+        let specs = [
+            spec_branch(&commits[0].0, "dev/me/topic"),
+            spec_branch(&commits[1].0, "dev/me/topic"),
+        ];
+        let e = plan_prs("b", &commits, &[], &[], &[], Some(&specs)).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("can't share the branch `dev/me/topic`"),
+            "{text}"
+        );
+
+        let specs = [spec(&commits[0].0, None), spec_branch(&commits[1].0, "b")];
+        let e = plan_prs("b", &commits, &[], &[], &[], Some(&specs)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("can't share the branch `b`"),
+            "{e:#}"
+        );
+    }
+
+    /// A branch a PR of the session already used can't name a new one.
+    #[test]
+    fn taken_branch_errors() {
+        let commits = commits(1);
+        let open = [pr(24, "b")];
+        let specs = [spec_branch(&commits[0].0, "b")];
+        let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(text.contains("already uses the branch `b`"), "{text}");
     }
 
     /// An abbreviated SHA names its commit too.
