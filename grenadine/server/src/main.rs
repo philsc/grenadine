@@ -22,6 +22,30 @@ mod sync;
 mod terminal;
 mod unstaged;
 
+#[cfg(test)]
+mod test_util {
+    /// Writes `contents` to `path` as an executable, from a child
+    /// process: a write fd open in the test process leaks into the
+    /// children other test threads fork, and exec'ing the file while
+    /// it's held open for writing fails with "Text file busy".
+    pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
+        use std::io::Write as _;
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
