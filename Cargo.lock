@@ -1003,6 +1003,7 @@ dependencies = [
  "grenadine_core",
  "libc",
  "pty-process",
+ "pulldown-cmark",
  "reqwest",
  "rusqlite",
  "rustls",

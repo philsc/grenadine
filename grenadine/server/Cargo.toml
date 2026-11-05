@@ -23,6 +23,7 @@ futures.workspace = true
 grenadine_core = { path = "../core" }
 libc.workspace = true
 pty-process.workspace = true
+pulldown-cmark.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 rustls.workspace = true

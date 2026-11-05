@@ -39,9 +39,6 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// `until` to end, unless Claude says otherwise.
 const IDLE: Duration = Duration::from_secs(3);
 
-/// The largest image `show_image` shows.
-const MAX_IMAGE: u64 = 20 << 20;
-
 /// The tools agents may use without asking: all of this server's but
 /// `approve`, which answers for a permission request.
 pub const ALLOWED_TOOLS: [&str; 6] = [
@@ -360,39 +357,11 @@ fn seconds(value: &Value) -> Option<Duration> {
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
 }
 
-/// The MIME type of an image in a format browsers show, from its first
-/// bytes.
-fn image_mime(data: &[u8]) -> Option<&'static str> {
-    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if data.starts_with(b"GIF8") {
-        Some("image/gif")
-    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
 /// Puts the image at `args.path` into the session's transcript.
 async fn show_image(state: &State, id: &str, args: &Value) -> anyhow::Result<String> {
     let path = args["path"].as_str().context("`path` is required")?;
     let session = state.db.agent(id)?.context("The session is gone.")?;
-    let path = std::path::Path::new(&session.worktree).join(path);
-    let size = tokio::fs::metadata(&path)
-        .await
-        .with_context(|| format!("Can't read {}", path.display()))?
-        .len();
-    if size > MAX_IMAGE {
-        bail!("{} is larger than {} MB.", path.display(), MAX_IMAGE >> 20);
-    }
-    let data = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("Can't read {}", path.display()))?;
-    let mime = image_mime(&data)
-        .with_context(|| format!("{} isn't a PNG, JPEG, GIF or WebP image.", path.display()))?;
+    let (mime, data) = agent::read_image(&session.worktree, path)?;
     let image = agent::store_image(state, id, mime, &data)?;
     let caption = args["caption"]
         .as_str()
