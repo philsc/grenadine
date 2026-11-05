@@ -40,6 +40,9 @@ from grenadine.testing.fake_github import (
 
 # How long the server may take to start listening.
 STARTUP_TIMEOUT = 30
+# The first poll searches and syncs every PR of the class's scenario,
+# which takes a while on a loaded machine.
+FIRST_POLL_TIMEOUT = 120
 
 
 def devin_scenario(tmp: Path) -> dict:
@@ -648,6 +651,11 @@ class ServerTestCase(unittest.TestCase):
         )
         cls.start_server()
         cls.addClassCleanup(cls.stop_server)
+        # Tests assert state that only the first poll fills, so it must
+        # have finished before the first one runs. The wait lives here
+        # rather than in start_server because the restart test reuses
+        # start_server without needing a poll to have finished.
+        cls.wait_for_first_poll()
 
         cls.playwright = sync_playwright().start()
         cls.addClassCleanup(cls.playwright.stop)
@@ -680,6 +688,18 @@ class ServerTestCase(unittest.TestCase):
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(0.1)
+
+    @classmethod
+    def wait_for_first_poll(cls) -> None:
+        """Waits until the server's first GitHub poll has finished."""
+        deadline = time.monotonic() + FIRST_POLL_TIMEOUT
+        while True:
+            with urllib.request.urlopen(f"{cls.url}api/sync") as resp:
+                if json.load(resp)["last_finished"] is not None:
+                    return
+            if time.monotonic() > deadline:
+                raise RuntimeError("the server's first poll never finished")
+            time.sleep(0.1)
 
     def setUp(self) -> None:
         # Each page gets its own context, so local storage starts empty.
