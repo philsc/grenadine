@@ -636,7 +636,7 @@ class FakeGitHub:
 
     def _handle(self, req: BaseHTTPRequestHandler, method: str) -> None:
         url = urllib.parse.urlsplit(req.path)
-        self.requests.append(f"{method} {url.path}")
+        self.requests.append(f"{method} {req.path}")
         if req.headers.get("Authorization") != f"Bearer {TOKEN}":
             return _reply(req, 401, {"message": "Bad credentials"}, self.rate_limit)
         body = req.rfile.read(int(req.headers.get("Content-Length") or 0))
@@ -912,6 +912,14 @@ class FakeGitHub:
     # GraphQL.
 
     def graphql(self, request: dict[str, Any]) -> dict[str, Any]:
+        # A query that names a PR gets recorded by it, so tests can tell
+        # which PRs the server asked about; the rest stay "POST /graphql".
+        variables = request.get("variables") or {}
+        if "pullRequest(number:" in request["query"] and "number" in variables:
+            self.requests.append(
+                f"graphql pr {variables['owner']}/{variables['name']}"
+                f"#{variables['number']}"
+            )
         result = graphql_sync(
             SCHEMA,
             request["query"],

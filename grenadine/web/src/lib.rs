@@ -169,8 +169,10 @@ fn refetch_sync(updates: Updates) {
     });
 }
 
-/// Subscribes to the server's events for the life of the page.
-fn listen(updates: Updates) {
+/// Subscribes to the server's events for the life of the page. `url`
+/// carries the watched PR, so that the server syncs the PR the page
+/// shows.
+fn listen(updates: Updates, url: Signal<String>) {
     let on_message = move |data: String| match serde_json::from_str::<ServerEvent>(&data) {
         Ok(ServerEvent::InboxesChanged) => {
             updates.inboxes.update(|n| *n += 1);
@@ -204,7 +206,19 @@ fn listen(updates: Updates) {
         updates.auto_reviews.update(|n| *n += 1);
         refetch_sync(updates);
     };
-    events::subscribe("/api/events".into(), on_message, on_open);
+    events::subscribe(url, on_message, on_open);
+}
+
+/// The events URL for the route: a PR page watches its PR, every other
+/// page watches nothing.
+fn events_url(route: &Route) -> String {
+    match route {
+        Route::Pr(key) => format!(
+            "/api/events?watch={}",
+            js_sys::encode_uri_component(&format!("pr/{}/{}", key.repo, key.number))
+        ),
+        _ => "/api/events".into(),
+    }
 }
 
 fn pr_of(route: &Route) -> Option<PrKey> {
@@ -227,7 +241,6 @@ fn App() -> impl IntoView {
         auto_reviews: RwSignal::new(0),
     };
     provide_context(updates);
-    listen(updates);
 
     let initial = route_from_hash(&current_hash());
     let open = match &initial {
@@ -252,6 +265,10 @@ fn App() -> impl IntoView {
         api::agents()
     }));
     let route = RwSignal::new(open_draft(initial, drafts));
+    // A Memo so the connection only reopens when the URL actually
+    // changes, e.g. between two PR pages.
+    let url = Memo::new(move |_| route.with(events_url));
+    listen(updates, url.into());
     // The PR shown most recently, highlighted when going back to the inboxes.
     let last = RwSignal::new(route.with_untracked(pr_of));
     let handle = window_event_listener_untyped("hashchange", move |_| {

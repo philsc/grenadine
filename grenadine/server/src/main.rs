@@ -279,6 +279,7 @@ async fn main() -> Result<()> {
         sync_status: std::sync::Mutex::default(),
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
+        watched: std::sync::Mutex::new(BTreeMap::new()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         shutdown: shutdown.clone(),

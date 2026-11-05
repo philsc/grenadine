@@ -55,14 +55,16 @@ fn main() {}
 """
 
 
-def default_inboxes() -> list[tuple[str, str, bool]]:
-    """The `(name, filter, count_in_total)` triples of the server's default
-    inboxes, read from its source so that they can't drift."""
+def default_inboxes() -> list[tuple[str, str, bool, bool]]:
+    """The `(name, filter, count_in_total, sync_in_background)` tuples of
+    the server's default inboxes, read from its source so that they can't
+    drift."""
     src = (Path(__file__).parents[1] / "server/src/inboxes.rs").read_text()
     return [
-        (name, filter, counted == "true")
-        for name, filter, counted in re.findall(
-            r'name:\s*"([^"]*)",\s*filter:\s*"([^"]*)",\s*count_in_total:\s*(true|false)',
+        (name, filter, counted == "true", background == "true")
+        for name, filter, counted, background in re.findall(
+            r'name:\s*"([^"]*)",\s*filter:\s*"([^"]*)",\s*count_in_total:\s*(true|false),'
+            r"\s*sync_in_background:\s*(true|false)",
             src,
         )
     ]
@@ -230,7 +232,7 @@ class Inboxes:
     def titles_in(self, inbox: str) -> list[str]:
         """The titles `inbox` should list, in its own order."""
         prs = [self.prs[t] for t, i in self.expected.items() if inbox in i]
-        filter = next(f for n, f, _ in default_inboxes() if n == inbox)
+        filter = next(f for n, f, *_ in default_inboxes() if n == inbox)
         if "gr:sort:title-asc" in filter:
             return [pr.title for pr in sorted(prs, key=lambda pr: pr.title.lower())]
         return [

@@ -227,8 +227,10 @@ fn missing(what: PrMissing) -> Response {
 }
 
 /// The PR's detail, or why there is none. A configured repository's PR
-/// that no inbox covers is synced on demand: asking for it kicks off a
-/// background sync and the page refetches on the PrChanged event.
+/// that no background-syncing inbox covers is synced when a page's event
+/// stream watches it; a never-synced one gets a sync on the first
+/// request so a direct link works before the stream is up. The page
+/// refetches on the PrChanged event.
 async fn pr(
     AxState(state): St,
     Path((owner, name, number)): Path<(String, String, u64)>,
@@ -240,9 +242,10 @@ async fn pr(
     if !state.repos.contains_key(&key.repo) {
         return Ok(missing(PrMissing::NotConfigured));
     }
-    // A PR no inbox covers gets a sync on every request, cached or not;
-    // `sync_once` dedupes while one is already running.
-    if !state.db.in_any_inbox(&key)? {
+    // A watched PR's resyncs come from the watch, so a request only
+    // syncs a PR that was never synced; `sync_once` dedupes it against
+    // the watch's own.
+    if !state.db.in_background_inbox(&key)? && state.db.sync_mark(&key)?.is_none() {
         state.sync_once(key.clone());
     }
     if let Some(pr) = state.db.pr(&key)? {
@@ -539,7 +542,8 @@ async fn unresolve_thread(
 
 /// Syncs the PR's stack-mates that changed since their last sync, going by
 /// what the stack says about them, so that clicking through the stack is
-/// fast. Stack-mates in an inbox are left to the poller.
+/// fast. Stack-mates in a background-syncing inbox are left to the
+/// poller.
 fn prefetch_stack(state: &Arc<State>, pr: &PrDetail) -> ApiResult<()> {
     let Some(stack) = &pr.stack else {
         return Ok(());
@@ -559,7 +563,7 @@ fn prefetch_stack(state: &Arc<State>, pr: &PrDetail) -> ApiResult<()> {
             .db
             .sync_mark(&key)?
             .is_none_or(|m| m.updated_at < mate.updated_at);
-        if stale && !state.db.in_any_inbox(&key)? {
+        if stale && !state.db.in_background_inbox(&key)? {
             state.sync_once(key);
         }
     }
@@ -645,8 +649,48 @@ fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> 
     )
 }
 
-async fn events(AxState(state): St) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(event_stream(&state)).keep_alive(keep_alive())
+/// The PR keys a `watch` parameter names: `pr/<owner>/<name>/<number>`.
+/// Malformed values and unconfigured repositories are ignored.
+fn watch_keys(state: &State, query: &[(String, String)]) -> Vec<PrKey> {
+    query
+        .iter()
+        .filter(|(k, _)| k == "watch")
+        .filter_map(|(_, v)| v.strip_prefix("pr/"))
+        .filter_map(|v| {
+            let (repo, number) = v.rsplit_once('/')?;
+            let key = PrKey {
+                repo: repo.to_owned(),
+                number: number.parse().ok()?,
+            };
+            state.repos.contains_key(&key.repo).then_some(key)
+        })
+        .collect()
+}
+
+/// The SSE stream of server events. `watch` parameters register the PRs
+/// the page is showing for the life of the stream; a watched PR the
+/// background inboxes don't cover gets a sync, however often it synced
+/// before, and the polls keep it fresh while it's watched.
+async fn events(
+    AxState(state): St,
+    Query(query): Query<Vec<(String, String)>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let keys = watch_keys(&state, &query);
+    for key in &keys {
+        // A database error doesn't block the stream; it only skips the
+        // watch's sync.
+        if !state.db.in_background_inbox(key).unwrap_or(true) {
+            state.sync_once(key.clone());
+        }
+    }
+    // The guard lives in the stream's map closure, so a dropped
+    // connection, a closed tab or a reload unregisters the watch.
+    let watch = state.watch(keys);
+    let stream = event_stream(&state).map(move |event| {
+        let _guard = &watch;
+        event
+    });
+    Sse::new(stream).keep_alive(keep_alive())
 }
 
 /// The configured repositories, for the page's repository pickers.
@@ -1181,6 +1225,61 @@ mod tests {
         assert!(matches!(next, Ok(None)));
     }
 
+    /// A watch registers while its stream lives and unregisters when the
+    /// stream ends; two streams on the same PR keep it watched until
+    /// both end.
+    #[tokio::test]
+    async fn watches_follow_their_streams() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let key = PrKey {
+            repo: "owner/name".into(),
+            number: 7,
+        };
+        let query = || Query(vec![("watch".to_owned(), "pr/owner/name/7".to_owned())]);
+        let one = events(AxState(state.clone()), query()).await;
+        let two = events(AxState(state.clone()), query()).await;
+        assert_eq!(
+            state.watched(),
+            std::collections::BTreeSet::from([key.clone()])
+        );
+        drop(one);
+        assert!(state.watched().contains(&key));
+        drop(two);
+        assert!(state.watched().is_empty());
+    }
+
+    /// Malformed watch values and unconfigured repositories watch
+    /// nothing.
+    #[tokio::test]
+    async fn malformed_watches_are_ignored() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let stream = events(
+            AxState(state.clone()),
+            Query(vec![
+                ("watch".into(), "bogus".into()),
+                ("watch".into(), "pr/owner/name".into()),
+                ("watch".into(), "pr/owner/name/abc".into()),
+                ("watch".into(), "pr/other/repo/7".into()),
+                ("other".into(), "pr/owner/name/7".into()),
+            ]),
+        )
+        .await;
+        assert!(state.watched().is_empty());
+        drop(stream);
+    }
+
     #[tokio::test]
     async fn sync_status_returns_the_snapshot() {
         let state = crate::sync::test_state();
@@ -1499,11 +1598,12 @@ mod tests {
         assert!(body(response).await.contains("sync_failed"));
     }
 
-    /// Even a cached PR gets a fresh on-demand sync when no inbox covers
-    /// it: the dead test API makes the background sync fail and the error
-    /// lands on the PR.
+    /// A cached PR that no background inbox covers isn't resynced on a
+    /// plain request: its resyncs come from a page watching it. The dead
+    /// test API would make a sync fail, so an error showing up means one
+    /// ran.
     #[tokio::test]
-    async fn cached_non_inbox_pr_resyncs_on_demand() {
+    async fn cached_non_inbox_pr_is_not_resynced() {
         let fx = crate::git::tests::fixture();
         let cloned = Arc::new(crate::sync::ClonedRepo {
             repo: fx.clone.clone(),
@@ -1551,13 +1651,9 @@ mod tests {
         .map_err(|e| e.0)
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        for _ in 0..50 {
-            if state.db.pr_sync_error(&key).unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(state.db.pr_sync_error(&key).unwrap().is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(state.on_demand.lock().unwrap().is_empty());
+        assert!(state.db.pr_sync_error(&key).unwrap().is_none());
     }
 
     /// Opening a PR syncs its stack-mates that no inbox covers; the dead
@@ -1898,5 +1994,60 @@ mod tests {
         assert_eq!(body(response).await, r#""not_synced""#);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(state.on_demand.lock().unwrap().is_empty());
+    }
+
+    /// A PR that only an inbox without background sync covers syncs on
+    /// its first request, like one in no inbox.
+    #[tokio::test]
+    async fn off_inbox_pr_syncs_on_first_request() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let key = PrKey {
+            repo: "owner/name".into(),
+            number: 7,
+        };
+        // Inbox 2 doesn't sync in background.
+        state
+            .db
+            .set_inbox_results(
+                2,
+                Ok(&[crate::github::Hit {
+                    key: key.clone(),
+                    title: "t".into(),
+                    author: "a".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    queued: false,
+                    url: "u".into(),
+                    updated_at: "u".into(),
+                    head_oid: "h".into(),
+                    threads: Default::default(),
+                    ci: None,
+                    review_decision: None,
+                    facts: Default::default(),
+                }]),
+                None,
+            )
+            .unwrap();
+        let response = pr(
+            AxState(state.clone()),
+            Path(("owner".into(), "name".into(), 7)),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(body(response).await, r#""not_synced""#);
+        for _ in 0..50 {
+            if state.db.pr_sync_error(&key).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(state.db.pr_sync_error(&key).unwrap().is_some());
     }
 }

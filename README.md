@@ -116,24 +116,24 @@ Each inbox has a "count in total" setting. The top bar's Inboxes tab and the bro
 
 ## Default inboxes
 
-A new database starts with these inboxes. The ones marked "total" count in the total.
+A new database starts with these inboxes. The ones marked "total" count in the total. The ones marked "sync" sync in the background; an inbox without that mark is listed from its search results, and its PRs sync when you open them.
 
-| Inbox                    | Total | Filter                                                                                                                                                    |
-| ------------------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Needs your review        | yes   | `state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc`                                                |
-| Needs your teams' review |       | `state:open archived:false draft:false team-review-requested-user:@me -user-review-requested:@me sort:updated-desc`                                       |
-| Returned to you          | yes   | `state:open archived:false draft:false author:@me -is:queued ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc` |
-| Approved                 | yes   | `state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed sort:updated-desc`         |
-| Merging                  |       | `state:open archived:false draft:false author:@me is:queued sort:updated-desc`                                                                            |
-| Drafts                   |       | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                       |
-| Drafts from others       |       | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                            |
-| Waiting for reviewers    |       | `state:open archived:false draft:false author:@me -is:queued -gr:review:active -review:approved sort:updated-desc`                                        |
-| All my open PRs          |       | `state:open archived:false author:@me sort:updated-desc`                                                                                                  |
-| Waiting for author       |       | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                               |
-| Merged by me             |       | `state:closed archived:false author:@me sort:updated-desc`                                                                                                |
-| Merged by others         |       | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                |
-| All open PRs             |       | `state:open archived:false -is:queued sort:updated-desc`                                                                                                  |
-| Unmerged PRs on mine     |       | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                    |
+| Inbox                    | Total | Sync | Filter                                                                                                                                                    |
+| ------------------------ | ----- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Needs your review        | yes   | yes  | `state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc`                                                |
+| Needs your teams' review |       |      | `state:open archived:false draft:false team-review-requested-user:@me -user-review-requested:@me sort:updated-desc`                                       |
+| Returned to you          | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc` |
+| Approved                 | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed sort:updated-desc`         |
+| Merging                  |       |      | `state:open archived:false draft:false author:@me is:queued sort:updated-desc`                                                                            |
+| Drafts                   |       |      | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                       |
+| Drafts from others       |       |      | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                            |
+| Waiting for reviewers    |       |      | `state:open archived:false draft:false author:@me -is:queued -gr:review:active -review:approved sort:updated-desc`                                        |
+| All my open PRs          |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                  |
+| Waiting for author       |       |      | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                               |
+| Merged by me             |       |      | `state:closed archived:false author:@me sort:updated-desc`                                                                                                |
+| Merged by others         |       |      | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                |
+| All open PRs             |       |      | `state:open archived:false -is:queued sort:updated-desc`                                                                                                  |
+| Unmerged PRs on mine     |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                    |
 
 Your open PRs that aren't drafts each appear in exactly one of Returned to you, Approved, Merging and Waiting for reviewers:
 

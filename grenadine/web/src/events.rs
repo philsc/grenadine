@@ -89,11 +89,12 @@ struct State {
     last_check: f64,
 }
 
-/// Follows the event stream at `url` for the life of the current owner.
-/// `on_message` gets each message's data, and `on_open` runs on every
-/// (re)connect, so that it can refetch whatever was missed.
+/// Follows the event stream at `url` for the life of the current owner;
+/// a new `url` closes the connection and opens a new one. `on_message`
+/// gets each message's data, and `on_open` runs on every (re)connect, so
+/// that it can refetch whatever was missed.
 pub fn subscribe(
-    url: String,
+    url: Signal<String>,
     on_message: impl FnMut(String) + 'static,
     on_open: impl FnMut() + 'static,
 ) {
@@ -102,12 +103,26 @@ pub fn subscribe(
         on_message: RefCell::new(Box::new(on_message)),
         on_open: RefCell::new(Box::new(on_open)),
     });
-    let connection = Connection::open(&url, &handlers);
+    let connection = Connection::open(&url.get_untracked(), &handlers);
     let state = StoredValue::new_local(State {
-        url,
+        url: url.get_untracked(),
         handlers,
         connection,
         last_check: now(),
+    });
+
+    // A new URL replaces the connection; the new one's `on_open`
+    // refetches, which covers what a missed message would have.
+    Effect::new(move |_| {
+        let url = url.get();
+        state.try_update_value(|s| {
+            if s.url != url {
+                s.connection = None;
+                s.url = url;
+                s.handlers.last_seen.set(now());
+                s.connection = Connection::open(&s.url, &s.handlers);
+            }
+        });
     });
 
     let check = move || {

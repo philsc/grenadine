@@ -1655,7 +1655,11 @@ fn follow(
     // Text streamed on a connection that died is incomplete; the replay
     // brings the finished message.
     let on_open = move || push(Incoming::Opened);
-    crate::events::subscribe(format!("/api/agents/{id}/events"), on_message, on_open);
+    crate::events::subscribe(
+        format!("/api/agents/{id}/events").into(),
+        on_message,
+        on_open,
+    );
 }
 
 /// `command` without a leading `cd` into `worktree`, which changes nothing
