@@ -89,7 +89,7 @@ fn syntax_for<'a>(set: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference>
         })
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -501,6 +501,12 @@ mod tests {
         }
         assert_eq!(steps, RUST.lines().count());
         assert_eq!(lines.finish(RUST), expected);
+    }
+
+    #[test]
+    fn bash_and_json_tokens_highlight() {
+        assert!(highlight_code("bash", "ls -la | wc").is_some());
+        assert!(highlight_code("json", "{\"a\": 1}").is_some());
     }
 
     #[test]

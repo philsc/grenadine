@@ -2623,6 +2623,17 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-text")).to_contain_text("On it.")
         approval = transcript.locator(".approval")
         expect(approval).to_contain_text("Devin wants to use Bash")
+        # The call shows its command highlighted, not the raw JSON.
+        tool_input = approval.locator(".tool-input")
+        expect(tool_input).to_contain_text("touch note.txt")
+        expect(tool_input.locator('span[class*="sy-"]').first).to_be_visible()
+        expect(tool_input).not_to_contain_text('"command":')
+        # The toggle swaps it for the raw JSON and back.
+        toggle = approval.get_by_role("button", name="JSON")
+        toggle.click()
+        expect(tool_input).to_contain_text('"command":')
+        toggle.click()
+        expect(tool_input).not_to_contain_text('"command":')
         # Devin's options render as a button each.
         approval.get_by_role("button", name="Allow").click()
         expect(approval).to_contain_text("Allowed Bash")
@@ -3013,6 +3024,10 @@ class AgentTest(ServerTestCase):
                 tool = tools.nth(i)
                 tool.locator("summary").click()
                 expect(tool.locator(".tool-result")).to_contain_text(f"result {i}:")
+                # A Bash call shows its command highlighted, not raw JSON.
+                tool_input = tool.locator(".tool-input")
+                expect(tool_input).to_contain_text(f"step {i}")
+                expect(tool_input.locator('span[class*="sy-"]').first).to_be_visible()
                 tool.locator("summary").click()
 
         # As it streams in.
