@@ -154,6 +154,22 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(8)]
 }
 
+/// What the page says for a PR that hasn't synced yet. While background
+/// syncs are paused to keep GitHub's rate limit, the poller won't sync it
+/// until the reset.
+fn pending_message(key: &PrKey, paused_until: Option<i64>, now: i64) -> String {
+    if let Some(t) = paused_until.filter(|&t| t > now) {
+        format!(
+            "{}#{} hasn't synced yet. It may be waiting for GitHub's rate limit to reset at {}.",
+            key.repo,
+            key.number,
+            crate::topbar::hm(t)
+        )
+    } else {
+        format!("{}#{} hasn't synced yet", key.repo, key.number)
+    }
+}
+
 #[component]
 pub fn PrView(key: PrKey) -> impl IntoView {
     let updates = expect_context::<Updates>();
@@ -244,7 +260,12 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         match pr.get() {
         None => view! { <main class="main"><div class="empty">"Loading…"</div></main> }.into_any(),
         Some(Err(e)) => view! { <main class="main"><div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div></main> }.into_any(),
-        Some(Ok(api::PrResponse::Pending)) => view! { <main class="main"><div class="empty">{format!("{}#{} hasn't synced yet", key.repo, key.number)}</div></main> }.into_any(),
+        Some(Ok(api::PrResponse::Pending)) => {
+            // The closure reads `updates.sync` so only this text, not the
+            // whole view, re-renders when the sync status changes.
+            let key = key.clone();
+            view! { <main class="main"><div class="empty">{move || pending_message(&key, updates.sync.with(|s| s.paused_until), (js_sys::Date::now() / 1000.0) as i64)}</div></main> }.into_any()
+        }
         Some(Ok(api::PrResponse::NotConfigured)) => view! {
             <main class="main"><div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
         }.into_any(),
@@ -1402,5 +1423,42 @@ mod tests {
         // A queued flag on a merged PR means nothing.
         assert_eq!(state_label("MERGED", true), "merged");
         assert_eq!(state_label("CLOSED", false), "closed");
+    }
+
+    #[test]
+    fn pending_message_is_plain_without_a_pause() {
+        let key = PrKey {
+            repo: "o/r".into(),
+            number: 7,
+        };
+        assert_eq!(pending_message(&key, None, 100), "o/r#7 hasn't synced yet");
+    }
+
+    #[test]
+    fn pending_message_names_the_reset_while_paused() {
+        let key = PrKey {
+            repo: "o/r".into(),
+            number: 7,
+        };
+        // 14:39 UTC, how the non-wasm `hm` renders it.
+        let t = 14 * 3600 + 39 * 60;
+        assert_eq!(
+            pending_message(&key, Some(t), t - 1),
+            "o/r#7 hasn't synced yet. It may be waiting for GitHub's rate limit to reset at 14:39."
+        );
+    }
+
+    #[test]
+    fn pending_message_is_plain_once_the_pause_passed() {
+        let key = PrKey {
+            repo: "o/r".into(),
+            number: 7,
+        };
+        let t = 14 * 3600 + 39 * 60;
+        assert_eq!(pending_message(&key, Some(t), t), "o/r#7 hasn't synced yet");
+        assert_eq!(
+            pending_message(&key, Some(t), t + 1),
+            "o/r#7 hasn't synced yet"
+        );
     }
 }
