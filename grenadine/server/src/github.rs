@@ -942,30 +942,38 @@ impl GitHub {
         Ok(())
     }
 
-    /// Updates `kind`'s window on `resource` from the response's headers.
-    /// `repos` are the `owner/name` repos the request named.
+    /// Records the response's headers on the counter they came from and
+    /// returns what they reported, if anything. `repos` are the
+    /// `owner/name` repos the request named.
     fn saw_headers(
         &self,
         resource: ApiResource,
         kind: &'static str,
         repos: &[String],
         headers: &header::HeaderMap,
-    ) {
-        if let Some(state) = limit_from_headers(headers) {
-            let state = LimitState {
-                seen: chrono::Utc::now().timestamp(),
-                ..state
-            };
-            self.usage
-                .lock()
-                .unwrap()
-                .saw(resource, kind, repos.to_vec(), state);
-        }
+    ) -> Option<LimitState> {
+        let state = limit_from_headers(headers)?;
+        let state = LimitState {
+            seen: chrono::Utc::now().timestamp(),
+            ..state
+        };
+        self.usage
+            .lock()
+            .unwrap()
+            .saw(resource, kind, repos.to_vec(), state);
+        Some(state)
     }
 
-    /// Logs a request that was sent, `points` what it cost where the
-    /// response says.
-    fn logged(&self, kind: &'static str, resource: ApiResource, points: Option<u32>, at: i64) {
+    /// Logs a request that was sent, `points` what it cost and `reset`
+    /// which counter answered it where the response says.
+    fn logged(
+        &self,
+        kind: &'static str,
+        resource: ApiResource,
+        points: Option<u32>,
+        at: i64,
+        reset: Option<i64>,
+    ) {
         self.usage.lock().unwrap().log(ratelimit::Entry {
             at,
             kind,
@@ -973,6 +981,7 @@ impl GitHub {
             priority: ratelimit::current(),
             points,
             deferred: false,
+            reset,
         });
     }
 
@@ -981,7 +990,7 @@ impl GitHub {
     fn check_exhausted(
         &self,
         resource: ApiResource,
-        kind: &'static str,
+        reported: Option<LimitState>,
         resp: reqwest::Response,
     ) -> Result<reqwest::Response> {
         let status = resp.status();
@@ -990,7 +999,7 @@ impl GitHub {
         {
             return Ok(resp);
         }
-        let Some(state) = self.usage.lock().unwrap().state(resource, kind) else {
+        let Some(state) = reported else {
             return Ok(resp);
         };
         if state.remaining != 0 {
@@ -1038,16 +1047,17 @@ impl GitHub {
             .json(&json!({ "query": query, "variables": variables }))
             .send()
             .await?;
-        self.saw_headers(ApiResource::GraphQl, kind, repos, resp.headers());
+        let reported = self.saw_headers(ApiResource::GraphQl, kind, repos, resp.headers());
+        let reset = reported.map(|s| s.reset);
         // A refused or failed response still counts at GitHub, so it's
         // logged too.
         let resp = match self
-            .check_exhausted(ApiResource::GraphQl, kind, resp)
+            .check_exhausted(ApiResource::GraphQl, reported, resp)
             .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
         {
             Ok(resp) => resp,
             Err(e) => {
-                self.logged(kind, ApiResource::GraphQl, None, at);
+                self.logged(kind, ApiResource::GraphQl, None, at, reset);
                 return Err(e);
             }
         };
@@ -1056,7 +1066,7 @@ impl GitHub {
             .pointer("/data/rateLimit/cost")
             .and_then(Value::as_u64)
             .map(|p| p as u32);
-        self.logged(kind, ApiResource::GraphQl, points, at);
+        self.logged(kind, ApiResource::GraphQl, points, at, reset);
         let errors = resp
             .get("errors")
             .and_then(Value::as_array)
@@ -1066,13 +1076,7 @@ impl GitHub {
             .iter()
             .any(|e| e["type"].as_str() == Some("RATE_LIMITED"))
         {
-            let until = self
-                .usage
-                .lock()
-                .unwrap()
-                .state(ApiResource::GraphQl, kind)
-                .map(|s| s.reset)
-                .unwrap_or(at + 3600);
+            let until = reset.unwrap_or(at + 3600);
             return Err(RateLimited {
                 resource: ApiResource::GraphQl,
                 until,
@@ -1765,20 +1769,21 @@ impl GitHub {
             .json(&json!({ "head": head, "base": base, "title": title, "body": body }))
             .send()
             .await?;
-        self.saw_headers(
+        let reported = self.saw_headers(
             ApiResource::Rest,
             "create_pr",
             &url_repos(&url),
             resp.headers(),
         );
-        let resp = match self.check_exhausted(ApiResource::Rest, "create_pr", resp) {
+        let reset = reported.map(|s| s.reset);
+        let resp = match self.check_exhausted(ApiResource::Rest, reported, resp) {
             Ok(resp) => resp,
             Err(e) => {
-                self.logged("create_pr", ApiResource::Rest, None, at);
+                self.logged("create_pr", ApiResource::Rest, None, at, reset);
                 return Err(e);
             }
         };
-        self.logged("create_pr", ApiResource::Rest, None, at);
+        self.logged("create_pr", ApiResource::Rest, None, at, reset);
         let status = resp.status();
         let v: Value = resp.json().await.unwrap_or_default();
         if !status.is_success() {
@@ -1812,20 +1817,21 @@ impl GitHub {
         self.admit(kind, ApiResource::Rest)?;
         let at = chrono::Utc::now().timestamp();
         let resp = req.send().await?;
-        self.saw_headers(
+        let reported = self.saw_headers(
             ApiResource::Rest,
             kind,
             std::slice::from_ref(&repo.to_owned()),
             resp.headers(),
         );
-        let resp = match self.check_exhausted(ApiResource::Rest, kind, resp) {
+        let reset = reported.map(|s| s.reset);
+        let resp = match self.check_exhausted(ApiResource::Rest, reported, resp) {
             Ok(resp) => resp,
             Err(e) => {
-                self.logged(kind, ApiResource::Rest, None, at);
+                self.logged(kind, ApiResource::Rest, None, at, reset);
                 return Err(e);
             }
         };
-        self.logged(kind, ApiResource::Rest, None, at);
+        self.logged(kind, ApiResource::Rest, None, at, reset);
         Ok(resp)
     }
 
@@ -1934,20 +1940,22 @@ impl GitHub {
             self.admit(kind, ApiResource::Rest)?;
             let at = chrono::Utc::now().timestamp();
             let resp = self.http.get(&url).send().await?;
-            self.saw_headers(ApiResource::Rest, kind, &url_repos(&url), resp.headers());
+            let reported =
+                self.saw_headers(ApiResource::Rest, kind, &url_repos(&url), resp.headers());
+            let reset = reported.map(|s| s.reset);
             let resp = match self
-                .check_exhausted(ApiResource::Rest, kind, resp)
+                .check_exhausted(ApiResource::Rest, reported, resp)
                 .and_then(|r| r.error_for_status().map_err(anyhow::Error::from))
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    self.logged(kind, ApiResource::Rest, None, at);
+                    self.logged(kind, ApiResource::Rest, None, at, reset);
                     return Err(e);
                 }
             };
             next = next_link(resp.headers());
             out.extend(resp.json::<Vec<T>>().await?);
-            self.logged(kind, ApiResource::Rest, None, at);
+            self.logged(kind, ApiResource::Rest, None, at, reset);
         }
         Ok(out)
     }

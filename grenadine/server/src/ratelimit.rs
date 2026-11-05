@@ -3,10 +3,11 @@
 //!
 //! Requests run under a priority from a task-local: the viewer's own
 //! actions always go, inbox searches pause below a tenth of the limit,
-//! background syncs below a fifth. Every response's `x-ratelimit-*`
-//! headers update the window tracked for that request's kind — GitHub
-//! reports different budgets to different requests — and every request
-//! lands in an hour-long log that the Debug tab reads.
+//! background syncs below a fifth. GitHub answers each response from
+//! one of a few independent counters per resource, each with its own
+//! `x-ratelimit-reset` window, so the states are kept per counter —
+//! matched by the reported reset — and every request lands in an
+//! hour-long log that the Debug tab reads.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -90,16 +91,19 @@ pub struct Entry {
     pub points: Option<u32>,
     /// Held back without being sent.
     pub deferred: bool,
+    /// The reset the response's headers reported, `None` for deferred
+    /// requests and responses without headers.
+    pub reset: Option<i64>,
 }
 
-/// What a `GitHub` has seen of its limits and spent, per request kind.
+/// What a `GitHub` has seen of its limits and spent, per counter.
 /// In memory only; it starts over on a restart.
 #[derive(Default)]
 pub struct Usage {
-    /// GitHub reports different budgets to different requests, so the
-    /// state is kept per request kind.
-    states: States,
-    seq: u64,
+    /// GitHub answers each response from one of a few independent
+    /// counters per resource, each with its own window; the counter a
+    /// response came from is told by its `reset`.
+    counters: Vec<(ApiResource, LimitState)>,
     log: VecDeque<Entry>,
     /// The last responses' reports, oldest first.
     reports: VecDeque<RateLimitReport>,
@@ -111,16 +115,15 @@ const WINDOW: i64 = 3600;
 /// How many reports are kept for the Debug tab.
 const REPORTS: usize = 100;
 
-/// A state per (resource, request kind), the u64 ordering same-second
-/// reports.
-type States = BTreeMap<(ApiResource, &'static str), (LimitState, u64)>;
-
-/// The states of the kinds that report one window.
-type KindStates = Vec<(&'static str, LimitState, u64)>;
+/// GitHub's reported reset can wobble by a second between two responses
+/// from the same counter.
+const RESET_SLACK: i64 = 2;
 
 impl Usage {
     /// Records `state` for `resource`, from a `kind` response's headers.
-    /// `repos` are the `owner/name` repos the request named.
+    /// `repos` are the `owner/name` repos the request named. The state
+    /// joins the live counter whose reset matches within `RESET_SLACK`,
+    /// keeping the highest `used` seen, or starts a new counter.
     pub fn saw(
         &mut self,
         resource: ApiResource,
@@ -128,8 +131,16 @@ impl Usage {
         repos: Vec<String>,
         state: LimitState,
     ) {
-        self.seq += 1;
-        self.states.insert((resource, kind), (state, self.seq));
+        self.counters.retain(|(_, s)| state.seen < s.reset);
+        match self
+            .counters
+            .iter_mut()
+            .find(|(r, s)| *r == resource && (s.reset - state.reset).abs() <= RESET_SLACK)
+        {
+            Some((_, s)) if state.used >= s.used => *s = state,
+            Some(_) => {}
+            None => self.counters.push((resource, state)),
+        }
         self.reports.push_back(RateLimitReport {
             at: state.seen,
             resource,
@@ -145,14 +156,6 @@ impl Usage {
         }
     }
 
-    /// The last state `kind`'s responses on `resource` reported.
-    pub fn state(&self, resource: ApiResource, kind: &str) -> Option<LimitState> {
-        self.states
-            .iter()
-            .find(|&(&(r, k), _)| r == resource && k == kind)
-            .map(|(_, &(s, _))| s)
-    }
-
     /// Logs a request that was sent.
     pub fn log(&mut self, entry: Entry) {
         self.prune(entry.at);
@@ -166,11 +169,12 @@ impl Usage {
         }
     }
 
-    /// Lets `priority`'s request of `kind` go, or refuses it when the
-    /// window's remainder is below the tier's reserve. A refused request
-    /// is logged as deferred and must not be sent. Once the reset has
-    /// passed everything goes again; the next response refreshes the
-    /// state.
+    /// Lets `priority`'s request of `kind` go, or refuses it when a
+    /// live counter's remainder is below the tier's reserve: the
+    /// most-spent counter decides. A refused request is logged as
+    /// deferred and must not be sent. Once the reset has passed
+    /// everything goes again; the next response refreshes the
+    /// counter.
     pub fn admit(
         &mut self,
         kind: &'static str,
@@ -178,7 +182,13 @@ impl Usage {
         priority: RequestPriority,
         now: i64,
     ) -> Result<(), RateLimited> {
-        if let Some(until) = self.denied(resource, kind, priority, now) {
+        let until = self
+            .counters
+            .iter()
+            .filter(|(r, _)| *r == resource)
+            .filter_map(|(_, s)| Self::denied_state(s, priority, now))
+            .max();
+        if let Some(until) = until {
             self.log(Entry {
                 at: now,
                 kind,
@@ -186,23 +196,11 @@ impl Usage {
                 priority,
                 points: None,
                 deferred: true,
+                reset: None,
             });
             return Err(RateLimited { resource, until });
         }
         Ok(())
-    }
-
-    /// The reset time when `priority`'s `kind` request on `resource`
-    /// would be refused now, else `None`.
-    fn denied(
-        &self,
-        resource: ApiResource,
-        kind: &'static str,
-        priority: RequestPriority,
-        now: i64,
-    ) -> Option<i64> {
-        let &(s, _) = self.states.get(&(resource, kind))?;
-        Self::denied_state(&s, priority, now)
     }
 
     /// The reset time when `s` refuses `priority` now, else `None`.
@@ -218,25 +216,19 @@ impl Usage {
         (s.remaining <= reserve).then_some(s.reset)
     }
 
-    /// The reset time when `priority` is paused on a window it uses, the
-    /// latest if several are, else `None`. Searches are only refused
-    /// where a kind they actually send is, read off the log.
+    /// The latest reset among the live counters that refuse `priority`,
+    /// else `None`. Searches are GraphQL only, so a spent REST counter
+    /// doesn't pause them.
     pub fn paused_until(&self, priority: RequestPriority, now: i64) -> Option<i64> {
-        self.states
+        self.counters
             .iter()
-            .filter(|&(&(_, kind), _)| {
-                priority != RequestPriority::Search
-                    || self
-                        .log
-                        .iter()
-                        .any(|e| e.kind == kind && e.priority == RequestPriority::Search)
-            })
-            .filter_map(|(&(resource, kind), _)| self.denied(resource, kind, priority, now))
+            .filter(|(r, _)| priority != RequestPriority::Search || *r == ApiResource::GraphQl)
+            .filter_map(|(_, s)| Self::denied_state(s, priority, now))
             .max()
     }
 
-    /// What the Debug tab shows: the known limits, the last hour grouped
-    /// by kind and the last hour minute by minute.
+    /// What the Debug tab shows: the live counters, the last hour
+    /// grouped by kind and the last hour minute by minute.
     pub fn snapshot(&mut self, now: i64) -> GitHubUsage {
         self.prune(now);
         let mut groups: BTreeMap<(ApiResource, &'static str, RequestPriority), RequestKindUsage> =
@@ -291,61 +283,50 @@ impl Usage {
             RequestPriority::Search,
             RequestPriority::User,
         ];
-        // The states of one window, grouped into the budgets GitHub
-        // reports: a gap in `used` of over a twentieth of the limit
-        // means two budgets.
-        let mut windows: BTreeMap<(ApiResource, i64), KindStates> = BTreeMap::new();
-        for (&(resource, kind), &(s, seq)) in &self.states {
-            if now < s.reset {
-                windows
-                    .entry((resource, s.reset))
-                    .or_default()
-                    .push((kind, s, seq));
-            }
-        }
         let mut limits = Vec::new();
-        for ((resource, reset), mut states) in windows {
-            states.sort_by_key(|(_, s, _)| s.used);
-            for group in states.chunk_by(|a, b| b.1.used - a.1.used <= b.1.limit / 20) {
-                let s = group
-                    .iter()
-                    .max_by_key(|(_, s, seq)| (s.seen, seq))
-                    .map(|(_, s, _)| s)
-                    .unwrap();
-                let kinds: Vec<&str> = {
-                    let mut k: Vec<&str> = group.iter().map(|(k, _, _)| *k).collect();
-                    k.sort_unstable();
-                    k
-                };
-                let since = reset - WINDOW;
-                let ours = self
-                    .log
-                    .iter()
-                    .filter(|e| {
-                        e.resource == resource
-                            && kinds.contains(&e.kind)
-                            && !e.deferred
-                            && e.at >= since
-                    })
-                    .map(|e| match resource {
-                        ApiResource::GraphQl => e.points.unwrap_or(0),
-                        ApiResource::Rest => 1,
-                    })
-                    .sum();
-                limits.push(RateLimitInfo {
-                    resource,
-                    limit: s.limit,
-                    remaining: s.remaining,
-                    used: s.used,
-                    reset: s.reset,
-                    kinds: kinds.iter().map(|k| k.to_string()).collect(),
-                    ours,
-                    paused: TIERS
-                        .into_iter()
-                        .filter(|&p| Self::denied_state(s, p, now).is_some())
-                        .collect(),
-                });
+        for &(resource, s) in &self.counters {
+            if now >= s.reset {
+                continue;
             }
+            let since = s.reset - WINDOW;
+            let ours = self
+                .log
+                .iter()
+                .filter(|e| {
+                    e.resource == resource
+                        && !e.deferred
+                        && e.at >= since
+                        && e.reset.is_some_and(|r| (r - s.reset).abs() <= RESET_SLACK)
+                })
+                .map(|e| match resource {
+                    ApiResource::GraphQl => e.points.unwrap_or(0),
+                    ApiResource::Rest => 1,
+                })
+                .sum();
+            let responses = self
+                .reports
+                .iter()
+                .filter(|r| r.resource == resource)
+                .count() as u32;
+            let answered = self
+                .reports
+                .iter()
+                .filter(|r| r.resource == resource && (r.reset - s.reset).abs() <= RESET_SLACK)
+                .count() as u32;
+            limits.push(RateLimitInfo {
+                resource,
+                limit: s.limit,
+                remaining: s.remaining,
+                used: s.used,
+                reset: s.reset,
+                answered,
+                responses,
+                ours,
+                paused: TIERS
+                    .into_iter()
+                    .filter(|&p| Self::denied_state(&s, p, now).is_some())
+                    .collect(),
+            });
         }
         limits.sort_by_key(|l| (l.resource, l.remaining));
         GitHubUsage {
@@ -382,6 +363,26 @@ mod tests {
             state(limit, remaining, reset),
         );
         u
+    }
+
+    /// Logs a request that ran at `at` on a counter resetting at `reset`.
+    fn sent(
+        u: &mut Usage,
+        resource: ApiResource,
+        kind: &'static str,
+        points: u32,
+        at: i64,
+        reset: i64,
+    ) {
+        u.log(Entry {
+            at,
+            kind,
+            resource,
+            priority: RequestPriority::Background,
+            points: (resource == ApiResource::GraphQl).then_some(points),
+            deferred: false,
+            reset: Some(reset),
+        });
     }
 
     fn admit(u: &mut Usage, priority: RequestPriority, now: i64) -> Result<(), RateLimited> {
@@ -450,23 +451,92 @@ mod tests {
 
     #[test]
     fn paused_until_reports_the_pause() {
-        let u = usage("pr", 5000, 700, 3700);
-        assert_eq!(u.paused_until(RequestPriority::Background, 100), Some(3700));
-        assert_eq!(u.paused_until(RequestPriority::Search, 100), None);
-        assert_eq!(u.paused_until(RequestPriority::Background, 3700), None);
+        let now = 100;
+        let u = &mut usage("pr", 5000, 400, 3700);
+        assert_eq!(u.paused_until(RequestPriority::Background, now), Some(3700));
+        assert_eq!(u.paused_until(RequestPriority::Search, now), Some(3700));
+        assert_eq!(u.paused_until(RequestPriority::User, now), None);
 
-        // A spent REST limit doesn't pause searches: no search kind
-        // sent a REST request yet.
+        // A spent REST counter pauses background syncs but not searches:
+        // searches are GraphQL only.
+        u.saw(ApiResource::Rest, "activity", vec![], state(60, 0, 4000));
+        assert_eq!(u.paused_until(RequestPriority::Search, now), Some(3700));
+        assert_eq!(u.paused_until(RequestPriority::Background, now), Some(4000));
+
+        // Nothing is paused past the resets.
+        assert_eq!(u.paused_until(RequestPriority::Background, 4000), None);
+        assert_eq!(u.paused_until(RequestPriority::Search, 3700), None);
+    }
+
+    #[test]
+    fn one_counter_keeps_the_highest_used() {
+        let now = 10_000;
+        let reset = now + 1800;
         let mut u = Usage::default();
-        u.saw(ApiResource::Rest, "activity", vec![], state(60, 0, 3700));
-        assert_eq!(u.paused_until(RequestPriority::Search, 100), None);
-        assert_eq!(u.paused_until(RequestPriority::Background, 100), Some(3700));
+        for (used, reset, seen) in [(1000, reset, 1), (990, reset, 2), (1010, reset + 1, 3)] {
+            // A reset that wobbles by a second is the same counter.
+            let mut s = state(5000, 5000 - used, reset);
+            s.seen = now - seen;
+            u.saw(ApiResource::GraphQl, "pr", vec![], s);
+        }
+        let snap = u.snapshot(now);
+        assert_eq!(snap.limits.len(), 1);
+        assert_eq!(snap.limits[0].used, 1010);
+        assert_eq!(snap.limits[0].answered, 3);
+        assert_eq!(snap.limits[0].responses, 3);
+    }
+
+    #[test]
+    fn the_most_spent_counter_decides() {
+        let now = 100;
+        let reset_a = 3700;
+        let mut u = Usage::default();
+        // Counter A is nearly out; counter B, its reset a little later,
+        // has plenty left.
+        u.saw(
+            ApiResource::GraphQl,
+            "pr",
+            vec![],
+            state(5000, 400, reset_a),
+        );
+        u.saw(
+            ApiResource::GraphQl,
+            "review_threads",
+            vec![],
+            state(5000, 3600, reset_a + 34),
+        );
+        for kind in ["pr", "search"] {
+            for priority in [RequestPriority::Search, RequestPriority::Background] {
+                assert_eq!(
+                    u.admit(kind, ApiResource::GraphQl, priority, now)
+                        .unwrap_err()
+                        .until,
+                    reset_a
+                );
+            }
+            u.admit(kind, ApiResource::GraphQl, RequestPriority::User, now)
+                .unwrap();
+        }
+
+        // A healthy report from B doesn't lift the pause.
+        u.saw(
+            ApiResource::GraphQl,
+            "pr",
+            vec![],
+            state(5000, 4000, reset_a + 34),
+        );
+        admit(&mut u, RequestPriority::Background, now).unwrap_err();
+
+        // Past A's reset it has expired and everything goes again.
+        admit(&mut u, RequestPriority::Search, reset_a).unwrap();
+        admit(&mut u, RequestPriority::Background, reset_a).unwrap();
     }
 
     #[test]
     fn snapshots_group_sort_and_prune() {
         let now = 10_000;
-        let mut u = usage("pr", 5000, 4500, now + 1800);
+        let reset = now + 1800;
+        let mut u = usage("pr", 5000, 4500, reset);
         // Older than an hour: gone.
         u.log(Entry {
             at: now - 3600,
@@ -475,8 +545,10 @@ mod tests {
             priority: RequestPriority::Background,
             points: Some(100),
             deferred: false,
+            reset: Some(reset),
         });
-        // Inside both the log's hour and the limit's window (reset-3600).
+        // Inside both the log's hour and the counter's window
+        // (reset-3600).
         let at = now - 1000;
         for (kind, priority, points) in [
             ("pr", RequestPriority::Background, 4),
@@ -484,25 +556,22 @@ mod tests {
             ("search", RequestPriority::Search, 3),
             ("activity", RequestPriority::Background, 0),
         ] {
+            let resource = if kind == "activity" {
+                ApiResource::Rest
+            } else {
+                ApiResource::GraphQl
+            };
             u.log(Entry {
                 at,
                 kind,
-                resource: if kind == "activity" {
-                    ApiResource::Rest
-                } else {
-                    ApiResource::GraphQl
-                },
+                resource,
                 priority,
                 points: (kind != "activity").then_some(points),
                 deferred: false,
+                reset: Some(reset),
             });
         }
-        u.saw(
-            ApiResource::Rest,
-            "activity",
-            vec![],
-            state(60, 55, now + 1800),
-        );
+        u.saw(ApiResource::Rest, "activity", vec![], state(60, 55, reset));
         let snap = u.snapshot(now);
         assert_eq!(snap.kinds.len(), 3);
         // Sorted by points desc: pr (6) then search (3) then activity.
@@ -520,126 +589,83 @@ mod tests {
         assert_eq!(snap.minutes[i].graphql_points, 9);
         assert_eq!(snap.minutes[i].rest_requests, 1);
 
-        // `ours` counts only this window and this budget's kinds.
+        // `ours` counts only this window and this counter's entries.
         let gql = snap
             .limits
             .iter()
             .find(|l| l.resource == ApiResource::GraphQl)
             .unwrap();
-        assert_eq!(gql.ours, 6);
-        assert_eq!(gql.kinds, ["pr"]);
+        assert_eq!(gql.ours, 9);
         let rest = snap
             .limits
             .iter()
             .find(|l| l.resource == ApiResource::Rest)
             .unwrap();
         assert_eq!(rest.ours, 1);
-        assert_eq!(rest.kinds, ["activity"]);
     }
 
     #[test]
-    fn kinds_have_their_own_windows() {
-        let now = 100;
-        let reset = 3700;
-        // GitHub reports different budgets to different kinds: "pr" is
-        // nearly out, "search" is fine.
-        let mut u = usage("search", 5000, 4000, reset);
-        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 900, reset));
-        u.admit("pr", ApiResource::GraphQl, RequestPriority::Background, now)
-            .unwrap_err();
-        u.admit(
-            "search",
-            ApiResource::GraphQl,
-            RequestPriority::Background,
-            now,
-        )
-        .unwrap();
-        u.admit("search", ApiResource::GraphQl, RequestPriority::Search, now)
-            .unwrap();
-
-        // A low "search" window holds searches even after a kind with
-        // a healthy budget reported more recently; it goes once its
-        // own reset passes.
+    fn snapshots_have_one_limit_per_counter() {
+        let now = 10_000;
+        let reset_a = now + 1800;
+        let reset_b = reset_a + 34;
+        let mut u = Usage::default();
         u.saw(
             ApiResource::GraphQl,
-            "search",
+            "pr",
             vec![],
-            state(5000, 400, reset),
+            state(5000, 3600, reset_b),
         );
-        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 4000, reset));
-        u.admit("search", ApiResource::GraphQl, RequestPriority::Search, now)
-            .unwrap_err();
-        u.admit(
-            "search",
+        u.saw(
             ApiResource::GraphQl,
-            RequestPriority::Search,
-            reset,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn paused_until_uses_the_kinds_a_tier_sends() {
-        let now = 100;
-        let reset = 3700;
-        let mut u = usage("search", 5000, 4000, reset);
-        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 900, reset));
-        // A Search-priority request ran under the "search" kind, so
-        // only its window counts for searches.
-        u.log(Entry {
-            at: now,
-            kind: "search",
-            resource: ApiResource::GraphQl,
-            priority: RequestPriority::Search,
-            points: Some(3),
-            deferred: false,
-        });
-        assert_eq!(u.paused_until(RequestPriority::Search, now), None);
-        assert_eq!(
-            u.paused_until(RequestPriority::Background, now),
-            Some(reset)
+            "pr",
+            vec![],
+            state(5000, 400, reset_a),
         );
-        // Even "pr" fully spent doesn't pause searches: they don't send
-        // it.
-        u.saw(ApiResource::GraphQl, "pr", vec![], state(5000, 0, reset));
-        assert_eq!(u.paused_until(RequestPriority::Search, now), None);
-    }
-
-    #[test]
-    fn snapshots_group_states_into_budgets() {
-        let now = 10_000;
-        let reset = now + 1800;
-        let mut u = Usage::default();
-        for (kind, used, seen) in [
-            ("search", 1100, 2),
-            ("users", 1120, 1),
-            ("pr", 3000, 4),
-            ("review_threads", 3040, 3),
-        ] {
-            let mut s = state(5000, 5000 - used, reset);
-            s.seen = now - seen;
-            u.saw(ApiResource::GraphQl, kind, vec![], s);
-            u.log(Entry {
-                at: now - 100,
-                kind,
-                resource: ApiResource::GraphQl,
-                priority: RequestPriority::Background,
-                points: Some(10),
-                deferred: false,
-            });
-        }
+        u.saw(
+            ApiResource::Rest,
+            "activity",
+            vec![],
+            state(60, 55, now + 2000),
+        );
+        // The requests' resets say which counter answered them; a
+        // request without headers counts for none.
+        sent(&mut u, ApiResource::GraphQl, "pr", 10, now - 100, reset_a);
+        sent(&mut u, ApiResource::GraphQl, "pr", 20, now - 100, reset_b);
+        u.log(Entry {
+            at: now - 100,
+            kind: "pr",
+            resource: ApiResource::GraphQl,
+            priority: RequestPriority::Background,
+            points: Some(5),
+            deferred: false,
+            reset: None,
+        });
+        sent(
+            &mut u,
+            ApiResource::Rest,
+            "activity",
+            0,
+            now - 100,
+            now + 2000,
+        );
         let snap = u.snapshot(now);
-        assert_eq!(snap.limits.len(), 2);
-        // Sorted by remaining ascending: the spent budget first.
-        let spent = &snap.limits[0];
-        assert_eq!(spent.kinds, ["pr", "review_threads"]);
-        // Numbers come from the newest-seen member, "review_threads".
-        assert_eq!(spent.used, 3040);
-        assert_eq!(spent.ours, 20);
-        let fine = &snap.limits[1];
-        assert_eq!(fine.kinds, ["search", "users"]);
-        assert_eq!(fine.used, 1120);
-        assert_eq!(fine.ours, 20);
+        assert_eq!(snap.limits.len(), 3);
+        // The most-spent GraphQL counter comes first.
+        assert_eq!(snap.limits[0].reset, reset_a);
+        assert_eq!(snap.limits[0].used, 4600);
+        assert_eq!(snap.limits[0].ours, 10);
+        assert_eq!(snap.limits[0].answered, 1);
+        assert_eq!(snap.limits[0].responses, 2);
+        assert_eq!(snap.limits[1].reset, reset_b);
+        assert_eq!(snap.limits[1].used, 1400);
+        assert_eq!(snap.limits[1].ours, 20);
+        assert_eq!(snap.limits[1].answered, 1);
+        let rest = &snap.limits[2];
+        assert_eq!(rest.resource, ApiResource::Rest);
+        assert_eq!(rest.ours, 1);
+        assert_eq!(rest.answered, 1);
+        assert_eq!(rest.responses, 1);
     }
 
     #[test]
