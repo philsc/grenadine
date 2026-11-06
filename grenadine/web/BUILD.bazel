@@ -18,6 +18,7 @@ rust_test(
     name = "web_test",
     size = "small",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["static/style.css"],
     crate_name = "grenadine_web",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],

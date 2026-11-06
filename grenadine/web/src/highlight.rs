@@ -46,9 +46,245 @@ pub fn stylesheet() -> String {
     };
     format!(
         "{}\n{}\n",
-        scope(&strip(light), ":root[data-theme=\"light\"]"),
-        scope(&strip(dark), ":root[data-theme=\"dark\"]")
+        scope(&enforce(&strip(light), &LIGHT_THEME), LIGHT_THEME.scope),
+        scope(&enforce(&strip(dark), &DARK_THEME), DARK_THEME.scope)
     )
+}
+
+/// The WCAG 2.x contrast ratio a token colour must reach against every
+/// background it can sit on: the AA bar for normal text.
+const MIN_CONTRAST: f64 = 4.5;
+
+/// A background that highlighted code can appear on, named by its
+/// variable in style.css. `bases` lists the variables the value is
+/// alpha-composited onto when it is translucent; empty means opaque.
+struct Background {
+    var: &'static str,
+    value: &'static str,
+    bases: &'static [&'static str],
+}
+
+const fn bg(var: &'static str, value: &'static str, bases: &'static [&'static str]) -> Background {
+    Background { var, value, bases }
+}
+
+/// One theme's selector scope, foreground, and the backgrounds behind
+/// highlighted code. The values mirror style.css and a test keeps them
+/// in sync.
+struct ThemeColors {
+    scope: &'static str,
+    fg: Background,
+    backgrounds: &'static [Background],
+}
+
+/// The backgrounds covered: the page background (`.diff td.code`), the
+/// subtle background (`.markdown pre`, tool inputs, blank diff cells),
+/// the added/removed line backgrounds, and the upstream/mixed stripes
+/// composited over each of them. The word-diff marks inside added and
+/// removed lines are not backgrounds to meet the bar against: text
+/// inside a changed-word mark may fall slightly below 4.5:1, which is
+/// accepted because meeting the bar there would wash the syntax
+/// colours out toward the foreground.
+const LIGHT_BACKGROUNDS: &[Background] = &[
+    bg("--bg", "#ffffff", &[]),
+    bg("--bg-subtle", "#f6f8fa", &[]),
+    bg("--add-bg", "#e6ffec", &["--bg"]),
+    bg("--del-bg", "#ffebe9", &["--bg"]),
+    bg(
+        "--upstream-stripe",
+        "rgba(128, 128, 128, 0.12)",
+        &["--bg", "--add-bg", "--del-bg"],
+    ),
+    bg(
+        "--mixed-stripe",
+        "rgba(212, 167, 44, 0.25)",
+        &["--bg", "--add-bg", "--del-bg"],
+    ),
+];
+
+const DARK_BACKGROUNDS: &[Background] = &[
+    bg("--bg", "#0d1117", &[]),
+    bg("--bg-subtle", "#161b22", &[]),
+    bg("--add-bg", "rgba(46, 160, 67, 0.15)", &["--bg"]),
+    bg("--del-bg", "rgba(248, 81, 73, 0.1)", &["--bg"]),
+    bg(
+        "--upstream-stripe",
+        "rgba(200, 200, 200, 0.08)",
+        &["--bg", "--add-bg", "--del-bg"],
+    ),
+    bg(
+        "--mixed-stripe",
+        "rgba(210, 153, 34, 0.18)",
+        &["--bg", "--add-bg", "--del-bg"],
+    ),
+];
+
+const LIGHT_THEME: ThemeColors = ThemeColors {
+    scope: ":root[data-theme=\"light\"]",
+    fg: bg("--fg", "#1f2328", &[]),
+    backgrounds: LIGHT_BACKGROUNDS,
+};
+
+const DARK_THEME: ThemeColors = ThemeColors {
+    scope: ":root[data-theme=\"dark\"]",
+    fg: bg("--fg", "#e6edf3", &[]),
+    backgrounds: DARK_BACKGROUNDS,
+};
+
+/// An sRGB colour; `a` is the alpha for compositing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: f64,
+}
+
+/// Parses `#rgb`, `#rrggbb`, `rgb(r, g, b)` and `rgba(r, g, b, a)`.
+fn parse_color(s: &str) -> Option<Color> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return Some(match hex.len() {
+            3 => Color {
+                r: ((v >> 8) & 0xf) as u8 * 0x11,
+                g: ((v >> 4) & 0xf) as u8 * 0x11,
+                b: (v & 0xf) as u8 * 0x11,
+                a: 1.0,
+            },
+            6 => Color {
+                r: (v >> 16) as u8,
+                g: (v >> 8) as u8,
+                b: v as u8,
+                a: 1.0,
+            },
+            _ => return None,
+        });
+    }
+    let inner = s
+        .strip_prefix("rgba(")
+        .or_else(|| s.strip_prefix("rgb("))?
+        .strip_suffix(')')?;
+    let parts: Vec<f64> = inner
+        .split(',')
+        .map(|p| p.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    match *parts.as_slice() {
+        [r, g, b] | [r, g, b, _] => Some(Color {
+            r: r as u8,
+            g: g as u8,
+            b: b as u8,
+            a: *parts.get(3).unwrap_or(&1.0),
+        }),
+        _ => None,
+    }
+}
+
+/// `over` alpha-composited onto `under`.
+fn composite(over: Color, under: Color) -> Color {
+    let mix = |o: u8, u: u8| (over.a * o as f64 + (1.0 - over.a) * u as f64).round() as u8;
+    Color {
+        r: mix(over.r, under.r),
+        g: mix(over.g, under.g),
+        b: mix(over.b, under.b),
+        a: 1.0,
+    }
+}
+
+/// The relative luminance of an opaque colour, per WCAG 2.x.
+fn luminance(c: Color) -> f64 {
+    let channel = |v: u8| {
+        let s = v as f64 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+}
+
+/// The WCAG 2.x contrast ratio between two opaque colours.
+fn contrast(a: Color, b: Color) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The effective opaque colour of each background, composited over each
+/// of its bases.
+fn backgrounds(theme: &ThemeColors) -> Vec<Color> {
+    // A translucent colour resolved as a base sits on `--bg`.
+    fn resolve(theme: &ThemeColors, var: &str) -> Color {
+        let b = theme
+            .backgrounds
+            .iter()
+            .find(|b| b.var == var)
+            .expect("unknown `bases` background");
+        let c = parse_color(b.value).expect("unparseable colour constant");
+        if c.a >= 1.0 {
+            c
+        } else {
+            composite(c, resolve(theme, "--bg"))
+        }
+    }
+    theme
+        .backgrounds
+        .iter()
+        .flat_map(|b| {
+            let c = parse_color(b.value).expect("unparseable colour constant");
+            if b.bases.is_empty() {
+                vec![resolve(theme, b.var)]
+            } else {
+                b.bases
+                    .iter()
+                    .map(|&base| composite(c, resolve(theme, base)))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// Rewrites each `color: #…` declaration in `css` so that it contrasts at
+/// least MIN_CONTRAST with every one of the theme's backgrounds. A
+/// colour that falls short is blended toward the theme's foreground in
+/// 2% steps; the syntect themes were designed for their own
+/// backgrounds, not these, so their off-target colours are pulled
+/// toward the foreground rather than re-picked.
+fn enforce(css: &str, theme: &ThemeColors) -> String {
+    let fg = parse_color(theme.fg.value).expect("unparseable --fg");
+    let bgs = backgrounds(theme);
+    let passes = |c: Color| bgs.iter().all(|&b| contrast(c, b) >= MIN_CONTRAST);
+    css.lines()
+        .map(|line| {
+            let Some(decl) = line.trim_start().strip_prefix("color:") else {
+                return line.to_owned();
+            };
+            let value = decl.trim().trim_end_matches(';');
+            let Some(color) = parse_color(value) else {
+                return line.to_owned();
+            };
+            let mut fixed = color;
+            for step in 1..=50 {
+                if passes(fixed) {
+                    break;
+                }
+                let t = step as f64 / 50.0;
+                let blend = |c: u8, f: u8| (c as f64 + (f as f64 - c as f64) * t).round() as u8;
+                fixed = Color {
+                    r: blend(color.r, fg.r),
+                    g: blend(color.g, fg.g),
+                    b: blend(color.b, fg.b),
+                    a: 1.0,
+                };
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            format!(
+                "{indent}color: #{:02x}{:02x}{:02x};",
+                fixed.r, fixed.g, fixed.b
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Prepends `prefix` to every selector in `css`. Rule lines end in `{` and
@@ -475,6 +711,114 @@ mod tests {
         assert!(
             json_string_selectors.iter().all(|s| s.starts_with(LIGHT)),
             "{json_string_selectors:?}"
+        );
+    }
+
+    /// The `color:` declarations of `css`, each with the theme whose
+    /// scope introduces its rule.
+    fn declared_colors(css: &str) -> Vec<(&'static ThemeColors, Color)> {
+        let mut theme = &LIGHT_THEME;
+        let mut out = Vec::new();
+        for line in css.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(DARK_THEME.scope) {
+                theme = &DARK_THEME;
+            } else if trimmed.starts_with(LIGHT_THEME.scope) {
+                theme = &LIGHT_THEME;
+            } else if let Some(decl) = trimmed.strip_prefix("color:") {
+                let value = decl.trim().trim_end_matches(';');
+                out.push((
+                    theme,
+                    parse_color(value).unwrap_or_else(|| panic!("unparseable {line}")),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stylesheet_colors_contrast_with_their_backgrounds() {
+        let colors = declared_colors(&stylesheet());
+        assert!(!colors.is_empty());
+        assert!(colors.iter().any(|(t, _)| t.scope == LIGHT_THEME.scope));
+        assert!(colors.iter().any(|(t, _)| t.scope == DARK_THEME.scope));
+        for (theme, color) in colors {
+            let bgs = backgrounds(theme);
+            let worst = bgs
+                .iter()
+                .map(|&b| contrast(color, b))
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                worst >= MIN_CONTRAST - 0.001,
+                "{color:?} is only {worst:.2}:1 on a {} background",
+                theme.scope
+            );
+        }
+    }
+
+    /// The variables of a `:root[data-theme="…"]` block in `css`.
+    fn theme_vars<'a>(css: &'a str, scope: &str) -> HashMap<&'a str, &'a str> {
+        let start = css.find(scope).expect("theme block missing");
+        let end = css[start..].find("\n}").map_or(css.len(), |i| start + i);
+        css[start..end]
+            .lines()
+            .filter_map(|l| l.trim().split_once(':'))
+            .filter(|(name, _)| name.starts_with("--"))
+            .map(|(n, v)| (n, v.trim().trim_end_matches(';')))
+            .collect()
+    }
+
+    #[test]
+    fn background_constants_match_style_css() {
+        let css = include_str!("../static/style.css");
+        for theme in [&LIGHT_THEME, &DARK_THEME] {
+            let vars = theme_vars(css, theme.scope);
+            let mut checked = HashMap::new();
+            for b in theme.backgrounds.iter().chain([&theme.fg]) {
+                checked.insert(b.var, b.value);
+            }
+            for (var, value) in checked {
+                assert_eq!(
+                    vars.get(var).copied(),
+                    Some(value),
+                    "{var} in {}",
+                    theme.scope
+                );
+            }
+        }
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 1.0 }
+    }
+
+    #[test]
+    fn contrast_ratio_is_wcag() {
+        assert!((contrast(rgb(0, 0, 0), rgb(255, 255, 255)) - 21.0).abs() < 0.01);
+        assert!((contrast(rgb(255, 255, 255), rgb(255, 255, 255)) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn composite_blends_by_alpha() {
+        let over = parse_color("rgba(248, 81, 73, 0.4)").unwrap();
+        let under = parse_color("#0d1117").unwrap();
+        let c = composite(over, under);
+        assert_eq!((c.r, c.g, c.b), (107, 43, 43));
+    }
+
+    #[test]
+    fn enforce_lightens_dark_comment_but_keeps_passing_colors() {
+        // The dark theme's comment colour fails on `--bg` and worse on
+        // the added/removed lines; the brighter text colour already passes.
+        let css = ".sy-comment {\n color: #65737e;\n}\n.sy-text {\n color: #c0c5ce;\n}\n";
+        let out = enforce(css, &DARK_THEME);
+        assert!(out.contains("color: #c0c5ce;"));
+        let comment = declared_colors(&scope(&out, DARK_THEME.scope))[0].1;
+        assert_ne!(comment, rgb(0x65, 0x73, 0x7e));
+        assert!(
+            backgrounds(&DARK_THEME)
+                .iter()
+                .all(|&b| contrast(comment, b) >= MIN_CONTRAST)
         );
     }
 
