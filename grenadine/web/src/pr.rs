@@ -743,8 +743,18 @@ pub(crate) fn PersonChip(person: Person, guess: bool) -> impl IntoView {
     }
 }
 
-/// The number of the latest version the viewer reviewed: the version
-/// whose SHA is the commit of their newest submitted review.
+/// The `YYYY-MM-DDTHH:MM:SS` prefix of a timestamp, or `None` when the
+/// string is shorter. `Version::pushed_at` and `Review::submitted_at` are
+/// both UTC, so the prefixes compare chronologically despite their
+/// different zone suffixes.
+fn utc_prefix(t: &str) -> Option<&str> {
+    t.get(..19)
+}
+
+/// The number of the latest version the viewer reviewed. The version
+/// whose SHA is the review's commit wins when it was pushed at or before
+/// the review. When the commit points at a version pushed after the
+/// review, the newest version pushed before the review wins instead.
 fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u32> {
     let info = review?;
     let mut mine: Vec<&Review> = info
@@ -754,10 +764,34 @@ fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u3
         .collect();
     // RFC 3339 strings sort chronologically.
     mine.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
-    mine.iter()
-        .filter_map(|r| r.commit.as_deref())
-        .find_map(|commit| versions.iter().find(|v| v.sha == commit))
-        .map(|v| v.number)
+    for r in mine {
+        let Some(commit) = r.commit.as_deref() else {
+            continue;
+        };
+        let Some(v) = versions.iter().find(|v| v.sha == commit) else {
+            continue;
+        };
+        let submitted = utc_prefix(&r.submitted_at);
+        let pushed = v.pushed_at.as_deref().and_then(utc_prefix);
+        match (pushed, submitted) {
+            (Some(p), Some(s)) if p > s => {
+                let fallback = versions
+                    .iter()
+                    .filter(|v| {
+                        v.pushed_at
+                            .as_deref()
+                            .and_then(utc_prefix)
+                            .is_some_and(|p| p <= s)
+                    })
+                    .max_by_key(|v| v.number);
+                if let Some(v) = fallback {
+                    return Some(v.number);
+                }
+            }
+            _ => return Some(v.number),
+        }
+    }
+    None
 }
 
 #[component]
@@ -1229,12 +1263,16 @@ mod tests {
     use super::*;
 
     fn version(n: u32, sha: &str) -> Version {
+        version_pushed(n, sha, None)
+    }
+
+    fn version_pushed(n: u32, sha: &str, pushed_at: Option<&str>) -> Version {
         Version {
             number: n,
             sha: sha.into(),
             merge_base: Some("mb".into()),
             kind: VersionKind::Push,
-            pushed_at: None,
+            pushed_at: pushed_at.map(str::to_owned),
             pushed_by: None,
             pushed_by_is_guess: false,
             missing: false,
@@ -1414,6 +1452,34 @@ mod tests {
             review("me", "2026-01-02T00:00:00Z", None),
         ]);
         assert_eq!(last_reviewed(&versions, Some(&info)), None);
+    }
+
+    #[test]
+    fn last_reviewed_ignores_a_commit_pushed_after_the_review() {
+        let versions = [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+            version_pushed(3, "c", Some("2026-01-03T10:00:00+00:00")),
+        ];
+        let info = review_info(vec![review("me", "2026-01-02T12:00:00Z", Some("c"))]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
+    }
+
+    #[test]
+    fn last_reviewed_counts_a_version_pushed_at_the_same_second() {
+        let versions = [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+        ];
+        let info = review_info(vec![review("me", "2026-01-02T10:00:00Z", Some("b"))]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
+    }
+
+    #[test]
+    fn last_reviewed_trusts_the_commit_without_a_push_time() {
+        let versions = [version(1, "a"), version(2, "b")];
+        let info = review_info(vec![review("me", "2026-01-01T00:00:00Z", Some("b"))]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
     }
 
     #[test]
