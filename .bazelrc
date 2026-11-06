@@ -45,6 +45,27 @@ build:lint --aspects=//tools/lint:linters.bzl%ruff
 build:lint --output_groups=+rules_lint_human
 build:lint --@aspect_rules_lint//lint:fail_on_violation
 
+# BuildBuddy's remote cache and build results UI: bazel build --config=remote
+# The API key isn't here because the repository is public. CI passes it from
+# a secret, and locally it goes in .bazelrc.user:
+#   build --config=remote
+#   build --remote_header=x-buildbuddy-api-key=KEY
+#   build --bes_header=x-buildbuddy-api-key=KEY
+build:remote --remote_cache=grpcs://remote.buildbuddy.io
+build:remote --bes_backend=grpcs://remote.buildbuddy.io
+build:remote --bes_results_url=https://app.buildbuddy.io/invocation/
+build:remote --remote_timeout=10m
+build:remote --remote_cache_compression
+# --jobs defaults to the number of cores, which also caps how many actions
+# are looked up in the cache at once. Local actions stay limited by
+# --local_resources.
+build:remote --jobs=64
+# Leave outputs in the cache unless they're needed locally, which keeps the
+# free plan's monthly transfer in bounds. Test logs are always fetched so that
+# CI can collect the ones of failed tests.
+build:remote --remote_download_minimal
+build:remote --remote_download_regex=.*/testlogs/.*
+
 # Opt out of the usage reports that Aspect's rulesets (rules_lint, rules_js)
 # send. See https://github.com/aspect-build/tools_telemetry
 common --repo_env=DO_NOT_TRACK=1
