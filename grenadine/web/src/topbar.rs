@@ -1,7 +1,8 @@
 //! The top bar: the wordmark and the tabs on the left, the poller's sync
 //! status and the settings' gear on the right. The Inboxes, Agents and
-//! Auto-reviews tabs count what needs the user; hovering the status shows
-//! what is syncing or what went wrong.
+//! Auto-reviews tabs count what needs the user, and link to the page they
+//! last showed while another tab is on; hovering the status shows what is
+//! syncing or what went wrong.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -13,7 +14,8 @@ use grenadine_core::api::{
 use leptos::prelude::*;
 
 use crate::global_settings::{GlobalSettingsButton, GlobalSettingsDialog};
-use crate::{Route, Updates, api};
+use crate::tabs::{self, Tab};
+use crate::{Route, Updates, api, drafts};
 
 /// A relative timestamp like "5m ago" for the status line.
 fn ago(now: i64, then: i64) -> String {
@@ -188,6 +190,24 @@ pub fn Topbar(
         }
     });
 
+    // The page each tab last showed decides what it links to; a
+    // remembered session that's gone or a draft that's started or was
+    // discarded falls back to the tab's root. Until the sessions load, a
+    // remembered session keeps its link.
+    let memory = expect_context::<tabs::Memory>();
+    let drafts = expect_context::<drafts::Drafts>();
+    let exists = move |r: &Route| match r {
+        Route::Draft(id) => drafts.with(id, |_| ()).is_some(),
+        Route::Agent(id) | Route::AutoReview(id) => sessions
+            .get()
+            .and_then(|r| r.ok())
+            .map(|list| list.iter().any(|s| s.id == *id))
+            .unwrap_or(true),
+        _ => true,
+    };
+    let href = move |tab| route.with(|r| tabs::href(tab, r, memory.get(tab).as_ref(), exists));
+    let active = move |tab| route.with(|r| tabs::tab_of(r) == tab);
+
     // The tab's title carries the total too.
     Effect::new(move || {
         let title = match total() {
@@ -202,19 +222,19 @@ pub fn Topbar(
             <span class="topbar-left">
                 <a class="topbar-brand" href="#/">"grenadine"</a>
                 <nav class="topbar-tabs">
-                    <a href="#/" class:active=move || route.with(|r| matches!(r, Route::Inboxes | Route::Pr(_)))>
+                    <a href=move || href(Tab::Inboxes) class:active=move || active(Tab::Inboxes)>
                         "Inboxes"
                         {move || (total() > 0).then(|| view! { <span class="count">{total()}</span> })}
                     </a>
-                    <a href="#/agents" class:active=move || route.with(|r| matches!(r, Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup))>
+                    <a href=move || href(Tab::Agents) class:active=move || active(Tab::Agents)>
                         "Agents"
                         {move || (waiting() > 0).then(|| view! { <span class="count">{waiting()}</span> })}
                     </a>
-                    <a href="#/auto-reviews" class:active=move || route.with(|r| matches!(r, Route::AutoReviews | Route::AutoReview(_)))>
+                    <a href=move || href(Tab::AutoReviews) class:active=move || active(Tab::AutoReviews)>
                         "Auto-reviews"
                         {move || (pending() > 0).then(|| view! { <span class="count">{pending()}</span> })}
                     </a>
-                    <a href="#/debug" class:active=move || route.with(|r| matches!(r, Route::Debug))>"Debug"</a>
+                    <a href="#/debug" class:active=move || active(Tab::Debug)>"Debug"</a>
                 </nav>
             </span>
             <span class="topbar-right">

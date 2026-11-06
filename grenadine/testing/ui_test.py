@@ -3507,6 +3507,85 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
 
+    def open_pr(self, title: str) -> Any:
+        repo = self.gh.repo(scenarios.REPO)
+        branch = re.sub(r"\W+", "-", title).lower()
+        repo.checkout(branch, "main")
+        repo.commit(title, {f"{branch}.txt": title})
+        repo.push(branch)
+        return repo.open_pr(title, head=branch)
+
+    def delete_session_via_api(self, id: str) -> None:
+        req = urllib.request.Request(
+            f"{self.url}api/agents/{id}",
+            method="DELETE",
+            headers={"Origin": self.url.rstrip("/")},
+        )
+        urllib.request.urlopen(req).close()
+
+    def test_tabs_remember_their_last_page(self) -> None:
+        pr_a = self.open_pr("Tab memory A")
+        pr_b = self.open_pr("Tab memory B")
+        url_a = f"#/{scenarios.REPO}/{pr_a.number}$"
+        url_b = f"#/{scenarios.REPO}/{pr_b.number}$"
+
+        def tab(name: str) -> Locator:
+            return self.page.locator(".topbar-tabs a").filter(has_text=name)
+
+        # On PR A, Agents has nothing remembered and opens a draft.
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr_a.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr_a.title} #{pr_a.number}"
+        )
+        tab("Agents").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
+        # Starting a session makes it the tab's page.
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("tab memory")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        session_url = self.page.url
+        session_id = session_url.split("/")[-1]
+
+        # Inboxes goes back to PR A; visiting PR B moves the memory.
+        tab("Inboxes").click()
+        expect(self.page).to_have_url(re.compile(url_a))
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr_b.number}")
+        tab("Agents").click()
+        expect(self.page).to_have_url(session_url)
+        tab("Inboxes").click()
+        expect(self.page).to_have_url(re.compile(url_b))
+
+        # The active tab goes to its root instead.
+        tab("Inboxes").click()
+        expect(self.page).to_have_url(re.compile(r"#/$"))
+        tab("Agents").click()
+        expect(self.page).to_have_url(session_url)
+        tab("Agents").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
+        # Back on the session through its sidebar link, a reload keeps
+        # the memory: Agents still goes to it.
+        self.page.locator(f'a.agent-item[href="#/agents/{session_id}"]').click()
+        expect(self.page).to_have_url(session_url)
+        # The hashchange for the click lands before the next navigation.
+        self.page.wait_for_function(
+            f"sessionStorage.getItem('grenadine.tabs').includes('{session_id}')"
+        )
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr_b.number}")
+        self.page.reload()
+        tab("Agents").click()
+        expect(self.page).to_have_url(session_url)
+
+        # With the session gone, Agents opens a new draft.
+        tab("Inboxes").click()
+        self.delete_session_via_api(session_id)
+        expect(tab("Agents")).to_have_attribute("href", "#/agents")
+        tab("Agents").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
     def test_long_transcript(self) -> None:
         # A session whose transcript has hundreds of tool calls renders
         # them both as they stream in and replayed on a reload. Each tool
