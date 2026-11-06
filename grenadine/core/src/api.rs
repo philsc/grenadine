@@ -1002,6 +1002,10 @@ pub struct ServerStats {
 pub struct SessionResources {
     pub id: String,
     pub title: String,
+    /// A short summary of the first prompt, written in the background;
+    /// `None` until it's written, or if writing it failed.
+    #[serde(default)]
+    pub summary: Option<String>,
     pub status: AgentStatus,
     /// Anonymous memory plus the kernel's, from the cgroup's
     /// memory.stat.
