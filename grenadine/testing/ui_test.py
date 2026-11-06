@@ -1729,6 +1729,55 @@ class ReviewTest(ServerTestCase):
             "approved"
         )
 
+    def test_click_outside_closes_the_review_panel(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        popup = panel.locator(".review-popup")
+        box = panel.get_by_role("textbox", name="Review summary")
+        box.fill("Looks good.")
+        panel.get_by_label("Approve").check()
+
+        # Pressing elsewhere on the page hides the popup.
+        self.page.locator(".pr-header h1").click()
+        expect(popup).to_be_hidden()
+
+        # The summary's draft and the chosen event survive reopening.
+        self.review_panel()
+        expect(popup).to_be_visible()
+        expect(box).to_have_value("Looks good.")
+        expect(panel.get_by_label("Approve")).to_be_checked()
+
+    def test_editor_tabs_dont_close_the_review_panel(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        popup = panel.locator(".review-popup")
+        panel.get_by_role("textbox", name="Review summary").fill("A **note**.")
+        panel.get_by_role("tab", name="Preview").click()
+        expect(popup).to_be_visible()
+        panel.get_by_role("tab", name="Write").click()
+        expect(popup).to_be_visible()
+
+    def test_escape_closes_the_review_panel(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        popup = panel.locator(".review-popup")
+        expect(popup).to_be_visible()
+        self.page.locator("body").focus()
+        self.page.keyboard.press("Escape")
+        expect(popup).to_be_hidden()
+
+    def test_review_button_toggles_the_panel(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.open(scenarios.APPROVE)
+        panel = self.review_panel()
+        popup = panel.locator(".review-popup")
+        expect(popup).to_be_visible()
+        panel.locator(".review-button").click()
+        expect(popup).to_be_hidden()
+
     def test_discard_a_review(self) -> None:
         pr = self.prs[scenarios.DISCARD]
         self.open(scenarios.DISCARD)
