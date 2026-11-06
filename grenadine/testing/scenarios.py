@@ -437,6 +437,20 @@ PR_SETTINGS = {
 UPSTREAM_SETTINGS = {50: "SETTING_50 = 50 - 1  # changed upstream"}
 EDITED_SETTING = "SETTING_06 = 6 + 200  # edited after the rebase"
 
+UPSTREAM_FILE = "Edit a file that upstream added"
+UPSTREAM_ADDED = "upstream_file/added.py"
+UPSTREAM_ADDED_LINES = [f"added line {i}" for i in range(1, 21)]
+UPSTREAM_ADDED_EDITS = [
+    "added line 5, edited",
+    "added line 10, edited",
+    "added line 21, new",
+]
+CONFLICT = "Conflict with upstream"
+CONFLICT_PATH = "conflict/shared.py"
+PR_SETTING_10 = "SETTING_10 = 10 + 100  # changed by the PR"
+UPSTREAM_SETTING_10 = "SETTING_10 = 10 - 1  # changed upstream"
+RESOLVED_SETTING_10 = "SETTING_10 = 10 * 2  # resolved"
+
 
 def settings(changes: dict[int, str]) -> str:
     return "\n".join(changes.get(i, line) for i, line in enumerate(SETTINGS, 1)) + "\n"
@@ -524,6 +538,61 @@ def versions_cases(gh: FakeGitHub) -> Versions:
             )
         v.append(repo.push(branch))
         shas[title] = v
+
+    # The PR never touches a file that upstream adds between the versions;
+    # the rebased version edits two of its lines and adds one.
+    d = "upstream_file"
+    shared = f"{d}/shared.py"
+    repo.checkout("main")
+    repo.commit(f"Add {d}", {shared: settings({})})
+    repo.push("main")
+    branch = f"case/{d}"
+    repo.checkout(branch, "main")
+    v = [repo.commit("Change settings 5 to 7", {shared: settings(PR_SETTINGS)})]
+    repo.push(branch)
+    prs[UPSTREAM_FILE] = repo.open_pr(UPSTREAM_FILE, head=branch)
+    repo.checkout("main")
+    repo.commit(
+        "Add a file upstream", {UPSTREAM_ADDED: "\n".join(UPSTREAM_ADDED_LINES) + "\n"}
+    )
+    repo.push("main")
+    repo.checkout(branch)
+    repo.rebase("main")
+    edited = list(UPSTREAM_ADDED_LINES)
+    edited[4] = UPSTREAM_ADDED_EDITS[0]
+    edited[9] = UPSTREAM_ADDED_EDITS[1]
+    edited.append(UPSTREAM_ADDED_EDITS[2])
+    repo.commit(
+        "Edit the file upstream added", {UPSTREAM_ADDED: "\n".join(edited) + "\n"}
+    )
+    v.append(repo.push(branch))
+    shas[UPSTREAM_FILE] = v
+
+    # The PR and upstream change the same line; the rebased version is a
+    # commit on the newer main resolving it the PR's way.
+    repo.checkout("main")
+    repo.commit("Add conflict", {CONFLICT_PATH: settings({})})
+    repo.push("main")
+    branch = "case/conflict"
+    repo.checkout(branch, "main")
+    v = [
+        repo.commit("Change setting 10", {CONFLICT_PATH: settings({10: PR_SETTING_10})})
+    ]
+    repo.push(branch)
+    prs[CONFLICT] = repo.open_pr(CONFLICT, head=branch)
+    repo.checkout("main")
+    repo.commit(
+        "Change setting 10 upstream",
+        {CONFLICT_PATH: settings({10: UPSTREAM_SETTING_10})},
+    )
+    repo.push("main")
+    # A rebase would conflict, so version 2 is committed on the new main.
+    repo.checkout(branch, "main")
+    repo.commit(
+        "Change setting 10", {CONFLICT_PATH: settings({10: RESOLVED_SETTING_10})}
+    )
+    v.append(repo.push(branch))
+    shas[CONFLICT] = v
 
     repo.checkout("main")
     repo.commit(

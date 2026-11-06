@@ -2797,21 +2797,15 @@ class VersionsTest(ServerTestCase):
     def test_rebase_only_changes_are_hidden(self) -> None:
         self.open(scenarios.REBASE)
         self.choose(1, 2)
-        expect(self.page.locator(".diff-summary")).to_contain_text(
-            "1 files changed · 2 files changed only by the rebase are hidden"
+        # Every change between the versions came in with the rebase, so in
+        # both modes nothing is shown.
+        expect(self.page.locator("p.empty")).to_have_text(
+            "No changes. 3 files changed only by the rebase are hidden."
         )
-        expect(self.page.locator(".diff-summary .legend")).to_be_visible()
-        expect(self.page.locator(".file-index li")).to_have_text(["rebase/shared.py"])
-
-        # The one file left has only rebase changes, so it starts collapsed.
-        file = self.file("rebase/shared.py")
-        expect(file.locator(".upstream-badge")).to_have_text("only rebase changes")
-        expect(file.locator("table.diff")).to_have_count(0)
-        file.locator(".file-header").click()
-        rows = file.locator("tr.line.upstream")
-        expect(rows).not_to_have_count(0)
-        expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_count(0)
-        expect(rows.locator("td.code.add")).to_contain_text(["changed upstream"])
+        self.page.get_by_label("Rebase older version").check()
+        expect(self.page.locator("p.empty")).to_have_text(
+            "No changes. 3 files changed only by the rebase are hidden."
+        )
 
     def test_rebase_with_an_edit_shows_the_edit(self) -> None:
         self.open(scenarios.REBASE_AND_EDIT)
@@ -2820,7 +2814,6 @@ class VersionsTest(ServerTestCase):
             "1 files changed · 2 files changed only by the rebase are hidden"
         )
         file = self.file("rebase_and_edit/shared.py")
-        expect(file.locator(".upstream-badge")).to_have_count(0)
         # The PR's own edit is a plain change; the upstream one is marked.
         expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_text(
             [scenarios.EDITED_SETTING]
@@ -2828,6 +2821,96 @@ class VersionsTest(ServerTestCase):
         expect(file.locator("tr.line.upstream td.code.add")).to_contain_text(
             ["changed upstream"]
         )
+
+        # The rebased view diffs the older version replayed onto the newer
+        # base, which leaves just the PR's edit.
+        self.page.get_by_label("Rebase older version").check()
+        expect(file.locator(".status")).to_have_text("modified")
+        expect(file.locator(".stats")).to_have_text("+1 −1")
+        expect(file.locator("tr.line.upstream")).to_have_count(0)
+        expect(file.locator("td.code.add")).to_have_text([scenarios.EDITED_SETTING])
+        expect(file.locator("td.code.del")).to_contain_text(["changed by the PR"])
+
+    def test_edit_of_a_file_upstream_added(self) -> None:
+        self.open(scenarios.UPSTREAM_FILE)
+        self.choose(1, 2)
+        expect(self.page.locator(".diff-summary")).to_contain_text("1 files changed")
+        file = self.file(scenarios.UPSTREAM_ADDED)
+        # The file is new between the versions: the upstream lines are
+        # shaded, the PR's three lines are not.
+        expect(file.locator(".status")).to_have_text("added")
+        expect(file.locator("tr.line.upstream td.code.add")).to_have_count(18)
+        expect(file.locator("tr.line:not(.upstream) td.code.add")).to_have_text(
+            scenarios.UPSTREAM_ADDED_EDITS
+        )
+
+        # The rebased view shows the file as modified with only the PR's
+        # changes.
+        self.page.get_by_label("Rebase older version").check()
+        expect(file.locator(".status")).to_have_text("modified")
+        expect(file.locator("tr.line.upstream")).to_have_count(0)
+        expect(file.locator("tr.line.mixed")).to_have_count(0)
+        expect(file.locator("td.code.add")).to_have_text(scenarios.UPSTREAM_ADDED_EDITS)
+        expect(file.locator("td.code.del")).to_have_text(
+            ["added line 5", "added line 10"]
+        )
+
+    def test_conflict_with_upstream_shows_mixed(self) -> None:
+        self.open(scenarios.CONFLICT)
+        self.choose(1, 2)
+        expect(self.page.locator(".diff-summary")).to_contain_text(
+            "changes mixed with the rebase"
+        )
+        file = self.file(scenarios.CONFLICT_PATH)
+        expect(file.locator("tr.line.mixed")).to_have_count(1)
+        expect(
+            file.locator("td.code.del:not(.mixed), td.code.add:not(.mixed)")
+        ).to_have_count(0)
+        expect(file.locator("td.code.del")).to_have_text([scenarios.PR_SETTING_10])
+        expect(file.locator("td.code.add")).to_have_text(
+            [scenarios.RESOLVED_SETTING_10]
+        )
+
+        self.page.get_by_label("Rebase older version").check()
+        expect(file.locator("tr.line.mixed")).to_have_count(1)
+        expect(
+            file.locator("td.code.del:not(.mixed), td.code.add:not(.mixed)")
+        ).to_have_count(0)
+
+    def test_rebase_toggle_keeps_folds(self) -> None:
+        self.open(scenarios.REBASE_AND_EDIT)
+        self.choose(1, 2)
+        file = self.file("rebase_and_edit/shared.py")
+        file.locator(".file-header").click()
+        expect(file.locator("table.diff")).to_have_count(0)
+        # Flipping the mode re-renders the diff but doesn't remount the
+        # files, so the fold survives.
+        self.page.get_by_label("Rebase older version").check()
+        expect(file.locator("table.diff")).to_have_count(0)
+        self.page.get_by_label("Rebase older version").uncheck()
+        expect(file.locator("table.diff")).to_have_count(0)
+
+    def test_rebase_older_version_toggle(self) -> None:
+        self.open(scenarios.REBASE)
+        toggle = self.page.get_by_label("Rebase older version")
+        label = self.page.locator("label.toggle", has_text="Rebase older version")
+        # Diffing the base against the head leaves nothing to rebase.
+        expect(toggle).to_be_disabled()
+        expect(label).to_have_attribute(
+            "title", "Both sides have the same base, so there's nothing to rebase."
+        )
+        self.choose(1, 2)
+        expect(toggle).to_be_enabled()
+        expect(label).to_have_attribute(
+            "title",
+            "Show the older version's changes replayed onto the newer version's base.",
+        )
+        # The choice survives a reload.
+        toggle.check()
+        expect(toggle).to_be_checked()
+        self.page.reload()
+        self.choose(1, 2)
+        expect(toggle).to_be_checked()
 
     def test_rebased_version_against_the_base(self) -> None:
         # Against its own merge-base, the rebased version shows only the

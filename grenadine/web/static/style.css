@@ -31,6 +31,7 @@
   --error-fg: #cf222e;
   --error-bg: #ffebe9;
   --upstream-stripe: rgba(128, 128, 128, 0.12);
+  --mixed-stripe: rgba(212, 167, 44, 0.25);
 }
 
 :root[data-theme="dark"] {
@@ -57,6 +58,7 @@
   --error-fg: #f85149;
   --error-bg: rgba(248, 81, 73, 0.1);
   --upstream-stripe: rgba(200, 200, 200, 0.08);
+  --mixed-stripe: rgba(210, 153, 34, 0.18);
 }
 
 * {
@@ -920,6 +922,17 @@ input[type="text"] {
     transparent 4px 8px
   );
 }
+.mixed-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--border);
+  background: repeating-linear-gradient(
+    135deg,
+    var(--mixed-stripe) 0 4px,
+    transparent 4px 8px
+  );
+}
 
 .file-index {
   columns: 2;
@@ -977,9 +990,6 @@ input[type="text"] {
 }
 .status-deleted {
   color: var(--del-fg);
-}
-.upstream-badge {
-  margin-left: 4px;
 }
 .binary {
   padding: 8px 12px;
@@ -1049,14 +1059,24 @@ input[type="text"] {
   border-radius: 2px;
 }
 
-/* Changes that came from upstream between the two bases. */
-.diff tr.upstream td {
+/* Changes that came from upstream between the two bases, or that mix
+   the rebase with the PR's own edits. */
+.diff tr.upstream td,
+.diff td.upstream {
   background-image: repeating-linear-gradient(
     135deg,
     var(--upstream-stripe) 0 4px,
     transparent 4px 8px
   );
   opacity: 0.55;
+}
+.diff tr.mixed td,
+.diff td.mixed {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--mixed-stripe) 0 4px,
+    transparent 4px 8px
+  );
 }
 
 .diff tr.skip td {

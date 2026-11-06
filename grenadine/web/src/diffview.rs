@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, NewThread, PrKey, Side, WorktreeFile};
 use grenadine_core::diff::{self, Hunk, Line};
@@ -148,13 +148,70 @@ const BIG_FILE: usize = 3000;
 /// The old and new blob of one side of a file change.
 type BlobPair = (Option<Arc<Blob>>, Option<Arc<Blob>>);
 
+/// What a rebase did to a file upstream touched, worked out once per diff.
+struct RebaseInfo {
+    /// The file's upstream change between the two bases.
+    upstream: BlobPair,
+    /// The older version's changes replayed onto the newer base; a
+    /// synthetic blob with no id.
+    rebased: Option<Arc<Blob>>,
+}
+
+/// What `stats` works out: added and removed lines, change blocks, and
+/// whether every changed line is the rebase's.
+struct Stats {
+    added: usize,
+    removed: usize,
+    blocks: usize,
+    all_rebase: bool,
+}
+
 struct FileData {
     change: FileChange,
     old: Option<Arc<Blob>>,
     new: Option<Arc<Blob>>,
-    /// The same file's upstream change between the two bases, when the
-    /// diff spans a rebase and upstream touched the file.
-    upstream: Option<BlobPair>,
+    /// What the rebase did to this file, when the diff spans one and
+    /// upstream touched it.
+    rebase: Option<RebaseInfo>,
+    /// The stats per mode, filled on first use. Files with no rebase info
+    /// look the same in both modes and share slot 0.
+    stats: [OnceLock<Stats>; 2],
+}
+
+impl FileData {
+    /// The diff's stats in `rebase_older` mode, computed once per mode.
+    fn stats(&self, rebase_older: bool) -> &Stats {
+        let slot = (self.rebase.is_some() && rebase_older) as usize;
+        self.stats[slot].get_or_init(|| stats(self, rebase_older))
+    }
+}
+
+/// The older version's text merged onto the newer base, for the rebased
+/// left side of the diff. `None` when a side is binary.
+fn rebased_blob(upstream: &BlobPair, old: &Option<Arc<Blob>>) -> Option<Arc<Blob>> {
+    if [&upstream.0, &upstream.1, old]
+        .into_iter()
+        .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()))
+    {
+        return None;
+    }
+    let base_old = rebase::lines(text(&upstream.0).unwrap_or_default());
+    let base_new_text = text(&upstream.1).unwrap_or_default();
+    let base_new = rebase::lines(base_new_text);
+    let old_text = text(old).unwrap_or_default();
+    let merged = rebase::merge3(&base_old, &rebase::lines(old_text), &base_new);
+    let mut merged_text = merged.lines.join("\n");
+    let newline = match old.as_ref().and_then(|b| b.text.as_deref()) {
+        Some(t) => t.ends_with('\n'),
+        None => base_new_text.ends_with('\n'),
+    };
+    if newline && !merged_text.is_empty() {
+        merged_text.push('\n');
+    }
+    Some(Arc::new(Blob {
+        size: merged_text.len() as u64,
+        text: Some(merged_text),
+    }))
 }
 
 fn blob(id: &Option<String>) -> Option<Arc<Blob>> {
@@ -205,13 +262,19 @@ async fn load(
         files
             .iter()
             .map(|f| {
+                let old = blob(&f.old_blob);
                 Arc::new(FileData {
                     change: f.clone(),
-                    old: blob(&f.old_blob),
+                    old: old.clone(),
                     new: blob(&f.new_blob),
-                    upstream: up_by_path
-                        .get(f.path())
-                        .map(|u| (blob(&u.old_blob), blob(&u.new_blob))),
+                    rebase: up_by_path.get(f.path()).map(|u| {
+                        let upstream = (blob(&u.old_blob), blob(&u.new_blob));
+                        RebaseInfo {
+                            rebased: rebased_blob(&upstream, &old),
+                            upstream,
+                        }
+                    }),
+                    stats: [OnceLock::new(), OnceLock::new()],
                 })
             })
             .collect(),
@@ -228,6 +291,7 @@ pub fn DiffView(
     comments: Arc<HashMap<String, Vec<Placed>>>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
+    rebase_older: Signal<bool>,
     #[prop(optional_no_strip)] commenting: Option<Commenting>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
@@ -252,30 +316,72 @@ pub fn DiffView(
         Some(Ok((files, hidden))) => {
             let comments = comments.clone();
             start_reveal();
+            let files = Arc::new(files);
+            // Files with no change of the PR's own — which depends on the
+            // mode — join the files the rebase alone changed.
             view! {
                 <div class="diff-summary muted">
-                    {format!("{} files changed", files.len())}
-                    {(hidden > 0).then(|| view! {
-                        <span>{format!(" · {hidden} files changed only by the rebase are hidden")}</span>
-                    })}
+                    {{
+                        let files = files.clone();
+                        move || format!("{} files changed", files.len() - hidden_by_rebase(&files, rebase_older.get()))
+                    }}
+                    {{
+                        let files = files.clone();
+                        move || {
+                            let total = hidden + hidden_by_rebase(&files, rebase_older.get());
+                            (total > 0).then(|| view! {
+                                <span>{format!(" · {total} files changed only by the rebase are hidden")}</span>
+                            })
+                        }
+                    }}
                     {has_upstream.then(|| view! {
                         <span class="legend"><span class="upstream-swatch"></span>" changes brought in by the rebase"</span>
+                        <span class="legend"><span class="mixed-swatch"></span>" changes mixed with the rebase"</span>
                     })}
                 </div>
+                {{
+                    let files = files.clone();
+                    move || {
+                        let total = hidden + hidden_by_rebase(&files, rebase_older.get());
+                        (files.len() == hidden_by_rebase(&files, rebase_older.get())).then(|| view! {
+                            <p class="empty">{format!("No changes.{}", if total > 0 {
+                                format!(" {total} files changed only by the rebase are hidden.")
+                            } else {
+                                String::new()
+                            })}</p>
+                        })
+                    }
+                }}
                 <ul class="file-index">
-                    {files.iter().map(|f| {
-                        let path = f.change.path().to_owned();
-                        view! { <li><a href="#" on:click=move |ev| { ev.prevent_default(); scroll_to(&path) }>{f.change.path().to_owned()}</a></li> }
-                    }).collect_view()}
+                    {{
+                        let files = files.clone();
+                        move || files
+                            .iter()
+                            .filter(|f| !f.stats(rebase_older.get()).all_rebase)
+                            .map(|f| {
+                                let path = f.change.path().to_owned();
+                                view! { <li><a href="#" on:click=move |ev| { ev.prevent_default(); scroll_to(&path) }>{f.change.path().to_owned()}</a></li> }
+                            })
+                            .collect_view()
+                    }}
                 </ul>
                 {files.iter().map(|f| {
                     let placed = comments.get(f.change.path()).cloned().unwrap_or_default();
-                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes commenting=commenting.clone() /> }
+                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=commenting.clone() /> }
                 }).collect_view()}
             }
             .into_any()
         }
     }
+}
+
+/// How many of `files` have no change of the PR's own in `rebase_older`
+/// mode; they hide and count with the rebase-only files.
+fn hidden_by_rebase(files: &[Arc<FileData>], rebase_older: bool) -> usize {
+    files
+        .iter()
+        .filter(|f| f.stats(rebase_older).all_rebase)
+        .count()
 }
 
 fn file_id(path: &str) -> String {
@@ -311,8 +417,10 @@ fn text(b: &Option<Arc<Blob>>) -> Option<&str> {
 struct Shape {
     hunks: Vec<Hunk>,
     skipped_after: usize,
-    /// Per change block: whether upstream made the same change.
-    upstream: Vec<bool>,
+    /// Per old and new line: whether the change is the PR's, the rebase's,
+    /// or the two mixed. Unchanged lines are `Kind::Pr`.
+    old_kinds: Vec<rebase::Kind>,
+    new_kinds: Vec<rebase::Kind>,
     marks: Vec<Mark>,
 }
 
@@ -337,10 +445,11 @@ thread_local! {
 }
 
 /// The file's shape, kept for the life of the page when the file has no
-/// upstream change, so that coming back to a diff doesn't redo it.
-fn cached_shape(file: &FileData, old_id: &str, new_id: &str) -> Arc<Shape> {
-    if file.upstream.is_some() {
-        return Arc::new(shape(file));
+/// upstream change, so that coming back to a diff doesn't redo it. Files
+/// with rebase info differ between the modes and are never cached.
+fn cached_shape(file: &FileData, old_id: &str, new_id: &str, rebase_older: bool) -> Arc<Shape> {
+    if file.rebase.is_some() {
+        return Arc::new(shape(file, rebase_older));
     }
     let key = (old_id.to_owned(), new_id.to_owned());
     if let Some(s) =
@@ -348,7 +457,7 @@ fn cached_shape(file: &FileData, old_id: &str, new_id: &str) -> Arc<Shape> {
     {
         return s;
     }
-    let s = Arc::new(shape(file));
+    let s = Arc::new(shape(file, rebase_older));
     SHAPE_CACHE.with_borrow_mut(|c| {
         if c.len() >= SHAPES {
             c.pop_front();
@@ -358,44 +467,77 @@ fn cached_shape(file: &FileData, old_id: &str, new_id: &str) -> Arc<Shape> {
     s
 }
 
-fn shape(file: &FileData) -> Shape {
-    let upstream = file
-        .upstream
-        .as_ref()
-        .map(|(a, b)| (text(a).unwrap_or_default(), text(b).unwrap_or_default()));
-    shape_texts(
-        text(&file.old).unwrap_or_default(),
-        text(&file.new).unwrap_or_default(),
-        upstream,
-    )
+/// The old text `rebase_older` picks: the rebased text when it exists,
+/// else the older version's own.
+fn old_text(file: &FileData, rebase_older: bool) -> &str {
+    if rebase_older && let Some(t) = file.rebase.as_ref().and_then(|i| text(&i.rebased)) {
+        return t;
+    }
+    text(&file.old).unwrap_or_default()
 }
 
-/// Works out the diff from `old` to `new`. `upstream` is the same file's
-/// upstream change.
-fn shape_texts(old: &str, new: &str, upstream: Option<(&str, &str)>) -> Shape {
-    let (old_lines, new_lines) = (rebase::lines(old), rebase::lines(new));
-    let blocks = rebase::change_blocks(&old_lines, &new_lines);
-    let upstream = match upstream {
-        Some((ua, ub)) => rebase::from_upstream(
-            &old_lines,
-            &new_lines,
-            &blocks,
-            &rebase::lines(ua),
-            &rebase::lines(ub),
-        ),
-        None => vec![false; blocks.len()],
+/// The per-line kinds of the file's diff in `rebase_older` mode, the diff
+/// being `old` to `new` split into `blocks`.
+fn line_kinds(
+    file: &FileData,
+    old: &[&str],
+    new: &[&str],
+    blocks: &[rebase::Block],
+    rebase_older: bool,
+) -> (Vec<rebase::Kind>, Vec<rebase::Kind>) {
+    let Some(info) = &file.rebase else {
+        return (
+            vec![rebase::Kind::Pr; old.len()],
+            vec![rebase::Kind::Pr; new.len()],
+        );
     };
-    let aligned: Vec<Vec<Aligned>> = blocks
-        .iter()
-        .map(|b| inline::align(&old_lines, &new_lines, b))
-        .collect();
-    let hunks = diff::hunks(&blocks, &aligned, old_lines.len(), new_lines.len(), CONTEXT);
+    let base_old = rebase::lines(text(&info.upstream.0).unwrap_or_default());
+    let base_new = rebase::lines(text(&info.upstream.1).unwrap_or_default());
+    if !rebase_older {
+        let kinds = rebase::classify(&base_old, old, &base_new, new);
+        return (kinds.old, kinds.new);
+    }
+    let v2 = rebase::lines(text(&file.old).unwrap_or_default());
+    let merged = rebase::merge3(&base_old, &v2, &base_new);
+    let block_kinds = rebase::rebased_block_kinds(&merged, new, blocks, &base_old, &base_new);
+    let mut old_kinds = vec![rebase::Kind::Pr; old.len()];
+    let mut new_kinds = vec![rebase::Kind::Pr; new.len()];
+    for (k, b) in blocks.iter().enumerate() {
+        for i in b.old.clone() {
+            old_kinds[i] = block_kinds[k];
+        }
+        for i in b.new.clone() {
+            new_kinds[i] = block_kinds[k];
+        }
+    }
+    (old_kinds, new_kinds)
+}
+
+fn shape(file: &FileData, rebase_older: bool) -> Shape {
+    let old = rebase::lines(old_text(file, rebase_older));
+    let new = rebase::lines(text(&file.new).unwrap_or_default());
+    let blocks = rebase::change_blocks(&old, &new);
+    let (old_kinds, new_kinds) = line_kinds(file, &old, &new, &blocks, rebase_older);
+    shape_lines(&old, &new, &blocks, old_kinds, new_kinds)
+}
+
+/// Works out the diff from `old` to `new` split into `blocks`, with the
+/// per-line kinds given.
+fn shape_lines(
+    old: &[&str],
+    new: &[&str],
+    blocks: &[rebase::Block],
+    old_kinds: Vec<rebase::Kind>,
+    new_kinds: Vec<rebase::Kind>,
+) -> Shape {
+    let aligned: Vec<Vec<Aligned>> = blocks.iter().map(|b| inline::align(old, new, b)).collect();
+    let hunks = diff::hunks(blocks, &aligned, old.len(), new.len(), CONTEXT);
     let marks = aligned
         .iter()
         .flatten()
         .filter_map(|r| match (r.paired, r.old, r.new) {
             (true, Some(o), Some(n)) => {
-                let (dels, inss) = inline::changed_ranges(old_lines[o], new_lines[n]);
+                let (dels, inss) = inline::changed_ranges(old[o], new[n]);
                 Some(Mark {
                     old: o,
                     new: n,
@@ -407,11 +549,25 @@ fn shape_texts(old: &str, new: &str, upstream: Option<(&str, &str)>) -> Shape {
         })
         .collect();
     Shape {
-        skipped_after: diff::skipped_after(&hunks, old_lines.len()),
+        skipped_after: diff::skipped_after(&hunks, old.len()),
         hunks,
-        upstream,
+        old_kinds,
+        new_kinds,
         marks,
     }
+}
+
+/// Works out the diff of two texts without rebase info.
+fn shape_texts(old: &str, new: &str) -> Shape {
+    let (old, new) = (rebase::lines(old), rebase::lines(new));
+    let blocks = rebase::change_blocks(&old, &new);
+    shape_lines(
+        &old,
+        &new,
+        &blocks,
+        vec![rebase::Kind::Pr; old.len()],
+        vec![rebase::Kind::Pr; new.len()],
+    )
 }
 
 /// Lays out `shape` with the given lines' HTML, highlighted or plain.
@@ -502,29 +658,38 @@ fn reveal(rows: usize, shown: RwSignal<bool>) -> bool {
 }
 
 /// Counts added and removed lines and change blocks without laying the
-/// diff out.
-fn stats(file: &FileData) -> (usize, usize, usize, bool) {
-    let (old, new) = (
-        text(&file.old).unwrap_or_default(),
-        text(&file.new).unwrap_or_default(),
-    );
-    let (o, n) = (rebase::lines(old), rebase::lines(new));
+/// diff out, and whether every changed line is the rebase's —
+/// `rebase_older` picks which diff is counted.
+fn stats(file: &FileData, rebase_older: bool) -> Stats {
+    let binary = [&file.old, &file.new]
+        .iter()
+        .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
+    if binary {
+        return Stats {
+            added: 0,
+            removed: 0,
+            blocks: 0,
+            all_rebase: false,
+        };
+    }
+    let o = rebase::lines(old_text(file, rebase_older));
+    let n = rebase::lines(text(&file.new).unwrap_or_default());
     let blocks = rebase::change_blocks(&o, &n);
     let added = blocks.iter().map(|b| b.new.len()).sum();
     let removed = blocks.iter().map(|b| b.old.len()).sum();
-    let all_upstream = match &file.upstream {
-        // Upstream touched the file too, and nothing else changed in it
-        // (e.g. an empty file that upstream added).
-        Some(_) if blocks.is_empty() => true,
-        Some((a, b)) => {
-            let (ua, ub) = (text(a).unwrap_or_default(), text(b).unwrap_or_default());
-            rebase::from_upstream(&o, &n, &blocks, &rebase::lines(ua), &rebase::lines(ub))
-                .into_iter()
-                .all(|m| m)
-        }
-        _ => false,
-    };
-    (added, removed, blocks.len(), all_upstream)
+    let (old_kinds, new_kinds) = line_kinds(file, &o, &n, &blocks, rebase_older);
+    // Only a file upstream touched can be wholly the rebase's.
+    let all_rebase = file.rebase.is_some()
+        && blocks.iter().all(|b| {
+            b.old.clone().all(|i| old_kinds[i] == rebase::Kind::Rebase)
+                && b.new.clone().all(|i| new_kinds[i] == rebase::Kind::Rebase)
+        });
+    Stats {
+        added,
+        removed,
+        blocks: blocks.len(),
+        all_rebase,
+    }
 }
 
 /// One side of a file, highlighted in the background.
@@ -629,16 +794,34 @@ impl Folds {
     }
 }
 
+/// The status the file header shows. In the rebased mode the left side is
+/// the merged text: a file the merge produced that the newer version also
+/// has is modified, whatever the raw statuses say.
+fn status_shown(file: &FileData, rebase_older: bool) -> &'static str {
+    if rebase_older && file.rebase.is_some() {
+        let Some(left) = file.rebase.as_ref().and_then(|i| text(&i.rebased)) else {
+            return status_label(file.change.status);
+        };
+        return match (!left.is_empty(), file.new.is_some()) {
+            (true, true) => "modified",
+            (false, true) => "added",
+            (_, false) => "deleted",
+        };
+    }
+    status_label(file.change.status)
+}
+
 #[component]
 fn FileView(
     file: Arc<FileData>,
     comments: Vec<Placed>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
+    rebase_older: Signal<bool>,
     #[prop(optional_no_strip)] commenting: Option<Commenting>,
     #[prop(optional)] folds: Option<Folds>,
 ) -> impl IntoView {
-    let c = &file.change;
+    let c = file.change.clone();
     let fc = commenting.map(|commenting| FileCommenting {
         commenting,
         path: c.path().to_owned(),
@@ -647,28 +830,29 @@ fn FileView(
     let binary = [&file.old, &file.new]
         .iter()
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
-    let (added, removed, blocks, all_upstream) = if binary {
-        (0, 0, 0, false)
-    } else {
-        stats(&file)
-    };
+    let initial = file.stats(rebase_older.get_untracked());
     let expanded = RwSignal::new(
         folds
             .as_ref()
             .and_then(|f| f.get(c.path()))
-            .unwrap_or(!all_upstream && added + removed <= BIG_FILE),
+            .unwrap_or(!initial.all_rebase && initial.added + initial.removed <= BIG_FILE),
     );
     // Roughly: the changed lines and the context around each block.
     let rows = if expanded.get_untracked() {
-        added + removed + blocks * (2 * CONTEXT + 1)
+        initial.added + initial.removed + initial.blocks * (2 * CONTEXT + 1)
     } else {
         0
     };
     let shown = RwSignal::new(false);
     shown.set(reveal(rows, shown));
-    let old_path = c.old_path.as_deref().unwrap_or(c.path());
-    let old_lines = SideLines::new(old_path, &c.old_blob, &file.old, expanded.get_untracked());
+    let old_path = c.old_path.clone().unwrap_or_else(|| c.path().to_owned());
+    let old_lines = SideLines::new(&old_path, &c.old_blob, &file.old, expanded.get_untracked());
     let new_lines = SideLines::new(c.path(), &c.new_blob, &file.new, expanded.get_untracked());
+    let rebased_lines = file
+        .rebase
+        .as_ref()
+        .and_then(|i| i.rebased.clone())
+        .map(|b| SideLines::new(&old_path, &None, &Some(b), expanded.get_untracked()));
     let title = match (c.status, &c.old_path, &c.new_path) {
         (ChangeStatus::Renamed | ChangeStatus::Copied, Some(o), Some(n)) => format!("{o} → {n}"),
         _ => c.path().to_owned(),
@@ -684,8 +868,8 @@ fn FileView(
         let comments = comments.clone();
         let fc = fc.clone();
         // Laid out plain on first expansion, and again once both sides are
-        // highlighted; the flag says which.
-        let cache = StoredValue::new_local(None::<(bool, Arc<Layout>)>);
+        // highlighted or the rebase mode flips; the flags say which.
+        let cache = StoredValue::new_local(None::<(bool, bool, Arc<Layout>)>);
         move || {
             if !expanded.get() {
                 return ().into_any();
@@ -702,20 +886,27 @@ fn FileView(
                 };
                 return view! { <p class="binary muted">{format!("Binary file: {} → {} bytes", size(&file.old), size(&file.new))}</p> }.into_any();
             }
-            let highlighted = old_lines.ready() && new_lines.ready();
+            let mode = rebase_older.get();
+            // The left side is the rebased text in rebased mode, the older
+            // version's own blob otherwise.
+            let left_lines = match mode.then_some(rebased_lines.as_ref()).flatten() {
+                Some(l) => l,
+                None => &old_lines,
+            };
+            let highlighted = left_lines.ready() && new_lines.ready();
             if !highlighted {
-                old_lines.request(true);
+                left_lines.request(true);
                 new_lines.request(true);
             }
             let cached = cache.with_value(|c| {
                 c.as_ref()
-                    .filter(|(h, _)| *h == highlighted)
-                    .map(|(_, l)| l.clone())
+                    .filter(|(h, m, _)| *h == highlighted && *m == mode)
+                    .map(|(_, _, l)| l.clone())
             });
             let l = cached.unwrap_or_else(|| {
-                let shape = cached_shape(&file, &old_lines.id, &new_lines.id);
-                let l = Arc::new(layout(shape, old_lines.html(), new_lines.html()));
-                cache.set_value(Some((highlighted, l.clone())));
+                let shape = cached_shape(&file, &left_lines.id, &new_lines.id, mode);
+                let l = Arc::new(layout(shape, left_lines.html(), new_lines.html()));
+                cache.set_value(Some((highlighted, mode, l.clone())));
                 l
             });
             if side_by_side.get() {
@@ -726,7 +917,10 @@ fn FileView(
         }
     };
     view! {
-        <section class="file" id=file_id(c.path())>
+        <section class="file" id=file_id(c.path()) prop:hidden={
+            let f = file.clone();
+            move || f.stats(rebase_older.get()).all_rebase
+        }>
             <header class="file-header" on:click={
                 let path = c.path().to_owned();
                 move |_| {
@@ -737,10 +931,21 @@ fn FileView(
                 }
             }>
                 <span class="chevron">{move || if expanded.get() { "▾" } else { "▸" }}</span>
-                <span class=format!("status status-{}", status_label(c.status).replace(' ', "-"))>{status_label(c.status)}</span>
+                <span class={
+                    let f = file.clone();
+                    move || format!("status status-{}", status_shown(&f, rebase_older.get()).replace(' ', "-"))
+                }>{{
+                    let f = file.clone();
+                    move || status_shown(&f, rebase_older.get())
+                }}</span>
                 <span class="path">{title}</span>
-                {all_upstream.then(|| view! { <span class="badge upstream-badge">"only rebase changes"</span> })}
-                <span class="stats"><span class="plus">{format!("+{added}")}</span>" "<span class="minus">{format!("−{removed}")}</span></span>
+                <span class="stats"><span class="plus">{{
+                    let f = file.clone();
+                    move || format!("+{}", f.stats(rebase_older.get()).added)
+                }}</span>" "<span class="minus">{{
+                    let f = file.clone();
+                    move || format!("−{}", f.stats(rebase_older.get()).removed)
+                }}</span></span>
                 {fc.clone().map(|fc| {
                     let draft = fc.commenting.draft(&fc.path, None);
                     view! {
@@ -771,6 +976,7 @@ fn FileView(
 pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl IntoView {
     let inline_changes = Signal::stored(load_flag("inline-changes", true));
     let side_by_side = Signal::stored(false);
+    let rebase_older = Signal::stored(false);
     let folds = Folds::new(&session);
     let key = |f: &WorktreeFile| {
         let mut h = DefaultHasher::new();
@@ -784,9 +990,10 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
                     change: f.change,
                     old: f.old.map(Arc::new),
                     new: f.new.map(Arc::new),
-                    upstream: None,
+                    rebase: None,
+                    stats: [OnceLock::new(), OnceLock::new()],
                 });
-                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes folds=folds.clone() /> }
+                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older folds=folds.clone() /> }
             }
         </For>
     }
@@ -804,7 +1011,7 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
                     old_start: f.old_start,
                     new_start: f.new_start,
                     ..layout(
-                        Arc::new(shape_texts(&f.old, &f.new, None)),
+                        Arc::new(shape_texts(&f.old, &f.new)),
                         highlight_lines(&path, &f.old),
                         highlight_lines(&path, &f.new),
                     )
@@ -1036,8 +1243,13 @@ fn html(lines: &[String], n: Option<usize>) -> &str {
     n.and_then(|n| lines.get(n)).map_or("", String::as_str)
 }
 
-fn upstream_class(upstream: bool) -> &'static str {
-    if upstream { " upstream" } else { "" }
+/// The extra class a row or cell of a changed line of `kind` gets.
+fn kind_class(kind: rebase::Kind) -> &'static str {
+    match kind {
+        rebase::Kind::Rebase => " upstream",
+        rebase::Kind::Mixed => " mixed",
+        rebase::Kind::Pr => "",
+    }
 }
 
 fn unified_view(
@@ -1051,37 +1263,37 @@ fn unified_view(
     for h in &l.shape.hunks {
         rows.extend(Row::skip(h.skipped_before, 4));
         for line in &h.lines {
-            let (old, new, kind, block, code) = match *line {
+            let (old, new, kind, line_kind, code) = match *line {
                 Line::Context { old, new } => (
                     Some(old),
                     Some(new),
                     "ctx",
-                    None,
+                    rebase::Kind::Pr,
                     html(&l.new_html, Some(new)),
                 ),
-                Line::Removed { old, block } => (
+                Line::Removed { old, .. } => (
                     Some(old),
                     None,
                     "del",
-                    Some(block),
+                    l.shape.old_kinds[old],
                     html(&l.old_html, Some(old)),
                 ),
-                Line::Added { new, block } => (
+                Line::Added { new, .. } => (
                     None,
                     Some(new),
                     "add",
-                    Some(block),
+                    l.shape.new_kinds[new],
                     html(&l.new_html, Some(new)),
                 ),
             };
-            let upstream = upstream_class(block.is_some_and(|b| l.shape.upstream[b]));
+            let shaded = kind_class(line_kind);
             let marker = match kind {
                 "del" => "−",
                 "add" => "+",
                 _ => " ",
             };
             let cells = format!(
-                "{}{}<td class=\"marker\">{marker}</td><td class=\"code\">{code}</td>",
+                "{}{}<td class=\"marker\">{marker}</td><td class=\"code{shaded}\">{code}</td>",
                 ln_cell(fc, "ln", Side::Left, old, num(old.map(|o| o + l.old_start))),
                 ln_cell(
                     fc,
@@ -1094,7 +1306,7 @@ fn unified_view(
             let mut threads = lc.take(Side::Left, old);
             threads.extend(lc.take(Side::Right, new));
             rows.push(Row::new(
-                format!("line {kind}{upstream}"),
+                format!("line {kind}{shaded}"),
                 cells,
                 threads,
                 &[(Side::Left, old), (Side::Right, new)],
@@ -1120,7 +1332,18 @@ fn split_view(
     for h in &l.shape.hunks {
         rows.extend(Row::skip(h.skipped_before, 4));
         for r in &h.rows {
-            let upstream = upstream_class(r.block.is_some_and(|b| l.shape.upstream[b]));
+            // Each side's line has its own kind; a row is upstream when
+            // every changed side is, and mixed when any side is.
+            let ok = r.old.map(|i| l.shape.old_kinds[i]);
+            let nk = r.new.map(|i| l.shape.new_kinds[i]);
+            let sides: Vec<rebase::Kind> = [ok, nk].into_iter().flatten().collect();
+            let shaded = if sides.contains(&rebase::Kind::Mixed) {
+                " mixed"
+            } else if !sides.is_empty() && sides.iter().all(|k| *k == rebase::Kind::Rebase) {
+                " upstream"
+            } else {
+                ""
+            };
             let (lk, rk) = match (r.block, r.old, r.new) {
                 (None, _, _) => ("ctx", "ctx"),
                 (Some(_), o, n) => (
@@ -1129,16 +1352,18 @@ fn split_view(
                 ),
             };
             let cells = format!(
-                "{}<td class=\"code {lk}\">{}</td>{}<td class=\"code {rk}\">{}</td>",
+                "{}<td class=\"code {lk}{}\">{}</td>{}<td class=\"code {rk}{}\">{}</td>",
                 ln_cell(fc, &format!("ln {lk}"), Side::Left, r.old, num(r.old)),
+                kind_class(ok.unwrap_or(rebase::Kind::Pr)),
                 html(&l.old_html, r.old),
                 ln_cell(fc, &format!("ln {rk}"), Side::Right, r.new, num(r.new)),
+                kind_class(nk.unwrap_or(rebase::Kind::Pr)),
                 html(&l.new_html, r.new),
             );
             let mut threads = lc.take(Side::Left, r.old);
             threads.extend(lc.take(Side::Right, r.new));
             rows.push(Row::new(
-                format!("line{upstream}"),
+                format!("line{shaded}"),
                 cells,
                 threads,
                 &[(Side::Left, r.old), (Side::Right, r.new)],

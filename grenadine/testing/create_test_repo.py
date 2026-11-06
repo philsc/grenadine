@@ -874,6 +874,87 @@ def versions_rebase(fx: Fixture, case: str, *, edit_after_rebase: bool) -> None:
     fx.push(pr, force=True)
 
 
+def versions_upstream_added(fx: Fixture) -> None:
+    case = "versions-upstream-file"
+    d = "upstream_file"
+    shared, added = f"{d}/shared.py", f"{d}/added.py"
+    base = [f"SETTING_{i:02d} = {i}" for i in range(1, 61)]
+    pr_lines = {
+        i: f"SETTING_{i:02d} = {i} + 100  # changed by the PR" for i in (5, 6, 7)
+    }
+    upstream_file = [f"added line {i}" for i in range(1, 21)]
+
+    fx.advance_main(f"Add {d}", {shared: lines(base)})
+    fx.start_branch(f"case/{case}")
+    fx.commit(
+        "Change settings 5 to 7",
+        {shared: lines([pr_lines.get(i, s) for i, s in enumerate(base, 1)])},
+    )
+    fx.push_branch(f"case/{case}")
+    notes = (
+        "Version 2 rebases onto a main that added added.py, then edits two "
+        "of its lines and adds one. Between versions 1 and 2 the default "
+        "view shows the file added with its upstream lines shaded; the "
+        "rebased view shows it as modified with just the PR's edits."
+    )
+    pr = fx.open_pr(
+        case,
+        "Edit a file that upstream added",
+        notes,
+        expected_inbox=WAITING_FOR_REVIEWERS,
+        notes=notes,
+    )
+    fx.advance_main("Add a file upstream", {added: lines(upstream_file)})
+    fx.git("checkout", "--quiet", pr.branch)
+    fx.git("rebase", "--quiet", "origin/main")
+    edited = list(upstream_file)
+    edited[4] = "added line 5, edited"
+    edited[9] = "added line 10, edited"
+    edited.append("added line 21, new")
+    fx.commit("Edit the file upstream added", {added: lines(edited)})
+    fx.push(pr, force=True)
+
+
+def versions_conflict(fx: Fixture) -> None:
+    case = "versions-conflict"
+    shared = "conflict/shared.py"
+    base = [f"SETTING_{i:02d} = {i}" for i in range(1, 61)]
+
+    def settings(change: str) -> str:
+        return lines([change if i == 10 else s for i, s in enumerate(base, 1)])
+
+    fx.advance_main("Add conflict", {shared: lines(base)})
+    fx.start_branch(f"case/{case}")
+    fx.commit(
+        "Change setting 10",
+        {shared: settings("SETTING_10 = 10 + 100  # changed by the PR")},
+    )
+    fx.push_branch(f"case/{case}")
+    notes = (
+        "Version 1 changes SETTING_10, which upstream also changed; version "
+        "2 is a commit on the newer main that resolves the line the PR's "
+        "way, so a rebase would have conflicted. Between versions 1 and 2 "
+        "the line shows as mixed in both diff modes."
+    )
+    pr = fx.open_pr(
+        case,
+        "Conflict with upstream",
+        notes,
+        expected_inbox=WAITING_FOR_REVIEWERS,
+        notes=notes,
+    )
+    fx.advance_main(
+        "Change setting 10 upstream",
+        {shared: settings("SETTING_10 = 10 - 1  # changed upstream")},
+    )
+    # A rebase would conflict, so version 2 is committed on the new main.
+    fx.git("checkout", "--quiet", "-B", pr.branch, "origin/main")
+    fx.commit(
+        "Change setting 10", {shared: settings("SETTING_10 = 10 * 2  # resolved")}
+    )
+    fx.push(pr, force=True)
+
+
 def diff_file_kinds(fx: Fixture) -> None:
     case = "diff-file-kinds"
     d = "kinds"
@@ -1432,6 +1513,8 @@ def main() -> int:
         versions_pushes(fx)
         versions_rebase(fx, "versions-rebase", edit_after_rebase=False)
         versions_rebase(fx, "versions-rebase-and-edit", edit_after_rebase=True)
+        versions_upstream_added(fx)
+        versions_conflict(fx)
         diff_file_kinds(fx)
         diff_inline(fx)
         diff_syntax(fx)
