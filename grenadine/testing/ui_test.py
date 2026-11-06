@@ -3712,6 +3712,40 @@ class AgentTest(ServerTestCase):
         check()
         self.delete_session()
 
+    def test_collapsed_tools_compact(self) -> None:
+        # Collapsed tool calls carry no visible border and pack tight;
+        # opening one gives it back its border.
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("long transcript 3")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(
+            1, timeout=60_000
+        )
+
+        tools = self.page.locator(".transcript .tool")
+        expect(tools).to_have_count(3)
+        first = tools.first
+        self.assertEqual(
+            first.evaluate("e => getComputedStyle(e).borderTopColor"),
+            "rgba(0, 0, 0, 0)",
+        )
+        first.locator("summary").click()
+        self.assertNotEqual(
+            first.evaluate("e => getComputedStyle(e).borderTopColor"),
+            "rgba(0, 0, 0, 0)",
+        )
+        first.locator("summary").click()
+
+        first_box = tools.nth(0).bounding_box()
+        second_box = tools.nth(1).bounding_box()
+        assert first_box and second_box
+        self.assertLessEqual(
+            second_box["y"] - (first_box["y"] + first_box["height"]), 3
+        )
+        self.delete_session()
+
     def test_activity_bar(self) -> None:
         # The activity bar waits with the agent for the approval and goes
         # once the turn ends.
