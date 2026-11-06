@@ -1,16 +1,19 @@
-//! The Debug tab: what grenadine spent on GitHub over the last hour,
-//! and where GitHub's rate limits stand.
+//! The Debug tab: the machine's and the agent sessions' resource use,
+//! what grenadine spent on GitHub over the last hour, and where GitHub's
+//! rate limits stand.
 
 use std::time::Duration;
 
 use grenadine_core::api::{
-    ApiResource, GitHubUsage, MinuteUsage, RateLimitInfo, RateLimitReport, RequestKindUsage,
-    RequestPriority,
+    ApiResource, DiskUsage, GitHubUsage, MinuteUsage, RateLimitInfo, RateLimitReport,
+    RequestKindUsage, RequestPriority, SessionResources, SystemStats,
 };
 use leptos::prelude::*;
 
 use crate::{
-    Updates, api,
+    Updates,
+    agents::status_label,
+    api,
     topbar::{hm, hms},
 };
 
@@ -25,6 +28,176 @@ fn thousands(n: u32) -> String {
         out.push(c);
     }
     out
+}
+
+/// `n` bytes in binary units, e.g. "512 MiB"; GiB and up get one
+/// decimal, e.g. "11.3 GiB".
+fn bytes(n: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const TIB: u64 = 1 << 40;
+    match n {
+        n if n >= TIB => format!("{:.1} TiB", n as f64 / TIB as f64),
+        n if n >= GIB => format!("{:.1} GiB", n as f64 / GIB as f64),
+        n if n >= MIB => format!("{} MiB", n / MIB),
+        n if n >= KIB => format!("{} KiB", n / KIB),
+        n => format!("{n} B"),
+    }
+}
+
+/// How long ago `started` was, e.g. "up 3 h 12 min".
+fn uptime(now: i64, started: i64) -> String {
+    let mins = (now - started).max(0) / 60;
+    match mins {
+        m if m >= 24 * 60 => format!("up {} d {} h", m / (24 * 60), m % (24 * 60) / 60),
+        m if m >= 60 => format!("up {} h {} min", m / 60, m % 60),
+        m => format!("up {m} min"),
+    }
+}
+
+/// A label with a usage-meter bar of `part` out of `total`.
+#[component]
+fn Metered(label: String, part: u64, total: u64) -> impl IntoView {
+    let width = part
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100);
+    view! {
+        <p>{label}</p>
+        <div class="usage-meter">
+            <div class="usage-meter-ours" style:width=format!("{width}%")></div>
+        </div>
+    }
+}
+
+/// The machine's and the sessions' resource use.
+#[component]
+fn SystemView(stats: SystemStats) -> impl IntoView {
+    let mem = &stats.memory;
+    let mem_used = mem.total_bytes.saturating_sub(mem.available_bytes);
+    let swap_used = mem.swap_total_bytes.saturating_sub(mem.swap_free_bytes);
+    let pressure: Vec<String> = [
+        ("CPU", stats.pressure.cpu),
+        ("memory", stats.pressure.memory),
+        ("I/O", stats.pressure.io),
+    ]
+    .into_iter()
+    .filter_map(|(name, v)| v.map(|v| format!("{name} {v:.1}%")))
+    .collect();
+    let server = &stats.server;
+    let now = stats.now;
+    view! {
+        <Metered
+            label=format!("RAM: {} of {} used · {} cache",
+                bytes(mem_used), bytes(mem.total_bytes), bytes(mem.cached_bytes))
+            part=mem_used total=mem.total_bytes
+        />
+        {(mem.swap_total_bytes > 0).then(|| view! {
+            <Metered
+                label=format!("Swap: {} of {} used", bytes(swap_used), bytes(mem.swap_total_bytes))
+                part=swap_used total=mem.swap_total_bytes
+            />
+        })}
+        {stats.disks.into_iter().map(|d: DiskUsage| {
+            let used = d.total_bytes.saturating_sub(d.free_bytes);
+            view! {
+                <Metered
+                    label=format!("{}: {} free of {}", d.label, bytes(d.free_bytes), bytes(d.total_bytes))
+                    part=used total=d.total_bytes
+                />
+            }
+        }).collect_view()}
+        <p>{format!("Load: {:.2} / {:.2} / {:.2} on {} cores",
+            stats.load.load1, stats.load.load5, stats.load.load15, stats.load.cpus)}</p>
+        {(!pressure.is_empty()).then(|| view! {
+            <p>{format!("Pressure (stalled, last 10 s): {}", pressure.join(" · "))}</p>
+        })}
+        <p>{format!("Server: RSS {} · {} threads · {} open files · {}",
+            bytes(server.rss_bytes), server.threads, server.open_fds,
+            uptime(now, server.started_at))}</p>
+        {match stats.sessions {
+            None => view! {
+                <p class="muted">"Per-session stats need a systemd user manager."</p>
+            }.into_any(),
+            Some(sessions) => view! { <SessionsView sessions leftover=stats.leftover /> }.into_any(),
+        }}
+    }
+}
+
+/// The sessions' slices' counters and what unknown slices add up to.
+#[component]
+fn SessionsView(
+    sessions: Vec<SessionResources>,
+    leftover: Option<grenadine_core::api::LeftoverResources>,
+) -> impl IntoView {
+    let mut process_total = 0;
+    let mut cache_total = 0;
+    let mut processes_total = 0;
+    let mut cpu_total = 0.0;
+    let mut any_cpu = false;
+    for s in &sessions {
+        process_total += s.process_bytes;
+        cache_total += s.cache_bytes;
+        processes_total += s.processes;
+        if let Some(c) = s.cpu_percent {
+            cpu_total += c;
+            any_cpu = true;
+        }
+    }
+    let leftover_row = leftover.map(|l| {
+        process_total += l.process_bytes;
+        cache_total += l.cache_bytes;
+        processes_total += l.processes;
+        view! {
+            <tr>
+                <td>{format!("Deleted sessions ({} slices)", l.slices)}</td>
+                <td></td>
+                <td class="num">{bytes(l.process_bytes)}</td>
+                <td class="num">{bytes(l.cache_bytes)}</td>
+                <td class="num">{l.processes}</td>
+                <td class="num">"—"</td>
+            </tr>
+        }
+    });
+    view! {
+        <table class="usage-table usage-sessions">
+            <thead>
+                <tr>
+                    <th>"Session"</th>
+                    <th>"Status"</th>
+                    <th class="num">"Process memory"</th>
+                    <th class="num">"Cache"</th>
+                    <th class="num">"Processes"</th>
+                    <th class="num">"CPU"</th>
+                </tr>
+            </thead>
+            <tbody>
+                {sessions.into_iter().map(|s| view! {
+                    <tr>
+                        <td><a href=format!("#/agents/{}", s.id)>{
+                            if s.title.is_empty() { s.id.clone() } else { s.title.clone() }
+                        }</a></td>
+                        <td>{status_label(s.status)}</td>
+                        <td class="num">{bytes(s.process_bytes)}</td>
+                        <td class="num">{bytes(s.cache_bytes)}</td>
+                        <td class="num">{s.processes}</td>
+                        <td class="num">{s.cpu_percent.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "—".into())}</td>
+                    </tr>
+                }).collect_view()}
+                {leftover_row}
+                <tr class="usage-total">
+                    <td>"Total"</td>
+                    <td></td>
+                    <td class="num">{bytes(process_total)}</td>
+                    <td class="num">{bytes(cache_total)}</td>
+                    <td class="num">{processes_total}</td>
+                    <td class="num">{if any_cpu { format!("{cpu_total:.0}%") } else { "—".into() }}</td>
+                </tr>
+            </tbody>
+        </table>
+    }
 }
 
 fn resource_name(r: ApiResource) -> &'static str {
@@ -272,8 +445,19 @@ pub fn Debug() -> impl IntoView {
         tick.track();
         api::github_usage()
     });
+    let system = LocalResource::new(move || {
+        updates.sync.track();
+        tick.track();
+        api::system_stats()
+    });
     view! {
         <div class="debug">
+            <h1>"System"</h1>
+            {move || match system.get() {
+                None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                Some(Ok(s)) => view! { <SystemView stats=s /> }.into_any(),
+            }}
             <h1>"GitHub API usage"</h1>
             {move || match usage.get() {
                 None => view! { <p class="muted">"Loading…"</p> }.into_any(),
@@ -313,5 +497,15 @@ mod tests {
         assert_eq!(thousands(1234), "1,234");
         assert_eq!(thousands(5000), "5,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn bytes_binary_units() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(512), "512 B");
+        assert_eq!(bytes(2048), "2 KiB");
+        assert_eq!(bytes(512 << 20), "512 MiB");
+        assert_eq!(bytes(11 * (1 << 30) + 322_122_547), "11.3 GiB");
+        assert_eq!(bytes(3 << 40), "3.0 TiB");
     }
 }

@@ -110,6 +110,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/blobs", post(blobs))
         .route("/api/sync", get(sync_status))
         .route("/api/debug/github", get(github_usage))
+        .route("/api/debug/system", get(system_stats))
         .route("/api/events", get(events))
         .route("/api/repos", get(repos))
         .route(
@@ -627,6 +628,17 @@ async fn sync_status(AxState(state): St) -> Json<grenadine_core::api::SyncStatus
 /// Debug tab.
 async fn github_usage(AxState(state): St) -> Json<grenadine_core::api::GitHubUsage> {
     Json(state.github.usage())
+}
+
+/// The machine's and sessions' resource use, for the Debug tab.
+async fn system_stats(AxState(state): St) -> ApiResult<Json<grenadine_core::api::SystemStats>> {
+    let sessions = state.db.agents()?;
+    let cgroup = crate::system::agent_cgroup(&state).await;
+    let stats = tokio::task::spawn_blocking(move || {
+        crate::system::sample(&state, &sessions, cgroup.as_deref())
+    })
+    .await?;
+    Ok(Json(stats))
 }
 
 /// Keep-alives as a named "ping" event rather than a comment, so that the

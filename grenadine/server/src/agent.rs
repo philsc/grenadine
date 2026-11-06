@@ -953,6 +953,17 @@ impl Agents {
         self.slices.then(|| slice(id))
     }
 
+    /// Whether the sessions' processes go into their own systemd user
+    /// slices.
+    pub fn slices(&self) -> bool {
+        self.slices
+    }
+
+    /// Where the sessions' worktrees are.
+    pub fn worktrees(&self) -> &Path {
+        &self.worktrees
+    }
+
     /// What runs the turns and background jobs of `backend`.
     pub fn backend(&self, backend: AgentBackend) -> &dyn Backend {
         match backend {

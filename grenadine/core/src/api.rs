@@ -922,6 +922,104 @@ pub struct MinuteUsage {
     pub rest_requests: u32,
 }
 
+/// The machine's resources and what the sessions use, for the Debug
+/// tab's System section.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SystemStats {
+    /// Unix seconds when the snapshot was taken.
+    pub now: i64,
+    pub memory: MemoryStats,
+    pub load: LoadStats,
+    /// How much of the last 10 s tasks stalled on each resource;
+    /// `None` per resource whose /proc/pressure file is missing.
+    pub pressure: PressureStats,
+    /// The filesystems grenadine keeps its data on.
+    pub disks: Vec<DiskUsage>,
+    pub server: ServerStats,
+    /// `None` when there is no systemd user manager or the agent
+    /// slices' cgroup can't be found.
+    pub sessions: Option<Vec<SessionResources>>,
+    /// What the agent slices no session owns add up to.
+    pub leftover: Option<LeftoverResources>,
+}
+
+/// What /proc/meminfo reported.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryStats {
+    pub total_bytes: u64,
+    /// Free plus what the kernel can reclaim; the rest is in use.
+    pub available_bytes: u64,
+    /// The page cache's part of `available_bytes`.
+    pub cached_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_free_bytes: u64,
+}
+
+/// /proc/loadavg and the core count.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoadStats {
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    pub cpus: u32,
+}
+
+/// Pressure stall averages over the last 10 s, in percent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PressureStats {
+    pub cpu: Option<f64>,
+    pub memory: Option<f64>,
+    pub io: Option<f64>,
+}
+
+/// One filesystem's space, as statvfs reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsage {
+    /// What the path is, e.g. "Worktrees".
+    pub label: String,
+    pub path: String,
+    pub total_bytes: u64,
+    /// Free for unprivileged users (f_bavail).
+    pub free_bytes: u64,
+}
+
+/// The server process's own use.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStats {
+    pub rss_bytes: u64,
+    pub threads: u32,
+    pub open_fds: u32,
+    /// Unix seconds when the server started.
+    pub started_at: i64,
+}
+
+/// What one session's systemd slice holds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionResources {
+    pub id: String,
+    pub title: String,
+    pub status: AgentStatus,
+    /// Anonymous memory plus the kernel's, from the cgroup's
+    /// memory.stat.
+    pub process_bytes: u64,
+    /// Page cache charged to the slice.
+    pub cache_bytes: u64,
+    pub processes: u32,
+    /// Percent of one core since the previous sample, can exceed 100;
+    /// `None` on the first sample.
+    pub cpu_percent: Option<f64>,
+}
+
+/// What the agent slices that belong to no session add up to, e.g. ones
+/// a deleted session left running.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftoverResources {
+    pub slices: u32,
+    pub process_bytes: u64,
+    pub cache_bytes: u64,
+    pub processes: u32,
+}
+
 /// Pushed to the page over server-sent events.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerEvent {

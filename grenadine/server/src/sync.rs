@@ -107,6 +107,12 @@ pub struct State {
     /// event streams end.
     /// The Claude Code sessions started from the UI.
     pub agents: crate::agent::Agents,
+    /// Where the database file lives; the Debug tab reports its disk.
+    pub db_dir: std::path::PathBuf,
+    /// Unix seconds when the server started.
+    pub started_at: i64,
+    /// What /api/debug/system samples through.
+    pub system: crate::system::Sampler,
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -952,6 +958,9 @@ pub fn test_state_with_agents(
         watched: std::sync::Mutex::new(BTreeMap::new()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
+        db_dir: std::env::temp_dir(),
+        started_at: crate::agent::now(),
+        system: crate::system::Sampler::default(),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }
