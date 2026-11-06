@@ -4450,6 +4450,20 @@ class AgentTest(ServerTestCase):
         toggle = self.page.get_by_role("button", name="Terminal", exact=True)
         first = self.page.url
         tabs.nth(1).click()
+
+        # Escape sequences that ask the terminal about itself, which a
+        # program may leave in the pty's output, get answers from xterm;
+        # the interrupt flushes the live ones out of the shell's input
+        # and the clear takes their echoes off the screen. On a reconnect
+        # the same queries come back in the replay and must not reach the
+        # shell again.
+        self.page.keyboard.type("printf '\\033[c\\033]11;?\\033\\\\'\n")
+        self.page.wait_for_timeout(500)
+        self.page.keyboard.press("Control+C")
+        self.page.keyboard.type("clear\n")
+        self.page.keyboard.type("echo back-$((6 * 7))\n")
+        expect(screen).to_contain_text("back-42")
+
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
         self.page.get_by_label("Prompt").fill("write another note")
@@ -4460,7 +4474,17 @@ class AgentTest(ServerTestCase):
         self.page.goto(first)
         expect(toggle).to_have_attribute("aria-expanded", "true")
         expect(tabs.nth(1)).to_have_attribute("aria-selected", "true")
-        expect(screen).to_contain_text("second-42")
+        # The marker sits at the replay's end, so the replay is parsed
+        # once it shows.
+        expect(screen).to_contain_text("back-42")
+
+        # The tab reports the replay's progress, and the answers xterm
+        # gives its queries while parsing don't reach the shell.
+        expect(tabs.nth(1)).to_have_attribute("aria-busy", "false")
+        self.page.keyboard.type("echo clean-$((6 * 7))\n")
+        expect(screen).to_contain_text("clean-42")
+        expect(screen).not_to_contain_text("rgb:")
+        expect(screen).not_to_contain_text("1;2c")
 
         # Closing a tab hangs up on its shell; exiting a shell closes its tab,
         # and the panel collapses without any.
