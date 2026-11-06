@@ -1345,6 +1345,39 @@ impl Db {
             .collect())
     }
 
+    /// The sessions associated with the PR `key`, oldest first: the
+    /// interactive ones in its repository that started from it or opened
+    /// it, each once. Sessions whose backend or cost unit this build
+    /// doesn't know are left out with a warning, like `agents` does.
+    pub fn pr_agents(&self, key: &PrKey) -> Result<Vec<AgentSession>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLUMNS} FROM agents
+             WHERE kind = 'interactive' AND repo = ?
+               AND (pr_number = ? OR EXISTS
+                   (SELECT 1 FROM agent_prs p
+                    WHERE p.agent_id = agents.id AND p.repo = ? AND p.number = ?))
+             ORDER BY created_at ASC, id"
+        ))?;
+        let rows = stmt.query_map(
+            params![key.repo, key.number, key.repo, key.number],
+            agent_from_row_unchecked,
+        )?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(session, known)| {
+                if !known {
+                    tracing::warn!(
+                        "agent {}: its backend or cost unit is unknown to this build",
+                        session.id
+                    );
+                }
+                known.then_some(session)
+            })
+            .collect())
+    }
+
     /// Every agent session, newest first, with whether this build knows
     /// its backend and cost unit; unknown ones read as the defaults. Only
     /// for what doesn't run the session, like removing what it owns.
@@ -2981,6 +3014,83 @@ mod tests {
         assert!(!db.delete_agent("a").unwrap());
         assert_eq!(db.agent_events("a").unwrap(), []);
         assert_eq!(db.agent_image("i").unwrap(), None);
+    }
+
+    /// A PR's agents are the interactive sessions in its repository that
+    /// started from it or opened it, oldest first.
+    #[test]
+    fn pr_agents_are_the_sessions_that_started_from_or_opened_it() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        let at = |id: &str, pr: Option<u64>, created_at: i64| AgentSession {
+            pr,
+            created_at,
+            ..agent(id, AgentStatus::Idle)
+        };
+        // Sessions that started from o/n#7, opened it, and did both; the
+        // last is listed once, all oldest first.
+        db.create_agent(&at("started", Some(7), 2)).unwrap();
+        db.create_agent(&at("opened", None, 1)).unwrap();
+        db.create_agent(&at("both", Some(7), 3)).unwrap();
+        db.add_agent_pr("opened", &key, "OPEN").unwrap();
+        db.add_agent_pr("both", &key, "OPEN").unwrap();
+        // One in another repository, one that opened a different PR, and
+        // one that opened the same number in another repository.
+        db.create_agent(&AgentSession {
+            pr: Some(7),
+            ..AgentSession::fixture("other-repo", "o/m")
+        })
+        .unwrap();
+        db.create_agent(&at("other-pr", None, 4)).unwrap();
+        db.add_agent_pr(
+            "other-pr",
+            &PrKey {
+                repo: "o/n".into(),
+                number: 8,
+            },
+            "OPEN",
+        )
+        .unwrap();
+        db.create_agent(&at("other-repo-pr", None, 5)).unwrap();
+        db.add_agent_pr(
+            "other-repo-pr",
+            &PrKey {
+                repo: "o/m".into(),
+                number: 7,
+            },
+            "OPEN",
+        )
+        .unwrap();
+        // An auto-review that covers the PR doesn't count.
+        db.create_agent(&AgentSession {
+            pr: Some(7),
+            kind: SessionKind::AutoReview,
+            ..agent("auto-review", AgentStatus::Idle)
+        })
+        .unwrap();
+        // Neither does one whose backend this build doesn't know.
+        db.create_agent(&at("unknown", Some(7), 6)).unwrap();
+        db.set_agent_backend_raw("unknown", "hal", "usd");
+
+        let ids: Vec<_> = db
+            .pr_agents(&key)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["opened", "started", "both"]);
+        assert_eq!(
+            db.pr_agents(&PrKey {
+                number: 8,
+                ..key.clone()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]
