@@ -410,6 +410,14 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE inboxes ADD COLUMN searched_at INTEGER;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Each session's associated PRs include the PR it started from;
+    -- the next poll looks up its state and title.
+    INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
+        SELECT id, repo, pr_number, 'OPEN' FROM agents WHERE pr_number IS NOT NULL;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1358,21 +1366,22 @@ impl Db {
     }
 
     /// The sessions associated with the PR `key`, oldest first: the
-    /// interactive ones in its repository that started from it or opened
-    /// it, each once. Sessions whose backend or cost unit this build
-    /// doesn't know are left out with a warning, like `agents` does.
+    /// interactive ones in its repository whose associated PRs include
+    /// it, having started from it or opened it. Sessions whose backend
+    /// or cost unit this build doesn't know are left out with a warning,
+    /// like `agents` does.
     pub fn pr_agents(&self, key: &PrKey) -> Result<Vec<AgentSession>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {AGENT_COLUMNS} FROM agents
              WHERE kind = 'interactive' AND repo = ?
-               AND (pr_number = ? OR EXISTS
+               AND EXISTS
                    (SELECT 1 FROM agent_prs p
-                    WHERE p.agent_id = agents.id AND p.repo = ? AND p.number = ?))
+                    WHERE p.agent_id = agents.id AND p.repo = ? AND p.number = ?)
              ORDER BY created_at ASC, id"
         ))?;
         let rows = stmt.query_map(
-            params![key.repo, key.number, key.repo, key.number],
+            params![key.repo, key.repo, key.number],
             agent_from_row_unchecked,
         )?;
         Ok(rows
@@ -3357,6 +3366,48 @@ mod tests {
                 repo: "o/n".into(),
                 number: 4
             }]
+        );
+    }
+
+    /// Sessions that started from a PR get it among their associated
+    /// PRs, unless a poll recorded it already.
+    #[test]
+    fn backfills_start_prs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        // One session started from a PR, one from the trunk, and one
+        // whose start PR is recorded already.
+        conn.execute(
+            "INSERT INTO agents
+                (id, repo, pr_number, title, branch, worktree, base_sha, status, created_at)
+             VALUES ('started', 'o/n', 7, 't', 'b', '/w', 's', 'idle', 0),
+                    ('trunk', 'o/n', NULL, 't', 'b', '/w', 's', 'idle', 0),
+                    ('known', 'o/n', 8, 't', 'b', '/w', 's', 'idle', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_prs (agent_id, repo, number, state, title)
+             VALUES ('known', 'o/n', 8, 'MERGED', 'done')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        let rows: Vec<(String, u64, String, Option<String>)> = conn
+            .prepare("SELECT agent_id, number, state, title FROM agent_prs ORDER BY agent_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("known".into(), 8, "MERGED".into(), Some("done".into())),
+                ("started".into(), 7, "OPEN".into(), None),
+            ]
         );
     }
 
