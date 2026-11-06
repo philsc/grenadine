@@ -434,6 +434,9 @@ async fn update_prs(
     tool_use: &str,
     args: &Value,
 ) -> anyhow::Result<String> {
+    // The approval wait is the slow part; a resent call must be refused
+    // before it shows a second approval card.
+    let landing = agent::begin_landing(state, id)?;
     let session = state.db.agent(id)?.context("The session is gone.")?;
     if let Some(number) = session.pr {
         let key = PrKey {
@@ -462,7 +465,8 @@ async fn update_prs(
                 .context("`prs` must be a list of {commit, pr, branch} objects")?,
         ),
     };
-    let (landed, notes) = agent::land_now(state, id, WrapUpTarget::PullRequest, specs).await?;
+    let (landed, notes) =
+        agent::land_now(state, id, WrapUpTarget::PullRequest, specs, &landing).await?;
     let mut out = landed
         .prs()
         .iter()
@@ -478,7 +482,8 @@ async fn update_prs(
 /// Rebases the session's commits onto the user's checkout and
 /// fast-forwards it, as the page's Land on checkout wrap-up does.
 async fn land_on_checkout(state: &Arc<State>, id: &str) -> anyhow::Result<String> {
-    match agent::land_now(state, id, WrapUpTarget::Checkout, None).await? {
+    let landing = agent::begin_landing(state, id)?;
+    match agent::land_now(state, id, WrapUpTarget::Checkout, None, &landing).await? {
         (Landed::Checkout { sha }, _) => Ok(format!("Landed on the checkout at {sha}.")),
         _ => bail!("the session didn't land on the checkout"),
     }
@@ -1059,6 +1064,29 @@ mod tests {
             let (text, failed) = tool(&state, name, json!({})).await;
             assert!(failed && text.contains("review"), "{name}: {text}");
         }
+    }
+
+    /// A landing call that comes again while the first still runs, as
+    /// Devin's MCP client resends them, is refused.
+    #[tokio::test]
+    async fn landing_tools_refuse_a_second_call() {
+        let state = state_with(|s| s.pr = Some(24));
+        let _landing = agent::begin_landing(&state, ID).unwrap();
+        for name in ["update_prs", "land_on_checkout"] {
+            let (text, failed) = tool(&state, name, json!({})).await;
+            assert!(
+                failed && text.contains("landing this session's work already"),
+                "{name}: {text}"
+            );
+        }
+        // The refused update_prs call showed no approval card.
+        let asked = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::ApprovalRequested { .. }));
+        assert!(!asked);
     }
 
     /// The answers Claude Code 2.1 takes, as tried with a real `claude -p`.
