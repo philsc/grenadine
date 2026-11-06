@@ -199,6 +199,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let chosen = RwSignal::new(None::<Selection>);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
+    let rebase_older = RwSignal::new(load_flag("rebase-older-version", false));
     let github = github_url(&key);
     // Kept here, outside what syncs and version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
@@ -371,7 +372,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                 let pr = Arc::new(*pr);
                 prefetch(&pr);
                 view! {
-                    <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /></main>
+                    <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older /></main>
                 }.into_any()
             }
         }
@@ -529,6 +530,7 @@ fn PrBody(
     chosen: RwSignal<Option<Selection>>,
     side_by_side: RwSignal<bool>,
     inline_changes: RwSignal<bool>,
+    rebase_older: RwSignal<bool>,
 ) -> impl IntoView {
     provide_context(PrLinks {
         repo: pr.summary.key.repo.clone(),
@@ -574,6 +576,27 @@ fn PrBody(
             }
         })
     };
+    // Only when both sides sit on different bases does a rebase bring in
+    // upstream changes.
+    let upstream = {
+        let pr = pr.clone();
+        Memo::new(move |_| {
+            if pr.versions.is_empty() {
+                return None;
+            }
+            let sel = selection.get();
+            let head = &pr.versions[sel.head as usize - 1];
+            (sel.base != 0)
+                .then(|| {
+                    (
+                        pr.versions[sel.base as usize - 1].merge_base.clone(),
+                        head.merge_base.clone(),
+                    )
+                })
+                .and_then(|(a, b)| Some((a?, b?)))
+                .filter(|(a, b)| a != b)
+        })
+    };
     let s = &pr.summary;
     let review = pr.review.as_ref();
     let reviewed = last_reviewed(&pr.versions, review);
@@ -599,17 +622,7 @@ fn PrBody(
             let Some(left) = left else {
                 return view! { <p class="empty error">"The merge-base of this version is unknown."</p> }.into_any();
             };
-            // Only when both sides sit on different bases does a rebase
-            // bring in upstream changes.
-            let upstream = (sel.base != 0)
-                .then(|| {
-                    (
-                        pr.versions[sel.base as usize - 1].merge_base.clone(),
-                        head.merge_base.clone(),
-                    )
-                })
-                .and_then(|(a, b)| Some((a?, b?)))
-                .filter(|(a, b)| a != b);
+            let upstream = upstream.get();
             let (inline, panel) = place(&pr.comments, &pr.versions, sel);
             // GitHub anchors new comments to the PR's diff from the merge
             // base to the head, and refuses lines outside it. Against an
@@ -633,6 +646,7 @@ fn PrBody(
                     commenting=commenting
                     side_by_side=side_by_side.into()
                     inline_changes=inline_changes.into()
+                    rebase_older=rebase_older.into()
                 />
             }
             .into_any()
@@ -693,6 +707,26 @@ fn PrBody(
                         }
                     />
                     " Inline changes"
+                </label>
+                <label
+                    class="toggle"
+                    title=move || if upstream.get().is_some() {
+                        "Show the older version's changes replayed onto the newer version's base."
+                    } else {
+                        "Both sides have the same base, so there's nothing to rebase."
+                    }
+                >
+                    <input
+                        type="checkbox"
+                        prop:disabled=move || upstream.get().is_none()
+                        prop:checked=move || rebase_older.get()
+                        on:change=move |ev| {
+                            let on = event_target_checked(&ev);
+                            rebase_older.set(on);
+                            save_flag("rebase-older-version", on);
+                        }
+                    />
+                    " Rebase older version"
                 </label>
             </div>
             {diff}

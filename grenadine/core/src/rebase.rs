@@ -3,9 +3,8 @@
 //!
 //! When two versions sit on different bases, the raw diff between them mixes
 //! the author's changes with everything that landed upstream between the two
-//! bases. Like Gerrit, a change block of that diff is marked as coming from
-//! the rebase when the upstream diff (base A to base B) has a block with the
-//! same removed and added lines.
+//! bases. A three-way merge of the older version and the newer base against
+//! the older base tells which lines of the diff came from the rebase.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -57,29 +56,341 @@ fn key(old: &[&str], new: &[&str], b: &Block) -> Key {
     (owned(&old[b.old.clone()]), owned(&new[b.new.clone()]))
 }
 
-/// For each of `blocks` (the diff of `old` to `new`), whether the same change
-/// is in the upstream diff of `up_old` to `up_new`.
-pub fn from_upstream(
-    old: &[&str],
+/// Where a merged line came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Both sides kept it.
+    Base,
+    /// Only the older version changed it.
+    Ours,
+    /// Only upstream changed it.
+    Theirs,
+    /// Both sides changed it the same way.
+    Both,
+    /// Both sides changed it differently; the older version's line is
+    /// kept, flagged.
+    Conflict,
+}
+
+/// The 3-way merge of `ours` and `theirs` from their common `base`.
+pub struct Merged<'a> {
+    pub lines: Vec<&'a str>,
+    /// Per merged line: where it came from.
+    pub origin: Vec<Origin>,
+    /// Per line of `ours`: whether the merge dropped it because `theirs`
+    /// cleanly removed or replaced it.
+    pub ours_dropped_by_theirs: Vec<bool>,
+    /// Per line of `ours`: whether it lies in a conflict region.
+    pub ours_conflict: Vec<bool>,
+}
+
+/// A span of base lines that `ours` or `theirs` changed, or both.
+struct Region {
+    base: Range<usize>,
+    ours: Vec<Block>,
+    theirs: Vec<Block>,
+}
+
+/// Groups change blocks of both sides into regions: blocks whose base
+/// ranges overlap or touch are one region, and so are two insertions at
+/// the same base position.
+fn regions(ours: Vec<Block>, theirs: Vec<Block>) -> Vec<Region> {
+    let mut tagged: Vec<(bool, Block)> = ours
+        .into_iter()
+        .map(|b| (false, b))
+        .chain(theirs.into_iter().map(|b| (true, b)))
+        .collect();
+    tagged.sort_by_key(|(_, b)| b.old.start);
+    let mut out: Vec<Region> = Vec::new();
+    for (is_theirs, b) in tagged {
+        match out.last_mut() {
+            Some(last) if b.old.start <= last.base.end => {
+                last.base.end = last.base.end.max(b.old.end);
+                if is_theirs {
+                    last.theirs.push(b);
+                } else {
+                    last.ours.push(b);
+                }
+            }
+            _ => {
+                let base = b.old.clone();
+                out.push(Region {
+                    base,
+                    ours: if is_theirs {
+                        Vec::new()
+                    } else {
+                        vec![b.clone()]
+                    },
+                    theirs: if is_theirs { vec![b] } else { Vec::new() },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Maps each line of `old` that `blocks` keep to its index in `new`.
+fn carried_map(old_len: usize, blocks: &[Block]) -> Vec<usize> {
+    let mut map = vec![usize::MAX; old_len];
+    let (mut o, mut n) = (0, 0);
+    for b in blocks {
+        while o < b.old.start {
+            map[o] = n;
+            o += 1;
+            n += 1;
+        }
+        o = b.old.end;
+        n = b.new.end;
+    }
+    while o < old_len {
+        map[o] = n;
+        o += 1;
+        n += 1;
+    }
+    map
+}
+
+/// What `side` makes of `region`: the unchanged base lines and the side's
+/// own lines, in order. Each entry is the line's index in `side` (the
+/// carried index for base lines) and the line.
+fn side_output<'a>(
+    base: &[&'a str],
+    side: &[&'a str],
+    blocks: &[Block],
+    region: &Range<usize>,
+    carried: &[usize],
+) -> Vec<(usize, &'a str)> {
+    let mut out = Vec::new();
+    let mut cursor = region.start;
+    for b in blocks {
+        for p in cursor..b.old.start {
+            out.push((carried[p], base[p]));
+        }
+        out.extend(b.new.clone().map(|i| (i, side[i])));
+        cursor = b.old.end;
+    }
+    for p in cursor..region.end {
+        out.push((carried[p], base[p]));
+    }
+    out
+}
+
+/// The 3-way merge of `ours` and `theirs` from their common `base`.
+/// Conflicts resolve to `ours`' lines, flagged as such.
+pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Merged<'a> {
+    let blocks_ours = change_blocks(base, ours);
+    let blocks_theirs = change_blocks(base, theirs);
+    let carried_ours = carried_map(base.len(), &blocks_ours);
+    let mut lines: Vec<&'a str> = Vec::new();
+    let mut origin: Vec<Origin> = Vec::new();
+    let mut ours_dropped_by_theirs = vec![false; ours.len()];
+    let mut ours_conflict = vec![false; ours.len()];
+
+    let mut pos = 0;
+    for region in regions(blocks_ours, blocks_theirs) {
+        lines.extend(&base[pos..region.base.start]);
+        origin.resize(lines.len(), Origin::Base);
+        pos = region.base.end;
+        let ours_out = side_output(base, ours, &region.ours, &region.base, &carried_ours);
+        if region.theirs.is_empty() {
+            // Only the older version changed the region: the lines of its
+            // blocks are its own, the base lines between them unchanged.
+            let changed: HashSet<usize> = region.ours.iter().flat_map(|b| b.new.clone()).collect();
+            for (i, l) in &ours_out {
+                lines.push(l);
+                origin.push(if changed.contains(i) {
+                    Origin::Ours
+                } else {
+                    Origin::Base
+                });
+            }
+            continue;
+        }
+        if region.ours.is_empty() {
+            for b in &region.theirs {
+                for p in b.old.clone() {
+                    ours_dropped_by_theirs[carried_ours[p]] = true;
+                }
+            }
+            let mut cursor = region.base.start;
+            for b in &region.theirs {
+                lines.extend(&base[cursor..b.old.start]);
+                origin.resize(lines.len(), Origin::Base);
+                for i in b.new.clone() {
+                    lines.push(theirs[i]);
+                    origin.push(Origin::Theirs);
+                }
+                cursor = b.old.end;
+            }
+            lines.extend(&base[cursor..region.base.end]);
+            origin.resize(lines.len(), Origin::Base);
+            continue;
+        }
+        let theirs_out: Vec<&str> = {
+            let mut v = Vec::new();
+            let mut cursor = region.base.start;
+            for b in &region.theirs {
+                v.extend(&base[cursor..b.old.start]);
+                v.extend(&theirs[b.new.clone()]);
+                cursor = b.old.end;
+            }
+            v.extend(&base[cursor..region.base.end]);
+            v
+        };
+        let ours_lines: Vec<&str> = ours_out.iter().map(|(_, l)| *l).collect();
+        let same = ours_lines.len() == theirs_out.len()
+            && ours_lines
+                .iter()
+                .zip(&theirs_out)
+                .all(|(a, b)| a.trim_end() == b.trim_end());
+        if same {
+            for l in ours_lines {
+                lines.push(l);
+                origin.push(Origin::Both);
+            }
+        } else {
+            for (i, l) in &ours_out {
+                lines.push(l);
+                origin.push(Origin::Conflict);
+                ours_conflict[*i] = true;
+            }
+        }
+    }
+    lines.extend(&base[pos..]);
+    origin.resize(lines.len(), Origin::Base);
+    Merged {
+        lines,
+        origin,
+        ours_dropped_by_theirs,
+        ours_conflict,
+    }
+}
+
+/// What a changed line of a version diff is: the PR's own work, brought
+/// in by the rebase, or the two mixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Pr,
+    Rebase,
+    Mixed,
+}
+
+/// Kinds of the lines of `old` and `new`, indexed by line; only changed
+/// lines of the old->new diff matter, unchanged ones are `Kind::Pr`.
+pub struct LineKinds {
+    pub old: Vec<Kind>,
+    pub new: Vec<Kind>,
+}
+
+/// Maps each line of `new` to the line of `old` it equals, if any.
+fn equal_map(old: &[&str], new: &[&str]) -> Vec<Option<usize>> {
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_slices(old, new);
+    let mut map = vec![None; new.len()];
+    for op in diff.ops() {
+        if let DiffOp::Equal { .. } = op {
+            for (o, n) in op.old_range().zip(op.new_range()) {
+                map[n] = Some(o);
+            }
+        }
+    }
+    map
+}
+
+/// Classifies the changed lines of the diff of `old` to `new`, where
+/// `old` sits on `base_old` and `new` on `base_new`.
+pub fn classify(base_old: &[&str], old: &[&str], base_new: &[&str], new: &[&str]) -> LineKinds {
+    let merged = merge3(base_old, old, base_new);
+    let blocks = change_blocks(old, new);
+    let eq = equal_map(&merged.lines, new);
+    let mn_blocks = change_blocks(&merged.lines, new);
+    let mn_conflict: Vec<bool> = mn_blocks
+        .iter()
+        .map(|b| merged.origin[b.old.clone()].contains(&Origin::Conflict))
+        .collect();
+    let mut mn_block_of_new = vec![usize::MAX; new.len()];
+    for (k, b) in mn_blocks.iter().enumerate() {
+        for n in b.new.clone() {
+            mn_block_of_new[n] = k;
+        }
+    }
+    let mut kinds = LineKinds {
+        old: vec![Kind::Pr; old.len()],
+        new: vec![Kind::Pr; new.len()],
+    };
+    for b in &blocks {
+        for n in b.new.clone() {
+            kinds.new[n] = match eq[n] {
+                Some(m) => match merged.origin[m] {
+                    Origin::Theirs => Kind::Rebase,
+                    Origin::Conflict => Kind::Mixed,
+                    _ => Kind::Pr,
+                },
+                None if mn_block_of_new[n] != usize::MAX && mn_conflict[mn_block_of_new[n]] => {
+                    Kind::Mixed
+                }
+                None => Kind::Pr,
+            };
+        }
+        for o in b.old.clone() {
+            kinds.old[o] = if merged.ours_conflict[o] {
+                Kind::Mixed
+            } else if merged.ours_dropped_by_theirs[o] {
+                Kind::Rebase
+            } else {
+                Kind::Pr
+            };
+        }
+    }
+    kinds
+}
+
+/// Whether `range` of the merged lines touches a conflict line. An empty
+/// range counts when it sits strictly inside a run of conflict lines.
+fn overlaps_conflict(merged: &Merged, range: &Range<usize>) -> bool {
+    if !range.is_empty() {
+        return merged.origin[range.clone()].contains(&Origin::Conflict);
+    }
+    let p = range.start;
+    p > 0
+        && p < merged.origin.len()
+        && merged.origin[p - 1] == Origin::Conflict
+        && merged.origin[p] == Origin::Conflict
+}
+
+/// Kinds of the change blocks of `merged.lines` to `new`: `Mixed` when a
+/// block's merged range overlaps a conflict line, `Rebase` when it
+/// repeats an upstream change of `base_old` to `base_new`, else `Pr`.
+pub fn rebased_block_kinds(
+    merged: &Merged,
     new: &[&str],
     blocks: &[Block],
-    up_old: &[&str],
-    up_new: &[&str],
-) -> Vec<bool> {
-    let upstream: HashSet<Key> = change_blocks(up_old, up_new)
+    base_old: &[&str],
+    base_new: &[&str],
+) -> Vec<Kind> {
+    let upstream: HashSet<Key> = change_blocks(base_old, base_new)
         .iter()
-        .map(|b| key(up_old, up_new, b))
+        .map(|b| key(base_old, base_new, b))
         .collect();
     blocks
         .iter()
-        .map(|b| upstream.contains(&key(old, new, b)))
+        .map(|b| {
+            if overlaps_conflict(merged, &b.old) {
+                Kind::Mixed
+            } else if upstream.contains(&key(&merged.lines, new, b)) {
+                Kind::Rebase
+            } else {
+                Kind::Pr
+            }
+        })
         .collect()
 }
 
 /// Splits the files of the diff between two versions into those the PR
-/// changed in at least one of them (`pr_a` and `pr_b` are each version's diff
-/// against its own base) and the number of the rest, which only differ
-/// because of the rebase.
+/// changed in at least one of them (`pr_a` and `pr_b` are each version's
+/// diff against its own base) and the number of the rest, which only
+/// differ because of the rebase.
 pub fn touched_by_pr(
     interdiff: &[FileChange],
     pr_a: &[FileChange],
@@ -135,28 +446,209 @@ mod tests {
         assert!(change_blocks(&["a"], &["a"]).is_empty());
     }
 
-    #[test]
-    fn marks_blocks_that_upstream_also_made() {
-        // Version A sits on base A; version B is the same change rebased onto
-        // base B, which renamed `old_name`.
-        let base_a = ["fn old_name() {}", "", "fn f() {}"];
-        let base_b = ["fn new_name() {}", "", "fn f() {}"];
-        let v_a = ["fn old_name() {}", "", "fn f() { work(); }"];
-        let v_b = ["fn new_name() {}", "", "fn f() { work(); more(); }"];
-
-        let blocks = change_blocks(&v_a, &v_b);
-        assert_eq!(blocks.len(), 2);
-        let marks = from_upstream(&v_a, &v_b, &blocks, &base_a, &base_b);
-        assert_eq!(marks, [true, false]);
+    fn origins(m: &Merged) -> Vec<Origin> {
+        m.origin.clone()
     }
 
     #[test]
-    fn trailing_whitespace_does_not_matter() {
-        let blocks = change_blocks(&["x "], &["y"]);
+    fn merge_with_no_changes_is_the_base() {
+        let base = ["a", "b", "c"];
+        let m = merge3(&base, &base, &base);
+        assert_eq!(m.lines, base);
+        assert_eq!(origins(&m), [Origin::Base; 3]);
+        assert_eq!(m.ours_dropped_by_theirs, [false; 3]);
+        assert_eq!(m.ours_conflict, [false; 3]);
+    }
+
+    #[test]
+    fn merge_keeps_only_our_changes() {
+        let base = ["a", "b", "c"];
+        let ours = ["a", "B", "c", "d"];
+        let m = merge3(&base, &ours, &base);
+        assert_eq!(m.lines, ours);
         assert_eq!(
-            from_upstream(&["x "], &["y"], &blocks, &["x"], &["y"]),
-            [true]
+            origins(&m),
+            [Origin::Base, Origin::Ours, Origin::Base, Origin::Ours]
         );
+    }
+
+    #[test]
+    fn merge_keeps_only_their_changes() {
+        let base = ["a", "b", "c"];
+        let theirs = ["a", "B", "c"];
+        let m = merge3(&base, &base, &theirs);
+        assert_eq!(m.lines, theirs);
+        assert_eq!(origins(&m), [Origin::Base, Origin::Theirs, Origin::Base]);
+        // Theirs replaced base's "b", which is ours' line 1.
+        assert_eq!(m.ours_dropped_by_theirs, [false, true, false]);
+    }
+
+    #[test]
+    fn identical_edits_on_both_sides_merge_cleanly() {
+        let base = ["a", "b", "c"];
+        let ours = ["a", "B", "c"];
+        let theirs = ["a", "B ", "c"];
+        let m = merge3(&base, &ours, &theirs);
+        assert_eq!(m.lines, ["a", "B", "c"]);
+        assert_eq!(origins(&m), [Origin::Base, Origin::Both, Origin::Base]);
+        assert_eq!(m.ours_conflict, [false; 3]);
+    }
+
+    #[test]
+    fn touching_edits_conflict() {
+        // Ours edits line 1, theirs the adjacent line 2.
+        let base = ["a", "b", "c", "d"];
+        let ours = ["a", "B", "c", "d"];
+        let theirs = ["a", "b", "C", "d"];
+        let m = merge3(&base, &ours, &theirs);
+        assert_eq!(m.lines, ours);
+        assert_eq!(
+            origins(&m),
+            [
+                Origin::Base,
+                Origin::Conflict,
+                Origin::Conflict,
+                Origin::Base
+            ]
+        );
+        assert_eq!(m.ours_conflict, [false, true, true, false]);
+    }
+
+    #[test]
+    fn insertions_at_the_same_position_conflict() {
+        let base = ["a", "b"];
+        let ours = ["a", "x", "b"];
+        let theirs = ["a", "y", "b"];
+        let m = merge3(&base, &ours, &theirs);
+        assert_eq!(m.lines, ours);
+        assert_eq!(origins(&m), [Origin::Base, Origin::Conflict, Origin::Base]);
+        assert_eq!(m.ours_conflict, [false, true, false]);
+    }
+
+    #[test]
+    fn identical_insertions_at_the_same_position_merge() {
+        let base = ["a", "b"];
+        let ours = ["a", "x", "b"];
+        let m = merge3(&base, &ours, &ours);
+        assert_eq!(m.lines, ours);
+        assert_eq!(origins(&m), [Origin::Base, Origin::Both, Origin::Base]);
+    }
+
+    #[test]
+    fn deletion_at_the_end_merges() {
+        let base = ["a", "b", "c", "d"];
+        let ours = ["a", "b", "c"];
+        let theirs = ["A", "b", "c", "d"];
+        let m = merge3(&base, &ours, &theirs);
+        assert_eq!(m.lines, ["A", "b", "c"]);
+        assert_eq!(origins(&m), [Origin::Theirs, Origin::Base, Origin::Base]);
+        assert_eq!(m.ours_conflict, [false; 3]);
+    }
+
+    #[test]
+    fn theirs_adds_a_file_to_an_empty_ours() {
+        let file = ["one", "two", "three"];
+        let m = merge3(&[], &[], &file);
+        assert_eq!(m.lines, file);
+        assert_eq!(origins(&m), [Origin::Theirs; 3]);
+    }
+
+    #[test]
+    fn a_real_conflict_keeps_ours_flagged() {
+        let base = ["a", "b", "c"];
+        let ours = ["a", "ours", "c"];
+        let theirs = ["a", "theirs", "c"];
+        let m = merge3(&base, &ours, &theirs);
+        assert_eq!(m.lines, ours);
+        assert_eq!(origins(&m), [Origin::Base, Origin::Conflict, Origin::Base]);
+        assert_eq!(m.ours_conflict, [false, true, false]);
+    }
+
+    #[test]
+    fn upstream_file_shows_as_rebase_lines() {
+        // The reported case: upstream added a file between the bases;
+        // the newer version edits two of its lines and adds one.
+        let base_new: Vec<&str> = (1..=20).map(|_| "line").collect();
+        let mut new = base_new.clone();
+        new[4] = "edited";
+        new[9] = "edited";
+        new.push("added");
+        let k = classify(&[], &[], &base_new, &new);
+        let kinds: Vec<Kind> = k.new;
+        assert_eq!(kinds.len(), 21);
+        assert_eq!(kinds[4], Kind::Pr);
+        assert_eq!(kinds[9], Kind::Pr);
+        assert_eq!(kinds[20], Kind::Pr);
+        assert!(kinds[..4].iter().all(|k| *k == Kind::Rebase));
+        assert!(kinds[5..9].iter().all(|k| *k == Kind::Rebase));
+        assert!(kinds[10..20].iter().all(|k| *k == Kind::Rebase));
+    }
+
+    #[test]
+    fn upstream_edit_far_from_the_pr_edit_is_rebase() {
+        let base_old = ["a", "up", "m", "pr", "z"];
+        let old = ["a", "up", "m", "PR", "z"];
+        let base_new = ["a", "UP", "m", "pr", "z"];
+        let new = ["a", "UP", "m", "PR+", "z"];
+        let k = classify(&base_old, &old, &base_new, &new);
+        // "pr" -> "PR+" is the author's; "up" -> "UP" is upstream's.
+        assert_eq!(
+            k.old,
+            [Kind::Pr, Kind::Rebase, Kind::Pr, Kind::Pr, Kind::Pr]
+        );
+        assert_eq!(k.new[1], Kind::Rebase);
+        assert_eq!(k.new[3], Kind::Pr);
+    }
+
+    #[test]
+    fn conflicting_changes_are_mixed() {
+        let base_old = ["a", "b", "c"];
+        let old = ["a", "ours", "c"];
+        let base_new = ["a", "theirs", "c"];
+        // The newer version resolves the conflict its own way.
+        let new = ["a", "resolved", "c"];
+        let k = classify(&base_old, &old, &base_new, &new);
+        assert_eq!(k.old[1], Kind::Mixed);
+        assert_eq!(k.new[1], Kind::Mixed);
+    }
+
+    #[test]
+    fn upstream_deletion_marks_the_removed_old_line() {
+        // Upstream deleted a line the older version still had; dropping
+        // it in the newer version is the rebase's work.
+        let base_old = ["a", "gone", "c"];
+        let old = ["a", "gone", "c", "pr"];
+        let base_new = ["a", "c"];
+        let new = ["a", "c", "pr"];
+        let k = classify(&base_old, &old, &base_new, &new);
+        assert_eq!(k.old[1], Kind::Rebase);
+        // The new side gained no lines, so none are classified.
+        assert_eq!(k.new, [Kind::Pr; 3]);
+    }
+
+    #[test]
+    fn rebased_blocks_are_pr_without_conflicts() {
+        let base_old = ["a", "b", "c"];
+        let ours = ["a", "B", "c"];
+        let base_new = ["a", "b", "c", "d"];
+        let merged = merge3(&base_old, &ours, &base_new);
+        // The rebased text against the new version: the PR also adds "e".
+        let new = ["a", "B", "c", "d", "e"];
+        let blocks = change_blocks(&merged.lines, &new);
+        let kinds = rebased_block_kinds(&merged, &new, &blocks, &base_old, &base_new);
+        assert_eq!(kinds, [Kind::Pr]);
+    }
+
+    #[test]
+    fn rebased_blocks_over_a_conflict_are_mixed() {
+        let base_old = ["a", "b", "c"];
+        let ours = ["a", "ours", "c"];
+        let base_new = ["a", "theirs", "c"];
+        let merged = merge3(&base_old, &ours, &base_new);
+        let new = ["a", "resolved", "c"];
+        let blocks = change_blocks(&merged.lines, &new);
+        let kinds = rebased_block_kinds(&merged, &new, &blocks, &base_old, &base_new);
+        assert_eq!(kinds, [Kind::Mixed]);
     }
 
     fn file(old_path: Option<&str>, new_path: Option<&str>) -> FileChange {
@@ -221,6 +713,7 @@ mod tests {
         assert_eq!(hidden, 0);
 
         // pr_b has only the new path of an interdiff rename.
+        let interdiff = [file(Some("gone.rs"), Some("here.rs"))];
         let (kept, hidden) = touched_by_pr(&interdiff, &[], &[file(None, Some("here.rs"))]);
         assert_eq!(kept.len(), 1);
         assert_eq!(hidden, 0);
