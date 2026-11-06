@@ -72,6 +72,7 @@ fn api_routes() -> Router<Arc<State>> {
     Router::new()
         .route("/api/inboxes", get(inboxes).post(create_inbox))
         .route("/api/inboxes/{id}", put(update_inbox).delete(delete_inbox))
+        .route("/api/inboxes/refresh", post(refresh_inboxes))
         .route("/api/pr/{owner}/{name}/{number}", get(pr))
         .route(
             "/api/pr/{owner}/{name}/{number}/comments",
@@ -164,6 +165,7 @@ async fn inboxes(AxState(state): St) -> ApiResult<Json<Vec<InboxWithPrs>>> {
             prs: state.db.inbox_prs(inbox.id)?,
             error: state.db.inbox_error(inbox.id)?,
             truncated: state.db.inbox_truncation(inbox.id)?,
+            searched_at: state.db.inbox_searched_at(inbox.id)?,
             inbox,
         });
     }
@@ -195,6 +197,7 @@ async fn create_inbox(AxState(state): St, Json(edit): Json<InboxEdit>) -> ApiRes
         return Ok(r.into_response());
     }
     let id = state.db.create_inbox(&edit)?;
+    state.inbox_searches.lock().unwrap().request(id);
     inboxes_changed(&state);
     Ok(Json(id).into_response())
 }
@@ -210,6 +213,7 @@ async fn update_inbox(
     if !state.db.update_inbox(id, &edit)? {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
+    state.inbox_searches.lock().unwrap().request(id);
     inboxes_changed(&state);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -218,8 +222,16 @@ async fn delete_inbox(AxState(state): St, Path(id): Path<i64>) -> ApiResult<Stat
     if !state.db.delete_inbox(id)? {
         return Ok(StatusCode::NOT_FOUND);
     }
+    state.inbox_searches.lock().unwrap().forget(id);
     inboxes_changed(&state);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Searches every inbox on the next poll, due or not.
+async fn refresh_inboxes(AxState(state): St) -> StatusCode {
+    state.inbox_searches.lock().unwrap().request_all();
+    state.poke.notify_one();
+    StatusCode::NO_CONTENT
 }
 
 fn missing(what: PrMissing) -> Response {
@@ -1423,6 +1435,57 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn inbox_writes_request_searches() {
+        let state = crate::sync::test_state();
+        let edit = |name: &str| {
+            Json(InboxEdit {
+                name: name.into(),
+                filter: "state:open".into(),
+                position: None,
+                count_in_total: false,
+                sync_in_background: false,
+            })
+        };
+        // A create requests the new inbox's search.
+        let r = create_inbox(AxState(state.clone()), edit("custom"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        let id: i64 = body(r).await.parse().unwrap();
+        assert!(state.inbox_searches.lock().unwrap().now.contains(&id));
+        // So does an update.
+        state.inbox_searches.lock().unwrap().now.clear();
+        let r = update_inbox(AxState(state.clone()), Path(1), edit("renamed"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(state.inbox_searches.lock().unwrap().now.contains(&1));
+        // A refresh requests them all.
+        assert_eq!(
+            refresh_inboxes(AxState(state.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(state.inbox_searches.lock().unwrap().all);
+        // A delete drops the inbox's request and its search time.
+        {
+            let mut searches = state.inbox_searches.lock().unwrap();
+            searches.now.insert(2);
+            searches.last.insert(2, std::time::Instant::now());
+        }
+        assert_eq!(
+            delete_inbox(AxState(state.clone()), Path(2))
+                .await
+                .map_err(|e| e.0)
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let searches = state.inbox_searches.lock().unwrap();
+        assert!(!searches.now.contains(&2));
+        assert!(!searches.last.contains_key(&2));
     }
 
     async fn body(response: Response) -> String {

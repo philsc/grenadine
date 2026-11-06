@@ -390,6 +390,13 @@ input[type="text"] {
 .inbox-header:hover .inbox-actions {
   visibility: visible;
 }
+.inbox-toolbar {
+  margin-bottom: 8px;
+}
+.inbox-header .searched {
+  font-size: smaller;
+  margin-left: 6px;
+}
 .inbox-actions {
   visibility: hidden;
   white-space: nowrap;

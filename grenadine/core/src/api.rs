@@ -287,6 +287,10 @@ pub struct StackSummary {
 pub struct InboxWithPrs {
     pub inbox: Inbox,
     pub prs: Vec<PrSummary>,
+    /// Unix seconds. When the inbox's search last succeeded; `None` when
+    /// it never did, e.g. because the inbox was just created.
+    #[serde(default)]
+    pub searched_at: Option<i64>,
     /// Set when the inbox's last search failed, e.g. because of a typo in
     /// the filter.
     pub error: Option<String>,

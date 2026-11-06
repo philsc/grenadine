@@ -2,6 +2,7 @@
 //! matches. Inboxes can be added, edited, reordered and deleted in place.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use grenadine_core::api::{
     CiStatus, Inbox, InboxEdit, InboxWithPrs, PrKey, ReviewDecision, ThreadCounts,
@@ -31,9 +32,30 @@ pub fn Inboxes(
     // Kept here rather than in InboxSection so a refetch that rebuilds the
     // sections doesn't reset them; a page reload still does.
     let shown = RwSignal::new(HashMap::<i64, usize>::new());
+    // The "searched" ages refresh on this clock.
+    let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
+    let handle = set_interval_with_handle(
+        move || now.set((js_sys::Date::now() / 1000.0) as i64),
+        Duration::from_secs(30),
+    );
+    on_cleanup(move || {
+        if let Ok(h) = handle {
+            h.clear();
+        }
+    });
 
     view! {
         <div class="inboxes">
+            <div class="inbox-toolbar">
+                <button
+                    title="Search every inbox now"
+                    on:click=move |_| {
+                        spawn_local(async move {
+                            let _ = api::refresh_inboxes().await;
+                        });
+                    }
+                >"Refresh"</button>
+            </div>
             {move || match inboxes.get() {
                 None => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),
@@ -44,7 +66,7 @@ pub fn Inboxes(
                         .map(|(i, inbox)| {
                             let prev = i.checked_sub(1).map(|p| all[p].clone());
                             let next = all.get(i + 1).cloned();
-                            view! { <InboxSection inbox=inbox last=last prev=prev next=next shown=shown /> }
+                            view! { <InboxSection inbox=inbox last=last prev=prev next=next shown=shown now=now /> }
                         })
                         .collect_view()
                         .into_any()
@@ -107,6 +129,8 @@ fn InboxSection(
     next: Option<Inbox>,
     /// Rows shown per inbox id.
     shown: RwSignal<HashMap<i64, usize>>,
+    /// The shared clock for the "searched" ages, Unix seconds.
+    now: RwSignal<i64>,
 ) -> impl IntoView {
     let collapsed_key = format!("inbox-collapsed-{}", inbox.inbox.id);
     let collapsed = RwSignal::new(load_flag(&collapsed_key, false));
@@ -114,6 +138,7 @@ fn InboxSection(
     let InboxWithPrs {
         inbox,
         prs,
+        searched_at,
         error,
         truncated,
     } = inbox;
@@ -158,6 +183,15 @@ fn InboxSection(
                     <span class="inbox-name">{header_inbox.name.clone()}</span>
                     <span class="count">{count}</span>
                 </button>
+                {move || {
+                    // An inbox that doesn't sync in background is
+                    // searched on its interval; its rows can be that old.
+                    (!background).then(|| {
+                        searched_at.map(|t| {
+                            view! { <span class="searched muted">{format!("searched {}", crate::ago(now.get(), t))}</span> }
+                        })
+                    })
+                }}
                 <span class="inbox-actions">
                     <button class="icon" title="Move up" disabled=up_disabled on:click=move |_| reorder_up(prev.clone())>"↑"</button>
                     <button class="icon" title="Move down" disabled=down_disabled on:click=move |_| reorder(next.clone())>"↓"</button>
@@ -433,7 +467,7 @@ fn InboxForm(initial: InboxEdit, on_done: Callback<()>, id: Option<i64>) -> impl
             <label class="checkbox">"Count in total"
                 <input type="checkbox" prop:checked=move || count_in_total.get() on:change=move |ev| count_in_total.set(event_target_checked(&ev)) />
             </label>
-            <label class="checkbox">"Sync in background"
+            <label class="checkbox" title="Search every poll and sync the hits in the background. Without it the inbox is searched every 10 minutes by default, when it's saved, and on Refresh.">"Sync in background"
                 <input type="checkbox" prop:checked=move || sync_in_background.get() on:change=move |ev| sync_in_background.set(event_target_checked(&ev)) />
             </label>
             <p class="hint muted">"is:pr and repo: qualifiers for the configured repositories are added automatically. gr: qualifiers, described in the README, are evaluated by grenadine."</p>

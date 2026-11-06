@@ -1,7 +1,10 @@
 //! Keeps the database and the clones' refs in step with GitHub.
 //!
-//! Every poll runs all inbox searches in one request and then syncs each
-//! covered PR that changed since its last sync. Covered means: the hits
+//! Every poll searches the due inboxes in one request and then syncs each
+//! covered PR that changed since its last sync. Due means: the inboxes
+//! that sync in background, the ones whose last search is older than
+//! `--off-inbox-interval`, and the ones a create, edit or refresh
+//! requested a search for. Covered means: the hits
 //! of the inboxes that sync in background, the auto-review hits, and the
 //! PRs a page is watching. The other inboxes' PRs are listed from their
 //! search results and sync when a page watches them, so polls don't
@@ -16,8 +19,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use grenadine_core::api::{
-    CiStatus, MergeState, Person, PrDetail, PrKey, RequestPriority, ReviewComment, ReviewInfo,
-    ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
+    CiStatus, Inbox, MergeState, Person, PrDetail, PrKey, RequestPriority, ReviewComment,
+    ReviewInfo, ServerEvent, StackPr, SyncPhase, SyncStatus, SyncingPr, Version,
 };
 use grenadine_core::versions::{self, History};
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -47,6 +50,36 @@ const FOLLOW_UPS: [Duration; 3] = [
 /// that runs longer than this is stuck and the poll will catch up.
 const RESYNC_WAIT: Duration = Duration::from_secs(120);
 const RESYNC_POLL: Duration = Duration::from_millis(200);
+
+/// When each inbox was last searched in this process, and the searches
+/// requested ahead of their interval.
+#[derive(Default)]
+pub struct InboxSearches {
+    /// When each inbox's search was last attempted.
+    pub last: BTreeMap<i64, std::time::Instant>,
+    /// Inboxes to search on the next poll regardless of `last`.
+    pub now: BTreeSet<i64>,
+    /// Search every inbox on the next poll.
+    pub all: bool,
+}
+
+impl InboxSearches {
+    /// Searches `id` on the next poll, e.g. because it was edited.
+    pub fn request(&mut self, id: i64) {
+        self.now.insert(id);
+    }
+
+    /// Searches every inbox on the next poll.
+    pub fn request_all(&mut self) {
+        self.all = true;
+    }
+
+    /// Drops `id`'s record, e.g. because its inbox was deleted.
+    pub fn forget(&mut self, id: i64) {
+        self.last.remove(&id);
+        self.now.remove(&id);
+    }
+}
 
 /// A watch's guard: dropping it unwatches its keys, see `State::watch`.
 pub struct Watch {
@@ -98,6 +131,10 @@ pub struct State {
     /// don't cover syncs when a watch on it starts, and the polls pick
     /// its hits up while it's watched.
     pub watched: std::sync::Mutex<BTreeMap<PrKey, usize>>,
+    /// How long an inbox without background sync goes between searches.
+    pub off_inbox_interval: Duration,
+    /// The per-inbox search times and the requested searches.
+    pub inbox_searches: std::sync::Mutex<InboxSearches>,
     /// PRs that `follow_up` will sync again.
     pub following_up: std::sync::Mutex<BTreeSet<PrKey>>,
     /// A lock per PR that changes to the viewer's pending review on it
@@ -392,12 +429,35 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
     }
     state.status_searching();
     let inboxes = state.db.inboxes()?;
+    // Take the requested searches: a request that lands while the poll
+    // searches gets its own poll. The paused early return happens before
+    // this, so a request made while paused survives the pause.
+    let (lasts, now_ids, all) = {
+        let mut searches = state.inbox_searches.lock().unwrap();
+        (
+            searches.last.clone(),
+            std::mem::take(&mut searches.now),
+            std::mem::take(&mut searches.all),
+        )
+    };
+    let started = std::time::Instant::now();
     let slugs: Vec<String> = state.repos.keys().cloned().collect();
     // A filter that doesn't parse costs its inbox its search but not
     // the poll's.
     let mut prepared = Vec::new();
     let mut searched = Vec::new();
+    let mut attempted = Vec::new();
     for inbox in &inboxes {
+        if !due(
+            inbox,
+            lasts.get(&inbox.id).copied(),
+            all || now_ids.contains(&inbox.id),
+            started,
+            state.off_inbox_interval,
+        ) {
+            continue;
+        }
+        attempted.push(inbox.id);
         match inbox_search::prepare(&inbox.filter, &slugs) {
             Ok(p) => {
                 prepared.push(p);
@@ -414,10 +474,18 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
         r = ratelimit::with_priority(
             RequestPriority::Search,
             inbox_search::run(&state.github, &prepared, &repos),
-        ) => r?,
+        ) => match r {
+            Ok(r) => r.1,
+            // The taken requests wait for the next poll.
+            Err(e) => {
+                let mut searches = state.inbox_searches.lock().unwrap();
+                searches.now.extend(now_ids);
+                searches.all |= all;
+                return Err(e);
+            }
+        },
         _ = state.shutdown.cancelled() => return Ok(()),
-    }
-    .1;
+    };
 
     let mut hits = BTreeMap::new();
     // The keys the polls sync: hits of the inboxes that sync in
@@ -441,6 +509,14 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                 tracing::warn!("inbox {:?} ({}): {e}", inbox.name, inbox.filter);
                 state.db.set_inbox_results(inbox.id, Err(&e), None)?;
             }
+        }
+    }
+    // Attempts count, success or error alike, so a failing search
+    // retries on its interval.
+    {
+        let mut searches = state.inbox_searches.lock().unwrap();
+        for id in attempted {
+            searches.last.insert(id, started);
         }
     }
     state.send(ServerEvent::InboxesChanged);
@@ -538,6 +614,19 @@ fn short(versions: &[Version]) -> String {
         .map(|v| format!("v{}={}", v.number, &v.sha[..v.sha.len().min(10)]))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether a poll searches `inbox`: the ones that sync in background,
+/// the ones a request names, and the ones whose `last` search is at
+/// least `interval` old.
+fn due(
+    inbox: &Inbox,
+    last: Option<std::time::Instant>,
+    requested: bool,
+    now: std::time::Instant,
+    interval: Duration,
+) -> bool {
+    inbox.sync_in_background || requested || last.is_none_or(|t| now.duration_since(t) >= interval)
 }
 
 /// The PRs to sync this poll: the hits a background inbox, the
@@ -956,6 +1045,8 @@ pub fn test_state_with_agents(
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         watched: std::sync::Mutex::new(BTreeMap::new()),
+        off_inbox_interval: Duration::from_secs(600),
+        inbox_searches: std::sync::Mutex::new(InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1038,6 +1129,43 @@ mod tests {
             }),
             vec![key(4)]
         );
+    }
+
+    #[test]
+    fn due_rule() {
+        let inbox = |on: bool| Inbox {
+            id: 1,
+            name: "n".into(),
+            filter: "f".into(),
+            position: 0,
+            count_in_total: false,
+            sync_in_background: on,
+        };
+        let now = std::time::Instant::now();
+        let ago = |s: u64| now - Duration::from_secs(s);
+        let interval = Duration::from_secs(600);
+        // A background inbox is searched every poll; the others when
+        // never searched, requested, or due.
+        assert!(due(&inbox(true), Some(ago(0)), false, now, interval));
+        assert!(due(&inbox(false), None, false, now, interval));
+        assert!(due(&inbox(false), Some(ago(0)), true, now, interval));
+        assert!(due(&inbox(false), Some(ago(600)), false, now, interval));
+        assert!(!due(&inbox(false), Some(ago(599)), false, now, interval));
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_still_counts_as_an_attempt() {
+        // The test state's GitHub points at a dead address, so every
+        // search fails per-inbox. Attempts, not successes, move the
+        // interval, and the poll consumes the requested searches.
+        let state = test_state();
+        state.inbox_searches.lock().unwrap().request_all();
+        state.inbox_searches.lock().unwrap().request(1);
+        poll(&state, false).await.unwrap();
+        let searches = state.inbox_searches.lock().unwrap();
+        assert_eq!(searches.last.len(), state.db.inboxes().unwrap().len());
+        assert!(!searches.all);
+        assert!(!searches.now.contains(&1));
     }
 
     fn poll_syncs(state: &State, key: &PrKey) {
