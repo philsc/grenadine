@@ -4069,6 +4069,7 @@ class AgentTest(ServerTestCase):
         # repository's section while it's open.
         new.click()
         expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        expect(prompt).to_be_focused()
         repo.select_option(scenarios.REPO)
         expect(drafts).to_have_count(1)
         expect(drafts.locator(".agent-title")).to_have_text("New session")
@@ -4078,6 +4079,7 @@ class AgentTest(ServerTestCase):
         first = self.page.url
         new.click()
         expect(prompt).to_have_value("")
+        expect(prompt).to_be_focused()
         repo.select_option(scenarios.REPO)
         prompt.fill("second draft")
         permissions.select_option(label="Accept edits")
@@ -4108,6 +4110,12 @@ class AgentTest(ServerTestCase):
         drafts.click()
         self.assertEqual(self.page.url, first)
         expect(prompt).to_have_value("first draft\nwith more")
+        expect(prompt).to_be_focused()
+        end = len("first draft\nwith more")
+        self.assertEqual(
+            prompt.evaluate("e => [e.selectionStart, e.selectionEnd, e.value.length]"),
+            [end, end, end],
+        )
         expect(repo).to_have_value(scenarios.REPO)
         expect(permissions).to_have_value("plan")
         other_drafts.click()
@@ -4513,6 +4521,7 @@ class AgentTest(ServerTestCase):
         )
         expect(panel.get_by_label("Repository")).to_have_count(0)
         expect(panel.get_by_label("Start from PR")).to_have_count(0)
+        expect(panel.get_by_label("Prompt")).to_be_focused()
 
         # The run hints sit behind a summary naming the permission mode.
         hints = panel.locator(".session-hints")
