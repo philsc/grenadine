@@ -749,6 +749,21 @@ class ServerTestCase(unittest.TestCase):
             has=self.page.locator(".inbox-name", has_text=exactly(name))
         )
 
+    def merge_box(self) -> Locator:
+        return self.page.locator(".merge-box")
+
+    def merge(self) -> list[str]:
+        """Clicks Merge, accepting the dialog. Returns what it said."""
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        self.merge_box().get_by_role("button", name=re.compile("^Merge")).click()
+        return messages
+
     def repoll(self) -> None:
         """Forces a poll by saving the first inbox unchanged."""
         with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
@@ -2065,21 +2080,6 @@ class ReviewTest(ServerTestCase):
         self.assertEqual((pr.reviews[-1].state, pr.reviews[-1].body), (COMMENTED, ""))
         self.assertEqual(pr.comments[-1].body, "One thing.")
 
-    def merge_box(self) -> Locator:
-        return self.page.locator(".merge-box")
-
-    def merge(self) -> list[str]:
-        """Clicks Merge, accepting the dialog. Returns what it said."""
-        messages: list[str] = []
-
-        def accept(dialog: Dialog) -> None:
-            messages.append(dialog.message)
-            dialog.accept()
-
-        self.page.once("dialog", accept)
-        self.merge_box().get_by_role("button", name=re.compile("^Merge")).click()
-        return messages
-
     def resync(self, title: str) -> None:
         """Comments on the PR from outside the page, which resyncs it, and
         waits for the page to show the comment."""
@@ -2438,9 +2438,6 @@ class QueueTest(ServerTestCase):
         expect(self.page.locator(".pr-header h1")).to_have_text(
             f"{pr.title} #{pr.number}"
         )
-
-    def merge_box(self) -> Locator:
-        return self.page.locator(".merge-box")
 
     def status(self) -> Locator:
         return self.merge_box().locator(".merge-status")
@@ -5008,6 +5005,63 @@ class AgentTest(ServerTestCase):
         # Deleting it clears the count.
         self.delete_session()
         expect_tab_count(count, base)
+
+
+class AgentMergeTest(ServerTestCase):
+    """A session's PR list follows merges through grenadine."""
+
+    # The session must learn of the merge between polls, so the poll
+    # interval stays at its default.
+    POLL_INTERVAL: ClassVar[int] = 60
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.commit("Seed", {"README": "hello\n"})
+        repo.push("main")
+
+    def test_merge_updates_the_session_between_polls(self) -> None:
+        # The associated PRs are on the changes pane, which only a wide
+        # window shows.
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        repo = self.gh.repo(scenarios.REPO)
+        repo.checkout("assoc", "main")
+        repo.commit("assoc", {"assoc.txt": "assoc"})
+        repo.push("assoc")
+        pr = repo.open_pr("title-assoc", head="assoc")
+
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill(f"open pr {pr.url}")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        section = self.page.locator(".associated-prs")
+        # A poll fills in the title; the number is there right away.
+        expect(section.locator("li")).to_contain_text(f"#{pr.number}")
+        icon = section.locator(".pr-state")
+        expect(icon).to_have_class(re.compile(r"\bopen\b"))
+        session = self.page.url
+
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+
+        # The merge resyncs the PR, which reaches the session's own copy
+        # of its state without waiting for the next poll.
+        self.page.goto(session)
+        expect(icon).to_have_class(re.compile(r"\bmerged\b"), timeout=10_000)
+        expect(self.page.locator(".agent-prs")).to_have_text("1/1", timeout=10_000)
+
+        session_id = session.split("/")[-1]
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.get_by_role("button", name="Delete", exact=True).click()
+        expect(
+            self.page.locator(f'.agent-item[href="#/agents/{session_id}"]')
+        ).to_have_count(0)
 
 
 class AutoReviewTest(ServerTestCase):
