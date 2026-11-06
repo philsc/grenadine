@@ -4488,14 +4488,23 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end")).to_have_count(1)
         follow_up = panel.get_by_label("Follow-up")
         follow_up.fill("half a thought")
+        follow_up.focus()
+        # The node, tagged so a remount that replaced it shows.
+        follow_up.evaluate("el => { el.__kept = true; }")
 
         # A comment from outside the page resyncs the PR, which rebuilds
-        # the review sidebar but not the panel under it.
-        resp = self.page.request.post(
-            f"{self.url}api/pr/{scenarios.REPO}/{self.panel_pr.number}/comments",
-            headers={"Origin": self.url.rstrip("/")},
-            data={"body": "Ping"},
-        )
+        # the review sidebar but not the panel under it. The resync also
+        # refetches the panel's sessions.
+        with self.page.expect_response(
+            lambda r: r.url.endswith(
+                f"/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents"
+            )
+        ):
+            resp = self.page.request.post(
+                f"{self.url}api/pr/{scenarios.REPO}/{self.panel_pr.number}/comments",
+                headers={"Origin": self.url.rstrip("/")},
+                data={"body": "Ping"},
+            )
         self.assertEqual(resp.status, 204, resp.text())
         expect(self.page.locator("details.conversation summary")).to_have_text(
             "1 comment"
@@ -4503,6 +4512,10 @@ class AgentTest(ServerTestCase):
         expect(toggle).to_have_attribute("aria-expanded", "true")
         expect(follow_up).to_have_value("half a thought")
         expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
+        # The refetched panel keeps the box as the same node, still
+        # focused mid-typing.
+        expect(follow_up).to_be_focused()
+        self.assertTrue(follow_up.evaluate("el => el.__kept === true"))
 
         # The expansion and the selected tab survive a reload.
         self.page.reload()
