@@ -1297,8 +1297,12 @@ impl Db {
         rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect()
     }
 
+    /// Inserts the session, and a row for the PR it started from so the
+    /// session's associated PRs list it.
     pub fn create_agent(&self, a: &AgentSession) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO agents
                 (id, backend, repo, pr_number, title, branch, worktree, base_sha, status,
                  cost, cost_unit, context_tokens, context_window, model, created_at, kind,
@@ -1324,6 +1328,14 @@ impl Db {
                 a.draft
             ],
         )?;
+        if let Some(number) = a.pr {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
+                 VALUES (?, ?, ?, 'OPEN')",
+                params![a.id, a.repo, number],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1556,7 +1568,7 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The PRs session `id` opened, as of the last poll.
+    /// The PRs session `id` started from or opened, as of the last poll.
     pub fn agent_pr_list(&self, id: &str) -> Result<Vec<AgentPr>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -2877,7 +2889,10 @@ mod tests {
     #[test]
     fn agent_by_draft_round_trip() {
         let db = Db::in_memory();
-        let mut a = agent("a", AgentStatus::Idle);
+        let mut a = AgentSession {
+            pr: None,
+            ..agent("a", AgentStatus::Idle)
+        };
         a.draft = Some("d1".into());
         db.create_agent(&a).unwrap();
         db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
@@ -2892,6 +2907,10 @@ mod tests {
     #[test]
     fn agents_round_trip() {
         let db = Db::in_memory();
+        let agent = |id, status| AgentSession {
+            pr: None,
+            ..agent(id, status)
+        };
         db.create_agent(&agent("a", AgentStatus::Running)).unwrap();
         db.create_agent(&agent("b", AgentStatus::AwaitingApproval))
             .unwrap();
@@ -3093,11 +3112,49 @@ mod tests {
         );
     }
 
+    /// A session's associated PRs start with the PR it started from,
+    /// open and untitled until a poll looks it up.
+    #[test]
+    fn create_agent_records_the_start_pr() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        db.create_agent(&AgentSession {
+            pr: None,
+            ..agent("b", AgentStatus::Idle)
+        })
+        .unwrap();
+
+        let list = db.agent_pr_list("a").unwrap();
+        assert_eq!(
+            list.iter()
+                .map(|p| (p.key.repo.as_str(), p.key.number))
+                .collect::<Vec<_>>(),
+            [("o/n", 7)]
+        );
+        assert_eq!(list[0].state, "OPEN");
+        assert_eq!(list[0].title, None);
+        assert_eq!(
+            db.agent("a").unwrap().unwrap().prs,
+            Some(AgentPrs {
+                merged: 0,
+                total: 1,
+                conflicting: 0
+            })
+        );
+        // A session that started on the trunk has none.
+        assert!(db.agent_pr_list("b").unwrap().is_empty());
+        assert_eq!(db.agent("b").unwrap().unwrap().prs, None);
+    }
+
     #[test]
     fn agent_prs() {
         let db = Db::in_memory();
-        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
-        db.create_agent(&agent("b", AgentStatus::Idle)).unwrap();
+        let no_pr = |id| AgentSession {
+            pr: None,
+            ..agent(id, AgentStatus::Idle)
+        };
+        db.create_agent(&no_pr("a")).unwrap();
+        db.create_agent(&no_pr("b")).unwrap();
         let prs = |id| db.agent(id).unwrap().unwrap().prs;
         assert_eq!(prs("a"), None);
 

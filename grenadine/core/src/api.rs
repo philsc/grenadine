@@ -1170,7 +1170,8 @@ pub struct AgentSession {
     /// Where the session's work was last landed by wrapping up.
     #[serde(default)]
     pub landed: Option<Landed>,
-    /// The PRs the session opened; `None` when it opened none.
+    /// The PRs the session started from or opened; `None` when there
+    /// are none.
     #[serde(default)]
     pub prs: Option<AgentPrs>,
     /// How many files in the worktree have unstaged changes, as

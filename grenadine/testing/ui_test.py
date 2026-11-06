@@ -5012,6 +5012,25 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
+    def test_associated_prs_include_the_start_pr(self) -> None:
+        # The associated PRs are on the changes pane, which only a wide
+        # window shows.
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        repo = self.gh.repo(self.OTHER_REPO)
+        pr = self._foreign_pr(repo, "start", "main")
+        self._session_from_pr(pr.number)
+
+        items = self.page.locator(".associated-prs li")
+        # The number is there right away; a poll fills in the title.
+        expect(items).to_contain_text(f"#{pr.number}")
+        expect(items).to_have_text([f"#{pr.number} {pr.title}"], timeout=15_000)
+
+        # The session goes too, so later tests' counts aren't off.
+        entry = self.section(self.OTHER_REPO).locator(".agent-entry")
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        entry.get_by_role("button", name="Delete session").click()
+        expect(entry).to_have_count(0)
+
     def test_transcript_pr_links_open_in_grenadine(self) -> None:
         self.page.context.route(
             "https://github.com/**",
