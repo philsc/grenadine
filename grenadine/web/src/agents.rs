@@ -278,20 +278,25 @@ fn PrIcon() -> impl IntoView {
 
 /// How many of the PRs a session opened are merged, e.g. "1/2". It turns
 /// purple once they all are, when the session is likely done, and red
-/// while any open one conflicts with its base, when it needs attention.
+/// while any open one conflicts with its base or has failing checks,
+/// when it needs attention.
 #[component]
 fn PrCount(prs: AgentPrs) -> impl IntoView {
     let AgentPrs {
         merged,
         total,
         conflicting,
+        failing,
     } = prs;
     let done = total > 0 && merged == total;
-    let conflict = conflicting > 0;
+    let conflict = conflicting + failing > 0;
     let noun = if total == 1 { "PR" } else { "PRs" };
     let mut title = format!("{merged} of {total} {noun} merged");
-    if conflict {
+    if conflicting > 0 {
         title.push_str(&format!(", {conflicting} with conflicts"));
+    }
+    if failing > 0 {
+        title.push_str(&format!(", {failing} with failing checks"));
     }
     view! {
         <span class="agent-prs" class:done=done class:conflict=conflict title=title>

@@ -5150,6 +5150,16 @@ class AgentTest(ServerTestCase):
         expect(count).not_to_have_class(conflict, timeout=15_000)
         expect(count).to_have_attribute("title", "0 of 2 PRs merged")
 
+        # Failing checks turn it red too.
+        a.check_runs.append(CheckRun("build", conclusion="FAILURE"))
+        expect(count).to_have_class(conflict, timeout=15_000)
+        expect(count).to_have_attribute(
+            "title", "0 of 2 PRs merged, 1 with failing checks"
+        )
+        a.check_runs[0].conclusion = "SUCCESS"
+        expect(count).not_to_have_class(conflict, timeout=15_000)
+        expect(count).to_have_attribute("title", "0 of 2 PRs merged")
+
         # The next poll sees the merge.
         repo.merge(a)
         expect(count).to_have_text("1/2", timeout=15_000)
