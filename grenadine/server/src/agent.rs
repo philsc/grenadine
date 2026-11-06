@@ -18,8 +18,8 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrKey,
-    PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrDetail,
+    PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::claude;
 use crate::devin;
-use crate::git::Repo;
+use crate::git::{REF_PREFIX, Repo};
 use crate::github::StackLookup;
 use crate::pr_plan::{Planned, PrSpec, StackOp, plan_prs, plan_stack};
 use crate::reflow::reflow;
@@ -1256,6 +1256,7 @@ async fn ensure_worktree(state: &Arc<State>, session: &AgentSession) -> Result<(
     let repo = cloned.repo.clone();
     let worktree = PathBuf::from(&session.worktree);
     let branch = session.branch.clone();
+    let pr = session.pr;
     let base = tokio::task::spawn_blocking(move || -> Result<String> {
         repo.worktree_remove(&worktree, &branch)?;
         let base = match base {
@@ -1266,6 +1267,11 @@ async fn ensure_worktree(state: &Arc<State>, session: &AgentSession) -> Result<(
             std::fs::create_dir_all(parent)?;
         }
         repo.worktree_add(&worktree, &branch, &base)?;
+        if let Some(number) = pr {
+            // `@{u}` in the worktree is the PR's target branch, so
+            // `git merge-base @{u} HEAD` names the PR's base.
+            repo.set_upstream(&branch, &format!("{REF_PREFIX}/{number}/target"))?;
+        }
         Ok(base)
     })
     .await??;
@@ -2810,6 +2816,102 @@ fn prs_note(session: &AgentSession) -> Option<String> {
     )
 }
 
+/// What a session that started from a pull request knows about it: the
+/// PR's synced detail and which commits are the PR's own, from the merge
+/// base with its target branch to the session's base.
+pub(crate) struct SessionPr {
+    pub number: u64,
+    /// The PR as the last sync stored it; `None` when it hasn't synced.
+    pub detail: Option<PrDetail>,
+    /// The commit the session's worktree started from; empty when the
+    /// worktree doesn't exist yet.
+    pub base_sha: String,
+    /// The merge base of `base_sha` and the PR's target branch — for a
+    /// stacked PR the parent PR's branch — so `merge_base..base_sha` are
+    /// the PR's own commits, the same range its diff view shows. `None`
+    /// when unknown.
+    pub merge_base: Option<String>,
+}
+
+/// The `SessionPr` of a session started from a pull request; `None` for
+/// a trunk or general session.
+pub(crate) async fn session_pr(state: &Arc<State>, session: &AgentSession) -> Option<SessionPr> {
+    let number = session.pr?;
+    if session.repo == GENERAL {
+        return None;
+    }
+    let key = PrKey {
+        repo: session.repo.clone(),
+        number,
+    };
+    let detail = state.db.pr(&key).ok().flatten();
+    let base_sha = session.base_sha.clone();
+    // A version's merge base is recomputed against the PR's current
+    // target branch on each sync, so it matches the diff view's Base.
+    let mut merge_base = detail
+        .as_ref()
+        .and_then(|pr| pr.versions.iter().find(|v| v.sha == base_sha))
+        .and_then(|v| v.merge_base.clone());
+    if merge_base.is_none()
+        && !base_sha.is_empty()
+        && let Some(repo) = state.repos.get(&session.repo).map(|c| c.repo.clone())
+    {
+        let target = format!("{REF_PREFIX}/{number}/target");
+        let sha = base_sha.clone();
+        merge_base = tokio::task::spawn_blocking(move || repo.merge_base(&target, &sha))
+            .await
+            .ok()
+            .flatten();
+    }
+    Some(SessionPr {
+        number,
+        detail,
+        base_sha,
+        merge_base,
+    })
+}
+
+/// What a session started from a pull request is told about it: which
+/// commits are the PR's versus the session's own, that `@{u}` is the
+/// PR's target branch, and that `session_pr` says more.
+fn pr_note(pr: &SessionPr) -> String {
+    let Some(detail) = pr.detail.as_ref() else {
+        return format!(
+            "This session started from pull request #{}. It hasn't synced yet; the grenadine \
+             MCP server's session_pr tool gives its details once it has.",
+            pr.number
+        );
+    };
+    let mut note = format!(
+        "This session started from pull request #{} \"{}\" ({}), which merges `{}` into `{}`.",
+        pr.number, detail.summary.title, detail.summary.url, detail.head_ref, detail.base_ref
+    );
+    if let Some(merge_base) = &pr.merge_base {
+        note += &format!(
+            " When the user says \"this PR\", they mean its commits {merge_base}..{}, the same \
+             changes as its diff view, not everything since the default branch. Commits after \
+             {} are this session's own work.",
+            pr.base_sha, pr.base_sha
+        );
+    }
+    note += " This branch's upstream is the pull request's target branch, so \
+             `git merge-base @{u} HEAD` gives the PR's base. The grenadine MCP server's \
+             session_pr tool gives these details and the PR's stack.";
+    let head = detail
+        .versions
+        .iter()
+        .rev()
+        .find(|v| !v.missing)
+        .map(|v| v.sha.as_str());
+    if let Some(head) = head.filter(|h| *h != pr.base_sha) {
+        note += &format!(
+            " The pull request has since moved on to {head}, which this worktree \
+             doesn't include."
+        );
+    }
+    note
+}
+
 /// What agents are told about showing the user images: a Markdown image
 /// pointing at a local file doesn't load in the user's page, so they go
 /// through the MCP tool.
@@ -2883,9 +2985,11 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         state.agents.base_url,
         state.agents.secret(id)
     );
+    let starting_pr = session_pr(state, &session).await;
     let notes: Vec<_> = [
         (session.kind == SessionKind::AutoReview).then(|| crate::auto_review::NOTE.to_owned()),
         prs_note(&session),
+        starting_pr.as_ref().map(pr_note),
         landed_note(&session),
         terminals_note(state, id),
         Some(images_note()),
@@ -3298,6 +3402,7 @@ fn store_images(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use grenadine_core::api::{Stack, Version, VersionKind};
     use serde_json::json;
 
     use super::*;
@@ -3816,7 +3921,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             second.contains(
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
                  mcp__grenadine__wait_for_terminal mcp__grenadine__show_image \
-                 mcp__grenadine__update_prs mcp__grenadine__land_on_checkout --mcp-config "
+                 mcp__grenadine__update_prs mcp__grenadine__land_on_checkout \
+                 mcp__grenadine__session_pr --mcp-config "
             ),
             "{log}"
         );
@@ -6036,6 +6142,237 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     fn tells_agents_about_showing_images() {
         let note = images_note();
         assert!(note.contains("show_image"), "{note}");
+    }
+
+    /// A version of a stored PR, in the shape `store_sync` takes.
+    fn pr_version(number: u32, sha: &str, merge_base: Option<&str>) -> Version {
+        Version {
+            number,
+            sha: sha.into(),
+            merge_base: merge_base.map(str::to_owned),
+            kind: VersionKind::Initial,
+            pushed_at: None,
+            pushed_by: None,
+            pushed_by_is_guess: false,
+            missing: false,
+        }
+    }
+
+    /// Records an open PR in repo `o/n` without fetching anything.
+    fn store_pr_meta(state: &Arc<State>, number: u64, versions: &[Version], stack: Option<&Stack>) {
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: PrKey {
+                        repo: "o/n".into(),
+                        number,
+                    },
+                    title: "The PR".into(),
+                    body: String::new(),
+                    author: "me".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    queued: false,
+                    url: format!("https://github.com/o/n/pull/{number}"),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "main".into(),
+                    head_ref: "feature".into(),
+                    head_oid: versions.last().map(|v| v.sha.clone()).unwrap_or_default(),
+                    ci: None,
+                    review: None,
+                    review_error: None,
+                },
+                versions,
+                &[],
+                stack,
+                false,
+                None,
+            )
+            .unwrap();
+    }
+
+    /// A session in repo `o/n` started from PR `number` at `base_sha`.
+    fn pr_session(number: u64, base_sha: &str, kind: SessionKind) -> AgentSession {
+        AgentSession {
+            pr: Some(number),
+            base_sha: base_sha.into(),
+            kind,
+            ..session_row("abcdef01-2345", "o/n", Path::new("/w"))
+        }
+    }
+
+    /// A session started from a PR hears which commits are the PR's own:
+    /// the stored merge base with its target branch — a stacked PR's
+    /// parent branch, not the trunk — through the session's base.
+    #[tokio::test]
+    async fn tells_the_agent_the_prs_commit_range() {
+        let state = crate::sync::test_state();
+        let base = "b".repeat(40);
+        let parent_tip = "a".repeat(40);
+        store_pr_meta(&state, 7, &[pr_version(1, &base, Some(&parent_tip))], None);
+
+        for kind in [SessionKind::Interactive, SessionKind::AutoReview] {
+            let session = pr_session(7, &base, kind);
+            let ctx = session_pr(&state, &session).await.unwrap();
+            assert_eq!(ctx.merge_base.as_deref(), Some(parent_tip.as_str()));
+            let note = pr_note(&ctx);
+            assert!(
+                note.contains(
+                    "pull request #7 \"The PR\" (https://github.com/o/n/pull/7), \
+                     which merges `feature` into `main`"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains(&format!("its commits {parent_tip}..{base}")),
+                "{note}"
+            );
+            assert!(
+                note.contains(&format!("Commits after {base} are this session's own work")),
+                "{note}"
+            );
+            assert!(note.contains("git merge-base @{u} HEAD"), "{note}");
+            assert!(note.contains("session_pr"), "{note}");
+            assert!(!note.contains("moved on"), "{note}");
+        }
+    }
+
+    /// Without the version's merge base, the range comes from the PR's
+    /// `target` ref in the clone.
+    #[tokio::test]
+    async fn the_pr_range_falls_back_to_the_target_ref() {
+        use crate::git::tests::{commit, run};
+        let f = crate::git::tests::fixture();
+        let main = run(&f.upstream, &["rev-parse", "HEAD"]);
+        run(&f.upstream, &["checkout", "-q", "-b", "feature"]);
+        let head = commit(&f.upstream, "p", "1\n");
+        run(&f.upstream, &["checkout", "-q", "main"]);
+        f.clone.fetch_commits(std::slice::from_ref(&head));
+        f.clone
+            .update_refs(&[(format!("{REF_PREFIX}/7/target"), main.clone())], &[])
+            .unwrap();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: f.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([("o/n".to_owned(), cloned)].into_iter().collect());
+        store_pr_meta(&state, 7, &[pr_version(1, &head, None)], None);
+
+        let session = pr_session(7, &head, SessionKind::Interactive);
+        let ctx = session_pr(&state, &session).await.unwrap();
+        assert_eq!(ctx.merge_base.as_deref(), Some(main.as_str()));
+        let note = pr_note(&ctx);
+        assert!(
+            note.contains(&format!("its commits {main}..{head}")),
+            "{note}"
+        );
+    }
+
+    /// A session whose PR moved on since it started hears that its
+    /// worktree doesn't include the PR's new head.
+    #[tokio::test]
+    async fn the_pr_note_mentions_a_moved_head() {
+        let state = crate::sync::test_state();
+        let base = "b".repeat(40);
+        let moved = "c".repeat(40);
+        store_pr_meta(
+            &state,
+            7,
+            &[
+                pr_version(1, &base, Some(&"a".repeat(40))),
+                pr_version(2, &moved, Some(&"a".repeat(40))),
+            ],
+            None,
+        );
+
+        let session = pr_session(7, &base, SessionKind::Interactive);
+        let note = pr_note(&session_pr(&state, &session).await.unwrap());
+        assert!(
+            note.contains(&format!(
+                "The pull request has since moved on to {moved}, which this \
+                 worktree doesn't include."
+            )),
+            "{note}"
+        );
+    }
+
+    /// Trunk and general sessions get no PR note; an unsynced PR gets a
+    /// shorter one.
+    #[tokio::test]
+    async fn only_pr_sessions_get_the_pr_note() {
+        let state = crate::sync::test_state();
+
+        let trunk = session_row("abcdef01-2345", "o/n", Path::new("/w"));
+        assert!(session_pr(&state, &trunk).await.is_none());
+
+        let general = AgentSession {
+            repo: GENERAL.into(),
+            pr: Some(7),
+            ..session_row("abcdef01-2345", "o/n", Path::new("/w"))
+        };
+        assert!(session_pr(&state, &general).await.is_none());
+
+        let unsynced = pr_session(9, &"b".repeat(40), SessionKind::Interactive);
+        let ctx = session_pr(&state, &unsynced).await.unwrap();
+        let note = pr_note(&ctx);
+        assert!(note.contains("pull request #9"), "{note}");
+        assert!(note.contains("hasn't synced yet"), "{note}");
+        assert!(note.contains("session_pr"), "{note}");
+    }
+
+    /// A PR session's branch tracks the PR's target ref so `@{u}` is its
+    /// base; a trunk session's has no upstream.
+    #[tokio::test]
+    async fn a_pr_sessions_branch_tracks_its_target() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, clone) = wrap_up_state(&fx, dir.path());
+        run(&fx.upstream, &["checkout", "-qb", "pr-branch"]);
+        let head = commit(&fx.upstream, "p", "1\n");
+        store_pr(&state, &fx, 5, "pr-branch", &head);
+
+        let session = start_from_pr(&state, "commit w agent", 5).await;
+        assert_eq!(
+            run(
+                &clone,
+                &[
+                    "config",
+                    "--get",
+                    &format!("branch.{}.merge", session.branch)
+                ]
+            ),
+            format!("{REF_PREFIX}/5/target")
+        );
+        assert_eq!(
+            run(
+                &clone,
+                &[
+                    "config",
+                    "--get",
+                    &format!("branch.{}.remote", session.branch)
+                ]
+            ),
+            "."
+        );
+
+        let trunk = start(&state, "commit b agent").await;
+        assert_eq!(
+            run(
+                &clone,
+                &[
+                    "config",
+                    "--default",
+                    "",
+                    "--get",
+                    &format!("branch.{}.merge", trunk.branch)
+                ]
+            ),
+            ""
+        );
     }
 
     /// `capture_markdown_images` with a store that takes every
