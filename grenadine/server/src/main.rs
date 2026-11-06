@@ -19,6 +19,7 @@ mod reflow;
 mod stack;
 mod summary;
 mod sync;
+mod system;
 mod terminal;
 mod unstaged;
 
@@ -289,6 +290,9 @@ async fn main() -> Result<()> {
         inbox_searches: std::sync::Mutex::new(sync::InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
+        db_dir: db_path.parent().unwrap_or(db_path.as_path()).to_owned(),
+        started_at: agent::now(),
+        system: system::Sampler::default(),
         shutdown: shutdown.clone(),
     });
     let sync_task = tokio::spawn(sync::run(

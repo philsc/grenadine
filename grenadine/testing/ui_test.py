@@ -1543,12 +1543,29 @@ class InboxTest(ServerTestCase):
             self.inbox(scenarios.NEEDS_REVIEW).locator(".pr-list li")
         ).not_to_have_count(0)
         self.page.get_by_role("link", name="Debug", exact=True).click()
-        expect(self.page.locator(".debug h1")).to_have_text("GitHub API usage")
+        expect(
+            self.page.locator(".debug h1", has_text="GitHub API usage")
+        ).to_be_visible()
         expect(self.page.locator(".debug")).to_contain_text("of 5,000 points left")
-        expect(self.page.locator(".usage-table:not(.usage-reports)")).to_contain_text(
-            "Inbox search"
-        )
+        expect(
+            self.page.locator(".usage-table:not(.usage-reports):not(.usage-sessions)")
+        ).to_contain_text("Inbox search")
         expect(self.page.locator(".usage-reports")).to_contain_text(scenarios.REPO)
+
+    def test_debug_tab_shows_system_stats(self) -> None:
+        self.page.goto(self.url)
+        self.page.get_by_role("link", name="Debug", exact=True).click()
+        expect(self.page.locator(".debug h1").first).to_have_text("System")
+        expect(self.page.locator(".debug")).to_contain_text(
+            re.compile(r"RAM: .* of .* used")
+        )
+        # Slices need a systemd user manager; without one a note stands
+        # in for the table.
+        expect(
+            self.page.locator(
+                ".usage-sessions, .debug p.muted:has-text('systemd user manager')"
+            ).first
+        ).to_be_visible()
 
     def test_pauses_near_the_rate_limit(self) -> None:
         self.page.goto(self.url)

@@ -11,7 +11,7 @@ use grenadine_core::api::{
     Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GitHubUsage, InboxEdit,
     InboxWithPrs, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
     NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview,
-    SyncStatus, TerminalInfo, WorktreeChanges, WrapUp,
+    SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -137,6 +137,15 @@ pub async fn pr(key: &PrKey) -> Result<PrResponse> {
 /// What the server spent on GitHub, for the Debug tab.
 pub async fn github_usage() -> Result<GitHubUsage> {
     check(Request::get("/api/debug/github").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The machine's and sessions' resource use, for the Debug tab.
+pub async fn system_stats() -> Result<SystemStats> {
+    check(Request::get("/api/debug/system").send().await)
         .await?
         .json()
         .await
