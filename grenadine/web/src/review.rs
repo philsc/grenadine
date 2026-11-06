@@ -9,6 +9,7 @@ use grenadine_core::api::{
     ReviewInfo, ReviewState, SubmitReview, submit_blocker,
 };
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::composer::{
@@ -634,6 +635,33 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
             </label>
         }
     };
+    // Pointer presses outside the panel and Escape close the popup. It
+    // listens to pointerdown, not click: the MarkdownEditor's tabs swap the
+    // DOM under the pointer, so a click's target may already be detached and
+    // `closest` can't place it in the panel; pointerdown also doesn't fire
+    // when a selection drag that started in the textarea ends outside.
+    let on_pointer = window_event_listener(leptos::ev::pointerdown, move |ev| {
+        if !open.get_untracked() {
+            return;
+        }
+        let inside = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|t| t.closest(".review-panel").ok().flatten())
+            .is_some();
+        if !inside {
+            open.set(false);
+        }
+    });
+    let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            open.set(false);
+        }
+    });
+    on_cleanup(move || {
+        on_pointer.remove();
+        on_key.remove();
+    });
     view! {
         // Not a <details>: its toggle events race with the page being
         // rebuilt when the PR is refetched.
@@ -643,12 +671,7 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
                 "Review"
                 {(pending > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending}</span> })}
             </button>
-            <div class="review-popup" class:hidden=move || !open.get()
-                on:keydown=move |ev| {
-                    if ev.key() == "Escape" {
-                        open.set(false);
-                    }
-                }>
+            <div class="review-popup" class:hidden=move || !open.get()>
                 <MarkdownEditor
                     text=body
                     draft=draft
