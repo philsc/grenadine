@@ -1271,6 +1271,15 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
     // The images pasted so far, kept with the draft in IndexedDB.
     let images = image_drafts::draft_images(image_drafts::new_session_key(&draft));
     let error = RwSignal::new(None::<String>);
+    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    // The prompt gets the focus, with the caret at the end of any draft text.
+    Effect::new(move |_| {
+        if let Some(t) = textarea.get() {
+            let _ = t.focus();
+            let end = t.value().encode_utf16().count() as u32;
+            let _ = t.set_selection_range(end, end);
+        }
+    });
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
@@ -1467,6 +1476,7 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
                     <label>"Model" <ModelSelect model=model backend=backend.into() /></label>
                 </div>
                 <textarea
+                    node_ref=textarea
                     class="agent-prompt"
                     rows="5"
                     placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())

@@ -52,6 +52,7 @@ web-sys = { workspace = true, features = [
   "ImageBitmap",
   "HtmlCanvasElement",
   "HtmlInputElement",
+  "HtmlTextAreaElement",
   "HtmlDialogElement",
   "CanvasRenderingContext2d",
   "IdbDatabase",
