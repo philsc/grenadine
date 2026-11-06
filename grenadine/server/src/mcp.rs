@@ -20,7 +20,9 @@ use axum::Json;
 use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use grenadine_core::api::{AgentEventKind, Landed, PermissionMode, PrKey, WrapUpTarget};
+use grenadine_core::api::{
+    AgentBackend, AgentEventKind, Landed, PermissionMode, PrKey, WrapUpTarget,
+};
 use serde_json::{Value, json};
 
 use crate::agent::{self, Decision};
@@ -34,6 +36,12 @@ const WAIT: Duration = Duration::from_secs(600);
 
 /// The longest a wait for a terminal lasts.
 const MAX_WAIT: Duration = Duration::from_secs(3600);
+
+/// The longest a wait for a terminal lasts in a Devin session. Devin
+/// gives an MCP tool call 120 s, then sends it again once and reports
+/// the server as unreachable after the second try also runs out.
+/// Progress notifications don't extend that.
+const DEVIN_MAX_WAIT: Duration = Duration::from_secs(100);
 
 /// How long a terminal at its prompt has to be quiet for a wait without
 /// `until` to end, unless Claude says otherwise.
@@ -121,10 +129,13 @@ pub async fn handle(
     Path((id, secret)): Path<(String, String)>,
     Json(msg): Json<Value>,
 ) -> Response {
-    let known = agent::valid_id(&id) && state.db.agent(&id).ok().flatten().is_some();
-    if !known || state.agents.secret(&id) != secret {
+    let session = agent::valid_id(&id)
+        .then(|| state.db.agent(&id).ok().flatten())
+        .flatten();
+    let Some(session) = session.filter(|_| state.agents.secret(&id) == secret) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
+    let backend = session.backend;
     // Notifications and responses get no answer.
     let Some(rpc_id) = msg.get("id").filter(|_| msg.get("method").is_some()) else {
         return StatusCode::ACCEPTED.into_response();
@@ -209,7 +220,7 @@ pub async fn handle(
                         },
                         "timeout_seconds": {
                             "type": "number",
-                            "description": "Defaults to 600, at most 3600.",
+                            "description": timeout_description(backend),
                         },
                         "lines": {
                             "type": "integer",
@@ -345,7 +356,7 @@ pub async fn handle(
                     update_prs(&state, &id, &format!("update_prs-{rpc_id}"), args).await
                 }
                 "land_on_checkout" => land_on_checkout(&state, &id).await,
-                _ => terminal_tool(&state, &id, name, args).await,
+                _ => terminal_tool(&state, &id, name, args, backend).await,
             };
             let (text, failed) = match result {
                 Ok(text) => (text, false),
@@ -365,6 +376,37 @@ fn seconds(value: &Value) -> Option<Duration> {
     value
         .as_f64()
         .and_then(|s| Duration::try_from_secs_f64(s).ok())
+}
+
+/// The longest a wait for a terminal lasts on the session's backend.
+fn max_wait(backend: AgentBackend) -> Duration {
+    match backend {
+        AgentBackend::Claude => MAX_WAIT,
+        AgentBackend::Devin => DEVIN_MAX_WAIT,
+    }
+}
+
+/// How long a `wait_for_terminal` call waits: `timeout_seconds` or
+/// `WAIT`, capped at what the session's backend gives a tool call.
+fn wait_timeout(value: &Value, backend: AgentBackend) -> Duration {
+    seconds(value).unwrap_or(WAIT).min(max_wait(backend))
+}
+
+/// What `wait_for_terminal`'s `timeout_seconds` tells the agent: the
+/// default and the cap the session's backend allows.
+fn timeout_description(backend: AgentBackend) -> String {
+    match backend {
+        AgentBackend::Claude => format!(
+            "Defaults to {}, at most {}.",
+            WAIT.as_secs(),
+            MAX_WAIT.as_secs()
+        ),
+        AgentBackend::Devin => format!(
+            "Defaults to {}, at most {}. Call the tool again to keep waiting.",
+            DEVIN_MAX_WAIT.as_secs(),
+            DEVIN_MAX_WAIT.as_secs()
+        ),
+    }
 }
 
 /// Puts the image at `args.path` into the session's transcript.
@@ -448,6 +490,7 @@ async fn terminal_tool(
     id: &str,
     name: &str,
     args: &Value,
+    backend: AgentBackend,
 ) -> anyhow::Result<String> {
     let terminals = &state.agents.terminals;
     let open = terminals.list(id);
@@ -487,9 +530,7 @@ async fn terminal_tool(
                 .transpose()
                 .context("`until` isn't a valid regex")?;
             let idle = seconds(&args["idle_seconds"]).or(until.is_none().then_some(IDLE));
-            let timeout = seconds(&args["timeout_seconds"])
-                .unwrap_or(WAIT)
-                .min(MAX_WAIT);
+            let timeout = wait_timeout(&args["timeout_seconds"], backend);
             let end = tokio::select! {
                 end = terminal.wait(until.as_ref(), idle, timeout) => end,
                 _ = state.shutdown.cancelled() => bail!("The server is shutting down."),
@@ -610,6 +651,62 @@ mod tests {
         )
         .await;
         assert_eq!(body["error"]["code"], -32601);
+    }
+
+    /// `wait_for_terminal`'s `timeout_seconds` description states the
+    /// default and the cap the session's backend allows.
+    #[tokio::test]
+    async fn tools_list_describes_the_backends_timeout() {
+        for (backend, expected) in [
+            (AgentBackend::Claude, "Defaults to 600, at most 3600."),
+            (
+                AgentBackend::Devin,
+                "Defaults to 100, at most 100. Call the tool again to keep waiting.",
+            ),
+        ] {
+            let state = state_with(|s| s.backend = backend);
+            let secret = state.agents.secret(ID);
+            let (_, body) = call(
+                &state,
+                &secret,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            )
+            .await;
+            let description = body["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "wait_for_terminal")
+                .unwrap()["inputSchema"]["properties"]["timeout_seconds"]["description"]
+                .as_str()
+                .unwrap();
+            assert_eq!(description, expected, "{backend:?}");
+        }
+    }
+
+    /// `timeout_seconds` defaults to `WAIT` and is capped at what the
+    /// session's backend gives a tool call.
+    #[test]
+    fn the_wait_timeout_fits_the_backend() {
+        for (backend, cases) in [
+            (
+                AgentBackend::Claude,
+                [(None, 600), (Some(900), 900), (Some(5000), 3600)],
+            ),
+            (
+                AgentBackend::Devin,
+                [(None, 100), (Some(900), 100), (Some(30), 30)],
+            ),
+        ] {
+            for (value, expected) in cases {
+                let value = value.map_or(Value::Null, |s| json!(s));
+                assert_eq!(
+                    wait_timeout(&value, backend),
+                    Duration::from_secs(expected),
+                    "{backend:?} {value}"
+                );
+            }
+        }
     }
 
     /// Calls the tool the way Claude Code 2.1 does and answers on the page.
@@ -876,9 +973,15 @@ mod tests {
 
         // Another session doesn't see the terminal.
         let other = "99999999-2222-4333-8444-555555555555";
-        let err = terminal_tool(&state, other, "read_terminal", &json!({"terminal": id}))
-            .await
-            .unwrap_err();
+        let err = terminal_tool(
+            &state,
+            other,
+            "read_terminal",
+            &json!({"terminal": id}),
+            AgentBackend::Claude,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.to_string(), format!("Terminal {id} isn't open."));
 
         state.agents.terminals.close_all(ID).await;
