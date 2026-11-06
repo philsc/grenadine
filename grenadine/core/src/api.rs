@@ -1275,9 +1275,14 @@ pub struct AgentPr {
 pub struct AgentPrs {
     pub merged: u32,
     pub total: u32,
-    /// How many of the open ones conflict with their bases.
+    /// How many of the open ones that aren't in a merge queue conflict
+    /// with their bases.
     #[serde(default)]
     pub conflicting: u32,
+    /// How many of the open ones that aren't queued and don't conflict
+    /// have failing checks.
+    #[serde(default)]
+    pub failing: u32,
 }
 
 /// Which agent backend runs a session's turns.

@@ -1927,7 +1927,10 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id AND p.state != 'CLOSED'), \
      (SELECT COUNT(*) FROM agent_prs p WHERE p.agent_id = agents.id), \
      (SELECT COUNT(*) FROM agent_prs p \
-      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting), \
+      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND p.conflicting AND NOT p.queued), \
+     (SELECT COUNT(*) FROM agent_prs p \
+      WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND NOT p.conflicting \
+      AND NOT p.queued AND p.ci = 'failing'), \
      kind, draft_id";
 
 /// The session in `r`, and whether this build knows its backend and cost
@@ -1960,11 +1963,12 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
             merged: r.get(17)?,
             total: r.get(18)?,
             conflicting: r.get(20)?,
+            failing: r.get(21)?,
         }),
         // The listing looks at the worktree for these.
         unstaged: 0,
-        kind: SessionKind::parse(&r.get::<_, String>(21)?),
-        draft: r.get(22)?,
+        kind: SessionKind::parse(&r.get::<_, String>(22)?),
+        draft: r.get(23)?,
     };
     Ok((session, known))
 }
@@ -3147,7 +3151,8 @@ mod tests {
             Some(AgentPrs {
                 merged: 0,
                 total: 1,
-                conflicting: 0
+                conflicting: 0,
+                failing: 0
             })
         );
         // A session that started on the trunk has none.
@@ -3177,14 +3182,15 @@ mod tests {
         // Again, as a stale state, which changes nothing.
         db.add_agent_pr("a", &key(1), "MERGED").unwrap();
         db.add_agent_pr("b", &key(2), "OPEN").unwrap();
-        let counts = |merged, total, conflicting| {
+        let counts = |merged, total, conflicting, failing| {
             Some(AgentPrs {
                 merged,
                 total,
                 conflicting,
+                failing,
             })
         };
-        assert_eq!(prs("a"), counts(0, 3, 0));
+        assert_eq!(prs("a"), counts(0, 3, 0, 0));
         // Untitled PRs are looked up too, so ones recorded before titles
         // existed get one.
         assert_eq!(db.agent_prs_to_refresh().unwrap(), [key(1), key(2), key(3)]);
@@ -3207,11 +3213,19 @@ mod tests {
         let mut still_conflicting = conflicting.clone();
         still_conflicting.conflicting = None;
         assert!(!db.set_agent_pr_state(&key(2), &still_conflicting).unwrap());
-        assert_eq!(prs("a"), counts(0, 3, 1));
-        assert_eq!(prs("b"), counts(0, 1, 1));
+        assert_eq!(prs("a"), counts(0, 3, 1, 0));
+        assert_eq!(prs("b"), counts(0, 1, 1, 0));
         // A change in the checks alone is a change.
         let mut failing = still_conflicting.clone();
         failing.ci = Some(CiStatus::Failing);
+        assert!(db.set_agent_pr_state(&key(2), &failing).unwrap());
+        // A conflicting PR counts as conflicting, not failing, and a
+        // queued PR counts as neither.
+        assert_eq!(prs("a"), counts(0, 3, 1, 0));
+        let mut queued = failing.clone();
+        queued.queued = true;
+        assert!(db.set_agent_pr_state(&key(2), &queued).unwrap());
+        assert_eq!(prs("a"), counts(0, 3, 0, 0));
         assert!(db.set_agent_pr_state(&key(2), &failing).unwrap());
 
         let list = db.agent_pr_list("a").unwrap();
@@ -3229,7 +3243,13 @@ mod tests {
             db.set_agent_pr_state(&key(2), &status("OPEN", Some(false)))
                 .unwrap()
         );
-        assert_eq!(prs("a"), counts(0, 3, 0));
+        assert_eq!(prs("a"), counts(0, 3, 0, 0));
+        // Failing checks count on an open PR that neither conflicts nor
+        // is queued.
+        let mut failing_only = status("OPEN", Some(false));
+        failing_only.ci = Some(CiStatus::Failing);
+        assert!(db.set_agent_pr_state(&key(2), &failing_only).unwrap());
+        assert_eq!(prs("a"), counts(0, 3, 0, 1));
         assert!(
             db.set_agent_pr_state(&key(2), &status("OPEN", Some(true)))
                 .unwrap()
@@ -3253,8 +3273,8 @@ mod tests {
             db.set_agent_pr_state(&key(3), &status("CLOSED", None))
                 .unwrap()
         );
-        assert_eq!(prs("a"), counts(2, 2, 0));
-        assert_eq!(prs("b"), counts(1, 1, 0));
+        assert_eq!(prs("a"), counts(2, 2, 0, 0));
+        assert_eq!(prs("b"), counts(1, 1, 0, 0));
         // All titled, and none open: nothing left to look up.
         assert_eq!(db.agent_prs_to_refresh().unwrap(), []);
 
