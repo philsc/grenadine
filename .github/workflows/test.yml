@@ -13,6 +13,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Empty in runs for PRs from forks, which don't get the repository's
+      # secrets. Those runs build without BuildBuddy.
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       # Ubuntu 24.04 blocks unprivileged user namespaces, which the
@@ -21,9 +25,19 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}
+          # The disk cache only helps runs without BuildBuddy's remote cache.
+          disk-cache: ${{ env.BUILDBUDDY_API_KEY == '' && github.workflow }}
           repository-cache: true
-      - run: bazel test --build_event_json_file=bep.json //...
+      - if: env.BUILDBUDDY_API_KEY != ''
+        run: |
+          cat > .bazelrc.user <<EOF
+          build --config=remote
+          build --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build --bes_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          EOF
+      # The step below reads local file:// paths from bep.json. With
+      # BuildBuddy, Bazel would write bytestream:// URIs there instead.
+      - run: bazel test --build_event_json_file=bep.json --nobuild_event_json_file_path_conversion //...
       # Collect the logs and outputs of the tests that didn't pass.
       - if: failure()
         run: |
