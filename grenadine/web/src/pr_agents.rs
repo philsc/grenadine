@@ -101,6 +101,10 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
     });
     let error = RwSignal::new(None::<String>);
 
+    // What the body shows. A Memo, so a refetch that sets `selected` or
+    // `draft` to what they already hold doesn't remount the session.
+    let shown = Memo::new(move |_| (selected.get(), draft.get()));
+
     // The strip scrolls when the tabs overflow it; the tab just
     // selected may be out of view.
     Effect::new(move |_| {
@@ -338,8 +342,8 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
                 style:height=move || format!("{}px", height.get())
             >
                 {move || {
-                    let sel = selected.get();
-                    if let Some(d) = draft.get()
+                    let (sel, d) = shown.get();
+                    if let Some(d) = d
                         && sel.as_deref() == Some(d.as_str())
                     {
                         view! { <NewSession draft=d pr=key.clone() /> }.into_any()
