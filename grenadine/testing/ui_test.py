@@ -322,7 +322,9 @@ def devin_scenario(tmp: Path) -> dict:
 # `drop NAME` rebases that commit away, `swap` trades the top two
 # commits, `rebase N` rebases the top N commits onto the pushed main's
 # tip, and `update prs ENTRY...` calls the update_prs MCP tool, ENTRY
-# naming a commit as NAME, or NAME:N to update PR #N. It says how many
+# naming a commit as NAME, or NAME:N to update PR #N. The Open PR
+# wrap-up's naming prompt makes it call update_prs too, naming each new
+# pull request's branch dev/test/<subject>. It says how many
 # images came with the prompt. `long transcript N` has it run N Bash
 # calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
@@ -465,6 +467,18 @@ if prompt == "swap":
 if prompt.startswith("rebase "):
     git("fetch", "--quiet", "origin", "main")
     git("rebase", "--onto", "FETCH_HEAD", "HEAD~" + prompt.removeprefix("rebase "))
+def update_prs(arguments):
+    tool_use = use("mcp__grenadine__update_prs", arguments)
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    # The id becomes the approval's key, so a repeat call needs a new one.
+    updated = rpc(
+        "tools/call",
+        {"name": "update_prs", "arguments": arguments},
+        id=tool_use,
+    )
+    result(tool_use, updated["result"]["content"][0]["text"], is_error=updated["result"].get("isError", False))
+
+
 # `update prs ENTRY...` calls the update_prs MCP tool, ENTRY naming an
 # "Add NAME" commit, or NAME:N to update PR #N.
 if prompt.startswith("update prs"):
@@ -475,16 +489,17 @@ if prompt.startswith("update prs"):
         if pr:
             spec["pr"] = int(pr)
         prs.append(spec)
-    arguments = {"prs": prs}
-    tool_use = use("mcp__grenadine__update_prs", arguments)
-    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
-    # The id becomes the approval's key, so a repeat call needs a new one.
-    updated = rpc(
-        "tools/call",
-        {"name": "update_prs", "arguments": arguments},
-        id=tool_use,
-    )
-    result(tool_use, updated["result"]["content"][0]["text"], is_error=updated["result"].get("isError", False))
+    update_prs({"prs": prs})
+# The Open PR wrap-up hands the new pull requests' branch names to the
+# agent: each new one is named dev/test/<subject>, and the mapping the
+# prompt carries goes to update_prs.
+if prompt.startswith("Wrap up: call the grenadine MCP server's update_prs"):
+    prs = json.loads(re.search(r"set to `(\[.*?\])`", prompt)[1])
+    for spec in prs:
+        if "pr" not in spec:
+            subject = git("log", "-1", "--format=%s", spec["commit"])
+            spec["branch"] = "dev/test/" + re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")
+    update_prs({"prs": prs})
 # `screenshot` has it read a screenshot, whose result carries the image,
 # and then show it to the user.
 if prompt == "screenshot":
@@ -4068,7 +4083,7 @@ class AgentTest(ServerTestCase):
         )
         expect(entry.locator(".agent-prs")).to_have_text("0/1")
         self.assertEqual(pr.base, "main")
-        self.assertTrue(pr.head.startswith("grenadine/agent/"))
+        self.assertEqual(pr.head, "dev/test/write-notes")
         # The checkout stays where the first wrap-up left it.
         self.assertEqual(git("rev-parse", "HEAD"), sha)
 
@@ -4102,8 +4117,8 @@ class AgentTest(ServerTestCase):
 
         a, b = pr("Add stack-a"), pr("Add stack-b")
         self.assertEqual(a.base, "main")
-        self.assertTrue(a.head.startswith("grenadine/agent/"))
-        self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
+        self.assertEqual(a.head, "dev/test/add-stack-a")
+        self.assertEqual((b.base, b.head), (a.head, "dev/test/add-stack-b"))
         expect(links.nth(0)).to_have_attribute(
             "href", f"#/{self.OTHER_REPO}/{a.number}"
         )
@@ -4130,14 +4145,16 @@ class AgentTest(ServerTestCase):
         # More work goes on top of the stack; the PRs below stay.
         follow_up.fill("commit stack-c")
         follow_up.press("Enter")
-        expect(done).to_have_count(3)
+        expect(done).to_have_count(4)
         actions.get_by_role("button", name="Open PR").click()
         expect(
             opened.nth(1).get_by_role("link", name=re.compile(r"^PR #"))
         ).to_have_count(3)
         c = pr("Add stack-c")
-        self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
-        self.assertEqual(sum(pr.head.startswith(a.head) for pr in repo.prs.values()), 3)
+        self.assertEqual((c.base, c.head), (b.head, "dev/test/add-stack-c"))
+        self.assertEqual(
+            sum(pr.head.startswith("dev/test/") for pr in repo.prs.values()), 3
+        )
         expect(entry.locator(".agent-prs")).to_have_text("0/3")
         # The stack grows its PR on top.
         stack = next(s for s in repo.stacks.values() if a.number in s)
@@ -4173,8 +4190,8 @@ class AgentTest(ServerTestCase):
             )
 
         a, b, c = pr("Add stack-a"), pr("Add stack-b"), pr("Add stack-c")
-        self.assertEqual((b.base, b.head), (a.head, a.head + "-2"))
-        self.assertEqual((c.base, c.head), (b.head, a.head + "-3"))
+        self.assertEqual((b.base, b.head), (a.head, "dev/test/add-stack-b"))
+        self.assertEqual((c.base, c.head), (b.head, "dev/test/add-stack-c"))
 
         def commits(pr) -> list[str]:
             """The subjects of `pr`'s commits, from the pushed refs."""
@@ -4192,10 +4209,10 @@ class AgentTest(ServerTestCase):
         # and retargets the PR above it.
         follow_up.fill("drop stack-b")
         follow_up.press("Enter")
-        expect(done).to_have_count(4)
+        expect(done).to_have_count(5)
         follow_up.fill(f"update prs stack-a:{a.number} stack-c:{c.number}")
         follow_up.press("Enter")
-        expect(done).to_have_count(5)
+        expect(done).to_have_count(6)
         expect(transcript).to_contain_text(f"Closed #{b.number}")
         self.assertEqual(b.state, "CLOSED")
         self.assertTrue(
@@ -4228,10 +4245,10 @@ class AgentTest(ServerTestCase):
         # Reordering the commits retargets their PRs.
         follow_up.fill("swap")
         follow_up.press("Enter")
-        expect(done).to_have_count(6)
+        expect(done).to_have_count(7)
         follow_up.fill(f"update prs stack-c:{c.number} stack-a:{a.number}")
         follow_up.press("Enter")
-        expect(done).to_have_count(7)
+        expect(done).to_have_count(8)
         self.assertEqual((c.base, a.base), ("main", c.head))
         self.assertEqual(commits(c), ["Add stack-c"])
         self.assertEqual(commits(a), ["Add stack-a"])
@@ -4273,10 +4290,10 @@ class AgentTest(ServerTestCase):
 
         follow_up.fill("commit stack-c")
         follow_up.press("Enter")
-        expect(done).to_have_count(3)
+        expect(done).to_have_count(4)
         follow_up.fill(f"update prs stack-a:{a.number} stack-b:{b.number} stack-c")
         follow_up.press("Enter")
-        expect(done).to_have_count(4)
+        expect(done).to_have_count(5)
         expect(transcript).to_contain_text(
             "doesn't have GitHub's stacked pull requests"
         )
@@ -4319,7 +4336,7 @@ class AgentTest(ServerTestCase):
         repo.push("main")
         follow_up.fill(f"update prs stack-b:{b.number}")
         follow_up.press("Enter")
-        expect(done).to_have_count(3)
+        expect(done).to_have_count(4)
         expect(transcript).to_contain_text(f"#{a.number} merged into main")
         expect(transcript).to_contain_text("git rebase --onto")
         self.assertEqual(b.state, "OPEN")
@@ -4327,10 +4344,10 @@ class AgentTest(ServerTestCase):
 
         follow_up.fill("rebase 1")
         follow_up.press("Enter")
-        expect(done).to_have_count(4)
+        expect(done).to_have_count(5)
         follow_up.fill(f"update prs stack-b:{b.number}")
         follow_up.press("Enter")
-        expect(done).to_have_count(5)
+        expect(done).to_have_count(6)
         # B is retargeted at the trunk; the merged A isn't touched.
         self.assertEqual(b.base, "main")
         out = self.gh.git(

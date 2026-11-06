@@ -2,7 +2,7 @@
 //!
 //! Everything here blocks; async callers go through `spawn_blocking`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -241,6 +241,31 @@ impl Repo {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.git(&args)?;
         Ok(())
+    }
+
+    /// Which of `branches` exist on the GitHub repository.
+    pub fn remote_branches(&self, branches: &[String]) -> Result<BTreeSet<String>> {
+        let mut found = BTreeSet::new();
+        if branches.is_empty() {
+            return Ok(found);
+        }
+        let mut args = vec!["ls-remote".to_owned(), "--heads".into(), self.fetch_url()];
+        args.extend(branches.iter().map(|b| format!("refs/heads/{b}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        for line in self.git(&args)?.lines() {
+            if let Some(branch) = line
+                .split_once('\t')
+                .and_then(|(_, r)| r.strip_prefix("refs/heads/"))
+            {
+                found.insert(branch.to_owned());
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether `name` is a valid git branch name.
+    pub fn valid_branch_name(&self, name: &str) -> bool {
+        self.git_ok(&["check-ref-format", "--branch", name])
     }
 
     /// Deletes the GitHub repository's `branches`, all or none of them.
