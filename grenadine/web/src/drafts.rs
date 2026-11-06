@@ -70,6 +70,15 @@ pub fn listed(list: &[Draft], open: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The newest draft for `repo`'s PR `pr` (as `Draft::pr` spells it), if
+/// `list` has one.
+fn find(list: &[Draft], repo: &str, pr: &str) -> Option<String> {
+    list.iter()
+        .filter(|d| d.repo == repo && d.pr == pr)
+        .max_by(|a, b| a.created_at.total_cmp(&b.created_at))
+        .map(|d| d.id.clone())
+}
+
 /// All the drafts, saved whenever one changes.
 #[derive(Clone, Copy)]
 pub struct Drafts {
@@ -164,6 +173,11 @@ impl Drafts {
     /// the list instead read it through `with` or `listed`.
     pub fn contains(self, id: &str) -> bool {
         self.list.with_untracked(|l| l.iter().any(|d| d.id == id))
+    }
+
+    /// The newest draft for `repo`'s PR `pr`, if there's one.
+    pub fn find(self, repo: &str, pr: u64) -> Option<String> {
+        self.list.with_untracked(|l| find(l, repo, &pr.to_string()))
     }
 
     /// What `f` makes of the draft `id`, if there is one.
@@ -275,6 +289,23 @@ mod tests {
         // A draft with only images survives the load-time prune.
         let ids: Vec<String> = prune(vec![d], None).into_iter().map(|d| d.id).collect();
         assert_eq!(ids, ["a"]);
+    }
+
+    #[test]
+    fn finds_the_newest_draft_for_the_pr() {
+        let mut older = draft("a", "o/n", "one", 1.0);
+        older.pr = "7".into();
+        let mut newer = draft("b", "o/n", "two", 2.0);
+        newer.pr = "7".into();
+        let mut other_pr = draft("c", "o/n", "three", 3.0);
+        other_pr.pr = "8".into();
+        let mut other_repo = draft("d", "o/m", "four", 4.0);
+        other_repo.pr = "7".into();
+        let list = vec![older, newer, other_pr, other_repo];
+        assert_eq!(find(&list, "o/n", "7"), Some("b".into()));
+        assert_eq!(find(&list, "o/n", "8"), Some("c".into()));
+        assert_eq!(find(&list, "o/m", "7"), Some("d".into()));
+        assert_eq!(find(&list, "o/n", "9"), None);
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod images;
 mod inboxes;
 mod markdown;
 mod pr;
+mod pr_agents;
 mod review;
 mod settings;
 mod tabs;

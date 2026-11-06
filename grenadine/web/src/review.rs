@@ -1,7 +1,6 @@
 //! A PR's reviews, its conversation and whether it can be merged.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use grenadine_core::api::{
     AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
@@ -413,13 +412,25 @@ fn sidebar_checks(info: &ReviewInfo) -> AnyView {
     .into_any()
 }
 
-/// The PR page's right sidebar: the review decision, the reviewers and
-/// the checks, for open, closed and merged PRs alike. `overlay` floats
-/// it over the content on windows too narrow for a column. The sidebar
-/// toggle is passed as a child so it sits in the header row.
+/// The sidebar's scrolling body: the review decision, the reviewers and
+/// the checks, for open, closed and merged PRs alike.
+pub fn sidebar_body(pr: &PrDetail) -> AnyView {
+    match &pr.review {
+        Some(info) => view! {
+            {sidebar_review(info, &pr.summary.author)}
+            {sidebar_checks(info)}
+        }
+        .into_any(),
+        None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
+    }
+}
+
+/// The PR page's right sidebar. `overlay` floats it over the content on
+/// windows too narrow for a column. The body's children are what the PR
+/// shows; anything pinned under it is the caller's, so that it survives
+/// the body's rebuild on a sync.
 #[component]
 pub fn PrSidebar(
-    pr: Arc<PrDetail>,
     #[prop(into)] overlay: Signal<bool>,
     #[prop(into)] width: Signal<f64>,
     on_resize_start: Callback<web_sys::MouseEvent>,
@@ -440,20 +451,7 @@ pub fn PrSidebar(
                 on:mousedown=move |e| on_resize_start.run(e)
                 on:dblclick=move |e| on_resize_reset.run(e)
             ></div>
-            <div class="pr-sidebar-body">
-                <div class="sidebar-head">
-                    <h2>"Reviewers"</h2>
-                    {children()}
-                </div>
-                {match &pr.review {
-                    Some(info) => view! {
-                        {sidebar_review(info, &pr.summary.author)}
-                        {sidebar_checks(info)}
-                    }
-                    .into_any(),
-                    None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
-                }}
-            </div>
+            {children()}
         </aside>
     }
 }
