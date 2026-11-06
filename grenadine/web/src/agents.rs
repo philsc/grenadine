@@ -764,11 +764,7 @@ fn RepoSessions(
                                 }
                             };
                             let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
-                            // A general session has no branch.
-                            let mut meta: Vec<String> = [a.branch.clone(), cost(a.cost, a.cost_unit)]
-                                .into_iter()
-                                .filter(|m| !m.is_empty())
-                                .collect();
+                            let mut meta: Vec<String> = vec![cost(a.cost, a.cost_unit)];
                             if let Some(n) = a.pr {
                                 meta.insert(0, format!("#{n}"));
                             }
