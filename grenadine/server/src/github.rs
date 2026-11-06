@@ -8,9 +8,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
 use grenadine_core::api::{
     ApiResource, AutoMerge, Check, CiStatus, Enqueue, GitHubUsage, IssueComment, MergeInfo,
-    MergeMethod, MergeQueueInfo, MergeRequest, MergeState, NewThread, Person, PrKey, QueueEntry,
+    MergeMethod, MergeQueueInfo, MergeState, MergeStatus, NewThread, Person, PrKey, QueueEntry,
     QueueState, RequestPriority, RequestedReviewer, Review, ReviewComment, ReviewDecision,
-    ReviewEvent, ReviewInfo, ReviewState, Side, StackPr, SubmitReview, ThreadCounts,
+    ReviewEvent, ReviewInfo, ReviewState, Side, StackMerge, StackMergePr, StackPr, SubmitReview,
+    ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -341,6 +342,25 @@ fn queue_state(s: &str) -> QueueState {
     }
 }
 
+/// What a merge-async request came back with.
+pub enum MergeAsync {
+    /// The merge runs; `merge_progress` reports on it under the ID.
+    Pending(String),
+    /// It finished already: merged, or enqueued for a queue request.
+    Done(MergeStatus),
+}
+
+/// Maps a merge-async response's `status`; anything unexpected is still
+/// in flight.
+fn merge_async_status(v: &Value) -> MergeStatus {
+    match str_at(v, "/status") {
+        "merged" => MergeStatus::Merged,
+        "enqueued" => MergeStatus::Enqueued,
+        "failed" => MergeStatus::Failed(str_at(v, "/details/message").to_owned()),
+        _ => MergeStatus::Pending,
+    }
+}
+
 /// How the PR relates to the merge queue of its base branch in a
 /// `PR_QUERY` response; `None` when the branch has no queue.
 fn queue_info(pr: &Value) -> Option<MergeQueueInfo> {
@@ -416,6 +436,21 @@ query($owner: String!, $name: String!, $number: Int!) {
       isMergeQueueEnabled
       mergeQueue { configuration { mergeMethod } }
       mergeQueueEntry { position state jump }
+      stack {
+        baseRefName
+        entries(first: 100) {
+          nodes {
+            position
+            pullRequest {
+              number title headRefName state isDraft mergeable mergeStateStatus
+              commits(last: 1) {
+                nodes { commit { statusCheckRollup { state } } }
+              }
+            }
+          }
+        }
+      }
+      stackEntry { position }
       autoMergeRequest { enabledAt }
       viewerCanEnableAutoMerge viewerCanDisableAutoMerge
       reviews(last: 100) {
@@ -525,6 +560,8 @@ const REVIEW_FIELDS: &[&[&str]] = &[
     &["repository", "pullRequest", "isMergeQueueEnabled"],
     &["repository", "pullRequest", "mergeQueue"],
     &["repository", "pullRequest", "mergeQueueEntry"],
+    &["repository", "pullRequest", "stack"],
+    &["repository", "pullRequest", "stackEntry"],
     &["repository", "pullRequest", "autoMergeRequest"],
     &["repository", "pullRequest", "viewerCanEnableAutoMerge"],
     &["repository", "pullRequest", "viewerCanDisableAutoMerge"],
@@ -764,9 +801,53 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
                         == Some(true)
                 }),
             queue: queue_info(pr),
+            stack: stack_merge(pr),
         },
         pending_review: None,
     }
+}
+
+/// The PR's GitHub stack from a `PR_QUERY` response: `None` when it
+/// isn't in one. `below` holds the stack's open, unmerged PRs under it,
+/// bottom first.
+fn stack_merge(pr: &Value) -> Option<StackMerge> {
+    if pr["stack"].is_null() {
+        return None;
+    }
+    let own = pr
+        .pointer("/stackEntry/position")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let mut below: Vec<(u64, StackMergePr)> = nodes(pr, "/stack/entries/nodes")
+        .filter_map(|e| {
+            let position = e["position"].as_u64()?;
+            let p = &e["pullRequest"];
+            if position >= own || p["state"].as_str() != Some("OPEN") {
+                return None;
+            }
+            Some((
+                position,
+                StackMergePr {
+                    number: p["number"].as_u64().unwrap_or_default(),
+                    title: str_at(p, "/title").to_owned(),
+                    head_ref: str_at(p, "/headRefName").to_owned(),
+                    is_draft: p["isDraft"].as_bool().unwrap_or(false),
+                    conflicting: match str_at(p, "/mergeable") {
+                        "CONFLICTING" => Some(true),
+                        "MERGEABLE" => Some(false),
+                        _ => None,
+                    },
+                    state: merge_state(str_at(p, "/mergeStateStatus")),
+                    ci: ci_status(str_at(p, "/commits/nodes/0/commit/statusCheckRollup/state")),
+                },
+            ))
+        })
+        .collect();
+    below.sort_by_key(|(position, _)| *position);
+    Some(StackMerge {
+        base_ref: str_at(pr, "/stack/baseRefName").to_owned(),
+        below: below.into_iter().map(|(_, p)| p).collect(),
+    })
 }
 
 /// The viewer's pending review in a `PR_QUERY` response: its ID and its
@@ -1430,44 +1511,149 @@ impl GitHub {
         Ok(())
     }
 
-    /// Merges the PR. Returns a warning when it merged but its head branch
-    /// couldn't be deleted.
-    pub async fn merge(&self, key: &PrKey, m: &MergeRequest) -> Result<Option<String>> {
-        let pr = self.pr_node(key, "headRef { id }").await?;
+    /// Starts merging the PR through GitHub's asynchronous merge API,
+    /// which the open PRs below it in its GitHub stack go through with
+    /// it. `action` is GitHub's `merge_action`: "direct_merge" merges, or
+    /// queues, the stack atomically; "merge_queue" puts it in the base
+    /// branch's merge queue. `commit` is the merge commit's title and
+    /// body, which only a single-PR direct merge takes.
+    pub async fn merge_async(
+        &self,
+        key: &PrKey,
+        action: &str,
+        method: Option<MergeMethod>,
+        head_oid: &str,
+        commit: Option<(&str, &str)>,
+        bypass_rules: bool,
+    ) -> Result<MergeAsync> {
+        let url = format!(
+            "{}/repos/{}/pulls/{}/merge-async",
+            self.api, key.repo, key.number
+        );
+        let mut req = json!({
+            "sha": head_oid,
+            "merge_action": action,
+            "bypass_rules": bypass_rules,
+        });
+        if let Some(method) = method {
+            req["merge_method"] = method.as_github().to_lowercase().into();
+        }
+        if let Some((title, body)) = commit {
+            req["commit_title"] = title.into();
+            req["commit_message"] = body.into();
+        }
+        let resp = self
+            .stacks_send(
+                "merge_async",
+                &key.repo,
+                self.stacks_request(reqwest::Method::PUT, url).json(&req),
+            )
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_default();
+        match status {
+            // The request runs under `uuid`, or an earlier one for this
+            // PR still does.
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::CONFLICT => {
+                let uuid = str_at(&v, "/details/uuid").to_owned();
+                if uuid.is_empty() {
+                    bail!("GitHub's response has no merge request ID");
+                }
+                Ok(MergeAsync::Pending(uuid))
+            }
+            reqwest::StatusCode::OK => Ok(MergeAsync::Done(merge_async_status(&v))),
+            _ => {
+                let reason = v["message"].as_str().unwrap_or("no reason given");
+                bail!("GitHub didn't merge ({status}): {reason}");
+            }
+        }
+    }
+
+    /// Where the merge request `uuid` stands.
+    pub async fn merge_progress(&self, key: &PrKey, uuid: &str) -> Result<MergeStatus> {
+        let url = format!(
+            "{}/repos/{}/pulls/{}/merge-async/{uuid}",
+            self.api, key.repo, key.number
+        );
+        let resp = self
+            .stacks_send(
+                "merge_progress",
+                &key.repo,
+                self.stacks_request(reqwest::Method::GET, url),
+            )
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            let reason = v["message"].as_str().unwrap_or("no reason given");
+            bail!("GitHub didn't report the merge ({status}): {reason}");
+        }
+        Ok(merge_async_status(&v))
+    }
+
+    /// The head branches deleting the PR's after a merge takes along:
+    /// its own and the open PRs' below it in its GitHub stack, bottom
+    /// first, each as its branch name and its ref's GraphQL ID.
+    pub async fn merge_refs(&self, key: &PrKey) -> Result<Vec<(String, String)>> {
+        let pr = self
+            .pr_node(
+                key,
+                "headRefName headRef { id }
+                 stackEntry { position }
+                 stack {
+                   entries(first: 100) {
+                     nodes {
+                       position
+                       pullRequest { headRefName state headRef { id } }
+                     }
+                   }
+                 }",
+            )
+            .await?;
+        let own = pr
+            .pointer("/stackEntry/position")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX);
+        let mut refs: Vec<(u64, String, String)> = nodes(&pr, "/stack/entries/nodes")
+            .filter_map(|e| {
+                let position = e["position"].as_u64()?;
+                let p = &e["pullRequest"];
+                let id = str_at(p, "/headRef/id").to_owned();
+                if position >= own || p["state"].as_str() != Some("OPEN") || id.is_empty() {
+                    return None;
+                }
+                Some((position, str_at(p, "/headRefName").to_owned(), id))
+            })
+            .collect();
+        refs.sort_by_key(|(position, _, _)| *position);
+        let mut out = Vec::new();
+        // The branch may be gone already, leaving nothing to delete.
+        if !str_at(&pr, "/headRef/id").is_empty() {
+            out.push((
+                str_at(&pr, "/headRefName").to_owned(),
+                str_at(&pr, "/headRef/id").to_owned(),
+            ));
+        }
+        out.extend(refs.into_iter().map(|(_, name, id)| (name, id)));
+        Ok(out)
+    }
+
+    /// Deletes the head branch `ref_id` names, after its PR merged.
+    pub async fn delete_ref(&self, repo: &str, ref_id: &str) -> Result<()> {
         self.mutate(
-            std::slice::from_ref(&key.repo),
-            "mutation($pr: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!,
-                      $title: String, $body: String) {
-               mergePullRequest(input: {
-                 pullRequestId: $pr, mergeMethod: $method, expectedHeadOid: $head,
-                 commitHeadline: $title, commitBody: $body
-               }) {
-                 clientMutationId
-               }
-             }",
-            json!({
-                "pr": str_at(&pr, "/id"),
-                "method": m.method.as_github(),
-                "head": m.head_oid,
-                "title": m.title,
-                "body": m.body,
-            }),
+            std::slice::from_ref(&repo.to_owned()),
+            "mutation($ref: ID!) { deleteRef(input: { refId: $ref }) { clientMutationId } }",
+            json!({ "ref": ref_id }),
         )
         .await?;
-        let head_ref = str_at(&pr, "/headRef/id");
-        if !m.delete_branch || head_ref.is_empty() {
-            return Ok(None);
-        }
-        let deleted = self
-            .mutate(
-                std::slice::from_ref(&key.repo),
-                "mutation($ref: ID!) { deleteRef(input: { refId: $ref }) { clientMutationId } }",
-                json!({ "ref": head_ref }),
-            )
-            .await;
-        Ok(deleted
-            .err()
-            .map(|e| format!("Merged, but the branch wasn't deleted: {e:#}")))
+        Ok(())
+    }
+
+    /// Whether the PR is in a GitHub stack, which merging and queueing
+    /// go through the merge-async API for.
+    pub async fn in_stack(&self, key: &PrKey) -> Result<bool> {
+        let pr = self.pr_node(key, "stackEntry { position }").await?;
+        Ok(!pr["stackEntry"].is_null())
     }
 
     /// Adds the PR to its merge queue, ahead of the queued PRs when
@@ -1946,15 +2132,16 @@ impl GitHub {
         Ok((number, str_at(&v, "/html_url").to_owned()))
     }
 
-    /// A request to the stacks API: the only endpoints on the
-    /// 2026-03-10 API version the client otherwise predates.
+    /// A request to the endpoints on the 2026-03-10 API version, which
+    /// the client otherwise predates.
     fn stacks_request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
         self.http
             .request(method, url)
             .header("X-GitHub-Api-Version", "2026-03-10")
     }
 
-    /// Sends `req` to the stacks API, counted as REST like `get_all`.
+    /// Sends `req` to one of those endpoints, counted as REST like
+    /// `get_all`.
     async fn stacks_send(
         &self,
         kind: &'static str,
@@ -2825,6 +3012,7 @@ mod tests {
                     can_enable_auto_merge: false,
                     can_disable_auto_merge: true,
                 }),
+                stack: None,
             }
         );
     }
@@ -3004,6 +3192,7 @@ mod tests {
                     can_merge_as_admin: false,
                     requires_conversation_resolution: false,
                     queue: None,
+                    stack: None,
                 },
                 pending_review: None,
             }),
@@ -3028,5 +3217,99 @@ mod tests {
             ..data
         };
         assert_eq!(PrStatus::from(&data).conflicting, None);
+    }
+    #[test]
+    fn merge_async_status_maps_the_states() {
+        assert_eq!(
+            merge_async_status(&json!({ "status": "merged" })),
+            MergeStatus::Merged
+        );
+        assert_eq!(
+            merge_async_status(&json!({ "status": "enqueued" })),
+            MergeStatus::Enqueued
+        );
+        assert_eq!(
+            merge_async_status(&json!({ "status": "failed", "details": { "message": "nope" } })),
+            MergeStatus::Failed("nope".into())
+        );
+        assert_eq!(
+            merge_async_status(&json!({ "status": "pending" })),
+            MergeStatus::Pending
+        );
+    }
+
+    #[test]
+    fn stack_merge_reads_the_open_prs_below() {
+        let pr = |number: u64, position: u64| {
+            json!({
+                "position": position,
+                "pullRequest": {
+                    "number": number,
+                    "title": format!("PR {number}"),
+                    "headRefName": format!("dev/{number}"),
+                    "state": "OPEN",
+                    "isDraft": number == 10,
+                    "mergeable": if number == 12 { "CONFLICTING" } else { "MERGEABLE" },
+                    "mergeStateStatus": if number == 12 { "DIRTY" } else { "CLEAN" },
+                    "commits": {
+                        "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }]
+                    },
+                },
+            })
+        };
+        let merged = json!({
+            "position": 2,
+            "pullRequest": { "number": 11, "state": "MERGED" },
+        });
+        let data = json!({
+            "stack": {
+                "baseRefName": "main",
+                "entries": { "nodes": [pr(10, 1), merged, pr(12, 3), pr(14, 4)] },
+            },
+            "stackEntry": { "position": 4 },
+        });
+        assert_eq!(
+            stack_merge(&data),
+            Some(StackMerge {
+                base_ref: "main".into(),
+                below: vec![
+                    StackMergePr {
+                        number: 10,
+                        title: "PR 10".into(),
+                        head_ref: "dev/10".into(),
+                        is_draft: true,
+                        conflicting: Some(false),
+                        state: MergeState::Clean,
+                        ci: Some(CiStatus::Passing),
+                    },
+                    StackMergePr {
+                        number: 12,
+                        title: "PR 12".into(),
+                        head_ref: "dev/12".into(),
+                        is_draft: false,
+                        conflicting: Some(true),
+                        state: MergeState::Dirty,
+                        ci: Some(CiStatus::Passing),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn stack_merge_is_none_without_a_stack() {
+        assert_eq!(stack_merge(&json!({ "stack": null })), None);
+        // The bottom PR is in a stack but has nothing below it.
+        let data = json!({
+            "stack": { "baseRefName": "main", "entries": { "nodes": [] } },
+            "stackEntry": { "position": 1 },
+        });
+        assert_eq!(
+            stack_merge(&data),
+            Some(StackMerge {
+                base_ref: "main".into(),
+                below: vec![],
+            })
+        );
     }
 }

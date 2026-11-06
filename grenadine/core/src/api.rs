@@ -457,13 +457,38 @@ pub struct MergeRequest {
     pub body: Option<String>,
     /// Delete the head branch once merged.
     pub delete_branch: bool,
+    /// Merge despite unmet branch rules, which the viewer may bypass.
+    #[serde(default)]
+    pub bypass_rules: bool,
 }
 
-/// The response to a merge that went through.
+/// The response to a merge GitHub accepted: the ID of the asynchronous
+/// merge request, which `GET .../merge/{uuid}` reports the progress of.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Merged {
-    /// What went wrong after merging, e.g. deleting the branch.
+    pub uuid: String,
+}
+
+/// Where an asynchronous merge request is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeProgress {
+    pub status: MergeStatus,
+    /// What went wrong after merging, e.g. deleting the branches.
+    #[serde(default)]
     pub warning: Option<String>,
+}
+
+/// The state GitHub reports for an asynchronous merge request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MergeStatus {
+    /// Still running.
+    Pending,
+    /// The merge landed.
+    Merged,
+    /// The PRs joined the merge queue.
+    Enqueued,
+    /// The merge didn't land; the string says why.
+    Failed(String),
 }
 
 /// The body of a request that adds a PR to its merge queue.
@@ -683,6 +708,36 @@ pub struct MergeInfo {
     /// queue.
     #[serde(default)]
     pub queue: Option<MergeQueueInfo>,
+    /// `Some` when the PR is in a GitHub stack: merging it merges the
+    /// stack's open PRs below it too.
+    #[serde(default)]
+    pub stack: Option<StackMerge>,
+}
+
+/// A PR's place in its GitHub stack, as the merge box needs it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMerge {
+    /// The branch the stack's bottom targets.
+    pub base_ref: String,
+    /// The open, unmerged PRs below this one in the stack, bottom first;
+    /// empty when this is the bottom.
+    pub below: Vec<StackMergePr>,
+}
+
+/// A PR below the merged one in its GitHub stack.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMergePr {
+    pub number: u64,
+    pub title: String,
+    /// Its head branch, which merging deletes like the merged PR's.
+    pub head_ref: String,
+    pub is_draft: bool,
+    /// Whether it conflicts with its base; `None` while GitHub is still
+    /// working that out.
+    pub conflicting: Option<bool>,
+    pub state: MergeState,
+    /// The combined state of its head's checks.
+    pub ci: Option<CiStatus>,
 }
 
 /// Someone asked to review a PR who hasn't yet.

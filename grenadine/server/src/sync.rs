@@ -12,7 +12,7 @@
 //! startup every covered PR is synced, which recomputes all versions and
 //! so detects drift.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,6 +140,9 @@ pub struct State {
     /// A lock per PR that changes to the viewer's pending review on it
     /// take, see `lock_review`.
     pub review_locks: std::sync::Mutex<BTreeMap<PrKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// The asynchronous merges started from the merge box, by the ID
+    /// GitHub's merge-async API gave them, so the page can poll them.
+    pub merges: std::sync::Mutex<HashMap<String, crate::api::PendingMerge>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
     /// The Claude Code sessions started from the UI.
@@ -1055,6 +1058,7 @@ pub fn test_state_with_agents(
         inbox_searches: std::sync::Mutex::new(InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
+        merges: std::sync::Mutex::default(),
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
@@ -1388,6 +1392,7 @@ mod tests {
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
                 queue: None,
+                stack: None,
             },
         };
         assert!(!settling(&review));

@@ -2660,6 +2660,137 @@ class QueueTest(ServerTestCase):
         self.assertIn("bypassing the branch's rules", messages[0])
 
 
+class StackMergeTest(ServerTestCase):
+    """Merging a PR in a GitHub stack through the merge-async API."""
+
+    REPOS: ClassVar[list[str]] = [scenarios.GHSTACK_REPO, scenarios.QUEUE_REPO]
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.prs = scenarios.stack_merge_cases(gh)
+
+    def open(self, title: str, repo: str = scenarios.GHSTACK_REPO) -> None:
+        pr = self.prs[title]
+        self.page.goto(f"{self.url}#/{repo}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+
+    def test_merging_the_stack_top_merges_below_first(self) -> None:
+        low = self.prs[scenarios.GH_LOW]
+        top = self.prs[scenarios.GH_TOP]
+        self.open(scenarios.GH_TOP)
+        box = self.merge_box()
+        banner = box.locator(".banner.warn")
+        expect(banner).to_contain_text(f"Merging #{top.number} also merges")
+        expect(banner).to_contain_text(f"#{low.number}")
+        expect(banner).to_contain_text("below it")
+        expect(banner).to_contain_text("Each lands on main separately, in stack order")
+        rows = box.locator(".merge-stack li")
+        expect(rows).to_have_count(1)
+        expect(rows.nth(0)).to_contain_text(f"#{low.number} {low.title}")
+        expect(rows.nth(0)).to_contain_text("Ready")
+        # A stack merge offers no commit message to edit.
+        box.get_by_label("Merge method").select_option(label="Squash and merge")
+        expect(box.get_by_role("button", name="Edit the commit message")).to_have_count(
+            0
+        )
+        expect(
+            box.get_by_label(f"Delete the branches ({top.head}, {low.head})")
+        ).to_be_checked()
+
+        messages = self.merge()
+        self.assertEqual(
+            messages,
+            [f"Squash and merge #{low.number}, then #{top.number} into main?"],
+        )
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        self.assertEqual(top.state, "MERGED")
+        self.assertEqual(low.state, "MERGED")
+        # Both head branches went with it.
+        self.assertIn(top.head, top.repo.deleted_branches)
+        self.assertIn(low.head, top.repo.deleted_branches)
+        # The stack's commits each land on main, in order.
+        self.assertEqual(top.merged_with, ("SQUASH", None, None))
+        self.assertEqual(low.merged_with, ("SQUASH", None, None))
+
+    def test_merging_the_stack_bottom_leaves_the_top(self) -> None:
+        low = self.prs[scenarios.GH_LOW]
+        top = self.prs[scenarios.GH_TOP]
+        self.open(scenarios.GH_LOW)
+        box = self.merge_box()
+        expect(box.locator(".banner.warn")).to_have_count(0)
+        expect(box.locator(".merge-stack li")).to_have_count(0)
+        self.merge()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        self.assertEqual(low.state, "MERGED")
+        self.assertEqual(top.state, "OPEN")
+
+    def test_a_draft_below_blocks_merging(self) -> None:
+        low = self.prs[scenarios.GH_DRAFT_LOW]
+        self.open(scenarios.GH_DRAFT)
+        box = self.merge_box()
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text("Draft")
+        expect(box.locator(".merge-blocked")).to_have_text(f"#{low.number} is a draft.")
+        expect(box.get_by_role("button", name=re.compile("^Merge"))).to_be_disabled()
+
+    def test_a_blocked_below_merges_by_bypass(self) -> None:
+        low = self.prs[scenarios.GH_BLOCKED_LOW]
+        top = self.prs[scenarios.GH_BLOCKED]
+        self.open(scenarios.GH_BLOCKED)
+        box = self.merge_box()
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text("Blocked by rules")
+        button = box.get_by_role("button", name="Merge 2 PRs, bypassing rules")
+        expect(button).to_be_enabled()
+        expect(button).to_have_class("danger")
+        messages = self.merge()
+        self.assertIn("bypassing the branch's rules", messages[0])
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        self.assertEqual(top.state, "MERGED")
+        self.assertEqual(low.state, "MERGED")
+
+    def test_a_merge_failing_at_run_time_shows_the_error(self) -> None:
+        low = self.prs[scenarios.GH_FAIL_LOW]
+        top = self.prs[scenarios.GH_FAIL]
+        self.open(scenarios.GH_FAIL)
+        expect(
+            self.merge_box().get_by_role("button", name="Merge 2 PRs")
+        ).to_be_enabled()
+        # The below PR turns unmergeable after the page read it.
+        low.merge_state = "BLOCKED"
+        self.merge()
+        expect(self.merge_box().locator(".error")).to_contain_text(
+            "Pull Request is not mergeable"
+        )
+        self.assertEqual(low.state, "OPEN")
+        self.assertEqual(top.state, "OPEN")
+
+    def test_a_stacked_pr_queues_its_stack(self) -> None:
+        low = self.prs[scenarios.GHQ_LOW]
+        top = self.prs[scenarios.GHQ_TOP]
+        self.open(scenarios.GHQ_TOP, repo=scenarios.QUEUE_REPO)
+        box = self.merge_box()
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text(f"#{low.number} {low.title}")
+        # A stack has no jump and no merge-when-ready.
+        expect(box.get_by_role("button", name="Add to front of queue")).to_have_count(0)
+        expect(box.get_by_role("button", name="Merge when ready")).to_have_count(0)
+
+        messages: list[str] = []
+
+        def accept(dialog: Dialog) -> None:
+            messages.append(dialog.message)
+            dialog.accept()
+
+        self.page.once("dialog", accept)
+        box.get_by_role("button", name="Add 2 PRs to merge queue").click()
+        expect(box.locator(".merge-status")).to_contain_text("In the merge queue")
+        self.assertTrue(low.queued)
+        self.assertTrue(top.queued)
+
+
 class VersionsTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:

@@ -780,3 +780,75 @@ def queue_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
             pr.queued = True
         prs[title] = pr
     return prs
+
+
+GHSTACK_REPO = "test/stacked"
+GH_LOW = "Sit at the stack's bottom"
+GH_TOP = "Cap the stack"
+GH_DRAFT = "Sit on a draft"
+GH_BLOCKED = "Sit on a blocked PR"
+GH_FAIL = "Fail at merge time"
+GHQ_LOW = "Queue from the stack's bottom"
+GHQ_TOP = "Queue the whole stack"
+# The PRs whose page the tests open, and the PR below each.
+GHSTACK_CASES = [
+    (GH_LOW, None),
+    (GH_TOP, GH_LOW),
+    (GH_DRAFT, "Draft at the stack's bottom"),
+    (GH_BLOCKED, "Blocked at the stack's bottom"),
+    (GH_FAIL, "Fragile at the stack's bottom"),
+]
+GH_DRAFT_LOW = "Draft at the stack's bottom"
+GH_BLOCKED_LOW = "Blocked at the stack's bottom"
+GH_FAIL_LOW = "Fragile at the stack's bottom"
+
+
+def _gh_stack(
+    repo: FakeRepo, top: str, bottom: str, i: int
+) -> tuple[PullRequest, PullRequest]:
+    """A two-PR GitHub stack, bottom first."""
+    low_branch = f"dev/stack/{i}a"
+    top_branch = f"dev/stack/{i}b"
+    repo.checkout(low_branch, "main")
+    repo.commit(bottom, {f"stack/{i}a.md": f"{bottom}\n"}, author=OTHER)
+    repo.push(low_branch, actor=OTHER)
+    low = repo.open_pr(bottom, head=low_branch, base="main", author=OTHER)
+    repo.checkout(top_branch, low_branch)
+    repo.commit(top, {f"stack/{i}b.md": f"{top}\n"}, author=OTHER)
+    repo.push(top_branch, actor=OTHER)
+    top = repo.open_pr(top, head=top_branch, base=low_branch, author=OTHER)
+    repo.stacks[1000 + i] = [low.number, top.number]
+    return low, top
+
+
+def stack_merge_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
+    """GitHub stacks to merge through: a plain one, one on a draft, one
+    on a blocked PR the viewer may bypass, and one whose bottom turns
+    unmergeable while the merge runs. A last stack lives on the merge
+    queue repository."""
+    repo = gh.repo(GHSTACK_REPO)
+    repo.checkout("main")
+    repo.commit("Seed the repo", {"README.md": "# stacked\n"})
+    repo.push("main")
+    prs = {}
+    for i, (top, bottom) in enumerate(GHSTACK_CASES):
+        if bottom is None:
+            continue
+        low, top_pr = _gh_stack(repo, top, bottom, i)
+        prs[bottom] = low
+        prs[top] = top_pr
+    prs[GH_DRAFT_LOW].draft = True
+    prs[GH_BLOCKED_LOW].merge_state = "BLOCKED"
+    for title in (GH_BLOCKED_LOW, GH_BLOCKED):
+        prs[title].can_merge_as_admin = True
+
+    queue = gh.repo(QUEUE_REPO)
+    if queue.merge_queue is None:
+        queue.merge_queue = "SQUASH"
+        queue.checkout("main")
+        queue.commit("Seed the repo", {"README.md": "# queue\n"})
+        queue.push("main")
+    low, top = _gh_stack(queue, GHQ_TOP, GHQ_LOW, 9)
+    prs[GHQ_LOW] = low
+    prs[GHQ_TOP] = top
+    return prs

@@ -124,6 +124,22 @@ type MergeQueueEntry {
   jump: Boolean!
 }
 
+type PullRequestStack {
+  number: Int!
+  baseRefName: String!
+  size: Int!
+  entries(first: Int): PullRequestStackEntryConnection
+}
+
+type PullRequestStackEntryConnection {
+  nodes: [PullRequestStackEntry]
+}
+
+type PullRequestStackEntry {
+  position: Int!
+  pullRequest: PullRequest!
+}
+
 type AutoMergeRequest {
   enabledAt: DateTime
   enabledBy: Actor
@@ -368,6 +384,8 @@ type PullRequest {
   isMergeQueueEnabled: Boolean!
   mergeQueue: MergeQueue
   mergeQueueEntry: MergeQueueEntry
+  stack: PullRequestStack
+  stackEntry: PullRequestStackEntry
   autoMergeRequest: AutoMergeRequest
   viewerCanEnableAutoMerge: Boolean!
   viewerCanDisableAutoMerge: Boolean!

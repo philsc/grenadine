@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use grenadine_core::api::{
     AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
-    Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision, ReviewEvent,
-    ReviewInfo, ReviewState, SubmitReview, submit_blocker,
+    MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision,
+    ReviewEvent, ReviewInfo, ReviewState, StackMergePr, SubmitReview, submit_blocker,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -14,6 +14,7 @@ use crate::api;
 use crate::composer::{
     ComposerToggle, MarkdownEditor, OpenBoxes, comment_draft_key, draft_signal, sender,
 };
+use crate::hash_for;
 use crate::inboxes::CiIcon;
 use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget};
 
@@ -698,6 +699,43 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
     }
 }
 
+/// Whether a PR with `conflicting`, `state` and `is_draft` may merge
+/// now: `Ok(true)` when only by bypassing the branch's rules, or why it
+/// may not. `methods` is how many merge methods the repository allows;
+/// `conversations` blocks Blocked when the rules want `unresolved`
+/// threads resolved.
+fn mergeable(
+    conflicting: Option<bool>,
+    state: MergeState,
+    is_draft: bool,
+    methods: usize,
+    conversations: bool,
+    unresolved: usize,
+    admin: bool,
+) -> Result<bool, &'static str> {
+    if is_draft {
+        return Err("Drafts can't be merged.");
+    }
+    if methods == 0 {
+        return Err("The repository allows no merge method.");
+    }
+    if conflicting == Some(true) {
+        return Err("Resolve the conflicts first.");
+    }
+    match state {
+        MergeState::Dirty => Err("Resolve the conflicts first."),
+        MergeState::Clean | MergeState::HasHooks | MergeState::Unstable => Ok(false),
+        MergeState::Blocked | MergeState::Behind if admin => Ok(true),
+        MergeState::Blocked if conversations && unresolved > 0 => {
+            Err("Resolve the conversations first.")
+        }
+        MergeState::Blocked => Err("The branch's rules block merging."),
+        MergeState::Behind => Err("Bring the branch up to date first."),
+        MergeState::Draft => Err("Drafts can't be merged."),
+        MergeState::Unknown => Err("GitHub hasn't worked out yet whether this can be merged."),
+    }
+}
+
 /// Whether the PR may be merged now: `Ok(true)` when only by bypassing the
 /// branch's rules, which the viewer may do, or why it may not.
 /// `unresolved` is how many review threads are unresolved.
@@ -707,26 +745,99 @@ pub fn can_merge(
     unresolved: usize,
 ) -> Result<bool, &'static str> {
     let m = &info.merge;
-    if is_draft {
-        return Err("Drafts can't be merged.");
+    mergeable(
+        m.conflicting,
+        m.state,
+        is_draft,
+        m.methods.len(),
+        m.requires_conversation_resolution,
+        unresolved,
+        m.can_merge_as_admin,
+    )
+}
+
+/// Whether `p`, a PR below the merged one in its GitHub stack that
+/// merging takes along, may merge: `Ok(Some(why))` when only by the
+/// viewer bypassing the branch's rules, which `admin` allows, `Ok(None)`
+/// when it may plainly, or `Err` why not.
+fn below_mergeable(p: &StackMergePr, admin: bool) -> Result<Option<String>, String> {
+    let n = p.number;
+    if p.is_draft || p.state == MergeState::Draft {
+        return Err(format!("#{n} is a draft."));
     }
-    if m.methods.is_empty() {
-        return Err("The repository allows no merge method.");
+    if p.conflicting == Some(true) || p.state == MergeState::Dirty {
+        return Err(format!("#{n} conflicts with its base."));
     }
-    if m.conflicting == Some(true) {
-        return Err("Resolve the conflicts first.");
+    let bypass = |why: String| match admin {
+        true => Ok(Some(why)),
+        false => Err(why),
+    };
+    match p.state {
+        MergeState::Blocked => bypass(format!("#{n} is blocked by its branch's rules.")),
+        MergeState::Behind => bypass(format!("#{n} is behind its base.")),
+        MergeState::Unknown => Err(format!(
+            "GitHub hasn't worked out yet whether #{n} can be merged."
+        )),
+        _ => Ok(None),
     }
-    match m.state {
-        MergeState::Dirty => Err("Resolve the conflicts first."),
-        MergeState::Clean | MergeState::HasHooks | MergeState::Unstable => Ok(false),
-        MergeState::Blocked | MergeState::Behind if m.can_merge_as_admin => Ok(true),
-        MergeState::Blocked if m.requires_conversation_resolution && unresolved > 0 => {
-            Err("Resolve the conversations first.")
+}
+
+/// A stack PR's readiness in a line: what's keeping it from merging, or
+/// that nothing is.
+fn below_status(p: &StackMergePr) -> &'static str {
+    if p.is_draft || p.state == MergeState::Draft {
+        return "Draft";
+    }
+    if p.conflicting == Some(true) || p.state == MergeState::Dirty {
+        return "Conflicts";
+    }
+    match p.state {
+        MergeState::Blocked => "Blocked by rules",
+        MergeState::Behind => "Behind",
+        MergeState::Unknown => "GitHub hasn't worked it out yet",
+        _ => match p.ci {
+            Some(CiStatus::Failing) => "CI failing",
+            Some(CiStatus::Running) => "CI running",
+            _ => "Ready",
+        },
+    }
+}
+
+/// Resolves `ms` milliseconds from now.
+async fn sleep(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = web_sys::window()
+            .expect("no window")
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// How long polling a merge gives up after, in milliseconds.
+const MERGE_POLL_LIMIT: f64 = 10.0 * 60.0 * 1000.0;
+
+/// Follows GitHub's asynchronous merge `uuid` until it lands, joins the
+/// merge queue or fails. `warning` takes what went wrong after merging,
+/// e.g. a branch that stayed.
+async fn poll_merge(key: &PrKey, uuid: &str, warning: RwSignal<Option<String>>) -> api::Result<()> {
+    let deadline = js_sys::Date::now() + MERGE_POLL_LIMIT;
+    loop {
+        let progress = api::merge_progress(key, uuid).await?;
+        match progress.status {
+            MergeStatus::Merged => {
+                warning.try_set(progress.warning);
+                return Ok(());
+            }
+            MergeStatus::Enqueued => return Ok(()),
+            MergeStatus::Failed(why) => return Err(why),
+            MergeStatus::Pending => {}
         }
-        MergeState::Blocked => Err("The branch's rules block merging."),
-        MergeState::Behind => Err("Bring the branch up to date first."),
-        MergeState::Draft => Err("Drafts can't be merged."),
-        MergeState::Unknown => Err("GitHub hasn't worked out yet whether this can be merged."),
+        if js_sys::Date::now() > deadline {
+            return Err(
+                "GitHub hasn't finished the merge yet; the page updates once it does.".into(),
+            );
+        }
+        sleep(2000).await;
     }
 }
 
@@ -805,6 +916,8 @@ pub struct MergeTarget {
     /// The latest version, which is what gets merged.
     pub head_oid: Option<String>,
     pub base_ref: String,
+    /// Its head branch, which merging may delete.
+    pub head_ref: String,
     /// The open PR whose branch this one targets, if it's stacked on one.
     pub open_parent: Option<u64>,
     /// The branch the bottom of the PR's stack targets.
@@ -832,7 +945,35 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
     let name = StoredValue::new(merge_name(&key));
     let busy = move || name.with_value(|n| boxes.sending(n));
     let error = move || name.with_value(|n| boxes.error(n));
+    // The open PRs below this one in its GitHub stack, which merging it
+    // takes along, bottom first.
+    let below = info
+        .merge
+        .stack
+        .as_ref()
+        .map(|s| s.below.as_slice())
+        .unwrap_or_default()
+        .to_vec();
+    // In a GitHub stack, the merge lands on the stack's base; otherwise
+    // on the PR's own base branch.
+    let stack_base = info
+        .merge
+        .stack
+        .as_ref()
+        .map(|s| s.base_ref.clone())
+        .unwrap_or_else(|| target.base_ref.clone());
+    let count = below.len() + 1;
     let allowed = can_merge(info, target.is_draft, target.unresolved_threads);
+    let belows: Vec<Result<Option<String>, String>> = below
+        .iter()
+        .map(|p| below_mergeable(p, info.merge.can_merge_as_admin))
+        .collect();
+    let blocked = allowed
+        .err()
+        .map(str::to_owned)
+        .or_else(|| belows.iter().find_map(|r| r.clone().err()));
+    let is_blocked = blocked.is_some();
+    let stacked = count > 1;
     let fallback = pick_method(info);
     let chosen = move || method.get().or(fallback);
     let deletes = !info.merge.delete_branch_on_merge;
@@ -847,19 +988,44 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
     let editing = Memo::new(move |_| message.with(Option::is_some));
     let editing = move || editing.get();
     let methods = info.merge.methods.clone();
-    let admin = admin || allowed == Ok(true);
-    let blocked = allowed.err();
+    // The merge bypasses the rules when the PR's own state needs it or a
+    // PR below it does.
+    let admin = admin || allowed == Ok(true) || belows.iter().any(|r| matches!(r, Ok(Some(_))));
     let key = StoredValue::new(key);
     let head = target.head_oid.clone();
-    let base_ref = target.base_ref.clone();
-    // The viewer may bypass the rules: the dialog says which ones.
-    let bypassed = admin.then(|| merge_status(info, target.unresolved_threads).1);
+    // The PRs' numbers in the order they land, this one's last.
+    let landing: Vec<u64> = below
+        .iter()
+        .map(|p| p.number)
+        .chain(std::iter::once(key.with_value(|k| k.number)))
+        .collect();
+    let branches: Vec<String> = std::iter::once(target.head_ref.clone())
+        .chain(below.iter().map(|p| p.head_ref.clone()))
+        .collect();
+    // The viewer may bypass the rules: the dialog says which ones,
+    // including the PRs below it that need the bypass.
+    let bypassed = admin.then(|| {
+        let mut why = vec![merge_status(info, target.unresolved_threads).1];
+        why.extend(belows.iter().filter_map(|r| r.clone().ok().flatten()));
+        why.join("\n")
+    });
+    let merge_base = stack_base.clone();
     let merge = move |_| {
         let (Some(m), Some(head)) = (chosen(), head.clone()) else {
             return;
         };
-        let number = key.with_value(|k| k.number);
-        let what = format!("{} #{number} into {base_ref}", method_label(m));
+        let (last, rest) = landing.split_last().expect("the merged PR lands");
+        let numbers = match rest.is_empty() {
+            true => format!("#{last}"),
+            false => format!(
+                "{}, then #{last}",
+                rest.iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let what = format!("{} {numbers} into {merge_base}", method_label(m));
         let what = match &bypassed {
             Some(why) => format!("{what}, bypassing the branch's rules?\n\n{why}"),
             None => format!("{what}?"),
@@ -869,7 +1035,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         }
         let (title, body) = message
             .get_untracked()
-            .filter(|_| m == MergeMethod::Squash)
+            .filter(|_| m == MergeMethod::Squash && !stacked)
             .unzip();
         let request = MergeRequest {
             method: m,
@@ -877,13 +1043,13 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
             title,
             body,
             delete_branch: deletes && delete(),
+            bypass_rules: admin,
         };
         warning.set(None);
         let key = key.get_value();
         let merge = async move {
             let done = api::merge(&key, &request).await?;
-            warning.try_set(done.warning);
-            Ok(())
+            poll_merge(&key, &done.uuid, warning).await
         };
         name.with_value(|n| {
             boxes.send(n, merge, move || {
@@ -893,12 +1059,15 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
     };
     view! {
         <div class="merge-controls">
-            {target.open_parent.map(|p| view! {
-                <p class="banner warn">{format!(
-                    "This PR targets the branch of #{p}, so merging it puts its changes there, not into {}.",
-                    target.stack_base
-                )}</p>
-            })}
+            {match below.is_empty() {
+                false => stack_merge_banner(below.clone(), stack_base.clone(), key.with_value(|k| k.number)).into_any(),
+                true => target.open_parent.map(|p| view! {
+                    <p class="banner warn">{format!(
+                        "This PR targets the branch of #{p}, so merging it puts its changes there, not into {}.",
+                        target.stack_base
+                    )}</p>
+                }).into_any(),
+            }}
             {blocked.map(|why| view! { <p class="muted merge-blocked">{why}</p> })}
             <div class="form-buttons">
                 <select aria-label="Merge method"
@@ -908,24 +1077,29 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
                     }).collect_view()}
                 </select>
                 <button type="button" class=if admin { "danger" } else { "primary" }
-                    disabled=move || busy() || merged.get() || blocked.is_some() || target.head_oid.is_none()
+                    disabled=move || busy() || merged.get() || is_blocked || target.head_oid.is_none()
                     title=if admin { "Merges without waiting for the branch's rules, which you may bypass" } else { "" }
                     on:click=merge>
                     {move || match (busy(), merged.get(), admin) {
-                        (true, _, _) => "Merging…",
-                        (false, true, _) => "Merged",
-                        (false, false, true) => "Merge, bypassing rules",
-                        (false, false, false) => "Merge",
+                        (true, _, _) => "Merging…".to_owned(),
+                        (false, true, _) => "Merged".to_owned(),
+                        (false, false, true) if count > 1 => format!("Merge {count} PRs, bypassing rules"),
+                        (false, false, false) if count > 1 => format!("Merge {count} PRs"),
+                        (false, false, true) => "Merge, bypassing rules".to_owned(),
+                        (false, false, false) => "Merge".to_owned(),
                     }}
                 </button>
                 {deletes.then(|| view! {
                     <label class="toggle">
                         <input type="checkbox" prop:checked=delete
                             on:change=move |ev| delete_branch.set(Some(event_target_checked(&ev))) />
-                        " Delete the branch"
+                        {match branches.len() {
+                            1 => " Delete the branch".to_owned(),
+                            _ => format!(" Delete the branches ({})", branches.join(", ")),
+                        }}
                     </label>
                 })}
-                {move || (chosen() == Some(MergeMethod::Squash) && !editing()).then(|| {
+                {move || (chosen() == Some(MergeMethod::Squash) && !editing() && !stacked).then(|| {
                     let default_message = default_message.clone();
                     view! {
                         <button type="button" class="link" on:click=move |_| message.set(Some(default_message.clone()))>"Edit the commit message"</button>
@@ -944,6 +1118,51 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
             })}
             {move || error().map(|e| view! { <p class="error">{e}</p> })}
         </div>
+    }
+}
+
+/// That merging `number` merges `below`, the open PRs under it in its
+/// GitHub stack, and a readiness row per one.
+fn stack_merge_banner(
+    below: Vec<StackMergePr>,
+    base_ref: String,
+    number: u64,
+) -> impl IntoView + use<> {
+    let repo = expect_context::<ReviewTarget>().key.repo;
+    let links = below
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let key = PrKey {
+                repo: repo.clone(),
+                number: p.number,
+            };
+            let sep = match i {
+                0 => "",
+                i if i == below.len() - 1 => " and ",
+                _ => ", ",
+            };
+            view! { {sep}<a href=hash_for(&key)>{format!("#{}", p.number)}</a> }
+        })
+        .collect_view();
+    let rows = below
+        .iter()
+        .map(|p| {
+            let key = PrKey {
+                repo: repo.clone(),
+                number: p.number,
+            };
+            view! {
+                <li>
+                    <a href=hash_for(&key)>{format!("#{} {}", p.number, p.title)}</a>
+                    {format!(" — {}", below_status(p))}
+                </li>
+            }
+        })
+        .collect_view();
+    view! {
+        <p class="banner warn">{format!("Merging #{number} also merges ")}{links}" below it. Each lands on "{base_ref}" separately, in stack order, and if one can't merge, neither does."</p>
+        <ul class="merge-stack">{rows}</ul>
     }
 }
 
@@ -999,12 +1218,29 @@ fn queue_name(key: &PrKey) -> String {
 fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
     let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
     let boxes = expect_context::<OpenBoxes>();
-    let MergeChoice { bypass, .. } = expect_context::<MergeChoice>();
+    let MergeChoice {
+        bypass, warning, ..
+    } = expect_context::<MergeChoice>();
     let queue = info
         .merge
         .queue
         .clone()
         .expect("queue controls need a merge-queue branch");
+    // The open PRs below this one in its GitHub stack, which queueing it
+    // takes along, bottom first.
+    let below = info
+        .merge
+        .stack
+        .as_ref()
+        .map(|s| s.below.as_slice())
+        .unwrap_or_default()
+        .to_vec();
+    let count = below.len() + 1;
+    let numbers: Vec<String> = below
+        .iter()
+        .map(|p| format!("#{}", p.number))
+        .chain(std::iter::once(format!("#{}", key.number)))
+        .collect();
     let name = StoredValue::new(queue_name(&key));
     let busy = move || name.with_value(|n| boxes.sending(n));
     let error = move || name.with_value(|n| boxes.error(n));
@@ -1019,9 +1255,15 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
                 return;
             };
             let number = key.with_value(|k| k.number);
-            let what = match jump {
-                true => format!("Add #{number} to the front of the merge queue for {base_ref}?"),
-                false => format!("Add #{number} to the merge queue for {base_ref}?"),
+            let what = match (jump, numbers.len()) {
+                (true, _) => {
+                    format!("Add #{number} to the front of the merge queue for {base_ref}?")
+                }
+                (false, 1) => format!("Add #{number} to the merge queue for {base_ref}?"),
+                (false, _) => format!(
+                    "Add {} to the merge queue for {base_ref}?",
+                    numbers.join(", ")
+                ),
             };
             if !confirm(what) {
                 return;
@@ -1031,9 +1273,15 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
                 jump,
             };
             let key = key.get_value();
-            name.with_value(|n| {
-                boxes.send(n, async move { api::enqueue(&key, &request).await }, || {})
-            });
+            let enqueue = async move {
+                match api::enqueue(&key, &request).await? {
+                    // A stacked PR queues through the merge-async API,
+                    // which is polled like a merge.
+                    Some(started) => poll_merge(&key, &started.uuid, warning).await,
+                    None => Ok(()),
+                }
+            };
+            name.with_value(|n| boxes.send(n, enqueue, || {}));
         }
     };
     let merge_when_ready = {
@@ -1103,12 +1351,21 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     let admin = info.merge.can_merge_as_admin;
     let headless = target.head_oid.is_none();
     let in_queue = queue.entry.is_some();
+    // GitHub's merge queue has no jump or merge-when-ready for a stack.
+    let unstacked = info.merge.stack.is_none();
     let auto_merge = queue.auto_merge && !in_queue;
     let can_disable = queue.can_disable_auto_merge;
+    let stack_base = info
+        .merge
+        .stack
+        .as_ref()
+        .map(|s| s.base_ref.clone())
+        .unwrap_or_default();
     let info = info.clone();
     let bypass_target = target.clone();
     view! {
         <div class="merge-controls">
+            {(!below.is_empty()).then(|| stack_merge_banner(below.clone(), stack_base.clone(), key.with_value(|k| k.number)))}
             {method_line.map(|line| view! { <p class="muted queue-method">{line}</p> })}
             {blocked.map(|why| view! { <p class="muted merge-blocked">{why}</p> })}
             <div class="form-buttons">
@@ -1133,21 +1390,25 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
                                 <button type="button" class="primary"
                                     disabled=move || busy() || headless
                                     on:click=move |_| enqueue(false)>
-                                    {move || if busy() { "Adding…" } else { "Add to merge queue" }}
+                                    {move || match (busy(), count) {
+                                        (true, _) => "Adding…".to_owned(),
+                                        (false, 1) => "Add to merge queue".to_owned(),
+                                        (false, n) => format!("Add {n} PRs to merge queue"),
+                                    }}
                                 </button>
                             }.into_any()
                         }
-                        QueueAction::AutoMerge => view! {
+                        QueueAction::AutoMerge if unstacked => view! {
                             <button type="button" class="primary"
                                 disabled=move || busy() || headless
                                 on:click=merge_when_ready>
                                 {move || if busy() { "Enabling…" } else { "Merge when ready" }}
                             </button>
                         }.into_any(),
-                        QueueAction::Blocked(_) => ().into_any(),
+                        _ => ().into_any(),
                     }
                 })}
-                {(jumpable && !in_queue && !auto_merge).then(|| {
+                {(unstacked && jumpable && !in_queue && !auto_merge).then(|| {
                     let enqueue = enqueue.clone();
                     view! {
                         <button type="button" disabled=move || busy() || headless
@@ -1227,6 +1488,7 @@ mod tests {
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
                 queue: None,
+                stack: None,
             },
         }
     }
@@ -1572,6 +1834,58 @@ mod tests {
                 "2026-01-01T00:03:00Z",
                 "2026-01-01T00:04:00Z"
             ]
+        );
+    }
+
+    fn below_pr(number: u64, state: MergeState) -> StackMergePr {
+        StackMergePr {
+            number,
+            title: format!("PR {number}"),
+            head_ref: format!("dev/{number}"),
+            is_draft: false,
+            conflicting: Some(false),
+            state,
+            ci: None,
+        }
+    }
+
+    #[test]
+    fn below_mergeability() {
+        // Clean PRs merge along; blocked and behind ones only with the
+        // viewer's admin bypass.
+        assert_eq!(
+            below_mergeable(&below_pr(1, MergeState::Clean), false),
+            Ok(None)
+        );
+        assert_eq!(
+            below_mergeable(&below_pr(2, MergeState::Blocked), false),
+            Err("#2 is blocked by its branch's rules.".into())
+        );
+        assert_eq!(
+            below_mergeable(&below_pr(2, MergeState::Blocked), true),
+            Ok(Some("#2 is blocked by its branch's rules.".into()))
+        );
+        assert_eq!(
+            below_mergeable(&below_pr(3, MergeState::Behind), false),
+            Err("#3 is behind its base.".into())
+        );
+        assert_eq!(
+            below_mergeable(&below_pr(3, MergeState::Behind), true),
+            Ok(Some("#3 is behind its base.".into()))
+        );
+        // Drafts, conflicts and undecided states block outright.
+        let mut draft = below_pr(4, MergeState::Clean);
+        draft.is_draft = true;
+        assert_eq!(below_mergeable(&draft, true), Err("#4 is a draft.".into()));
+        let mut conflict = below_pr(5, MergeState::Clean);
+        conflict.conflicting = Some(true);
+        assert_eq!(
+            below_mergeable(&conflict, true),
+            Err("#5 conflicts with its base.".into())
+        );
+        assert_eq!(
+            below_mergeable(&below_pr(6, MergeState::Unknown), true),
+            Err("GitHub hasn't worked out yet whether #6 can be merged.".into())
         );
     }
 }

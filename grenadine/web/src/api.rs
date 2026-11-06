@@ -9,9 +9,9 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewEntry,
     Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GitHubUsage, InboxEdit,
-    InboxWithPrs, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
-    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, SubmitReview,
-    SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
+    InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment,
+    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
+    SubmitReview, SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -493,12 +493,31 @@ pub async fn merge(key: &PrKey, merge: &MergeRequest) -> Result<Merged> {
         .map_err(|e| e.to_string())
 }
 
-/// Adds the PR to its merge queue, or to the front when `e.jump`.
-pub async fn enqueue(key: &PrKey, e: &Enqueue) -> Result<()> {
+/// How the merge the server started as `uuid` is doing.
+pub async fn merge_progress(key: &PrKey, uuid: &str) -> Result<MergeProgress> {
+    check(
+        Request::get(&format!("{}/merge/{uuid}", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Adds the PR to its merge queue, or to the front when `e.jump`. A PR
+/// in a GitHub stack goes through the merge-async API instead, whose
+/// merge ID comes back for polling.
+pub async fn enqueue(key: &PrKey, e: &Enqueue) -> Result<Option<Merged>> {
     let req = Request::post(&format!("{}/queue", pr_url(key)))
         .json(e)
         .map_err(|e| e.to_string())?;
-    check(req.send().await).await.map(|_| ())
+    check(req.send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Takes the PR out of its merge queue.
