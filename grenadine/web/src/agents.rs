@@ -2240,8 +2240,9 @@ fn pr_state(pr: &AgentPr) -> (&'static str, &'static str) {
     }
 }
 
-/// The PRs the session opened, above the unstaged changes. Nothing
-/// renders until the first fetch comes back with at least one.
+/// The PRs the session started from or opened, above the unstaged
+/// changes. Nothing renders until the first fetch comes back with at
+/// least one.
 #[component]
 fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
     let updates = expect_context::<Updates>();

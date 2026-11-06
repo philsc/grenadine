@@ -1177,6 +1177,10 @@ pub async fn create_session(
         }
         Err(e) => return Err(e),
     }
+    if session.pr.is_some() {
+        // The next poll fills in the title right away.
+        state.poke.notify_one();
+    }
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
     if kind == SessionKind::Interactive {

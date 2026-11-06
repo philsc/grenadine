@@ -920,7 +920,7 @@ async fn pr_agents(
     Ok(Json(sessions))
 }
 
-/// The PRs the session opened, as of the last poll.
+/// The PRs the session started from or opened, as of the last poll.
 async fn agent_prs(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
