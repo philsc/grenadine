@@ -3065,6 +3065,78 @@ class VersionsTest(ServerTestCase):
                 expect(file.locator("tr.line td.code.add")).to_have_count(300)
                 expect(file.locator("td.code .sy-storage").first).to_have_text("def")
 
+    def toolbar_bottom(self) -> float:
+        box = self.page.locator(".toolbar").bounding_box()
+        return box["y"] + box["height"]
+
+    def test_file_headers_stick_below_the_toolbar(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        file = self.file(scenarios.BIG_FILES[0])
+        # Scrolling mid-file only sticks the header once the rows are laid
+        # out at their real height.
+        expect(file.locator("tr.line td.code.add")).to_have_count(300)
+        # Mid-file the header sticks to the toolbar's bottom edge.
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        header = file.locator(".file-header")
+        expect(header).to_be_visible()
+        self.assertAlmostEqual(
+            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
+        )
+
+    def test_file_index_scrolls_files_below_the_toolbar(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        path = scenarios.BIG_FILES[4]
+        self.page.locator(".file-index a", has_text=path).click()
+        header = self.file(path).locator(".file-header")
+        self.assertAlmostEqual(
+            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
+        )
+
+    def test_collapsing_a_stuck_file_keeps_its_header_in_view(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        file = self.file(scenarios.BIG_FILES[2])
+        # Scrolling mid-file only sticks the header once the rows are laid
+        # out at their real height.
+        expect(file.locator("tr.line td.code.add")).to_have_count(300)
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        header = file.locator(".file-header")
+        header.click()
+        expect(header).to_be_visible()
+        # Collapsing scrolls the file back below the toolbar.
+        self.page.wait_for_function(
+            "(file) => Math.abs("
+            "file.querySelector('.file-header').getBoundingClientRect().top"
+            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
+            ") <= 1",
+            arg=file.element_handle(),
+        )
+        self.assertAlmostEqual(
+            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
+        )
+
+    def test_collapsing_a_stuck_file_lets_the_user_scroll(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        file = self.file(scenarios.BIG_FILES[2])
+        expect(file.locator("tr.line td.code.add")).to_have_count(300)
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        file.locator(".file-header").click()
+        self.page.wait_for_function(
+            "(file) => Math.abs("
+            "file.querySelector('.file-header').getBoundingClientRect().top"
+            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
+            ") <= 1",
+            arg=file.element_handle(),
+        )
+        # The collapse's scroll-back must not fight a user who scrolls.
+        main_scroll_top = "el => el.closest('.main').scrollTop"
+        top_before = file.evaluate(main_scroll_top)
+        self.page.mouse.wheel(0, 2000)
+        self.page.wait_for_timeout(500)
+        top = file.evaluate(main_scroll_top)
+        self.page.wait_for_timeout(500)
+        self.assertEqual(file.evaluate(main_scroll_top), top)
+        self.assertGreater(top - top_before, 500)
+
 
 # A new session's form; each is a draft of its own.
 DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"

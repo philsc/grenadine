@@ -1,5 +1,5 @@
 {
-  "checksum": "c86e39d6e3e3f906550261ef8a6f5ab375ef64d6e8a063ac65e09465f1836495",
+  "checksum": "edddae8ab39ea379e976d70ed1311e7221afe3bb86c5ef770b6606f33fb3c207",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16554,6 +16554,8 @@
             "DeviceOrientationEvent",
             "Document",
             "DocumentFragment",
+            "DomRect",
+            "DomRectReadOnly",
             "DomStringMap",
             "DomTokenList",
             "DragEvent",

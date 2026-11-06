@@ -950,7 +950,9 @@ input[type="text"] {
   border: 1px solid var(--border);
   border-radius: 6px;
   margin-bottom: 16px;
-  overflow: hidden;
+  /* Clip, not hidden: hidden would make each file a scroll container and
+     break the header's sticky positioning. */
+  overflow: clip;
   /* Big diffs: the browser skips laying out files that are off screen. */
   content-visibility: auto;
   contain-intrinsic-size: auto 400px;
@@ -965,6 +967,16 @@ input[type="text"] {
   cursor: pointer;
   position: sticky;
   top: 0;
+  /* Under the toolbar (z-index 2) so its dropdowns overlay the headers. */
+  z-index: 1;
+}
+/* On the PR page the headers and scroll targets sit below its sticky
+   toolbar, whose height the page keeps in a variable. */
+.pr .file-header {
+  top: var(--toolbar-height, 0px);
+}
+.pr .file {
+  scroll-margin-top: var(--toolbar-height, 0px);
 }
 .file-header .path {
   font-family: var(--mono);
