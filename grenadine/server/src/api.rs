@@ -91,6 +91,7 @@ fn api_routes() -> Router<Arc<State>> {
             post(submit_review).delete(discard_review),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
+        .route("/api/pr/{owner}/{name}/{number}/agents", get(pr_agents))
         .route(
             "/api/pr/{owner}/{name}/{number}/queue",
             post(enqueue).delete(dequeue),
@@ -904,6 +905,21 @@ async fn agent_changes(AxState(state): St, Path(id): Path<String>) -> ApiResult<
     Ok(Json(WorktreeChanges { files }).into_response())
 }
 
+/// The sessions associated with the PR, oldest first.
+async fn pr_agents(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Json<Vec<AgentSession>>> {
+    let mut sessions = state.db.pr_agents(&PrKey {
+        repo: format!("{owner}/{name}"),
+        number,
+    })?;
+    for s in &mut sessions {
+        s.unstaged = state.agents.unstaged.get(&s.id);
+    }
+    Ok(Json(sessions))
+}
+
 /// The PRs the session opened, as of the last poll.
 async fn agent_prs(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     if find_agent(&state, &id)?.is_none() {
@@ -1498,6 +1514,60 @@ mod tests {
         let searches = state.inbox_searches.lock().unwrap();
         assert!(!searches.now.contains(&2));
         assert!(!searches.last.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn pr_agents_are_the_sessions_on_the_pr() {
+        let state = crate::sync::test_state();
+        let started = "00000000-0000-0000-0000-000000000000";
+        let opened = "00000000-0000-0000-0000-000000000001";
+        state
+            .db
+            .create_agent(&AgentSession {
+                pr: Some(7),
+                created_at: 2,
+                ..AgentSession::fixture(started, "o/n")
+            })
+            .unwrap();
+        state
+            .db
+            .create_agent(&AgentSession {
+                created_at: 1,
+                ..AgentSession::fixture(opened, "o/n")
+            })
+            .unwrap();
+        state
+            .db
+            .add_agent_pr(
+                opened,
+                &PrKey {
+                    repo: "o/n".into(),
+                    number: 7,
+                },
+                "OPEN",
+            )
+            .unwrap();
+        state
+            .db
+            .create_agent(&AgentSession::fixture(
+                "00000000-0000-0000-0000-000000000002",
+                "o/n",
+            ))
+            .unwrap();
+
+        let get = |number| {
+            pr_agents(
+                AxState(state.clone()),
+                Path(("o".to_owned(), "n".to_owned(), number)),
+            )
+        };
+        let Json(list) = get(7).await.map_err(|e| e.0).unwrap();
+        let ids: Vec<_> = list.iter().map(|s| s.id.as_str()).collect();
+        // Oldest first: the session that opened the PR before the one
+        // that started from it; the unrelated one isn't listed.
+        assert_eq!(ids, [opened, started]);
+        let Json(list) = get(8).await.map_err(|e| e.0).unwrap();
+        assert!(list.is_empty());
     }
 
     async fn body(response: Response) -> String {
