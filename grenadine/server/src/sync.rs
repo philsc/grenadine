@@ -704,6 +704,7 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
         }
     };
 
+    let status = github::PrStatus::from(&data);
     let meta = PrMeta {
         key: key.clone(),
         title: data.title,
@@ -733,6 +734,11 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
         computed.approximate,
         drifted.then_some((old_text.as_str(), new_text.as_str())),
     )?;
+    // The sessions' PR lists read their own copy of the state, which
+    // only the polls would otherwise refresh.
+    if state.db.set_agent_pr_state(key, &status)? {
+        state.send(ServerEvent::AgentsChanged);
+    }
     Ok(unsettled)
 }
 

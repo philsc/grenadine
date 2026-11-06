@@ -204,6 +204,22 @@ pub struct PrStatus {
     pub ci: Option<CiStatus>,
 }
 
+/// A full sync reads everything `pr_statuses` does, so it can report the
+/// same status without a separate lookup.
+impl From<&PrData> for PrStatus {
+    fn from(data: &PrData) -> Self {
+        Self {
+            state: data.state.clone(),
+            queued: data.queued,
+            conflicting: data.review.as_ref().and_then(|r| r.merge.conflicting),
+            title: data.title.clone(),
+            base_ref: data.base_ref.clone(),
+            head_oid: data.head_oid.clone(),
+            ci: data.ci,
+        }
+    }
+}
+
 /// Parses an RFC 3339 timestamp into Unix seconds.
 pub fn unix(ts: &str) -> Result<i64> {
     Ok(DateTime::parse_from_rfc3339(ts)
@@ -2950,5 +2966,67 @@ mod tests {
     fn timestamps() {
         assert_eq!(unix("1970-01-01T00:01:00Z").unwrap(), 60);
         assert!(unix("nope").is_err());
+    }
+
+    #[test]
+    fn status_from_pr_data() {
+        let data = PrData {
+            title: "Fix it".into(),
+            body: String::new(),
+            author: "alice".into(),
+            state: "MERGED".into(),
+            is_draft: false,
+            queued: true,
+            url: "https://github.com/o/r/pull/7".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
+            base_ref: "main".into(),
+            head_ref: "branch".into(),
+            head_oid: "abc".into(),
+            head_repo: Some("o/r".into()),
+            force_pushes: vec![],
+            commits: vec![],
+            ci: Some(CiStatus::Passing),
+            review: Some(ReviewInfo {
+                viewer: "me".into(),
+                decision: None,
+                reviews: vec![],
+                requested: vec![],
+                comments: vec![],
+                checks: vec![],
+                ci: None,
+                merge: MergeInfo {
+                    conflicting: Some(true),
+                    state: MergeState::Dirty,
+                    methods: vec![],
+                    default_method: None,
+                    delete_branch_on_merge: false,
+                    can_merge_as_admin: false,
+                    requires_conversation_resolution: false,
+                    queue: None,
+                },
+                pending_review: None,
+            }),
+            review_error: None,
+            pending: vec![],
+        };
+        assert_eq!(
+            PrStatus::from(&data),
+            PrStatus {
+                state: "MERGED".into(),
+                queued: true,
+                conflicting: Some(true),
+                title: "Fix it".into(),
+                base_ref: "main".into(),
+                head_oid: "abc".into(),
+                ci: Some(CiStatus::Passing),
+            }
+        );
+        // Without a review there's no merge state to report.
+        let data = PrData {
+            review: None,
+            ..data
+        };
+        assert_eq!(PrStatus::from(&data).conflicting, None);
     }
 }
