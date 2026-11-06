@@ -157,8 +157,8 @@ const MIN_HEIGHT: f64 = 120.0;
 /// How long a tab waits before it reconnects to a shell that still runs.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
-/// The panel's height when dragged to `height`, given the window's.
-fn clamp_height(height: f64, window_height: f64) -> f64 {
+/// The panel's height when dragged to `height`, given what's available.
+pub(crate) fn clamp_height(height: f64, window_height: f64) -> f64 {
     height.min(window_height * 0.85).max(MIN_HEIGHT)
 }
 

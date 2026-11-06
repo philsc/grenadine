@@ -2897,6 +2897,12 @@ class AgentTest(ServerTestCase):
             repo = gh.repo(slug)
             repo.commit("Seed", {"README": "hello\n"})
             repo.push("main")
+        # The PR the agents panel is tested on.
+        repo = gh.repo(scenarios.REPO)
+        repo.checkout("case/panel", "main")
+        repo.commit("Panel", {"panel.md": "# Panel\n"})
+        repo.push("case/panel")
+        cls.panel_pr = repo.open_pr("Panel", head="case/panel")
 
     def setUp(self) -> None:
         super().setUp()
@@ -4387,6 +4393,125 @@ class AgentTest(ServerTestCase):
 
         self.assertEqual(handshake("http://evil.example"), 403)
         self.assertEqual(handshake(f"http://127.0.0.1:{port}"), 101)
+
+    def pr_page(self) -> Locator:
+        """The PR page's agents panel, in a window wide enough for the sidebar."""
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{self.panel_pr.number}")
+        toggle = self.page.locator(".pr-agents-toggle")
+        expect(toggle).to_be_visible()
+        return self.page.locator(".pr-agents-panel")
+
+    def start_pr_session(self, prompt: str) -> None:
+        """Starts a session from the PR on the Agents tab."""
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        # The unlocked form shows its run hints plainly.
+        expect(self.page.locator(".agent-form")).to_contain_text(
+            "its own git worktree", use_inner_text=True
+        )
+        self.page.get_by_label("Start from PR").fill(str(self.panel_pr.number))
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill(prompt)
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+    def test_pr_agents_panel_starts_a_session(self) -> None:
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        # With no sessions, expanding shows the new session form locked
+        # to the PR.
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        form = panel.locator(".agent-form")
+        expect(form).to_contain_text(
+            f"Starts from #{self.panel_pr.number} in {scenarios.REPO}"
+        )
+        expect(panel.get_by_label("Repository")).to_have_count(0)
+        expect(panel.get_by_label("Start from PR")).to_have_count(0)
+
+        # The run hints sit behind a summary naming the permission mode.
+        hints = panel.locator(".session-hints")
+        summary = hints.locator("summary")
+        expect(summary).to_contain_text("How this session runs")
+        expect(form).not_to_contain_text("its own git worktree", use_inner_text=True)
+        summary.click()
+        expect(form).to_contain_text("its own git worktree", use_inner_text=True)
+
+        panel.get_by_label("Permissions", exact=True).select_option(label="Auto")
+        expect(summary).to_contain_text("Auto")
+        panel.get_by_label("Prompt").fill("say one")
+        panel.get_by_role("button", name="Start").click()
+        # The page stays on the PR, and the draft's tab becomes the
+        # session's, selected.
+        expect(self.page).to_have_url(
+            re.compile(f"#/{scenarios.REPO}/{self.panel_pr.number}$")
+        )
+        tabs = panel.get_by_role("tab")
+        expect(tabs).to_have_count(1)
+        expect(tabs.first).to_have_attribute("aria-selected", "true")
+        transcript = panel.locator(".transcript")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The session answers follow-ups from the composer.
+        follow_up = panel.get_by_label("Follow-up")
+        follow_up.fill("say more")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say one", "say more"])
+
+    def test_pr_agents_panel_lists_sessions_started_from_the_pr(self) -> None:
+        self.start_pr_session("say one")
+        self.start_pr_session("say two")
+
+        panel = self.pr_page()
+        panel.locator(".pr-agents-toggle").click()
+        tabs = panel.get_by_role("tab")
+        expect(tabs).to_have_count(2)
+        # Oldest first, and the oldest is the one opened.
+        expect(tabs.first).to_contain_text("say one")
+        expect(tabs.first).to_have_attribute("aria-selected", "true")
+        transcript = panel.locator(".transcript")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
+        # The other tab shows its own transcript.
+        tabs.nth(1).click()
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say two"])
+
+    def test_pr_agents_panel_survives_reload_and_sync(self) -> None:
+        self.start_pr_session("say one")
+
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        transcript = panel.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        follow_up = panel.get_by_label("Follow-up")
+        follow_up.fill("half a thought")
+
+        # A comment from outside the page resyncs the PR, which rebuilds
+        # the review sidebar but not the panel under it.
+        resp = self.page.request.post(
+            f"{self.url}api/pr/{scenarios.REPO}/{self.panel_pr.number}/comments",
+            headers={"Origin": self.url.rstrip("/")},
+            data={"body": "Ping"},
+        )
+        self.assertEqual(resp.status, 204, resp.text())
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            "1 comment"
+        )
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(follow_up).to_have_value("half a thought")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
+
+        # The expansion and the selected tab survive a reload.
+        self.page.reload()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        tabs = panel.get_by_role("tab")
+        expect(tabs).to_have_count(1)
+        expect(tabs.first).to_have_attribute("aria-selected", "true")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
+        expect(follow_up).to_have_value("half a thought")
 
     def test_wrap_up(self) -> None:
         # The server's clone has main checked out, which the work lands on.

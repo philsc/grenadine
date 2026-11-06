@@ -1179,20 +1179,25 @@ fn repo_default_mode(settings: Option<&RepoSettings>, backend: AgentBackend) -> 
 }
 
 /// The form that starts a session, filled in from the draft with id
-/// `draft` and kept in it as it changes.
+/// `draft` and kept in it as it changes. With `pr`, the session is
+/// locked to that PR: its repository and "Start from PR" aren't offered,
+/// and the draft takes them whatever it held.
 #[component]
-pub fn NewSession(draft: String) -> impl IntoView {
+pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
     let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
     let saved = drafts.open(&draft);
     // Drafts saved before they defaulted to `GENERAL` have no repository.
-    let repo = RwSignal::new(if saved.repo.is_empty() {
-        GENERAL.to_owned()
-    } else {
-        saved.repo
+    let repo = RwSignal::new(match &pr {
+        Some(key) => key.repo.clone(),
+        None if saved.repo.is_empty() => GENERAL.to_owned(),
+        None => saved.repo,
     });
-    let number = RwSignal::new(saved.pr);
+    let number = RwSignal::new(match &pr {
+        Some(key) => key.number.to_string(),
+        None => saved.pr,
+    });
     let prompt = RwSignal::new(saved.prompt);
     // The backend the draft picked, and the one the form goes with: a
     // backend the server doesn't offer, e.g. Devin once it can't list its
@@ -1388,10 +1393,13 @@ pub fn NewSession(draft: String) -> impl IntoView {
         });
     };
 
+    // Locked to a PR the run hints collapse behind a summary.
+    let locked = pr.is_some();
     view! {
         <div class="agents">
             <form
                 class="agent-form"
+                class:locked=pr.is_some()
                 on:submit=move |ev| {
                     ev.prevent_default();
                     start();
@@ -1400,18 +1408,23 @@ pub fn NewSession(draft: String) -> impl IntoView {
                 on:drop=move |ev| images::drop(ev, images, error)
             >
                 <h2>"New session"</h2>
+                {pr.clone().map(|key| view! {
+                    <p class="muted">{format!("Starts from #{} in {}", key.number, key.repo)}</p>
+                })}
                 <div class="agent-form-row">
-                    <label>"Repository"
-                        <select
-                            prop:value=move || repo.get()
-                            on:change=move |ev| repo.set(event_target_value(&ev))
-                        >
-                            {move || repos.get().and_then(Result::ok).map(with_general).unwrap_or_default().into_iter().map(|r| {
-                                let selected = repo.get_untracked() == r;
-                                view! { <option value=r.clone() selected=selected>{repo_label(&r).to_owned()}</option> }
-                            }).collect_view()}
-                        </select>
-                    </label>
+                    {pr.is_none().then(|| view! {
+                        <label>"Repository"
+                            <select
+                                prop:value=move || repo.get()
+                                on:change=move |ev| repo.set(event_target_value(&ev))
+                            >
+                                {move || repos.get().and_then(Result::ok).map(with_general).unwrap_or_default().into_iter().map(|r| {
+                                    let selected = repo.get_untracked() == r;
+                                    view! { <option value=r.clone() selected=selected>{repo_label(&r).to_owned()}</option> }
+                                }).collect_view()}
+                            </select>
+                        </label>
+                    })}
                     {move || {
                         let list = backends().get().and_then(Result::ok).unwrap_or_default();
                         // Hidden only when there's nothing else to pick.
@@ -1436,16 +1449,18 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             </label>
                         })
                     }}
-                    <label>"Start from PR"
-                        <input
-                            type="text"
-                            class="agent-pr"
-                            placeholder=move || if general.get() { "" } else { "trunk" }
-                            disabled=general
-                            prop:value=move || number.get()
-                            on:input=move |ev| number.set(event_target_value(&ev))
-                        />
-                    </label>
+                    {pr.is_none().then(|| view! {
+                        <label>"Start from PR"
+                            <input
+                                type="text"
+                                class="agent-pr"
+                                placeholder=move || if general.get() { "" } else { "trunk" }
+                                disabled=general
+                                prop:value=move || number.get()
+                                on:input=move |ev| number.set(event_target_value(&ev))
+                            />
+                        </label>
+                    })}
                     <label>"Permissions"
                         <ModeSelect mode=mode backend=backend.into() picked=mode_picked />
                     </label>
@@ -1467,7 +1482,26 @@ pub fn NewSession(draft: String) -> impl IntoView {
                     }
                 ></textarea>
                 <Attachments images=images />
-                <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
+                {move || {
+                    let hints = view! {
+                        <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
+                        {move || default_skill.get().map(|skill| view! {
+                            <p class="hint muted">
+                                {format!("Starts as /{skill} …, unless the prompt starts with a /skill of its own.")}
+                            </p>
+                        })}
+                    };
+                    if locked {
+                        view! {
+                            <details class="session-hints">
+                                <summary>{move || mode.with(|m| format!("How this session runs · {}", backend.get().mode_label(m.as_str()).unwrap_or_else(|| m.as_str())))}</summary>
+                                {hints}
+                            </details>
+                        }.into_any()
+                    } else {
+                        hints.into_any()
+                    }
+                }}
                 {move || {
                     let list = backends().get().and_then(Result::ok).unwrap_or_default();
                     let b = backend.get();
@@ -1483,11 +1517,6 @@ pub fn NewSession(draft: String) -> impl IntoView {
                             }
                         })
                 }}
-                {move || default_skill.get().map(|skill| view! {
-                    <p class="hint muted">
-                        {format!("Starts as /{skill} …, unless the prompt starts with a /skill of its own.")}
-                    </p>
-                })}
                 {move || error.get().or_else(|| drafts.start_error(&id.get_value())).map(|e| view! { <p class="error">{e}</p> })}
                 {move || none_installed().then(|| view! { <p class="error">"No agent backend is installed on the server."</p> })}
                 <div class="form-buttons">
@@ -1909,7 +1938,14 @@ enum Load {
 /// so it has no composer, and the session can only be stopped or
 /// deleted.
 #[component]
-pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView {
+pub fn AgentView(
+    id: String,
+    #[prop(optional)] read_only: bool,
+    /// Fits the session into a narrow sidebar: a slim header, no changes
+    /// pane and no terminal panel.
+    #[prop(optional)]
+    compact: bool,
+) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let session = {
         let id = id.clone();
@@ -1999,8 +2035,12 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
         });
     });
 
-    // A session shows on the page of its kind.
+    // A session shows on the page of its kind; a view embedded in
+    // another page doesn't redirect that page.
     Effect::new(move || {
+        if compact {
+            return;
+        }
         if let Some(s) = current.get() {
             let review = s.kind == SessionKind::AutoReview;
             if review != read_only {
@@ -2010,7 +2050,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
     });
     let terminal_id = id.clone();
     view! {
-        <div class="agent-page">
+        <div class="agent-page" class:compact=compact>
             <div class="agent-panes">
                 <main class="main">
                     <div class="agent">
@@ -2032,7 +2072,28 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                                     live_model.get().or_else(|| session.with(|s| s.model.clone()))
                                 });
                                 view! {
-                                    <AgentHeader session=session />
+                                    {if compact {
+                                        view! {
+                                            <header class="agent-header compact">
+                                                {move || {
+                                                    let s = session.get();
+                                                    let title = s.summary.clone().or(Some(s.title.clone()))
+                                                        .filter(|t| !t.is_empty())
+                                                        .unwrap_or_else(|| "New session".into());
+                                                    view! {
+                                                        <h1>{title}</h1>
+                                                        <p class="muted">
+                                                            <StatusBadge status=s.status />
+                                                            " "
+                                                            <a href=session_hash(&s.id, s.kind)>"Open in Agents tab"</a>
+                                                        </p>
+                                                    }
+                                                }}
+                                            </header>
+                                        }.into_any()
+                                    } else {
+                                        view! { <AgentHeader session=session /> }.into_any()
+                                    }}
                                     <Transcript session=session events=events streaming=streaming mode=mode model=model turn=turn now=now />
                                     <div class="agent-footer">
                                         <ActivityBar session=session events=events streaming=streaming last_event=last_event turn=turn now=now />
@@ -2041,7 +2102,7 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                                         } else {
                                             view! {
                                                 <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                                <AgentActions session=session mode=mode model=model />
+                                                <AgentActions session=session mode=mode model=model compact=compact />
                                             }.into_any()
                                         }}
                                     </div>
@@ -2050,12 +2111,13 @@ pub fn AgentView(id: String, #[prop(optional)] read_only: bool) -> impl IntoView
                         }}
                     </div>
                 </main>
-                // A general session's directory isn't a git worktree.
+                // A general session's directory isn't a git worktree, and a
+                // compact view has no room for the changes.
                 {move || {
-                    (load.get() == Load::Ready && !general.get()).then(|| view! { <ChangesPane id=id.clone() repo=repo.get_untracked() events=events /> })
+                    (load.get() == Load::Ready && !general.get() && !compact).then(|| view! { <ChangesPane id=id.clone() repo=repo.get_untracked() events=events /> })
                 }}
             </div>
-            {move || (load.get() == Load::Ready).then(|| view! {
+            {move || (load.get() == Load::Ready && !compact).then(|| view! {
                 <crate::terminal::TerminalPanel id=terminal_id.clone() />
             })}
         </div>
@@ -2291,6 +2353,10 @@ fn AgentActions(
     session: Signal<AgentSession>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
+    /// Whether the session shows embedded in another page: deleting it
+    /// mustn't navigate that page away.
+    #[prop(optional)]
+    compact: bool,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     // A wrap-up asked for during a turn waits for the turn, so the buttons
@@ -2315,8 +2381,13 @@ fn AgentActions(
         });
     };
     let delete = move |_| {
-        session
-            .with_untracked(|s| delete_session(s, || go("#/agents"), move |e| error.set(Some(e))));
+        session.with_untracked(|s| {
+            if compact {
+                delete_session(s, || {}, move |e| error.set(Some(e)));
+            } else {
+                delete_session(s, || go("#/agents"), move |e| error.set(Some(e)));
+            }
+        });
     };
     view! {
         {move || error.get().map(|e| view! { <p class="error">{e}</p> })}

@@ -319,71 +319,93 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         on_click.remove();
     });
 
-    move || {
-        match pr.get() {
-        None => view! { <main class="main"><div class="empty">"Loading…"</div></main> }.into_any(),
-        Some(Err(e)) => view! { <main class="main"><div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div></main> }.into_any(),
-        Some(Ok(api::PrResponse::Pending)) => {
-            // The closure reads `updates.sync` so only this text, not the
-            // whole view, re-renders when the sync status changes.
-            let key = key.clone();
-            view! { <main class="main"><div class="empty">{move || pending_message(&key, updates.sync.with(|s| s.paused_until), (js_sys::Date::now() / 1000.0) as i64)}</div></main> }.into_any()
+    // Whether the PR loaded. A Memo, so a refetch that leaves it true
+    // doesn't remount the sidebar: the agents panel pinned under its
+    // body holds the sessions' live event streams.
+    let ready = Memo::new(move |_| matches!(pr.get(), Some(Ok(api::PrResponse::Ready(_)))));
+    // While the sidebar shows, its toggle sits in the sidebar's header;
+    // while hidden, it floats clear of `.main`'s scrollbar at the page's
+    // top-right.
+    let button = move |floating: bool| {
+        view! {
+            <button type="button" class="sidebar-toggle" class:floating=floating
+                aria-label=move || if shown() { "Hide sidebar" } else { "Show sidebar" }
+                aria-expanded=move || shown().to_string()
+                on:click=toggle>
+                <svg
+                    viewBox="0 0 16 16"
+                    width="14"
+                    height="14"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                >
+                    <path d=move || if shown() { "M6 4l4 4-4 4" } else { "M10 4l-4 4 4 4" } />
+                </svg>
+            </button>
         }
-        Some(Ok(api::PrResponse::NotConfigured)) => view! {
-            <main class="main"><div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
-        }.into_any(),
-        Some(Ok(api::PrResponse::Failed(e))) => view! {
-            <main class="main"><div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
-        }.into_any(),
-        Some(Ok(api::PrResponse::Ready(pr))) => {
-            let pr = Arc::new(*pr);
-            prefetch(&pr);
-            // While the sidebar shows, its toggle sits in the sidebar's
-            // header; while hidden, it floats clear of `.main`'s
-            // scrollbar at the page's top-right.
-            let button = move |floating: bool| {
+    };
+    let panel_key = key.clone();
+
+    view! {
+        {move || {
+            match pr.get() {
+            None => view! { <main class="main"><div class="empty">"Loading…"</div></main> }.into_any(),
+            Some(Err(e)) => view! { <main class="main"><div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div></main> }.into_any(),
+            Some(Ok(api::PrResponse::Pending)) => {
+                // The closure reads `updates.sync` so only this text, not the
+                // whole view, re-renders when the sync status changes.
+                let key = key.clone();
+                view! { <main class="main"><div class="empty">{move || pending_message(&key, updates.sync.with(|s| s.paused_until), (js_sys::Date::now() / 1000.0) as i64)}</div></main> }.into_any()
+            }
+            Some(Ok(api::PrResponse::NotConfigured)) => view! {
+                <main class="main"><div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
+            }.into_any(),
+            Some(Ok(api::PrResponse::Failed(e))) => view! {
+                <main class="main"><div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
+            }.into_any(),
+            Some(Ok(api::PrResponse::Ready(pr))) => {
+                let pr = Arc::new(*pr);
+                prefetch(&pr);
                 view! {
-                    <button type="button" class="sidebar-toggle" class:floating=floating
-                        aria-label=move || if shown() { "Hide sidebar" } else { "Show sidebar" }
-                        aria-expanded=move || shown().to_string()
-                        on:click=toggle>
-                        <svg
-                            viewBox="0 0 16 16"
-                            width="14"
-                            height="14"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="1.5"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            aria-hidden="true"
-                        >
-                            <path d=move || if shown() { "M6 4l4 4-4 4" } else { "M10 4l-4 4 4 4" } />
-                        </svg>
-                    </button>
-                }
-            };
-            view! {
-                <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /></main>
-                {move || {
-                    let pr = pr.clone();
-                    if shown() {
-                        view! {
-                            <PrSidebar pr=pr overlay=Signal::derive(move || !wide.get())
-                                width=width
-                                on_resize_start=on_resize_start
-                                on_resize_reset=on_resize_reset>
-                                {button(false)}
-                            </PrSidebar>
-                        }
-                        .into_any()
-                    } else {
-                        button(true).into_any()
-                    }
-                }}
-            }.into_any()
+                    <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes /></main>
+                }.into_any()
+            }
         }
-    }
+        }}
+        {move || {
+            let panel_key = panel_key.clone();
+            if !ready.get() {
+                ().into_any()
+            } else if shown() {
+                view! {
+                    <PrSidebar overlay=Signal::derive(move || !wide.get())
+                        width=width
+                        on_resize_start=on_resize_start
+                        on_resize_reset=on_resize_reset>
+                        <div class="pr-sidebar-body">
+                            <div class="sidebar-head">
+                                <h2>"Reviewers"</h2>
+                                {button(false)}
+                            </div>
+                            {move || match pr.get() {
+                                Some(Ok(api::PrResponse::Ready(detail))) => {
+                                    crate::review::sidebar_body(&detail)
+                                }
+                                _ => ().into_any(),
+                            }}
+                        </div>
+                        <crate::pr_agents::PrAgentPanel key=panel_key />
+                    </PrSidebar>
+                }
+                .into_any()
+            } else {
+                button(true).into_any()
+            }
+        }}
     }
 }
 

@@ -2166,6 +2166,201 @@ body.resizing-sidebar * {
   align-items: center;
   justify-content: space-between;
 }
+
+/* The agents panel pinned under the sidebar's body, like the terminal
+   panel under a session's transcript. */
+.pr-agents-panel {
+  flex: none;
+  position: relative;
+  border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+/* Straddles the panel's top border. */
+.pr-agents-resize {
+  position: absolute;
+  top: -4px;
+  left: 0;
+  right: 0;
+  height: 7px;
+  cursor: ns-resize;
+  z-index: 1;
+}
+.pr-agents-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 0 8px;
+  font-size: 13px;
+}
+.pr-agents-bar button {
+  font: inherit;
+  color: var(--fg-muted);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.pr-agents-bar button:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.pr-agents-toggle {
+  flex: none;
+  font-weight: 600;
+}
+.pr-agents-chevron {
+  display: inline-block;
+  width: 1.2em;
+}
+.pr-agents-tabs {
+  display: flex;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  position: relative;
+}
+/* Tabs shrink to share the strip, so several fit and the selected one
+   can be scrolled into view. */
+.pr-agents-tab {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 64px;
+  max-width: 180px;
+  border-radius: 4px;
+}
+.pr-agents-tab.selected {
+  background: var(--bg);
+  box-shadow: inset 0 -2px var(--accent);
+}
+.pr-agents-tab.selected .pr-agents-tab-name {
+  color: var(--fg);
+}
+.pr-agents-tab-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+}
+/* The session's status as a dot, coloured like its badge. */
+.pr-agents-tab .agent-status {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  margin: 0;
+  font-size: 0;
+  border-radius: 50%;
+}
+.pr-agents-tab .agent-status.running {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.pr-agents-tab .agent-status.running::before {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pr-agents-tab .agent-status.running {
+    animation: none;
+  }
+}
+.pr-agents-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pr-agents-tab-name.draft {
+  border: 1px dashed var(--fg-muted);
+}
+.pr-agents-bar .error {
+  margin-left: 8px;
+}
+.pr-agents-body {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.pr-agents-body[hidden] {
+  display: none;
+}
+/* The embedded session fills the panel; its transcript scrolls in the
+   pane while the header and footer stick to its edges. */
+.pr-agents-body .agent-page,
+.pr-agents-body .agent-panes,
+.pr-agents-body .agents {
+  height: 100%;
+}
+.pr-agents-body .agent-panes > .main {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+}
+.pr-agents-body .agent,
+.pr-agents-body .agents {
+  max-width: none;
+  margin: 0;
+  padding: 8px;
+}
+/* The pane scrolls the agent's content; making it a second scroller
+   would keep the header and sticky footer inside it from pinning to
+   the pane's edges. */
+.pr-agents-body .agent {
+  min-height: 100%;
+  padding-bottom: 0;
+}
+.pr-agents-body .agents {
+  padding-bottom: 16px;
+  overflow-y: auto;
+}
+.pr-agents-body .agent-header.compact {
+  position: sticky;
+  top: -8px;
+  z-index: 1;
+  margin: -8px -8px 0;
+  padding: 8px 8px 4px;
+  background: var(--bg);
+}
+.pr-agents-body .agent-header h1 {
+  font-size: 15px;
+  margin: 4px 0;
+}
+.pr-agents-body .composer .form-buttons {
+  flex-wrap: wrap;
+}
+/* A session locked to the PR lists its fields down, not across, and
+   sits plainly in the panel rather than in a card. */
+.agent-form.locked .agent-form-row {
+  flex-direction: column;
+}
+.agent-form.locked .agent-pr {
+  width: auto;
+}
+.pr-agents-body .agent-form.locked {
+  border: none;
+  padding: 0;
+  margin-bottom: 0;
+  gap: 6px;
+}
+.pr-agents-body .agent-form.locked > h2,
+.pr-agents-body .agent-form.locked > p {
+  margin: 0;
+}
+/* The run hints collapse behind a summary in the locked form. */
+.agent-form.locked .session-hints {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.agent-form.locked .session-hints > summary {
+  margin-bottom: 4px;
+  cursor: pointer;
+}
 .sidebar-toggle {
   display: flex;
   align-items: center;

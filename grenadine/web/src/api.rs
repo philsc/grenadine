@@ -469,6 +469,19 @@ pub async fn discard_review(key: &PrKey) -> Result<()> {
     .map(|_| ())
 }
 
+/// The sessions associated with the PR, oldest first.
+pub async fn pr_agents(key: &PrKey) -> Result<Vec<AgentSession>> {
+    check(
+        Request::get(&format!("{}/agents", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
 pub async fn merge(key: &PrKey, merge: &MergeRequest) -> Result<Merged> {
     let req = Request::post(&format!("{}/merge", pr_url(key)))
         .json(merge)
