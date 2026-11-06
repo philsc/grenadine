@@ -19,6 +19,7 @@ mod markdown;
 mod pr;
 mod review;
 mod settings;
+mod tabs;
 mod terminal;
 mod theme;
 mod topbar;
@@ -264,7 +265,11 @@ fn App() -> impl IntoView {
         updates.agents.track();
         api::agents()
     }));
+    // The page each tab last showed, for its link.
+    let memory = tabs::Memory::load();
+    provide_context(memory);
     let route = RwSignal::new(open_draft(initial, drafts));
+    memory.record(&route.get_untracked());
     // A Memo so the connection only reopens when the URL actually
     // changes, e.g. between two PR pages.
     let url = Memo::new(move |_| route.with(events_url));
@@ -276,6 +281,7 @@ fn App() -> impl IntoView {
         if let Some(key) = pr_of(&r) {
             last.set(Some(key));
         }
+        memory.record(&r);
         route.set(r);
     });
     on_cleanup(move || handle.remove());
