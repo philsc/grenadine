@@ -87,6 +87,11 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     poll_interval: u64,
 
+    /// Seconds between searches of the inboxes that don't sync in
+    /// background.
+    #[arg(long, default_value_t = 600)]
+    off_inbox_interval: u64,
+
     /// A regex matching the trunk branches. Stacks end at a trunk: a PR
     /// into a trunk has no parent PR, and a PR from a trunk has no PRs on
     /// top of it. The regex isn't anchored implicitly and supports
@@ -280,6 +285,8 @@ async fn main() -> Result<()> {
         poke: Notify::new(),
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         watched: std::sync::Mutex::new(BTreeMap::new()),
+        off_inbox_interval: Duration::from_secs(args.off_inbox_interval),
+        inbox_searches: std::sync::Mutex::new(sync::InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         shutdown: shutdown.clone(),

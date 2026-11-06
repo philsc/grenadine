@@ -116,7 +116,7 @@ Each inbox has a "count in total" setting. The top bar's Inboxes tab and the bro
 
 ## Default inboxes
 
-A new database starts with these inboxes. The ones marked "total" count in the total. The ones marked "sync" sync in the background; an inbox without that mark is listed from its search results, and its PRs sync when you open them.
+A new database starts with these inboxes. The ones marked "total" count in the total. The ones marked "sync" sync in the background and are searched on every poll; an inbox without that mark is searched every 10 minutes by default (`--off-inbox-interval`), right away when it's created or edited, and when you press Refresh. Its header shows when its search last succeeded. Its PRs are listed from its search results and sync when you open them.
 
 | Inbox                    | Total | Sync | Filter                                                                                                                                                    |
 | ------------------------ | ----- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |

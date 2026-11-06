@@ -780,6 +780,25 @@ class ServerTestCase(unittest.TestCase):
         )
         urllib.request.urlopen(req).close()
 
+    def refresh(self) -> None:
+        """Asks the server to search every inbox on its next poll."""
+        req = urllib.request.Request(
+            f"{self.url}api/inboxes/refresh",
+            data=b"",
+            method="POST",
+            # Writes are only taken from the server's own pages.
+            headers={"Origin": self.url.rstrip("/")},
+        )
+        urllib.request.urlopen(req).close()
+
+    def searched_at(self, name: str) -> int | None:
+        """When `name`'s search last ran, from /api/inboxes."""
+        with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
+            for i in json.load(resp):
+                if i["inbox"]["name"] == name:
+                    return i["searched_at"]
+        self.fail(f"no inbox {name!r}")
+
     def devin_saw(self, needle: str) -> None:
         # Waits until the fake devin's client log holds `needle`.
         for _ in range(200):
@@ -1058,9 +1077,11 @@ class InboxTest(ServerTestCase):
         # "active", so the PR goes back to Waiting for reviewers.
         pr.review_requests.add(scenarios.OTHER)
         self.addCleanup(
-            lambda: (pr.review_requests.discard(scenarios.OTHER), self.repoll())
+            lambda: (pr.review_requests.discard(scenarios.OTHER), self.refresh())
         )
-        self.repoll()
+        # Waiting for reviewers doesn't sync in background; ask for a
+        # search so the moved PR appears.
+        self.refresh()
         self.expect_titles(
             self.inbox(scenarios.WAITING_FOR_REVIEWERS),
             [
@@ -1074,7 +1095,7 @@ class InboxTest(ServerTestCase):
         # Put it back how it was, in the fake and in the database, so
         # later tests see the scenario's state.
         pr.review_requests.discard(scenarios.OTHER)
-        self.repoll()
+        self.refresh()
         self.expect_titles(
             self.inbox(scenarios.RETURNED),
             ["Get a comment-only review", "Get changes requested"],
@@ -1746,6 +1767,44 @@ class BackgroundSyncTest(ServerTestCase):
         self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
         again = self.wait_for_requests(pr, first + 1)
         self.assertGreater(len(again), first)
+
+    def test_refresh_searches_off_inboxes(self) -> None:
+        # "Leave me out of it" is only in inboxes that don't sync in
+        # background. A poll doesn't re-search those: a changed hit waits
+        # for the off-inbox search the Refresh button requests.
+        pr = self.cases.prs["Leave me out of it"]
+        self.page.goto(self.url)
+        inbox = self.inbox(scenarios.ALL_OPEN)
+        # The first poll searched every inbox, and an "off" one says when.
+        expect(inbox.locator(".inbox-header")).to_contain_text("searched")
+        self.assertEqual(self.pr_requests(pr), [])
+
+        off_before = self.searched_at(scenarios.ALL_OPEN)
+        bg_before = self.searched_at(scenarios.NEEDS_REVIEW)
+        # Wait out the current second so the next search's stamp moves.
+        tick = int(time.time())
+        while int(time.time()) == tick:
+            time.sleep(0.05)
+        pr.title = "Renamed off-inbox PR"
+        self.repoll()
+        # The repoll re-searched the background inboxes…
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if (self.searched_at(scenarios.NEEDS_REVIEW) or -1) > (bg_before or -1):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the repoll never re-searched a background inbox")
+        # …but not the "off" one, whose stamp and hit didn't move.
+        self.assertEqual(self.searched_at(scenarios.ALL_OPEN), off_before)
+        expect(inbox.locator(".pr-title", has_text="Leave me out of it")).to_have_count(
+            1
+        )
+
+        self.page.get_by_role("button", name="Refresh").click()
+        expect(
+            inbox.locator(".pr-title", has_text="Renamed off-inbox PR")
+        ).to_have_count(1)
 
     def test_turning_on_background_syncs_the_inbox(self) -> None:
         # "Ask me to look at a draft" is only in inboxes that don't sync

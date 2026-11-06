@@ -54,6 +54,12 @@ pub async fn update_inbox(id: i64, edit: &InboxEdit) -> Result<()> {
     check(req.send().await).await.map(|_| ())
 }
 
+pub async fn refresh_inboxes() -> Result<()> {
+    check(Request::post("/api/inboxes/refresh").send().await)
+        .await
+        .map(|_| ())
+}
+
 pub async fn delete_inbox(id: i64) -> Result<()> {
     check(Request::delete(&format!("/api/inboxes/{id}")).send().await)
         .await

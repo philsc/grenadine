@@ -380,9 +380,35 @@ pub fn start() {
     highlight::warm();
 }
 
+/// A relative timestamp like "5m ago" for a status.
+pub(crate) fn ago(now: i64, then: i64) -> String {
+    let secs = (now - then).max(0);
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ago_ranges() {
+        assert_eq!(ago(100, 100), "just now");
+        assert_eq!(ago(100, 200), "just now");
+        assert_eq!(ago(119, 60), "just now");
+        assert_eq!(ago(120, 60), "1m ago");
+        assert_eq!(ago(3659, 60), "59m ago");
+        assert_eq!(ago(3660, 60), "1h ago");
+        assert_eq!(ago(86400 + 60, 60), "1d ago");
+        assert_eq!(ago(86400 * 5 + 60, 60), "5d ago");
+    }
 
     fn key(repo: &str, number: u64) -> PrKey {
         PrKey {

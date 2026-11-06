@@ -17,20 +17,6 @@ use crate::global_settings::{GlobalSettingsButton, GlobalSettingsDialog};
 use crate::tabs::{self, Tab};
 use crate::{Route, Updates, api, drafts};
 
-/// A relative timestamp like "5m ago" for the status line.
-fn ago(now: i64, then: i64) -> String {
-    let secs = (now - then).max(0);
-    if secs < 60 {
-        "just now".into()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86400)
-    }
-}
-
 /// `ts` (Unix seconds) as local "HH:MM".
 pub(crate) fn hm(ts: i64) -> String {
     #[cfg(target_arch = "wasm32")]
@@ -80,9 +66,9 @@ fn label(status: &SyncStatus, now: i64) -> String {
             }
         }
         SyncPhase::Idle => match (&status.last_error, status.last_finished) {
-            (Some(_), Some(at)) => format!("Sync failed {}", ago(now, at)),
+            (Some(_), Some(at)) => format!("Sync failed {}", crate::ago(now, at)),
             (Some(_), None) => "Sync failed".into(),
-            (None, Some(at)) => format!("Synced {}", ago(now, at)),
+            (None, Some(at)) => format!("Synced {}", crate::ago(now, at)),
             (None, None) => "Synced".into(),
         },
     }
@@ -287,18 +273,6 @@ mod tests {
     use grenadine_core::api::{CostUnit, PrKey, SyncPhase, SyncStatus, SyncingPr};
 
     use super::*;
-
-    #[test]
-    fn ago_ranges() {
-        assert_eq!(ago(100, 100), "just now");
-        assert_eq!(ago(100, 200), "just now");
-        assert_eq!(ago(119, 60), "just now");
-        assert_eq!(ago(120, 60), "1m ago");
-        assert_eq!(ago(3659, 60), "59m ago");
-        assert_eq!(ago(3660, 60), "1h ago");
-        assert_eq!(ago(86400 + 60, 60), "1d ago");
-        assert_eq!(ago(86400 * 5 + 60, 60), "5d ago");
-    }
 
     fn idle(error: Option<&str>, finished: Option<i64>) -> SyncStatus {
         SyncStatus {

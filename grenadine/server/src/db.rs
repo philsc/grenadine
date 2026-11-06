@@ -402,6 +402,14 @@ const MIGRATIONS: &[Migration] = &[
 "#,
     ),
     Migration::BackgroundDefaults,
+    Migration::Sql(
+        r#"
+    -- When each inbox's search last succeeded, in Unix seconds; NULL
+    -- until the first one. The inboxes page shows it as the age of an
+    -- inbox without background sync.
+    ALTER TABLE inboxes ADD COLUMN searched_at INTEGER;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -828,8 +836,8 @@ impl Db {
                 }
                 tx.execute(&sql, rusqlite::params_from_iter(args))?;
                 tx.execute(
-                    "UPDATE inboxes SET error = NULL, search_fetched = ?, search_found = ?
-                     WHERE id = ?",
+                    "UPDATE inboxes SET error = NULL, search_fetched = ?, search_found = ?,
+                        searched_at = unixepoch() WHERE id = ?",
                     params![truncated.map(|t| t.fetched), truncated.map(|t| t.found), id],
                 )?;
             }
@@ -1171,6 +1179,18 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// When the inbox's search last succeeded (Unix seconds); `None` when
+    /// it never did.
+    pub fn inbox_searched_at(&self, id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT searched_at FROM inboxes WHERE id = ?", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
     }
 
     /// Whether a PR is in the latest results of an inbox that syncs in
@@ -2650,6 +2670,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn searched_at_tracks_search_attempts() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        // A search stamps its inbox; a failed search leaves the stamp.
+        assert_eq!(db.inbox_searched_at(2).unwrap(), None);
+        db.set_inbox_results(2, Ok(std::slice::from_ref(&hit(&key))), None)
+            .unwrap();
+        let at = db.inbox_searched_at(2).unwrap().unwrap();
+        db.set_inbox_results(2, Err("x"), None).unwrap();
+        assert_eq!(db.inbox_searched_at(2).unwrap(), Some(at));
+    }
+
+    #[test]
+    fn searched_at_migrates_an_old_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        let db = Db::init(conn, None).unwrap();
+        assert_eq!(db.inbox_searched_at(1).unwrap(), None);
+    }
+
     /// The sync_in_background migration sets the flag on the defaults
     /// that have it and still match one, name and filter; an edited
     /// default keeps it off.
@@ -2657,7 +2702,11 @@ mod tests {
     fn background_defaults_migration() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        let target = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::BackgroundDefaults))
+            .unwrap();
+        migrate(&mut conn, target).unwrap();
         conn.execute(
             "UPDATE inboxes SET filter = 'custom' WHERE name = 'Approved'",
             [],
