@@ -1725,22 +1725,53 @@ fn relative_to<'a>(path: &'a str, worktree: &str) -> &'a str {
 }
 
 /// The full path for a summary that `relative_to` shortened, so a tooltip can
-/// show it; `None` when the summary is the path or the input has no path.
+/// show it; `None` when the summary shows the path or the input has no path.
+/// A file tool's `file_path` wins over a search tool's `path`.
 fn summary_title(input: &serde_json::Value, summary: &str) -> Option<String> {
-    input["file_path"]
+    if let Some(path) = input["file_path"].as_str() {
+        return (path != summary).then(|| path.to_owned());
+    }
+    input["path"]
         .as_str()
-        .filter(|path| *path != summary)
+        .filter(|path| !summary.contains(*path))
         .map(str::to_owned)
 }
 
 /// A one-line summary of a tool call's input, e.g. the command or the path.
 /// `worktree` hides a redundant leading `cd` into it in a `Bash` command and
-/// shortens a file tool's path inside it.
+/// shortens a file tool's or a search tool's path inside it.
 fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -> String {
     let field = match name {
         "Bash" => "command",
         "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "file_path",
-        "Grep" | "Glob" | "find_file_by_name" => "pattern",
+        "Grep" | "Glob" | "find_file_by_name" => {
+            let pattern = input["query"]
+                .as_str()
+                .or_else(|| input["pattern"].as_str());
+            let Some(pattern) = pattern else {
+                return String::new();
+            };
+            let mut summary = pattern.lines().next().unwrap_or_default().to_owned();
+            let path = input["path"].as_str().unwrap_or_default();
+            let path = match worktree {
+                Some(worktree) => relative_to(path, worktree),
+                None => path,
+            };
+            if !path.is_empty() && path != "." {
+                summary.push_str(" in ");
+                summary.push_str(path);
+            }
+            let filter = input["file_pattern"]
+                .as_str()
+                .or_else(|| input["glob"].as_str())
+                .unwrap_or_default();
+            if !filter.is_empty() {
+                summary.push_str(" (");
+                summary.push_str(filter);
+                summary.push(')');
+            }
+            return summary;
+        }
         "WebFetch" | "webfetch" => "url",
         "WebSearch" | "web_search" => "query",
         "Task" | "Agent" => "description",
@@ -3861,6 +3892,29 @@ mod tests {
         );
         let input = serde_json::json!({"pattern": "**/*.rs"});
         assert_eq!(tool_summary("find_file_by_name", &input, None), "**/*.rs");
+        let input = serde_json::json!({"query": "a|b", "path": "/w/t/src"});
+        assert_eq!(tool_summary("Grep", &input, Some("/w/t")), "a|b in src");
+        let input = serde_json::json!({"query": "a|b", "path": "/w/t/src", "file_pattern": "*.rs"});
+        assert_eq!(
+            tool_summary("Grep", &input, Some("/w/t")),
+            "a|b in src (*.rs)"
+        );
+        let input = serde_json::json!({"query": "a|b", "path": "/w/t"});
+        assert_eq!(tool_summary("Grep", &input, Some("/w/t")), "a|b");
+        let input = serde_json::json!({"query": "a|b", "path": "/etc"});
+        assert_eq!(tool_summary("Grep", &input, Some("/w/t")), "a|b in /etc");
+        let input = serde_json::json!({"query": "a|b"});
+        assert_eq!(tool_summary("Grep", &input, Some("/w/t")), "a|b");
+        let input = serde_json::json!({"pattern": "fn main", "path": "/w/t/x", "glob": "*.rs"});
+        assert_eq!(
+            tool_summary("Grep", &input, Some("/w/t")),
+            "fn main in x (*.rs)"
+        );
+        let input = serde_json::json!({"query": "a\nb"});
+        assert_eq!(tool_summary("Grep", &input, None), "a");
+        let input = serde_json::json!({"query": "**/*.rs"});
+        assert_eq!(tool_summary("find_file_by_name", &input, None), "**/*.rs");
+        assert_eq!(tool_summary("Grep", &serde_json::json!({}), None), "");
         let input = serde_json::json!({"title": "Explore auth", "task": "Find it"});
         assert_eq!(tool_summary("run_subagent", &input, None), "Explore auth");
     }
@@ -3894,6 +3948,13 @@ mod tests {
         assert_eq!(summary_title(&input, "/w/t/a.rs"), None);
         let input = serde_json::json!({"command": "ls"});
         assert_eq!(summary_title(&input, "ls"), None);
+        let input = serde_json::json!({"query": "a", "path": "/w/t/src"});
+        assert_eq!(
+            summary_title(&input, "a in src"),
+            Some("/w/t/src".to_owned())
+        );
+        let input = serde_json::json!({"query": "a", "path": "/etc"});
+        assert_eq!(summary_title(&input, "a in /etc"), None);
     }
 
     #[test]
