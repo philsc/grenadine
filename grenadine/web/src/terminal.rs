@@ -4,6 +4,7 @@
 //! output first.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -28,6 +29,9 @@ extern "C" {
     fn open(this: &XTerm, parent: &web_sys::HtmlElement);
     #[wasm_bindgen(method)]
     fn write(this: &XTerm, data: &js_sys::Uint8Array);
+    /// `write` with the callback it calls once the data is parsed.
+    #[wasm_bindgen(method, js_name = write)]
+    fn write_then(this: &XTerm, data: &js_sys::Uint8Array, callback: &js_sys::Function);
     #[wasm_bindgen(method)]
     fn reset(this: &XTerm);
     #[wasm_bindgen(method)]
@@ -229,6 +233,17 @@ struct Live {
     /// What was typed while the connection was still opening, sent once
     /// it opens.
     pending: RefCell<Vec<u8>>,
+    /// Whether the replay that opens a connection is still being parsed.
+    /// While it is, answers to the terminal queries in it must not reach
+    /// the shell, so `send` drops everything.
+    replaying: Cell<bool>,
+    /// The connection's number, bumped on every connect, so a replay's
+    /// write callback from a dead connection doesn't clear a newer one's
+    /// flag.
+    generation: Cell<u64>,
+    /// Tells the panel whether the tab is loading: from `connect` until
+    /// the replay is parsed, and again on every reconnect.
+    set_loading: Rc<dyn Fn(bool)>,
     stopped: Cell<bool>,
     observer: RefCell<Option<web_sys::ResizeObserver>>,
     _on_data: Closure<dyn FnMut(String)>,
@@ -239,7 +254,12 @@ struct Live {
 }
 
 impl Live {
-    fn start(session: String, terminal: u64, host: &web_sys::HtmlElement) -> Rc<Live> {
+    fn start(
+        session: String,
+        terminal: u64,
+        host: &web_sys::HtmlElement,
+        set_loading: Rc<dyn Fn(bool)>,
+    ) -> Rc<Live> {
         let options = js_sys::Object::new();
         let set = |k: &str, v: JsValue| {
             let _ = js_sys::Reflect::set(&options, &k.into(), &v);
@@ -288,6 +308,9 @@ impl Live {
                 fit,
                 connection: RefCell::new(None),
                 pending: RefCell::new(Vec::new()),
+                replaying: Cell::new(false),
+                generation: Cell::new(0),
+                set_loading,
                 stopped: Cell::new(false),
                 observer: RefCell::new(None),
                 _on_data: on_data,
@@ -333,6 +356,10 @@ impl Live {
             return;
         };
         socket.set_binary_type(BinaryType::Arraybuffer);
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        self.replaying.set(false);
+        (self.set_loading)(true);
         let w = Rc::downgrade(self);
         let on_open = Closure::<dyn FnMut()>::new(move || {
             if let Some(live) = w.upgrade() {
@@ -347,10 +374,31 @@ impl Live {
         });
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         let w = Rc::downgrade(self);
+        let first = Cell::new(true);
         let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             if let (Some(live), Ok(buf)) = (w.upgrade(), e.data().dyn_into::<js_sys::ArrayBuffer>())
             {
-                live.xterm.write(&js_sys::Uint8Array::new(&buf));
+                let data = js_sys::Uint8Array::new(&buf);
+                if first.replace(false) {
+                    // The first message of a connection is the replay of
+                    // recent output. While xterm parses it, the answers it
+                    // gives the queries in it are dropped, and the tab
+                    // shows as loading until the parse callback fires.
+                    live.replaying.set(true);
+                    let w = w.clone();
+                    let done: js_sys::Function = Closure::once_into_js(move || {
+                        if let Some(live) = w.upgrade()
+                            && live.generation.get() == generation
+                        {
+                            live.replaying.set(false);
+                            (live.set_loading)(false);
+                        }
+                    })
+                    .unchecked_into();
+                    live.xterm.write_then(&data, &done);
+                } else {
+                    live.xterm.write(&data);
+                }
             }
         });
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -394,6 +442,9 @@ impl Live {
     }
 
     fn send(&self, data: &[u8]) {
+        if self.replaying.get() {
+            return;
+        }
         let Some(c) = &*self.connection.borrow() else {
             return;
         };
@@ -439,12 +490,27 @@ impl Live {
 }
 
 /// One shell's tab, which stays connected while another tab is shown.
+/// `loading` holds the ids of the terminals still reading their replay.
 #[component]
-fn TerminalView(session: String, terminal: u64, active: Signal<bool>) -> impl IntoView {
+fn TerminalView(
+    session: String,
+    terminal: u64,
+    active: Signal<bool>,
+    loading: RwSignal<BTreeSet<u64>>,
+) -> impl IntoView {
     let host = NodeRef::<leptos::html::Div>::new();
     let live = StoredValue::new_local(None::<Rc<Live>>);
     host.on_load(move |el| {
-        let l = Live::start(session, terminal, &el);
+        let set_loading = move |on: bool| {
+            loading.try_update(|ids| {
+                if on {
+                    ids.insert(terminal);
+                } else {
+                    ids.remove(&terminal);
+                }
+            });
+        };
+        let l = Live::start(session, terminal, &el, Rc::new(set_loading));
         if active.get_untracked() {
             l.show();
         }
@@ -464,6 +530,9 @@ fn TerminalView(session: String, terminal: u64, active: Signal<bool>) -> impl In
             if let Some(l) = l.take() {
                 l.stop();
             }
+        });
+        loading.try_update(|ids| {
+            ids.remove(&terminal);
         });
     });
     view! {
@@ -506,6 +575,7 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
         })
     };
     let terminals = RwSignal::new(Vec::<u64>::new());
+    let loading = RwSignal::new(BTreeSet::<u64>::new());
     let selected = RwSignal::new(None::<u64>);
     let selected_key = selected_key(&id);
     let stored = storage()
@@ -637,11 +707,16 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
                                         class="terminal-tab-name"
                                         role="tab"
                                         aria-selected=move || (selected.get() == Some(t)).to_string()
+                                        aria-busy=move || loading.get().contains(&t).to_string()
                                         on:click=move |_| {
                                             selected.set(Some(t));
                                             open.set(true);
                                         }
-                                    >{format!("Terminal {t}")}</button>
+                                    >{format!("Terminal {t}")}
+                                        {move || loading.get().contains(&t).then(|| {
+                                            view! { <span class="spinner"></span> }
+                                        })}
+                                    </button>
                                     <button
                                         class="terminal-tab-close"
                                         aria-label=format!("Close terminal {t}")
@@ -683,7 +758,7 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
                     key=|t| *t
                     children=move |t| {
                         let active = Signal::derive(move || open.get() && selected.get() == Some(t));
-                        view! { <TerminalView session=session.clone() terminal=t active=active /> }
+                        view! { <TerminalView session=session.clone() terminal=t active=active loading=loading /> }
                     }
                 />
             </div>

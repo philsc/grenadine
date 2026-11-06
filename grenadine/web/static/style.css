@@ -1989,6 +1989,19 @@ textarea {
 .terminal-tab.selected .terminal-tab-name {
   color: var(--fg);
 }
+/* Replays are usually quick, so the spinner fades in too late to flash
+   on a fast load. */
+.terminal-tab .spinner {
+  opacity: 0;
+  animation:
+    spin 0.8s linear infinite,
+    terminal-tab-show 0.1s linear 0.2s forwards;
+}
+@keyframes terminal-tab-show {
+  to {
+    opacity: 1;
+  }
+}
 .terminal-bar .terminal-tab-close {
   padding: 3px 4px;
 }
