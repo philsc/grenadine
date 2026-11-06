@@ -1608,16 +1608,32 @@ textarea {
 }
 
 .tool {
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: 6px;
   font-size: 13px;
 }
+.tool[open] {
+  border-color: var(--border);
+}
 .tool summary {
   cursor: pointer;
-  padding: 3px 10px;
+  padding: 1px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--fg-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.tool summary:hover {
+  background: var(--bg-subtle);
+}
+.tool[open] summary {
+  border-radius: 6px 6px 0 0;
+}
+/* Consecutive collapsed calls read as one tight list. */
+.transcript > .tool:not([open]) + .tool:not([open]) {
+  margin-top: -6px;
 }
 /* A long summary keeps to one line so the spinner and duration after it
    stay visible. */
@@ -1632,6 +1648,7 @@ textarea {
 }
 .tool-name {
   font-weight: 600;
+  color: var(--fg);
 }
 .tool-input,
 .tool-result {
