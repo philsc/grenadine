@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use grenadine_core::api::{
     Person, PrDetail, PrKey, Review, ReviewComment, ReviewInfo, Side, Stack, Version, VersionKind,
@@ -13,7 +14,7 @@ use wasm_bindgen::JsCast;
 use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
 use crate::diffview::Commenting;
 use crate::diffview::DiffView;
-use crate::inboxes::{load_flag, save_flag};
+use crate::inboxes::{load_flag, save_flag, storage};
 use crate::review::{
     CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, conversation,
     merge_box, merge_warning,
@@ -206,10 +207,11 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
 
-    // The sidebar is a collapsible column on wide windows, which is
+    // The sidebar is a resizable column on wide windows, which is
     // remembered, and an overlay the button opens on narrow ones, which
     // isn't.
-    let wide = sidebar_wide();
+    let page = page_width();
+    let wide = Memo::new(move |_| page.get() >= DIFF_MIN + SIDEBAR_MIN);
     let collapsed = RwSignal::new(load_flag("pr-sidebar-collapsed", false));
     let open = RwSignal::new(false);
     Effect::new(move |_| {
@@ -232,6 +234,63 @@ pub fn PrView(key: PrKey) -> impl IntoView {
             open.update(|o| *o = !*o);
         }
     };
+    // The width the divider last dragged to, shared by all PRs; `None` is
+    // the default split. It's written when a drag ends, so a window too
+    // narrow for it shows it clamped rather than losing it.
+    let saved = RwSignal::new(saved_width());
+    let width = Signal::derive(move || sidebar_width(saved.get(), page.get(), wide.get()));
+    // The click the browser fires on the common ancestor when a drag ends
+    // away from the divider would close the overlay, so the next click
+    // after a drag is ignored here.
+    let dragged = StoredValue::new_local(false);
+    let drag = StoredValue::new_local(None::<(WindowListenerHandle, WindowListenerHandle)>);
+    let on_resize_start = Callback::new(move |e: web_sys::MouseEvent| {
+        e.prevent_default();
+        let (x, w) = (
+            e.client_x() as f64,
+            sidebar_width(
+                saved.get_untracked(),
+                page.get_untracked(),
+                wide.get_untracked(),
+            ),
+        );
+        if let Some(body) = document().body() {
+            let _ = body.class_list().add_1("resizing-sidebar");
+        }
+        let on_move = window_event_listener(leptos::ev::mousemove, move |e| {
+            saved.set(Some(sidebar_width(
+                Some(w + x - e.client_x() as f64),
+                page.get_untracked(),
+                wide.get_untracked(),
+            )));
+        });
+        let on_up = window_event_listener(leptos::ev::mouseup, move |_| {
+            if let (Some(s), Some(w)) = (storage(), saved.get_untracked()) {
+                let _ = s.set_item(WIDTH_KEY, &w.to_string());
+            }
+            if let Some(body) = document().body() {
+                let _ = body.class_list().remove_1("resizing-sidebar");
+            }
+            drag.update_value(|d| {
+                if let Some((a, b)) = d.take() {
+                    a.remove();
+                    b.remove();
+                }
+            });
+            dragged.set_value(true);
+            // The click that follows the mouseup is dispatched before
+            // timers run; releasing the mouse outside the window fires
+            // none, so the flag resets itself for the next click.
+            set_timeout(move || dragged.set_value(false), Duration::ZERO);
+        });
+        drag.set_value(Some((on_move, on_up)));
+    });
+    let on_resize_reset = Callback::new(move |_: web_sys::MouseEvent| {
+        saved.set(None);
+        if let Some(s) = storage() {
+            let _ = s.remove_item(WIDTH_KEY);
+        }
+    });
     // Escape and clicks outside the overlay's sidebar close it.
     let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" {
@@ -239,6 +298,10 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         }
     });
     let on_click = window_event_listener(leptos::ev::click, move |ev| {
+        if dragged.get_value() {
+            dragged.set_value(false);
+            return;
+        }
         if !open.get_untracked() || wide.get_untracked() {
             return;
         }
@@ -306,7 +369,10 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                     let pr = pr.clone();
                     if shown() {
                         view! {
-                            <PrSidebar pr=pr overlay=Signal::derive(move || !wide.get())>
+                            <PrSidebar pr=pr overlay=Signal::derive(move || !wide.get())
+                                width=width
+                                on_resize_start=on_resize_start
+                                on_resize_reset=on_resize_reset>
                                 {button(false)}
                             </PrSidebar>
                         }
@@ -321,32 +387,59 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     }
 }
 
-/// The window width from which the sidebar fits next to the PR as a
-/// column; below it the sidebar floats over the content as an overlay.
-/// The switch is JS-side only; style.css has no matching media query.
-const PR_SIDEBAR_QUERY: &str = "(min-width: 1500px)";
+/// The narrowest the diff is allowed to get by the sidebar widening.
+const DIFF_MIN: f64 = 1180.0;
+/// The narrowest the sidebar is allowed to get, on column and overlay
+/// alike.
+const SIDEBAR_MIN: f64 = 320.0;
+/// The diff's width before a drag moves it; the sidebar's default is the
+/// rest of the page.
+const DIFF_DEFAULT: f64 = 1600.0;
+/// The sliver of the page the overlay's sidebar leaves visible at its
+/// widest.
+const OVERLAY_GAP: f64 = 48.0;
+/// Where the dragged sidebar width is kept, for all PRs.
+const WIDTH_KEY: &str = "grenadine.pr-sidebar-width";
 
-fn sidebar_fits() -> bool {
-    window()
-        .match_media(PR_SIDEBAR_QUERY)
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.matches())
+/// The window's width, kept current. It decides both whether the
+/// sidebar's a column or an overlay and how wide it may get. The PR page
+/// comes and goes, so the listener is removed on unmount.
+fn page_width() -> RwSignal<f64> {
+    let width = || {
+        window()
+            .inner_width()
+            .ok()
+            .and_then(|w| w.as_f64())
+            .unwrap_or(0.0)
+    };
+    let page = RwSignal::new(width());
+    let on_resize = window_event_listener_untyped("resize", move |_| page.set(width()));
+    on_cleanup(move || on_resize.remove());
+    page
 }
 
-/// Whether the window is wide enough for the sidebar's column, kept
-/// current. The PR page comes and goes, so the listener is removed on
-/// unmount.
-fn sidebar_wide() -> RwSignal<bool> {
-    let wide = RwSignal::new(sidebar_fits());
-    let on_resize = window_event_listener_untyped("resize", move |_| {
-        let w = sidebar_fits();
-        if wide.get_untracked() != w {
-            wide.set(w);
-        }
-    });
-    on_cleanup(move || on_resize.remove());
-    wide
+/// The sidebar width kept from the last drag; `None` is the default
+/// split.
+fn saved_width() -> Option<f64> {
+    storage()
+        .and_then(|s| s.get_item(WIDTH_KEY).ok().flatten())
+        .and_then(|w| w.parse().ok())
+}
+
+/// The width the sidebar shows at. A `wide` page clamps it to what the
+/// diff's minimum leaves, an overlay to the page minus a sliver, and the
+/// minimum wins where even that isn't room. `saved` too wide is clamped
+/// rather than dropped, so widening the window brings it back.
+fn sidebar_width(saved: Option<f64>, page: f64, wide: bool) -> f64 {
+    let max = if wide {
+        page - DIFF_MIN
+    } else {
+        page - OVERLAY_GAP
+    };
+    saved
+        .unwrap_or(page - DIFF_DEFAULT)
+        .min(max)
+        .max(SIDEBAR_MIN)
 }
 
 /// Threads the user folded or unfolded, by root comment ID. Threads not in
@@ -1526,5 +1619,27 @@ mod tests {
             pending_message(&key, Some(t), t + 1),
             "o/r#7 hasn't synced yet"
         );
+    }
+
+    #[test]
+    fn sidebar_width_defaults_to_the_split() {
+        assert_eq!(sidebar_width(None, 2400.0, true), 800.0);
+        assert_eq!(sidebar_width(None, 1280.0, false), 320.0);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_the_column() {
+        assert_eq!(sidebar_width(Some(100.0), 2400.0, true), 320.0);
+        assert_eq!(sidebar_width(Some(2000.0), 2400.0, true), 1220.0);
+        // A window too narrow for the saved width clamps it rather than
+        // dropping it.
+        assert_eq!(sidebar_width(Some(1000.0), 1600.0, true), 420.0);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_the_overlay() {
+        assert_eq!(sidebar_width(Some(5000.0), 1280.0, false), 1232.0);
+        // The minimum wins even on a page narrower than it.
+        assert_eq!(sidebar_width(None, 300.0, false), 320.0);
     }
 }

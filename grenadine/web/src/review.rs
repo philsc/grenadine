@@ -420,22 +420,39 @@ fn sidebar_checks(info: &ReviewInfo) -> AnyView {
 pub fn PrSidebar(
     pr: Arc<PrDetail>,
     #[prop(into)] overlay: Signal<bool>,
+    #[prop(into)] width: Signal<f64>,
+    on_resize_start: Callback<web_sys::MouseEvent>,
+    on_resize_reset: Callback<web_sys::MouseEvent>,
     children: Children,
 ) -> impl IntoView {
     view! {
-        <aside class="pr-sidebar" class:overlay=move || overlay.get()>
-            <div class="sidebar-head">
-                <h2>"Reviewers"</h2>
-                {children()}
+        <aside
+            class="pr-sidebar"
+            class:overlay=move || overlay.get()
+            style:width=move || format!("{}px", width.get())
+        >
+            <div
+                class="sidebar-divider"
+                role="separator"
+                aria-orientation="vertical"
+                title="Drag to resize"
+                on:mousedown=move |e| on_resize_start.run(e)
+                on:dblclick=move |e| on_resize_reset.run(e)
+            ></div>
+            <div class="pr-sidebar-body">
+                <div class="sidebar-head">
+                    <h2>"Reviewers"</h2>
+                    {children()}
+                </div>
+                {match &pr.review {
+                    Some(info) => view! {
+                        {sidebar_review(info, &pr.summary.author)}
+                        {sidebar_checks(info)}
+                    }
+                    .into_any(),
+                    None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
+                }}
             </div>
-            {match &pr.review {
-                Some(info) => view! {
-                    {sidebar_review(info, &pr.summary.author)}
-                    {sidebar_checks(info)}
-                }
-                .into_any(),
-                None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
-            }}
         </aside>
     }
 }

@@ -1311,6 +1311,144 @@ class InboxTest(ServerTestCase):
         expect(self.sidebar()).to_have_count(1)
         expect(self.sidebar()).not_to_have_class(re.compile(r"\boverlay\b"))
 
+    def pr_page(self, title: str, width: int) -> None:
+        """Opens a PR's page at a window width, without a saved sidebar
+        width."""
+        pr = self.cases.prs[title]
+        self.page.set_viewport_size({"width": width, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        self.page.evaluate(
+            "() => localStorage.removeItem('grenadine.pr-sidebar-width')"
+        )
+        self.page.reload()
+        expect(self.sidebar()).to_be_visible()
+
+    def drag_sidebar(self, dx: float) -> None:
+        """Drags the sidebar's divider `dx` pixels to the right."""
+        divider = self.page.locator(".pr-sidebar .sidebar-divider")
+        expect(divider).to_be_visible()
+        box = divider.bounding_box()
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        self.page.mouse.move(x, y)
+        self.page.mouse.down()
+        self.page.mouse.move(max(0.0, x + dx), y)
+        self.page.mouse.up()
+
+    def assert_sidebar_width(self, expected: float, delta: float = 5) -> None:
+        """Waits for the sidebar's width to reach `expected` pixels."""
+        expect(self.sidebar()).to_have_css("width", f"{expected}px")
+        self.assertAlmostEqual(
+            self.sidebar().bounding_box()["width"], expected, delta=delta
+        )
+
+    def assert_main_width(self, expected: float, delta: float = 5) -> None:
+        """Waits for the PR's content width to reach `expected` pixels."""
+        main = self.page.locator(".pr-page .main")
+        expect(main).to_have_css("width", f"{expected}px")
+        self.assertAlmostEqual(main.bounding_box()["width"], expected, delta=delta)
+
+    def test_pr_sidebar_fills_wide_windows(self) -> None:
+        self.pr_page("Get approved", 2400)
+        self.assert_sidebar_width(800)
+        self.assert_main_width(1600)
+
+        # The divider straddles the sidebar's left edge.
+        divider = self.page.locator(".sidebar-divider")
+        expect(divider).to_be_visible()
+        dbox = divider.bounding_box()
+        self.assertAlmostEqual(dbox["width"], 6, delta=1)
+        self.assertAlmostEqual(
+            dbox["x"], self.sidebar().bounding_box()["x"] - 3, delta=1
+        )
+
+    def test_pr_sidebar_divider_stays_put_when_scrolled(self) -> None:
+        self.pr_page("Ask my team for a review", 2400)
+        self.page.set_viewport_size({"width": 2400, "height": 300})
+        # Fill the sidebar enough that its body scrolls.
+        for label in ("Failing (1)", "Passed (1)", "Skipped (1)"):
+            self.check_group(label).locator(".check-group-header").click()
+
+        body = self.page.locator(".pr-sidebar-body")
+        self.assertGreater(body.evaluate("el => el.scrollHeight - el.clientHeight"), 0)
+        body.evaluate("el => el.scrollTop = el.scrollHeight")
+
+        divider = self.page.locator(".sidebar-divider")
+        expect(divider).to_be_visible()
+        dbox = divider.bounding_box()
+        sbox = self.sidebar().bounding_box()
+        self.assertAlmostEqual(dbox["x"], sbox["x"] - 3, delta=1)
+        self.assertLess(dbox["y"], sbox["y"] + sbox["height"])
+
+    def test_pr_sidebar_drags_and_remembers(self) -> None:
+        self.pr_page("Get approved", 2400)
+
+        self.drag_sidebar(-200)
+        self.assert_sidebar_width(1000)
+
+        # The width survives a reload.
+        self.page.reload()
+        expect(self.sidebar()).to_be_visible()
+        self.assert_sidebar_width(1000)
+
+        # Drags clamp at both ends.
+        self.drag_sidebar(2000)
+        self.assert_sidebar_width(320)
+        self.drag_sidebar(-2000)
+        self.assert_sidebar_width(1220)
+        self.assert_main_width(1180)
+
+    def test_pr_sidebar_double_click_restores_the_split(self) -> None:
+        self.pr_page("Get approved", 2400)
+        self.drag_sidebar(-200)
+        self.assert_sidebar_width(1000)
+        self.page.locator(".sidebar-divider").dblclick()
+        self.assert_sidebar_width(800)
+
+    def test_pr_sidebar_clamps_until_the_window_fits_it(self) -> None:
+        self.pr_page("Get approved", 2400)
+        self.drag_sidebar(-200)
+        self.assert_sidebar_width(1000)
+
+        # A narrower window clamps the saved width; widening it back
+        # brings it back.
+        self.page.set_viewport_size({"width": 1600, "height": 900})
+        self.assert_sidebar_width(420)
+        self.page.set_viewport_size({"width": 2400, "height": 900})
+        self.assert_sidebar_width(1000)
+
+    def test_pr_sidebar_overlay_drags_too(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.set_viewport_size({"width": 1280, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        self.page.evaluate(
+            "() => localStorage.removeItem('grenadine.pr-sidebar-width')"
+        )
+        self.page.locator(".sidebar-toggle").click()
+        expect(self.sidebar()).to_be_visible()
+
+        self.drag_sidebar(-200)
+        self.assert_sidebar_width(520)
+
+        # A drag that ends outside the sidebar clamps at the page edge
+        # and doesn't close the overlay.
+        self.drag_sidebar(-2000)
+        self.assert_sidebar_width(1232)
+        expect(self.sidebar()).to_have_count(1)
+
+        # A later click outside still closes it. The sidebar covers all
+        # but the leftmost sliver of the header here.
+        self.page.locator(".pr-header h1").click(position={"x": 10, "y": 5})
+        expect(self.sidebar()).to_have_count(0)
+
+    def test_pr_fills_the_window_with_the_sidebar_collapsed(self) -> None:
+        self.pr_page("Get approved", 2400)
+        self.page.locator(".sidebar-toggle").click()
+        expect(self.sidebar()).to_have_count(0)
+        self.assertAlmostEqual(
+            self.page.locator(".pr").bounding_box()["width"], 2400, delta=30
+        )
+
     def test_check_group_folds_survive_a_sync(self) -> None:
         pr = self.cases.prs["Ask my team for a review"]
         self.page.set_viewport_size({"width": 1800, "height": 900})
