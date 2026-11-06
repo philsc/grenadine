@@ -515,6 +515,19 @@ if prompt == "screenshot":
     rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
     shown = rpc("tools/call", {"name": "show_image", "arguments": arguments})
     result(tool_use, shown["result"]["content"][0]["text"])
+# `question the plan` asks a question whose text is a plan: a title, then
+# Markdown. The answer goes back keyed by the whole question text.
+if prompt == "question the plan":
+    question = "Implement this plan?\n\n## Steps\n\n- Change **one** thing\n- Test it"
+    tool_input = {"questions": [{
+        "question": question,
+        "header": "Implement",
+        "options": [{"label": "Go ahead", "description": ""}, {"label": "Not yet", "description": ""}],
+        "multiSelect": False,
+    }]}
+    tool_use = use("AskUserQuestion", tool_input)
+    name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
+    result(tool_use, f'"{question}"="{name}"')
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -5364,6 +5377,35 @@ class AgentTest(ServerTestCase):
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
         expect(self.page.get_by_label("Permissions")).to_have_value("acceptEdits")
+
+    def test_question_with_a_markdown_body(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("question the plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+
+        # The legend holds the badge and the title; the rest of the
+        # question renders as Markdown under it.
+        question = transcript.locator(".approval.questions")
+        expect(question).to_contain_text("Claude asks")
+        expect(question.locator("legend")).to_have_text(
+            "Implement Implement this plan?"
+        )
+        body = question.locator(".question-body")
+        expect(body.locator("h2")).to_have_text("Steps")
+        expect(body.locator("strong")).to_have_text("one")
+
+        question.get_by_label("Go ahead").check()
+        question.get_by_role("button", name="Answer").click()
+        expect(question).to_contain_text("Answered")
+        # Answered, the card keeps the title and the Markdown body.
+        expect(question.locator("p.muted")).to_have_text("Implement this plan?")
+        expect(body.locator("h2")).to_have_text("Steps")
+        expect(body.locator("strong")).to_have_text("one")
+        # The answer went back keyed by the full question: the fake
+        # backend reads `answers[question]` and finishes the turn.
+        expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
 
     def test_approved_mode_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

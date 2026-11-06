@@ -1803,6 +1803,10 @@ textarea {
 .approval .question-other {
   font: inherit;
 }
+.approval .question-body {
+  margin: 4px 0;
+  font-weight: normal;
+}
 
 .agent-footer {
   position: sticky;

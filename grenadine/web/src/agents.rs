@@ -1823,10 +1823,13 @@ fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -
         "Skill" | "skill" => "skill",
         "ExitPlanMode" => "plan",
         "AskUserQuestion" => {
-            return input["questions"][0]["question"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
+            return question_parts(
+                input["questions"][0]["question"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+            .0
+            .to_owned();
         }
         _ => "",
     };
@@ -3025,6 +3028,7 @@ fn Transcript(
                                     agent=id
                                     tool=tool.clone()
                                     backend=backend
+                                    repo=repo.clone()
                                     questions=questions
                                     resolved=resolved
                                     waiting=waiting
@@ -3283,6 +3287,13 @@ struct QuestionOption {
     description: String,
 }
 
+/// A question's title, its first line, and the Markdown after it, if any.
+fn question_parts(question: &str) -> (&str, Option<&str>) {
+    let (title, body) = question.split_once('\n').unwrap_or((question, ""));
+    let body = body.trim();
+    (title.trim(), (!body.is_empty()).then_some(body))
+}
+
 /// The answer to a question: the picked options in their order, then
 /// whatever the user wrote.
 fn answer_values(q: &Question, picked: &[String], other: &str) -> Vec<String> {
@@ -3303,6 +3314,8 @@ fn QuestionCard(
     tool: String,
     /// The session's backend, for what the card calls the agent.
     backend: AgentBackend,
+    /// The session's repository, for links in a question's Markdown.
+    repo: String,
     questions: Vec<Question>,
     resolved: Memo<HashMap<String, bool>>,
     waiting: Signal<bool>,
@@ -3395,12 +3408,17 @@ fn QuestionCard(
                             </label>
                         }
                     }).collect_view();
+                    let (title, body) = question_parts(&q.question);
+                    let body = body.map(|b| markdown::to_html(b, &repo));
                     view! {
                         <fieldset class="question">
                             <legend>
                                 {(!q.header.is_empty()).then(|| view! { <span class="badge">{q.header}</span> " " })}
-                                {q.question}
+                                {title.to_owned()}
                             </legend>
+                            {body.map(|html| view! {
+                                <div class="question-body markdown" inner_html=html></div>
+                            })}
                             {options}
                             <input
                                 type="text"
@@ -3433,8 +3451,15 @@ fn QuestionCard(
                     </form>
                 }.into_any()
             } else {
-                questions.with_value(|qs| qs.iter().map(|q| view! {
-                    <p class="muted">{q.question.clone()}</p>
+                questions.with_value(|qs| qs.iter().map(|q| {
+                    let (title, body) = question_parts(&q.question);
+                    let body = body.map(|b| markdown::to_html(b, &repo));
+                    view! {
+                        <p class="muted">{title.to_owned()}</p>
+                        {body.map(|html| view! {
+                            <div class="question-body markdown" inner_html=html></div>
+                        })}
+                    }
                 }).collect_view()).into_any()
             }}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
@@ -3953,6 +3978,17 @@ mod tests {
     }
 
     #[test]
+    fn splits_a_questions_title_and_body() {
+        assert_eq!(question_parts("Tea?"), ("Tea?", None));
+        assert_eq!(
+            question_parts("Implement this plan?\n\n- one\n- two\n"),
+            ("Implement this plan?", Some("- one\n- two"))
+        );
+        assert_eq!(question_parts("Tea?   \n\nMilk?"), ("Tea?", Some("Milk?")));
+        assert_eq!(question_parts("Title\n   \n"), ("Title", None));
+    }
+
+    #[test]
     fn tool_summaries() {
         let input = serde_json::json!({"command": "ls -la\nmore", "description": "List"});
         assert_eq!(tool_summary("Bash", &input, None), "ls -la");
@@ -3966,6 +4002,11 @@ mod tests {
         assert_eq!(tool_summary("ExitPlanMode", &input, None), "# Plan");
         let input = serde_json::json!({"questions": [{"question": "Tea?"}]});
         assert_eq!(tool_summary("AskUserQuestion", &input, None), "Tea?");
+        let input = serde_json::json!({"questions": [{"question": "Implement this plan?\n\n- one\n- two"}]});
+        assert_eq!(
+            tool_summary("AskUserQuestion", &input, None),
+            "Implement this plan?"
+        );
         let input = serde_json::json!({"skill": "pr-title"});
         assert_eq!(tool_summary("Skill", &input, None), "pr-title");
         assert_eq!(tool_summary("skill", &input, None), "pr-title");
