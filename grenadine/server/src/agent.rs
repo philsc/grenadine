@@ -546,6 +546,10 @@ struct Live {
     turn: Option<(PermissionMode, Option<String>)>,
     /// The wrap-up in progress, if any.
     wrap_up: Option<Pending>,
+    /// An update_prs or land_on_checkout call is landing the session's
+    /// work. Devin sends a tool call again when it runs over 120 s, so a
+    /// second call must not land the same work at the same time.
+    landing: bool,
 }
 
 /// A prompt with the names of its images, and the mode and model its turn
@@ -569,6 +573,7 @@ impl Live {
             pending: HashMap::new(),
             turn: None,
             wrap_up: None,
+            landing: false,
         }
     }
 }
@@ -1819,6 +1824,20 @@ async fn continue_wrap_up(state: &Arc<State>, id: &str) {
     let Some(pending) = state.agents.with_live(id, |l| l.wrap_up.clone()) else {
         return;
     };
+    // A landing tool call lands the same work; it wins.
+    if state.agents.with_live(id, |l| l.landing) {
+        state.agents.with_live(id, |l| l.wrap_up = None);
+        let _ = emit(
+            state,
+            id,
+            AgentEventKind::WrapUpFailed(
+                "the agent is landing this session's work already; wrap up again once it's \
+                 done"
+                    .into(),
+            ),
+        );
+        return;
+    }
     let name_branches = pending.target == WrapUpTarget::PullRequest;
     let outcome = match land(state, id, pending.target, None, name_branches).await {
         Ok(Step::Landed { landed, notes }) => {
@@ -1885,16 +1904,57 @@ fn ask_again(reason: &str, prompt: &str, tool: &str) -> anyhow::Error {
     )
 }
 
+/// Marks the session as landing until it's dropped, see `begin_landing`.
+pub struct Landing {
+    state: Arc<State>,
+    id: String,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        if let Some(l) = self.state.agents.live.lock().unwrap().get_mut(&self.id) {
+            l.landing = false;
+        }
+    }
+}
+
+/// Marks the session's work as landing and returns the guard clearing the
+/// mark when it's dropped. It fails while the user wraps the session up
+/// or another landing call is in progress.
+pub fn begin_landing(state: &Arc<State>, id: &str) -> Result<Landing> {
+    state.agents.with_live(id, |l| {
+        if l.wrap_up.is_some() {
+            bail!(
+                "the user is wrapping up this session from Grenadine already; wait for that to \
+                 finish"
+            );
+        }
+        if l.landing {
+            bail!(
+                "another update_prs or land_on_checkout call is landing this session's work \
+                 already; wait for it to finish"
+            );
+        }
+        l.landing = true;
+        Ok(Landing {
+            state: state.clone(),
+            id: id.to_owned(),
+        })
+    })
+}
+
 /// Lands the session's work on `target` right away, for the session's own
 /// `update_prs` and `land_on_checkout` MCP tools. Unlike `wrap_up`, which
 /// runs once the turns in front of it are done, this runs inside the turn
-/// that calls it, so it must not wait for one. Its errors are the tool's
-/// result, told to the agent.
+/// that calls it, so it must not wait for one. Its caller holds a
+/// `Landing` from `begin_landing`. Its errors are the tool's result, told
+/// to the agent.
 pub async fn land_now(
     state: &Arc<State>,
     id: &str,
     target: WrapUpTarget,
     prs: Option<Vec<PrSpec>>,
+    _landing: &Landing,
 ) -> Result<(Landed, Vec<String>)> {
     let session = state
         .db
@@ -1902,12 +1962,6 @@ pub async fn land_now(
         .ok_or_else(|| anyhow!("the session is gone"))?;
     if session.kind == SessionKind::AutoReview {
         bail!("an unattended review's work is never landed");
-    }
-    if state.agents.with_live(id, |l| l.wrap_up.is_some()) {
-        bail!(
-            "the user is wrapping up this session from Grenadine already; wait for that to \
-             finish"
-        );
     }
     let tool = match target {
         WrapUpTarget::PullRequest => "update_prs",
@@ -4961,9 +5015,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit b agent").await;
 
         // The test state's GitHub is unreachable, so only the push works.
-        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(!format!("{err:#}").contains("no commits"), "{err:#}");
         let worktree = Path::new(&session.worktree);
         assert_eq!(
@@ -5031,9 +5091,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         // The agent's update_prs then pushes. The test state's GitHub is
         // unreachable, so only the push works.
         let worktree = Path::new(&session.worktree);
-        land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let tip = |branch: &str| {
             run(
                 &fx.upstream,
@@ -5070,9 +5136,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         }];
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
-            .await
-            .unwrap_err();
+        land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             run(&fx.upstream, &["rev-parse", "refs/heads/dev/someone/topic"]),
             sha
@@ -5108,9 +5180,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             branch: Some("dev/someone/taken".into()),
         }];
 
-        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("already exists on GitHub"), "{text}");
         assert!(text.contains("dev/someone/taken"), "{text}");
@@ -5132,9 +5210,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             branch: Some("bad..name".into()),
         }];
 
-        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, Some(specs))
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("isn't a valid branch name"),
             "{err:#}"
@@ -5252,10 +5336,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit b agent").await;
         let id = &session.id;
 
-        let (Landed::Checkout { sha }, _) = land_now(&state, id, WrapUpTarget::Checkout, None)
-            .await
-            .unwrap()
-        else {
+        let (Landed::Checkout { sha }, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::Checkout,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap() else {
             panic!("expected a checkout landing");
         };
         assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
@@ -5283,9 +5372,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             None,
         );
         wait_for_turns(&state, id, 2).await;
-        let err = land_now(&state, id, WrapUpTarget::Checkout, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::Checkout,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("Rebase your commits onto"), "{text}");
         assert!(text.contains("call `land_on_checkout` again"), "{text}");
@@ -5326,9 +5421,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         record_landed(&state, id, &pr).unwrap();
         run(worktree, &["commit", "--amend", "-qm", "Amended b"]);
 
-        let (landed, _) = land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap();
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(landed, pr);
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
         assert_eq!(
@@ -5379,9 +5480,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         wait_for_turns(&state, id, 2).await;
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD~"]));
         assert_eq!(
             tip(&format!("{}-2", session.branch)),
@@ -5424,9 +5531,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(worktree, &["rebase", "--quiet", "FETCH_HEAD"]);
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
         assert_eq!(
             run(
@@ -5486,9 +5599,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             &["rebase", "--quiet", "--onto", "FETCH_HEAD", &old],
         );
 
-        let (landed, _) = land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap();
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(landed, pr);
         let tip = |branch: &str| {
             run(
@@ -5531,9 +5650,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(&fx.upstream, &["checkout", "-q", "pr-branch"]);
         commit(&fx.upstream, "p2", "2\n");
 
-        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("git rebase --onto"), "{text}");
         assert_eq!(
@@ -5577,9 +5702,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(worktree, &["cherry-pick", &merged]);
         let picked = run(worktree, &["rev-parse", "HEAD"]);
 
-        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("already on main"), "{text}");
         assert!(text.contains(&picked[..12]), "{text}");
@@ -5617,9 +5748,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         run(worktree, &["checkout", "--orphan", "other"]);
         run(worktree, &["commit", "-qm", "other"]);
 
-        let err = land_now(&state, &session.id, WrapUpTarget::Checkout, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::Checkout,
+            None,
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("don't build on the checkout"), "{text}");
         assert!(text.contains("git rebase --onto"), "{text}");
@@ -5641,11 +5778,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "commit w agent").await;
         commit(&clone, "l", "local\n");
 
-        let (Landed::Checkout { sha }, _) =
-            land_now(&state, &session.id, WrapUpTarget::Checkout, None)
-                .await
-                .unwrap()
-        else {
+        let (Landed::Checkout { sha }, _) = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::Checkout,
+            None,
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap() else {
             panic!("expected a checkout landing");
         };
         let worktree = Path::new(&session.worktree);
@@ -5675,10 +5816,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
 
         // The first commit lands on the checkout.
-        let (Landed::Checkout { sha }, _) = land_now(&state, id, WrapUpTarget::Checkout, None)
-            .await
-            .unwrap()
-        else {
+        let (Landed::Checkout { sha }, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::Checkout,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap() else {
             panic!("expected a checkout landing");
         };
         assert_eq!(run(&clone, &["rev-parse", "HEAD"]), sha);
@@ -5695,9 +5841,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         wait_for_turns(&state, id, 2).await;
 
         // The test state's GitHub is unreachable, so only the push works.
-        land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(tip(&session.branch), run(worktree, &["rev-parse", "HEAD"]));
         assert_eq!(
             run(
@@ -5728,9 +5880,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = start(&state, "write b agent").await;
         let id = &session.id;
 
-        let err = land_now(&state, id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("uncommitted changes"), "{text}");
         assert!(text.contains("Commit all of your changes"), "{text}");
@@ -5760,9 +5918,15 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
 
-        let err = land_now(&state, &session.id, WrapUpTarget::PullRequest, None)
-            .await
-            .unwrap_err();
+        let err = land_now(
+            &state,
+            &session.id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, &session.id).unwrap(),
+        )
+        .await
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("1 commits but opened 2 pull requests"),
@@ -5789,15 +5953,11 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 asked: false,
             });
         });
-        for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
-            let err = land_now(&state, &session.id, target, None)
-                .await
-                .unwrap_err();
-            assert!(
-                format!("{err:#}").contains("wrapping up this session"),
-                "{err:#}"
-            );
-        }
+        let err = begin_landing(&state, &session.id).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("wrapping up this session"),
+            "{err:#}"
+        );
         state.agents.with_live(&session.id, |l| l.wrap_up = None);
 
         let review = AgentSession {
@@ -5806,11 +5966,52 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         state.db.create_agent(&review).unwrap();
         for target in [WrapUpTarget::Checkout, WrapUpTarget::PullRequest] {
-            let err = land_now(&state, &review.id, target, None)
+            let landing = begin_landing(&state, &review.id).unwrap();
+            let err = land_now(&state, &review.id, target, None, &landing)
                 .await
                 .unwrap_err();
             assert!(format!("{err:#}").contains("review"), "{err:#}");
         }
+    }
+
+    /// One landing at a time: a second call fails while a landing's guard
+    /// lives, and a dropped guard doesn't bring back a deleted session's
+    /// entry.
+    #[test]
+    fn begin_landing_allows_only_one_landing() {
+        let state = crate::sync::test_state();
+        let id = uuid();
+        let landing = begin_landing(&state, &id).unwrap();
+        let err = begin_landing(&state, &id).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("landing this session's work already"),
+            "{err:#}"
+        );
+        drop(landing);
+        let landing = begin_landing(&state, &id).unwrap();
+        state.agents.live.lock().unwrap().remove(&id);
+        drop(landing);
+        assert!(!state.agents.live.lock().unwrap().contains_key(&id));
+    }
+
+    /// A wrap-up started while a landing tool call holds the session
+    /// fails instead of landing the same work over it.
+    #[tokio::test]
+    async fn a_landing_fails_a_wrap_up() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let _landing = begin_landing(&state, id).unwrap();
+        let AgentEventKind::WrapUpFailed(message) = wrap(&state, id, WrapUpTarget::Checkout).await
+        else {
+            panic!("{:?}", state.db.agent_events(id));
+        };
+        assert!(
+            message.contains("landing this session's work already"),
+            "{message}"
+        );
     }
 
     /// Repo sessions hear about the landing tools; general sessions and
