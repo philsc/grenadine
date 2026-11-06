@@ -176,8 +176,9 @@ fn SessionsView(
             <tbody>
                 {sessions.into_iter().map(|s| view! {
                     <tr>
-                        <td><a href=format!("#/agents/{}", s.id)>{
-                            if s.title.is_empty() { s.id.clone() } else { s.title.clone() }
+                        <td><a href=format!("#/agents/{}", s.id) title=s.title.clone()>{
+                            let label = s.summary.clone().unwrap_or_else(|| s.title.clone());
+                            if label.is_empty() { s.id.clone() } else { label }
                         }</a></td>
                         <td>{status_label(s.status)}</td>
                         <td class="num">{bytes(s.process_bytes)}</td>

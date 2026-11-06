@@ -332,6 +332,7 @@ fn divide(
         used.push(SessionResources {
             id: session.id.clone(),
             title: session.title.clone(),
+            summary: session.summary.clone(),
             status: session.status,
             process_bytes: usage.process_bytes,
             cache_bytes: usage.cache_bytes,
@@ -499,11 +500,12 @@ mod tests {
         );
         std::fs::write(dir.path().join("cgroup.controllers"), "").unwrap();
 
-        let sessions = [
+        let mut sessions = [
             session("01234567-89ab-cdef-0123-456789abcdef"),
             session("11111111-1111-1111-1111-111111111111"),
             session("22222222-2222-2222-2222-222222222222"),
         ];
+        sessions[0].summary = Some("summary a".into());
         let cpu = HashMap::from([
             (format!("grenadine-agent-{a}.slice"), Some(12.5)),
             (
@@ -521,11 +523,13 @@ mod tests {
         assert_eq!(used[0].cache_bytes, 6000);
         assert_eq!(used[0].processes, 3);
         assert_eq!(used[0].cpu_percent, None);
+        assert_eq!(used[0].summary, None);
         assert_eq!(used[1].id, sessions[0].id);
         assert_eq!(used[1].process_bytes, 1300);
         assert_eq!(used[1].cache_bytes, 2000);
         assert_eq!(used[1].processes, 5);
         assert_eq!(used[1].cpu_percent, Some(12.5));
+        assert_eq!(used[1].summary, Some("summary a".to_owned()));
         assert_eq!(used[2].id, sessions[2].id);
         assert_eq!(used[2].process_bytes, 0);
         assert_eq!(used[2].cpu_percent, None);
