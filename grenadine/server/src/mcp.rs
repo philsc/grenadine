@@ -860,6 +860,7 @@ mod tests {
                     id: "toolu_1".into(),
                     allow: true,
                     message: None,
+                    answers: None,
                 },
                 AgentEventKind::ApprovalRequested {
                     id: "toolu_2".into(),
@@ -871,6 +872,7 @@ mod tests {
                     id: "toolu_2".into(),
                     allow: false,
                     message: None,
+                    answers: None,
                 },
             ]
         );

@@ -3546,6 +3546,7 @@ class AgentTest(ServerTestCase):
         # The answer goes back to Devin as the elicitation's q0.
         self.devin_saw('"q0":"Water"')
         expect(question).to_contain_text("Answered")
+        expect(question.locator(".question-answer")).to_have_text("Water")
         expect(transcript.locator(".turn-end")).to_have_count(1)
         self.delete_session()
 
@@ -3561,6 +3562,8 @@ class AgentTest(ServerTestCase):
         # A multi-select answer goes back to Devin as a JSON array.
         self.devin_saw('"action":"accept"')
         self.devin_saw('"q0":["Tea","Coffee"]')
+        expect(question).to_contain_text("Answered")
+        expect(question.locator(".question-answer")).to_have_text("Tea, Coffee")
         expect(transcript.locator(".turn-end")).to_have_count(1)
         self.delete_session()
 
@@ -5461,6 +5464,7 @@ class AgentTest(ServerTestCase):
         question.get_by_label("todo.txt").check()
         answer.click()
         expect(question).to_contain_text("Answered")
+        expect(question.locator(".question-answer")).to_have_text("todo.txt")
 
         # A plan sent back comes again with the feedback in it.
         plans = transcript.locator(".approval.plan")
@@ -5528,9 +5532,13 @@ class AgentTest(ServerTestCase):
         expect(question.locator("p.muted")).to_have_text("Implement this plan?")
         expect(body.locator("h2")).to_have_text("Steps")
         expect(body.locator("strong")).to_have_text("one")
+        expect(question.locator(".question-answer")).to_have_text("Go ahead")
         # The answer went back keyed by the full question: the fake
         # backend reads `answers[question]` and finishes the turn.
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
+        # Reloaded, the stored events still hold the answer.
+        self.page.reload()
+        expect(transcript.locator(".question-answer")).to_have_text("Go ahead")
 
     def test_approved_mode_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
