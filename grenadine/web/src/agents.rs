@@ -2,7 +2,7 @@
 //! starts one, and a session's page with its live transcript, permission
 //! requests and a box for follow-up prompts.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2792,6 +2792,21 @@ fn Transcript(
                 .collect::<HashMap<_, _>>()
         })
     });
+    // Calls with a row of their own carry the answer's mark, so a
+    // resolved approval card with such a row doesn't render at all.
+    let tool_rows = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::ToolUse {
+                        parent: None, id, ..
+                    } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>()
+        })
+    });
     // The plan the last turn ended on, unanswered. Only it can still be
     // answered: once a server restart cuts the turn off, by starting a new
     // turn.
@@ -2914,6 +2929,7 @@ fn Transcript(
                             let summary = tool_summary(name, &value, Some(&worktree));
                             let title = summary_title(&value, &summary);
                             let tool = tool.clone();
+                            let approval_id = tool.clone();
                             let result = Memo::new_with_compare(
                                 move |_| results.with(|r| r.get(&tool).cloned()),
                                 |prev, cur| match (prev, cur) {
@@ -2941,8 +2957,55 @@ fn Transcript(
                             view! {
                                 <details class="tool">
                                     <summary>
-                                        <span class="tool-name">{name.clone()}</span>
+                                        {move || {
+                                            let done = result.with(|r| {
+                                                r.as_ref().map(|e| {
+                                                    tool_result(e)
+                                                        .map(|(_, is_error, _, _)| is_error)
+                                                })
+                                            });
+                                            // Still running, in this turn: a
+                                            // spinner. Done or interrupted: a
+                                            // dot in the same spot.
+                                            match done {
+                                                None if waiting.get()
+                                                    && turn_start
+                                                        .get()
+                                                        .is_none_or(|t| {
+                                                            seq.is_some_and(|s| s > t)
+                                                        }) =>
+                                                {
+                                                    view! { <span class="spinner"></span> }
+                                                        .into_any()
+                                                }
+                                                None => view! {
+                                                    <span class="tool-status interrupted" role="img" aria-label="Interrupted" title="Interrupted"></span>
+                                                }
+                                                .into_any(),
+                                                Some(Some(true)) => view! {
+                                                    <span class="tool-status error" role="img" aria-label="Failed" title="Failed"></span>
+                                                }
+                                                .into_any(),
+                                                Some(_) => view! {
+                                                    <span class="tool-status ok" role="img" aria-label="Succeeded" title="Succeeded"></span>
+                                                }
+                                                .into_any(),
+                                            }
+                                        }}
+                                        " " <span class="tool-name">{name.clone()}</span>
                                         " " <code title=title>{summary}</code>
+                                        {move || {
+                                            resolved.with(|r| r.get(&approval_id).copied()).map(|allow| {
+                                                let (class, label, mark) = if allow {
+                                                    ("allowed", "Allowed", "✓")
+                                                } else {
+                                                    ("denied", "Denied", "✗")
+                                                };
+                                                view! {
+                                                    " " <span class=format!("approval-mark {class}") role="img" aria-label=label title=label>{mark}</span>
+                                                }
+                                            })
+                                        }}
                                         {move || {
                                             let done = result.with(|r| {
                                                 r.as_ref().map(|e| {
@@ -2954,9 +3017,8 @@ fn Transcript(
                                                 })
                                             });
                                             match done {
-                                                // Still running, in this turn: a
-                                                // spinner and, when the call is
-                                                // timed, how long it has taken.
+                                                // For a running call, how long it
+                                                // has taken when the call is timed.
                                                 None if waiting.get()
                                                     && turn_start
                                                         .get()
@@ -2964,27 +3026,17 @@ fn Transcript(
                                                             seq.is_some_and(|s| s > t)
                                                         }) =>
                                                 {
-                                                    view! {
-                                                        <span class="spinner"></span>
-                                                        {at.map(|at| view! {
-                                                            <span class="muted">" "{elapsed(now.get() - at)}</span>
-                                                        })}
-                                                    }
+                                                    at.map(|at| view! {
+                                                        <span class="muted">" "{elapsed(now.get() - at)}</span>
+                                                    })
                                                     .into_any()
                                                 }
-                                                None => {
-                                                    view! { <span class="muted">" …"</span> }
-                                                        .into_any()
-                                                }
-                                                Some((is_error, result_at)) => view! {
-                                                    {(is_error == Some(true)).then(|| {
-                                                        view! { <span class="error">" failed"</span> }
-                                                    })}
-                                                    {tool_duration(at, result_at).map(|d| view! {
+                                                None => ().into_any(),
+                                                Some((_, result_at)) => tool_duration(at, result_at)
+                                                    .map(|d| view! {
                                                         <span class="muted">" · "{elapsed(d)}</span>
-                                                    })}
-                                                }
-                                                .into_any(),
+                                                    })
+                                                    .into_any(),
                                             }
                                         }}
                                     </summary>
@@ -3057,6 +3109,10 @@ fn Transcript(
                             let summary = tool_summary(tool_name, &value, Some(&worktree));
                             let title = summary_title(&value, &summary);
                             let diff = edit_fragments(tool_name, &value, &[]);
+                            let on_row = {
+                                let tool = tool.clone();
+                                Signal::derive(move || tool_rows.with(|t| t.contains(&tool)))
+                            };
                             view! {
                                 <ApprovalCard
                                     agent=id
@@ -3069,6 +3125,7 @@ fn Transcript(
                                     diff=diff
                                     options=options.clone()
                                     resolved=resolved
+                                    on_row=on_row
                                     waiting=waiting
                                 />
                             }.into_any()
@@ -3510,6 +3567,9 @@ fn ApprovalCard(
     /// The answers the backend offers beyond allow/deny.
     options: Vec<ApprovalOption>,
     resolved: Memo<HashMap<String, bool>>,
+    /// Whether the call's own row shows the answer, making a resolved
+    /// card redundant.
+    on_row: Signal<bool>,
     /// Whether the backend is running and so may wait for an answer;
     /// requests from before a restart stay unanswered.
     waiting: Signal<bool>,
@@ -3534,60 +3594,72 @@ fn ApprovalCard(
     let options = StoredValue::new(options);
     let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
     view! {
-        <div class="approval" class:pending=move || state.get().is_none() && waiting.get()>
-            <p>
-                {move || match state.get() {
-                    Some(true) => "Allowed ".to_owned(),
-                    Some(false) => "Denied ".to_owned(),
-                    None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
-                    None => "Unanswered: ".to_owned(),
-                }}
-                <span class="tool-name">{tool_name.clone()}</span> " " <code title=title>{summary}</code>
-            </p>
-            {move || (state.get().is_none() && waiting.get()).then(|| {
-                let (answer, deny) = (answer.clone(), deny.clone());
-                view! {
-                    {match diff.clone() {
-                        Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
-                        None => view! { <ToolInput name=tool_name.clone() input=input.clone() /> }.into_any(),
-                    }}
-                    {move || {
-                        let options = options.get_value();
-                        if options.is_empty() {
-                            let (allow, deny) = (answer.clone(), deny.clone());
-                            view! {
-                                <div class="form-buttons">
-                                    <button class="primary" disabled=move || busy.get() on:click=move |_| allow(true, None)>"Allow"</button>
-                                    <button disabled=move || busy.get() on:click=move |_| deny(false, None)>"Deny"</button>
-                                </div>
-                            }.into_any()
-                        } else {
-                            let mut primary = true;
-                            view! {
-                                <div class="form-buttons">
-                                    {options.into_iter().map(|o| {
-                                        let class = if primary && o.kind == ApprovalKind::AllowOnce {
-                                            primary = false;
-                                            "primary"
-                                        } else {
-                                            ""
-                                        };
-                                        // The server goes by the option's kind
-                                        // either way.
-                                        let (id, allow) = (o.id.clone(), o.kind.is_allow());
-                                        let answer = answer.clone();
-                                        view! {
-                                            <button class=class disabled=move || busy.get() on:click=move |_| answer(allow, Some(id.clone()))>{o.label}</button>
-                                        }
-                                    }).collect_view()}
-                                </div>
-                            }.into_any()
+        {move || {
+            // An answered request's mark is on the call's own row.
+            if on_row.get() && state.get().is_some() {
+                return ().into_any();
+            }
+            let (summary, title) = (summary.clone(), title.clone());
+            let (answer, deny) = (answer.clone(), deny.clone());
+            let diff = diff.clone();
+            let (tool_name, input) = (tool_name.clone(), input.clone());
+            view! {
+                <div class="approval" class:pending=move || state.get().is_none() && waiting.get()>
+                    <p>
+                        {move || match state.get() {
+                            Some(true) => "Allowed ".to_owned(),
+                            Some(false) => "Denied ".to_owned(),
+                            None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
+                            None => "Unanswered: ".to_owned(),
+                        }}
+                        <span class="tool-name">{tool_name.clone()}</span> " " <code title=title>{summary}</code>
+                    </p>
+                    {move || (state.get().is_none() && waiting.get()).then(|| {
+                        let (answer, deny) = (answer.clone(), deny.clone());
+                        view! {
+                            {match diff.clone() {
+                                Some((path, fragments)) => view! { <EditDiff path=path fragments=fragments /> }.into_any(),
+                                None => view! { <ToolInput name=tool_name.clone() input=input.clone() /> }.into_any(),
+                            }}
+                            {move || {
+                                let options = options.get_value();
+                                if options.is_empty() {
+                                    let (allow, deny) = (answer.clone(), deny.clone());
+                                    view! {
+                                        <div class="form-buttons">
+                                            <button class="primary" disabled=move || busy.get() on:click=move |_| allow(true, None)>"Allow"</button>
+                                            <button disabled=move || busy.get() on:click=move |_| deny(false, None)>"Deny"</button>
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    let mut primary = true;
+                                    view! {
+                                        <div class="form-buttons">
+                                            {options.into_iter().map(|o| {
+                                                let class = if primary && o.kind == ApprovalKind::AllowOnce {
+                                                    primary = false;
+                                                    "primary"
+                                                } else {
+                                                    ""
+                                                };
+                                                // The server goes by the option's kind
+                                                // either way.
+                                                let (id, allow) = (o.id.clone(), o.kind.is_allow());
+                                                let answer = answer.clone();
+                                                view! {
+                                                    <button class=class disabled=move || busy.get() on:click=move |_| answer(allow, Some(id.clone()))>{o.label}</button>
+                                                }
+                                            }).collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }
+                            }}
                         }
-                    }}
-                }
-            })}
-            {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
-        </div>
+                    })}
+                    {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+                </div>
+            }.into_any()
+        }}
     }
 }
 

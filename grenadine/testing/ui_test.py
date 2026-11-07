@@ -3432,7 +3432,15 @@ class AgentTest(ServerTestCase):
         expect(tool_input).not_to_contain_text('"command":')
         # Devin's options render as a button each.
         approval.get_by_role("button", name="Allow").click()
-        expect(approval).to_contain_text("Allowed Bash")
+        # The answered card is gone; its mark is on the call's row.
+        expect(approval).to_have_count(0)
+        tool = transcript.locator("details.tool")
+        expect(tool.locator(".approval-mark")).to_have_attribute(
+            "aria-label", "Allowed"
+        )
+        expect(tool.locator(".tool-status")).to_have_attribute(
+            "aria-label", "Succeeded"
+        )
         expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.500 ACU"])
         expect(self.page.locator(".composer .agent-model")).to_have_text("swe-2")
         # The subagent's exec is recorded but its tool call doesn't render.
@@ -3672,7 +3680,8 @@ class AgentTest(ServerTestCase):
             "please write a note"
         )
         approval.get_by_role("button", name="Allow").click()
-        expect(approval).to_contain_text("Allowed Write")
+        # The answered card is gone; its mark is on the call's row.
+        expect(approval).to_have_count(0)
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
 
         # The context meter sits at the right of the composer's buttons,
@@ -3694,6 +3703,13 @@ class AgentTest(ServerTestCase):
         self.assertLess(send["x"] + send["width"], active_box["x"])
         self.assertLess(active_box["x"] + active_box["width"], box["x"])
         tool = transcript.locator(".tool")
+        # The row carries the allowed mark and the succeeded dot.
+        expect(tool.locator(".approval-mark")).to_have_attribute(
+            "aria-label", "Allowed"
+        )
+        expect(tool.locator(".tool-status")).to_have_attribute(
+            "aria-label", "Succeeded"
+        )
         tool.locator("summary").click()
         # The write shows as a diff, without the result that only repeats it.
         added = tool.locator(".edit-diff tr.add")
@@ -3730,7 +3746,7 @@ class AgentTest(ServerTestCase):
         follow_up.fill("write more")
         follow_up.press("Enter")
         expect(transcript.locator(".turn-end")).to_have_count(3)
-        expect(transcript.locator(".approval")).to_have_count(1)
+        expect(transcript.locator(".approval")).to_have_count(0)
         self.assertEqual((worktree / "notes.txt").read_text(), "write more")
 
         # The transcript is stored, so a reload shows it all again.
@@ -3740,7 +3756,10 @@ class AgentTest(ServerTestCase):
         )
         expect(permissions).to_have_value("auto")
         expect(model).to_have_value("sonnet")
-        expect(transcript.locator(".approval")).to_contain_text("Allowed Write")
+        expect(transcript.locator(".approval")).to_have_count(0)
+        expect(transcript.locator(".approval-mark")).to_have_attribute(
+            "aria-label", "Allowed"
+        )
         expect(self.page.locator(".agent-header")).to_contain_text("idle")
         expect(self.page.get_by_role("meter", name="Context")).to_contain_text(
             "41.5k / 200k"
@@ -3788,6 +3807,35 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_denied_approval_marks_the_row(self) -> None:
+        # A denied request leaves no card behind: its mark and the
+        # failure's dot are on the call's row.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("please write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        transcript = self.page.locator(".transcript")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Claude wants to use Write notes.txt")
+        # While the request waits, the call's row spins, the spinner
+        # first in the summary.
+        tool = transcript.locator("details.tool")
+        spinner = tool.locator("summary .spinner")
+        expect(spinner).to_be_visible()
+        spinner_box = spinner.bounding_box()
+        name_box = tool.locator(".tool-name").bounding_box()
+        assert spinner_box and name_box
+        self.assertLess(spinner_box["x"], name_box["x"])
+
+        approval.get_by_role("button", name="Deny").click()
+        expect(approval).to_have_count(0)
+        expect(tool.locator(".approval-mark")).to_have_attribute("aria-label", "Denied")
+        expect(tool.locator(".tool-status")).to_have_attribute("aria-label", "Failed")
+        expect(tool.locator("summary")).not_to_contain_text("failed")
+        self.delete_session()
 
     def open_pr(self, title: str) -> Any:
         repo = self.gh.repo(scenarios.REPO)
@@ -5143,8 +5191,8 @@ class AgentTest(ServerTestCase):
         return transcript, done, self.page.get_by_label("Follow-up")
 
     def _allow(self, transcript) -> None:
-        # Answered approvals stay in the transcript; the pending one
-        # takes the click.
+        # Answered approvals are gone from the transcript; the pending
+        # one takes the click.
         approval = transcript.locator(".approval.pending")
         expect(approval).to_contain_text("update_prs")
         approval.get_by_role("button", name="Allow").click()

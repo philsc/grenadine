@@ -1659,6 +1659,31 @@ textarea {
 .transcript > .tool:not([open]) + .tool:not([open]) {
   margin-top: -6px;
 }
+/* The status dot takes the spinner's footprint, so a call finishing
+   doesn't move the row's text. */
+.tool-status {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin: 2px;
+  border-radius: 50%;
+  vertical-align: -1px;
+}
+.tool-status.ok {
+  background: var(--add-fg);
+}
+.tool-status.error {
+  background: var(--del-fg);
+}
+.tool-status.interrupted {
+  background: var(--fg-muted);
+}
+.approval-mark.allowed {
+  color: var(--add-fg);
+}
+.approval-mark.denied {
+  color: var(--del-fg);
+}
 /* A long summary keeps to one line so the spinner and duration after it
    stay visible. */
 .approval p code,
