@@ -155,7 +155,14 @@ struct RebaseInfo {
     /// The older version's changes replayed onto the newer base; a
     /// synthetic blob with no id.
     rebased: Option<Arc<Blob>>,
+    /// Per line of the older version's text: its 0-based line in
+    /// `rebased`, `None` when the merge dropped it.
+    ours_to_merged: Option<OursToMerged>,
 }
+
+/// Where each line of the older version's text landed in the merged
+/// text; `None` when the merge dropped it.
+type OursToMerged = Arc<[Option<usize>]>;
 
 /// What `stats` works out: added and removed lines, change blocks, and
 /// whether every changed line is the rebase's.
@@ -187,8 +194,9 @@ impl FileData {
 }
 
 /// The older version's text merged onto the newer base, for the rebased
-/// left side of the diff. `None` when a side is binary.
-fn rebased_blob(upstream: &BlobPair, old: &Option<Arc<Blob>>) -> Option<Arc<Blob>> {
+/// left side of the diff, and where each of the older version's lines
+/// landed in it. `None` when a side is binary.
+fn rebased_blob(upstream: &BlobPair, old: &Option<Arc<Blob>>) -> Option<(Arc<Blob>, OursToMerged)> {
     if [&upstream.0, &upstream.1, old]
         .into_iter()
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()))
@@ -200,6 +208,7 @@ fn rebased_blob(upstream: &BlobPair, old: &Option<Arc<Blob>>) -> Option<Arc<Blob
     let base_new = rebase::lines(base_new_text);
     let old_text = text(old).unwrap_or_default();
     let merged = rebase::merge3(&base_old, &rebase::lines(old_text), &base_new);
+    let ours_to_merged: OursToMerged = merged.ours_to_merged.into();
     let mut merged_text = merged.lines.join("\n");
     let newline = match old.as_ref().and_then(|b| b.text.as_deref()) {
         Some(t) => t.ends_with('\n'),
@@ -208,10 +217,13 @@ fn rebased_blob(upstream: &BlobPair, old: &Option<Arc<Blob>>) -> Option<Arc<Blob
     if newline && !merged_text.is_empty() {
         merged_text.push('\n');
     }
-    Some(Arc::new(Blob {
-        size: merged_text.len() as u64,
-        text: Some(merged_text),
-    }))
+    Some((
+        Arc::new(Blob {
+            size: merged_text.len() as u64,
+            text: Some(merged_text),
+        }),
+        ours_to_merged,
+    ))
 }
 
 fn blob(id: &Option<String>) -> Option<Arc<Blob>> {
@@ -269,8 +281,12 @@ async fn load(
                     new: blob(&f.new_blob),
                     rebase: up_by_path.get(f.path()).map(|u| {
                         let upstream = (blob(&u.old_blob), blob(&u.new_blob));
+                        let (rebased, ours_to_merged) = rebased_blob(&upstream, &old)
+                            .map(|(b, m)| (Some(b), Some(m)))
+                            .unwrap_or_default();
                         RebaseInfo {
-                            rebased: rebased_blob(&upstream, &old),
+                            rebased,
+                            ours_to_merged,
                             upstream,
                         }
                     }),
@@ -366,7 +382,22 @@ pub fn DiffView(
                     }}
                 </ul>
                 {files.iter().map(|f| {
-                    let placed = comments.get(f.change.path()).cloned().unwrap_or_default();
+                    let mut placed = comments.get(f.change.path()).cloned().unwrap_or_default();
+                    // Threads made on the diff's left version are keyed by
+                    // the file's path as of that version: a renamed file's
+                    // old path.
+                    if let Some(old) = f.change.old_path.as_deref() && old != f.change.path() {
+                        placed.extend(
+                            comments
+                                .get(old)
+                                .into_iter()
+                                .flatten()
+                                .filter(|p| {
+                                    matches!(p.anchor, Anchor::Line(Side::Left, _) | Anchor::File)
+                                })
+                                .cloned(),
+                        );
+                    }
                     view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=commenting.clone() /> }
                 }).collect_view()}
             }
@@ -909,10 +940,16 @@ fn FileView(
                 cache.set_value(Some((highlighted, mode, l.clone())));
                 l
             });
+            // In rebased mode the left side's lines are the merged text:
+            // threads anchored to the older version's lines move along.
+            let map = mode
+                .then(|| file.rebase.as_ref().and_then(|i| i.ours_to_merged.clone()))
+                .flatten();
+            let (placed, dropped) = remap_left(&comments, map.as_deref());
             if side_by_side.get() {
-                split_view(&l, &comments, inline_changes, fc.as_ref()).into_any()
+                split_view(&l, &placed, &dropped, inline_changes, fc.as_ref()).into_any()
             } else {
-                unified_view(&l, &comments, inline_changes, fc.as_ref()).into_any()
+                unified_view(&l, &placed, &dropped, inline_changes, fc.as_ref()).into_any()
             }
         }
     };
@@ -1016,10 +1053,35 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
                         highlight_lines(&path, &f.new),
                     )
                 };
-                unified_view(&l, &[], inline_changes, None)
+                unified_view(&l, &[], &[], inline_changes, None)
             }).collect_view()}
         </div>
     }
+}
+
+/// The threads of `comments` with their left-side lines moved onto the
+/// merged text `map` describes, and the ones whose line the merge
+/// dropped, still at their original line.
+fn remap_left(comments: &[Placed], map: Option<&[Option<usize>]>) -> (Vec<Placed>, Vec<Placed>) {
+    let Some(map) = map else {
+        return (comments.to_vec(), Vec::new());
+    };
+    let mut placed = Vec::new();
+    let mut dropped = Vec::new();
+    for p in comments {
+        let mut p = p.clone();
+        if let Anchor::Line(Side::Left, l) = p.anchor {
+            match map.get(l.saturating_sub(1) as usize).copied().flatten() {
+                Some(m) => p.anchor = Anchor::Line(Side::Left, m as u32 + 1),
+                None => {
+                    dropped.push(p);
+                    continue;
+                }
+            }
+        }
+        placed.push(p);
+    }
+    (placed, dropped)
 }
 
 /// The threads anchored on each line, and those on lines the diff doesn't
@@ -1218,6 +1280,20 @@ fn ln_cell(
     }
 }
 
+/// The threads `lc` didn't place plus `dropped`, in line order.
+fn rest_and_dropped<'a>(
+    lc: LineComments<'a>,
+    dropped: &'a [Placed],
+) -> Vec<(Side, u32, &'a Placed)> {
+    let mut rest = lc.rest();
+    rest.extend(dropped.iter().filter_map(|p| match p.anchor {
+        Anchor::Line(side, line) => Some((side, line, p)),
+        _ => None,
+    }));
+    rest.sort_by_key(|(side, line, _)| (*line, *side == Side::Right));
+    rest
+}
+
 fn outside_comments(rest: Vec<(Side, u32, &Placed)>) -> Option<AnyView> {
     (!rest.is_empty()).then(|| {
         view! {
@@ -1255,6 +1331,7 @@ fn kind_class(kind: rebase::Kind) -> &'static str {
 fn unified_view(
     l: &Layout,
     comments: &[Placed],
+    dropped: &[Placed],
     inline_changes: Signal<bool>,
     fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
@@ -1314,7 +1391,7 @@ fn unified_view(
         }
     }
     rows.extend(Row::skip(l.shape.skipped_after, 4));
-    let outside = outside_comments(lc.rest());
+    let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
         {diff_table("diff unified", rows, inline_changes, fc.cloned())}
         {outside}
@@ -1324,6 +1401,7 @@ fn unified_view(
 fn split_view(
     l: &Layout,
     comments: &[Placed],
+    dropped: &[Placed],
     inline_changes: Signal<bool>,
     fc: Option<&FileCommenting>,
 ) -> impl IntoView + use<> {
@@ -1371,7 +1449,7 @@ fn split_view(
         }
     }
     rows.extend(Row::skip(l.shape.skipped_after, 4));
-    let outside = outside_comments(lc.rest());
+    let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
         {diff_table("diff split", rows, inline_changes, fc.cloned())}
         {outside}

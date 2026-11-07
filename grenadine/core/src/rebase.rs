@@ -82,6 +82,9 @@ pub struct Merged<'a> {
     pub ours_dropped_by_theirs: Vec<bool>,
     /// Per line of `ours`: whether it lies in a conflict region.
     pub ours_conflict: Vec<bool>,
+    /// Per line of `ours`: its index in `lines`, `None` when the merge
+    /// dropped it.
+    pub ours_to_merged: Vec<Option<usize>>,
 }
 
 /// A span of base lines that `ours` or `theirs` changed, or both.
@@ -175,6 +178,23 @@ fn side_output<'a>(
     out
 }
 
+/// Pushes the base lines of `range`, noting in `ours_to_merged` where each
+/// of `ours`' carried lines lands.
+fn push_carried<'a>(
+    lines: &mut Vec<&'a str>,
+    ours_to_merged: &mut [Option<usize>],
+    carried: &[usize],
+    base: &[&'a str],
+    range: Range<usize>,
+) {
+    for p in range {
+        if carried[p] != usize::MAX {
+            ours_to_merged[carried[p]] = Some(lines.len());
+        }
+        lines.push(base[p]);
+    }
+}
+
 /// The 3-way merge of `ours` and `theirs` from their common `base`.
 /// Conflicts resolve to `ours`' lines, flagged as such.
 pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Merged<'a> {
@@ -185,10 +205,17 @@ pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Mer
     let mut origin: Vec<Origin> = Vec::new();
     let mut ours_dropped_by_theirs = vec![false; ours.len()];
     let mut ours_conflict = vec![false; ours.len()];
+    let mut ours_to_merged = vec![None; ours.len()];
 
     let mut pos = 0;
     for region in regions(blocks_ours, blocks_theirs) {
-        lines.extend(&base[pos..region.base.start]);
+        push_carried(
+            &mut lines,
+            &mut ours_to_merged,
+            &carried_ours,
+            base,
+            pos..region.base.start,
+        );
         origin.resize(lines.len(), Origin::Base);
         pos = region.base.end;
         let ours_out = side_output(base, ours, &region.ours, &region.base, &carried_ours);
@@ -197,6 +224,7 @@ pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Mer
             // blocks are its own, the base lines between them unchanged.
             let changed: HashSet<usize> = region.ours.iter().flat_map(|b| b.new.clone()).collect();
             for (i, l) in &ours_out {
+                ours_to_merged[*i] = Some(lines.len());
                 lines.push(l);
                 origin.push(if changed.contains(i) {
                     Origin::Ours
@@ -214,7 +242,13 @@ pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Mer
             }
             let mut cursor = region.base.start;
             for b in &region.theirs {
-                lines.extend(&base[cursor..b.old.start]);
+                push_carried(
+                    &mut lines,
+                    &mut ours_to_merged,
+                    &carried_ours,
+                    base,
+                    cursor..b.old.start,
+                );
                 origin.resize(lines.len(), Origin::Base);
                 for i in b.new.clone() {
                     lines.push(theirs[i]);
@@ -222,7 +256,13 @@ pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Mer
                 }
                 cursor = b.old.end;
             }
-            lines.extend(&base[cursor..region.base.end]);
+            push_carried(
+                &mut lines,
+                &mut ours_to_merged,
+                &carried_ours,
+                base,
+                cursor..region.base.end,
+            );
             origin.resize(lines.len(), Origin::Base);
             continue;
         }
@@ -244,25 +284,34 @@ pub fn merge3<'a>(base: &[&'a str], ours: &[&'a str], theirs: &[&'a str]) -> Mer
                 .zip(&theirs_out)
                 .all(|(a, b)| a.trim_end() == b.trim_end());
         if same {
-            for l in ours_lines {
+            for (i, l) in &ours_out {
+                ours_to_merged[*i] = Some(lines.len());
                 lines.push(l);
                 origin.push(Origin::Both);
             }
         } else {
             for (i, l) in &ours_out {
+                ours_to_merged[*i] = Some(lines.len());
                 lines.push(l);
                 origin.push(Origin::Conflict);
                 ours_conflict[*i] = true;
             }
         }
     }
-    lines.extend(&base[pos..]);
+    push_carried(
+        &mut lines,
+        &mut ours_to_merged,
+        &carried_ours,
+        base,
+        pos..base.len(),
+    );
     origin.resize(lines.len(), Origin::Base);
     Merged {
         lines,
         origin,
         ours_dropped_by_theirs,
         ours_conflict,
+        ours_to_merged,
     }
 }
 
@@ -458,6 +507,7 @@ mod tests {
         assert_eq!(origins(&m), [Origin::Base; 3]);
         assert_eq!(m.ours_dropped_by_theirs, [false; 3]);
         assert_eq!(m.ours_conflict, [false; 3]);
+        assert_eq!(m.ours_to_merged, [Some(0), Some(1), Some(2)]);
     }
 
     #[test]
@@ -481,6 +531,7 @@ mod tests {
         assert_eq!(origins(&m), [Origin::Base, Origin::Theirs, Origin::Base]);
         // Theirs replaced base's "b", which is ours' line 1.
         assert_eq!(m.ours_dropped_by_theirs, [false, true, false]);
+        assert_eq!(m.ours_to_merged, [Some(0), None, Some(2)]);
     }
 
     #[test]
@@ -492,6 +543,7 @@ mod tests {
         assert_eq!(m.lines, ["a", "B", "c"]);
         assert_eq!(origins(&m), [Origin::Base, Origin::Both, Origin::Base]);
         assert_eq!(m.ours_conflict, [false; 3]);
+        assert_eq!(m.ours_to_merged, [Some(0), Some(1), Some(2)]);
     }
 
     #[test]
@@ -512,6 +564,16 @@ mod tests {
             ]
         );
         assert_eq!(m.ours_conflict, [false, true, true, false]);
+        assert_eq!(m.ours_to_merged, [Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn upstream_insertion_shifts_ours_lines() {
+        let base = ["a", "b", "c"];
+        let theirs = ["a", "x", "b", "c"];
+        let m = merge3(&base, &base, &theirs);
+        assert_eq!(m.lines, theirs);
+        assert_eq!(m.ours_to_merged, [Some(0), Some(2), Some(3)]);
     }
 
     #[test]
