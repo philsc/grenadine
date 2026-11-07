@@ -50,8 +50,14 @@ def log(line):
 
 
 if "plan_file" in scenario:
-    with open(scenario["plan_file"]["path"], "w") as f:
+    # Another fake Devin, e.g. the one the server starts to list models,
+    # can write the file while the server reads it for a session's plan.
+    # Replacing it in one step means it's never read empty.
+    path = scenario["plan_file"]["path"]
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as f:
         f.write(scenario["plan_file"]["text"])
+    os.replace(tmp, path)
 
 
 def send(message):

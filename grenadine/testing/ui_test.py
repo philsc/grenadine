@@ -3805,6 +3805,10 @@ class AgentTest(ServerTestCase):
         expect(title).to_have_attribute("title", "please write a note")
         status = entry.locator(".agent-status")
         expect(status).to_have_text("idle")
+        # The branch is on the session's page, not in the sidebar.
+        branch = self.page.locator(".agent-header p.muted code").last
+        expect(branch).not_to_have_text("")
+        expect(entry.locator(".agent-meta")).not_to_contain_text(branch.inner_text())
         trash = entry.get_by_role("button", name="Delete session")
         title_box = title.bounding_box()
         status_box = status.bounding_box()
