@@ -2670,6 +2670,49 @@ class VersionsTest(ServerTestCase):
         grow.reviews.append(
             Review(scenarios.OTHER, APPROVED, commit=shas[-1], submitted_at=gh.tick())
         )
+        # A thread made on v1 shows on the left of diffs starting at v1.
+        repo = gh.repo(scenarios.REPO)
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Left over from v1.",
+            path=scenarios.STEPS_PY,
+            line=9,
+            commit=shas[0],
+        )
+        # A thread on the head stays on the right.
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Doubling, eh?",
+            path=scenarios.STEPS_PY,
+            line=20,
+            commit=shas[-1],
+        )
+        # Threads on v1 of a rebased PR: one on a line the merge keeps,
+        # one on a line upstream replaced, and one on v2.
+        rebase_edit = cls.cases.prs[scenarios.REBASE_AND_EDIT]
+        r_shas = cls.cases.shas[scenarios.REBASE_AND_EDIT]
+        for line, body in (
+            (5, "Kept through the merge."),
+            (50, "Dropped by the merge."),
+        ):
+            repo.comment(
+                rebase_edit,
+                author=scenarios.OTHER,
+                body=body,
+                path="rebase_and_edit/shared.py",
+                line=line,
+                commit=r_shas[0],
+            )
+        repo.comment(
+            rebase_edit,
+            author=scenarios.OTHER,
+            body="Made on v2.",
+            path="rebase_and_edit/shared.py",
+            line=7,
+            commit=r_shas[1],
+        )
 
     def open(self, title: str) -> None:
         pr = self.cases.prs[title]
@@ -2742,7 +2785,7 @@ class VersionsTest(ServerTestCase):
     def test_threads_fold(self) -> None:
         self.open(scenarios.GROW)
         threads = self.file(scenarios.STEPS_PY).locator(".thread")
-        expect(threads).to_have_count(2)
+        expect(threads).to_have_count(4)
         open_thread, resolved = threads.nth(0), threads.nth(1)
 
         # Open threads start unfolded, resolved ones folded.
@@ -2806,6 +2849,60 @@ class VersionsTest(ServerTestCase):
         # steps.
         self.choose(2, 5)
         expect(file.locator(".stats")).to_have_text("+12 −0")
+
+    def row_above(self, file: Locator, thread_text: str) -> Locator:
+        """The diff row a thread's comment row sits under."""
+        return file.locator("tr.comment-row", has_text=thread_text).locator(
+            "xpath=preceding-sibling::tr[1]"
+        )
+
+    def test_threads_on_the_diffs_left_version(self) -> None:
+        self.open(scenarios.GROW)
+        self.choose(1, 6)
+        file = self.file(scenarios.STEPS_PY)
+        # The thread made on v1 sits under its line on the left; the one
+        # made on the head stays on the right.
+        expect(
+            self.row_above(file, "Left over from v1.").locator("td.ln").nth(0)
+        ).to_have_text("9")
+        expect(
+            self.row_above(file, "Doubling, eh?").locator("td.ln").nth(1)
+        ).to_have_text("20")
+
+        # The unified view places them the same way.
+        self.page.get_by_label("Side by side").uncheck()
+        expect(
+            self.row_above(file, "Left over from v1.").locator("td.ln").nth(0)
+        ).to_have_text("9")
+        expect(
+            self.row_above(file, "Doubling, eh?").locator("td.ln").nth(1)
+        ).to_have_text("20")
+
+    def test_threads_on_the_left_version_rebased(self) -> None:
+        self.open(scenarios.REBASE_AND_EDIT)
+        self.choose(1, 2)
+        file = self.file("rebase_and_edit/shared.py")
+        expect(
+            self.row_above(file, "Kept through the merge.").locator("td.ln").nth(0)
+        ).to_have_text("5")
+        expect(
+            self.row_above(file, "Dropped by the merge.").locator("td.ln").nth(0)
+        ).to_have_text("50")
+
+        # In the rebased view the left side is the merged text: the thread
+        # on the line upstream replaced moves to the list of lines the
+        # diff doesn't show, while the v2 thread stays on the right.
+        self.page.get_by_label("Rebase older version").check()
+        expect(
+            self.row_above(file, "Kept through the merge.").locator("td.ln").nth(0)
+        ).to_have_text("5")
+        expect(
+            self.row_above(file, "Made on v2.").locator("td.ln").nth(1)
+        ).to_have_text("7")
+        outside = file.locator(
+            ".outside-comments .outside", has_text="Dropped by the merge."
+        )
+        expect(outside).to_contain_text("old line 50")
 
     def test_rebase_only_changes_are_hidden(self) -> None:
         self.open(scenarios.REBASE)

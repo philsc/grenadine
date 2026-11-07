@@ -80,6 +80,8 @@ fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
 }
 
 /// Decides where each thread goes for the selected diff:
+/// - inline on the left at the line it was made on, when the diff's left
+///   side is the version it was made on;
 /// - inline, when Head is the commit the comment was made on;
 /// - inline at GitHub's mapped-forward line, when Head is the latest version;
 /// - otherwise in the side panel.
@@ -97,20 +99,33 @@ pub fn place(
     let is_latest = sel.head as usize == versions.len();
     for thread in threads(comments) {
         let c = &thread.root;
-        let line = if c.original_commit == head.sha {
-            c.original_line
-        } else if is_latest {
-            c.line
+        let anchor = if sel.base != 0 && c.original_commit == versions[sel.base as usize - 1].sha {
+            // Made on the version the diff's left side shows: its
+            // right-side lines are that version's own.
+            if c.on_file {
+                Some(Anchor::File)
+            } else {
+                match (c.original_line, c.side) {
+                    (Some(l), Side::Right) => Some(Anchor::Line(Side::Left, l)),
+                    _ => None,
+                }
+            }
         } else {
-            None
-        };
-        let anchor = if c.on_file && (c.original_commit == head.sha || is_latest) {
-            Some(Anchor::File)
-        } else {
-            match (line, c.side) {
-                (Some(l), Side::Right) => Some(Anchor::Line(Side::Right, l)),
-                (Some(l), Side::Left) if sel.base == 0 => Some(Anchor::Line(Side::Left, l)),
-                _ => None,
+            let line = if c.original_commit == head.sha {
+                c.original_line
+            } else if is_latest {
+                c.line
+            } else {
+                None
+            };
+            if c.on_file && (c.original_commit == head.sha || is_latest) {
+                Some(Anchor::File)
+            } else {
+                match (line, c.side) {
+                    (Some(l), Side::Right) => Some(Anchor::Line(Side::Right, l)),
+                    (Some(l), Side::Left) if sel.base == 0 => Some(Anchor::Line(Side::Left, l)),
+                    _ => None,
+                }
             }
         };
         let thread = Arc::new(thread);
@@ -1528,14 +1543,63 @@ mod tests {
         assert_eq!(panel.len(), 1);
         assert_eq!(panel[0].version, Some(2));
 
-        // v1 → v2: the comment made on v2 goes inline at its original line.
+        // v1 → v2: the comment made on v1 anchors the left, the one made
+        // on v2 the right.
         let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 2 });
-        assert_eq!(anchors(&inline), [(2, Anchor::Line(Side::Right, 20))]);
-        assert_eq!(panel.len(), 2);
+        assert_eq!(
+            anchors(&inline),
+            [
+                (1, Anchor::Line(Side::Left, 10)),
+                (2, Anchor::Line(Side::Right, 20))
+            ]
+        );
+        assert_eq!(panel.len(), 1);
 
-        // v2 → v3: left-side comments don't fit when the left isn't the base.
+        // v2 → v3: v2's own thread anchors the left too.
         let (inline, _) = place(&comments, &versions, Selection { base: 2, head: 3 });
-        assert_eq!(anchors(&inline), [(1, Anchor::Line(Side::Right, 12))]);
+        assert_eq!(
+            anchors(&inline),
+            [
+                (1, Anchor::Line(Side::Right, 12)),
+                (2, Anchor::Line(Side::Left, 20))
+            ]
+        );
+    }
+
+    #[test]
+    fn placement_on_the_left_version() {
+        let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
+        let mut file_comment = comment(5, "a", Side::Right, 0, None);
+        file_comment.on_file = true;
+        let comments = [
+            // Made on v1.
+            comment(1, "a", Side::Right, 10, Some(12)),
+            // A merge-base comment made on v1.
+            comment(2, "a", Side::Left, 7, Some(7)),
+            // Made on the version between the two diffed.
+            comment(3, "b", Side::Right, 20, Some(21)),
+            // Made on v3.
+            comment(4, "c", Side::Right, 30, Some(30)),
+            file_comment,
+        ];
+
+        let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 3 });
+        assert_eq!(
+            anchors(&inline),
+            [
+                // The thread made on v1 goes left once, not also right.
+                (1, Anchor::Line(Side::Left, 10)),
+                // The in-between version's thread maps forward to the
+                // latest.
+                (3, Anchor::Line(Side::Right, 21)),
+                (4, Anchor::Line(Side::Right, 30)),
+                (5, Anchor::File),
+            ]
+        );
+        // The merge-base comment has no line on v1 itself.
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].thread.root.id, 2);
+        assert_eq!(panel[0].version, Some(1));
     }
 
     #[test]
