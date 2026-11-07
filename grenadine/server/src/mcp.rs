@@ -21,7 +21,7 @@ use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use grenadine_core::api::{
-    AgentBackend, AgentEventKind, Landed, PermissionMode, PrKey, WrapUpTarget,
+    AgentBackend, AgentEventKind, AgentSession, Landed, PermissionMode, PrKey, WrapUpTarget,
 };
 use serde_json::{Value, json};
 
@@ -49,13 +49,14 @@ const IDLE: Duration = Duration::from_secs(3);
 
 /// The tools agents may use without asking: all of this server's but
 /// `approve`, which answers for a permission request.
-pub const ALLOWED_TOOLS: [&str; 6] = [
+pub const ALLOWED_TOOLS: [&str; 7] = [
     "mcp__grenadine__list_terminals",
     "mcp__grenadine__read_terminal",
     "mcp__grenadine__wait_for_terminal",
     "mcp__grenadine__show_image",
     "mcp__grenadine__update_prs",
     "mcp__grenadine__land_on_checkout",
+    "mcp__grenadine__session_pr",
 ];
 
 fn reply(id: &Value, result: Value) -> Response {
@@ -297,6 +298,15 @@ pub async fn handle(
                 "description": "Rebases this session's commits onto the user's checkout \
                     of the repository and fast-forwards the checkout to them.",
                 "inputSchema": {"type": "object", "properties": {}},
+            }, {
+                "name": "session_pr",
+                "description": "Describes the pull request this session started from: its \
+                    number, title, URL, state, branches, the commit range of its own \
+                    changes (from the merge base with its target branch, which for a \
+                    stacked pull request is the parent's branch), this session's own \
+                    commits, and its stack.",
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {"readOnlyHint": true},
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -356,6 +366,7 @@ pub async fn handle(
                     update_prs(&state, &id, &format!("update_prs-{rpc_id}"), args).await
                 }
                 "land_on_checkout" => land_on_checkout(&state, &id).await,
+                "session_pr" => session_pr(&state, &session).await,
                 _ => terminal_tool(&state, &id, name, args, backend).await,
             };
             let (text, failed) = match result {
@@ -487,6 +498,55 @@ async fn land_on_checkout(state: &Arc<State>, id: &str) -> anyhow::Result<String
         (Landed::Checkout { sha }, _) => Ok(format!("Landed on the checkout at {sha}.")),
         _ => bail!("the session didn't land on the checkout"),
     }
+}
+
+/// The pull request the session started from, as JSON: its detail, the
+/// range of its own commits, the session's own range, and its stack.
+async fn session_pr(state: &Arc<State>, session: &AgentSession) -> anyhow::Result<String> {
+    let Some(ctx) = agent::session_pr(state, session).await else {
+        return Ok("This session didn't start from a pull request.".into());
+    };
+    let mut out = json!({
+        "number": ctx.number,
+        "base_sha": ctx.base_sha,
+        "merge_base": ctx.merge_base,
+        "pr_range": ctx
+            .merge_base
+            .as_ref()
+            .map(|m| format!("{m}..{}", ctx.base_sha)),
+        "session_range": format!("{}..HEAD", ctx.base_sha),
+    });
+    if let Some(detail) = &ctx.detail {
+        out["title"] = json!(detail.summary.title);
+        out["url"] = json!(detail.summary.url);
+        out["state"] = json!(detail.summary.state);
+        out["base_ref"] = json!(detail.base_ref);
+        out["head_ref"] = json!(detail.head_ref);
+        out["head"] = json!(
+            detail
+                .versions
+                .iter()
+                .rev()
+                .find(|v| !v.missing)
+                .map(|v| v.sha.as_str())
+        );
+        if let Some(stack) = &detail.stack {
+            out["stack"] = json!({
+                "base_ref": stack.base_ref,
+                "prs": stack
+                    .prs
+                    .iter()
+                    .map(|p| json!({
+                        "number": p.number,
+                        "title": p.title,
+                        "state": p.state,
+                        "parent": p.parent,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+        }
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 /// Runs one of the tools that read the session's terminals.
@@ -646,7 +706,8 @@ mod tests {
                 "wait_for_terminal",
                 "show_image",
                 "update_prs",
-                "land_on_checkout"
+                "land_on_checkout",
+                "session_pr"
             ]
         );
         let (_, body) = call(
@@ -1157,6 +1218,105 @@ mod tests {
         assert_eq!(
             state.db.agent_image(id).unwrap(),
             Some(("image/png".into(), b"\x89PNG\r\n\x1a\nrest".to_vec()))
+        );
+    }
+
+    /// `session_pr` describes the PR the session started from, with the
+    /// range of its own commits and its stack; a session without one
+    /// gets a plain answer.
+    #[tokio::test]
+    async fn session_pr_describes_the_starting_pr() {
+        use grenadine_core::api::{Stack, StackPr, Version, VersionKind};
+        let base = "b".repeat(40);
+        let merge_base = "a".repeat(40);
+        let no_pr = state();
+        let state = state_with(|s| {
+            s.pr = Some(7);
+            s.base_sha = base.clone();
+        });
+        let stack_pr = |number: u64, title: &str, parent: Option<u64>, head_oid: String| StackPr {
+            number,
+            title: title.into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: "u".into(),
+            updated_at: "t".into(),
+            head_oid,
+            parent,
+            queued: false,
+        };
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: PrKey {
+                        repo: "o/n".into(),
+                        number: 7,
+                    },
+                    title: "The PR".into(),
+                    body: String::new(),
+                    author: "me".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    queued: false,
+                    url: "https://github.com/o/n/pull/7".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "parent-branch".into(),
+                    head_ref: "feature".into(),
+                    head_oid: base.clone(),
+                    ci: None,
+                    review: None,
+                    review_error: None,
+                },
+                &[Version {
+                    number: 1,
+                    sha: base.clone(),
+                    merge_base: Some(merge_base.clone()),
+                    kind: VersionKind::Initial,
+                    pushed_at: None,
+                    pushed_by: None,
+                    pushed_by_is_guess: false,
+                    missing: false,
+                }],
+                &[],
+                Some(&Stack {
+                    base_ref: "main".into(),
+                    prs: vec![
+                        stack_pr(6, "Parent", None, "h".into()),
+                        stack_pr(7, "The PR", Some(6), base.clone()),
+                    ],
+                    more_ancestors: false,
+                    more_descendants: false,
+                }),
+                false,
+                None,
+            )
+            .unwrap();
+
+        let (text, failed) = tool(&state, "session_pr", json!({})).await;
+        assert!(!failed, "{text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["number"], 7);
+        assert_eq!(out["title"], "The PR");
+        assert_eq!(out["url"], "https://github.com/o/n/pull/7");
+        assert_eq!(out["state"], "OPEN");
+        assert_eq!(out["base_ref"], "parent-branch");
+        assert_eq!(out["head_ref"], "feature");
+        assert_eq!(out["head"], base);
+        assert_eq!(out["merge_base"], merge_base);
+        assert_eq!(out["pr_range"], format!("{merge_base}..{base}"));
+        assert_eq!(out["session_range"], format!("{base}..HEAD"));
+        assert_eq!(out["stack"]["prs"][0]["number"], 6);
+        assert_eq!(out["stack"]["prs"][1]["parent"], 6);
+
+        let answer = tool(&no_pr, "session_pr", json!({})).await;
+        assert_eq!(
+            answer,
+            (
+                "This session didn't start from a pull request.".into(),
+                false
+            )
         );
     }
 }

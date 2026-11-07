@@ -481,6 +481,14 @@ impl Repo {
         Ok(())
     }
 
+    /// Points `branch`'s upstream at `upstream_ref`, a ref in this clone
+    /// (a `.` remote), so `@{u}` resolves to it in the branch's worktrees.
+    pub fn set_upstream(&self, branch: &str, upstream_ref: &str) -> Result<()> {
+        self.git(&["config", &format!("branch.{branch}.remote"), "."])?;
+        self.git(&["config", &format!("branch.{branch}.merge"), upstream_ref])?;
+        Ok(())
+    }
+
     /// Deletes a local branch, merged or not. It may be gone already.
     pub fn branch_delete(&self, branch: &str) -> Result<()> {
         if self.git_ok(&[
@@ -865,6 +873,33 @@ pub(crate) mod tests {
             .update_refs(&[], std::slice::from_ref(&v1_ref))
             .unwrap();
         assert!(!f.clone.refs(REF_PREFIX).unwrap().contains_key(&v1_ref));
+    }
+
+    /// `set_upstream` makes `@{u}` the given ref in the branch's
+    /// worktree, and deleting the branch removes its `branch.*` config.
+    #[test]
+    fn set_upstream_resolves_in_the_worktree() {
+        let f = fixture();
+        let main = run(&f.upstream, &["rev-parse", "HEAD"]);
+        let target = format!("{REF_PREFIX}/1/target");
+        f.clone
+            .update_refs(&[(target.clone(), main.clone())], &[])
+            .unwrap();
+        let worktree = f._dir.path().join("w");
+        f.clone.worktree_add(&worktree, "b", &main).unwrap();
+        f.clone.set_upstream("b", &target).unwrap();
+        assert_eq!(
+            run(&worktree, &["rev-parse", "--symbolic-full-name", "@{u}"]),
+            target
+        );
+        assert_eq!(run(&worktree, &["rev-parse", "@{u}"]), main);
+        f.clone.worktree_remove(&worktree, "b").unwrap();
+        assert!(f.clone.git(&["config", "--get", "branch.b.merge"]).is_err());
+        assert!(
+            f.clone
+                .git(&["config", "--get", "branch.b.remote"])
+                .is_err()
+        );
     }
 
     #[test]
