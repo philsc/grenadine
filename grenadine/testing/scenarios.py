@@ -518,6 +518,9 @@ def versions_cases(gh: FakeGitHub) -> Versions:
         v = [repo.commit("Change settings 5 to 7", {shared: settings(PR_SETTINGS)})]
         repo.push(branch)
         pr = prs[title] = repo.open_pr(title, head=branch)
+        if not edit:
+            # A thread on a line the diff's context doesn't show.
+            repo.comment(pr, author=OTHER, body="Is 30 right?", path=shared, line=30)
 
         repo.checkout("main")
         repo.commit(

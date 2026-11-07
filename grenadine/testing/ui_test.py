@@ -2929,6 +2929,102 @@ class VersionsTest(ServerTestCase):
         )
         expect(outside).to_contain_text("old line 50")
 
+    def test_expand_context_buttons(self) -> None:
+        # v1 → v2 of shared.py changes two far-apart lines, so its diff
+        # has a short gap at the top, a long one in the middle, and a
+        # short one at the end.
+        self.open(scenarios.REBASE_AND_EDIT)
+        self.choose(1, 2)
+        file = self.file("rebase_and_edit/shared.py")
+        skips = file.locator("tr.skip")
+        expect(skips).to_have_count(3)
+        expect(skips.nth(1)).to_contain_text("37 unchanged lines")
+        # The short gaps get one "expand all"; the long one gets both
+        # directions.
+        expect(file.get_by_role("button", name="Expand all")).to_have_count(2)
+        up = file.get_by_role("button", name="Expand up")
+        down = file.get_by_role("button", name="Expand down")
+        expect(up).to_have_count(1)
+        expect(down).to_have_count(1)
+
+        # Each click reveals 20 more lines; under 20 left the row offers
+        # only "expand all".
+        shown = file.locator("tr.line").count()
+        up.click()
+        expect(file.locator("tr.line")).to_have_count(shown + 20)
+        expect(skips.nth(1)).to_contain_text("17 unchanged lines")
+        expect(up).to_have_count(0)
+        expect(down).to_have_count(0)
+        skips.nth(1).get_by_role("button", name="Expand all").click()
+        # The gap is fully shown: its row is gone and the hunks joined.
+        expect(skips).to_have_count(2)
+        # Both sides of the split view show the revealed line.
+        expect(
+            file.locator("td.code", has_text=exactly("SETTING_30 = 30"))
+        ).to_have_count(2)
+
+        # Toggling the view keeps the expansion.
+        self.page.get_by_label("Side by side").uncheck()
+        expect(skips).to_have_count(2)
+        expect(
+            file.locator("tr.line td.code", has_text=exactly("SETTING_30 = 30"))
+        ).to_have_count(1)
+
+    def test_expand_at_the_file_start(self) -> None:
+        # v5 → v6 of steps.py changes one line near the end: a gap of 21
+        # lines at the top, which only "expand up" can reach.
+        self.open(scenarios.GROW)
+        self.choose(5, 6)
+        file = self.file(scenarios.STEPS_PY)
+        skips = file.locator("tr.skip")
+        expect(skips).to_have_count(1)
+        expect(skips).to_contain_text("21 unchanged lines")
+        up = file.get_by_role("button", name="Expand up")
+        expect(up).to_have_count(1)
+        expect(file.get_by_role("button", name="Expand down")).to_have_count(0)
+        expect(file.get_by_role("button", name="Expand all")).to_have_count(0)
+        up.click()
+        expect(skips).to_contain_text("1 unchanged lines")
+        file.get_by_role("button", name="Expand all").click()
+        expect(skips).to_have_count(0)
+        expect(
+            file.locator(
+                "td.code",
+                has_text=exactly('"""One function per pushed version."""'),
+            )
+        ).to_have_count(2)
+
+    def test_expanding_shows_a_hidden_thread(self) -> None:
+        self.open(scenarios.REBASE)
+        file = self.file("rebase/shared.py")
+        outside = file.locator(".outside-comments")
+        expect(outside).to_contain_text("Is 30 right?")
+        skips = file.locator("tr.skip")
+        down = file.get_by_role("button", name="Expand down")
+        down.click()
+        expect(outside).to_have_count(0)
+        expect(
+            file.locator("tr.comment-row .thread", has_text="Is 30 right?")
+        ).to_have_count(1)
+        # The gap after the change hides 50 lines; two more clicks of 20
+        # and an "expand all" show it all.
+        expect(skips.nth(1)).to_contain_text("30 unchanged lines")
+        down.click()
+        expect(skips.nth(1)).to_contain_text("10 unchanged lines")
+        skips.nth(1).get_by_role("button", name="Expand all").click()
+        expect(skips).to_have_count(1)
+
+        # A revealed line takes a comment like any context line.
+        file.locator('td.ln.commentable[data-side="R"]', has_text=exactly("30")).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Thanks, it is.")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        pr = self.cases.prs[scenarios.REBASE]
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.line, c.side), (30, "RIGHT"))
+
     def test_rebase_only_changes_are_hidden(self) -> None:
         self.open(scenarios.REBASE)
         self.choose(1, 2)

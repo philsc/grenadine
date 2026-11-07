@@ -504,6 +504,8 @@ impl Drop for RescrollGuard {
 /// Everything needed to draw a file's diff.
 struct Layout {
     shape: Arc<Shape>,
+    hunks: Vec<Hunk>,
+    skipped_after: Option<diff::Skip>,
     old_html: Vec<String>,
     new_html: Vec<String>,
     /// The file lines that the first old and new line are, when the texts
@@ -516,11 +518,14 @@ fn text(b: &Option<Arc<Blob>>) -> Option<&str> {
     b.as_ref().and_then(|b| b.text.as_deref())
 }
 
-/// What a diff looks like apart from its lines' HTML, so that it is worked
-/// out once whether the lines are highlighted yet or not.
+/// What a diff looks like apart from its lines' HTML and its expanded
+/// gaps, so that it is worked out once whether the lines are highlighted
+/// yet or not.
 struct Shape {
-    hunks: Vec<Hunk>,
-    skipped_after: usize,
+    blocks: Vec<rebase::Block>,
+    aligned: Vec<Vec<Aligned>>,
+    old_len: usize,
+    new_len: usize,
     /// Per old and new line: whether the change is the PR's, the rebase's,
     /// or the two mixed. Unchanged lines are `Kind::Pr`.
     old_kinds: Vec<rebase::Kind>,
@@ -622,7 +627,7 @@ fn shape(file: &FileData, rebase_older: bool) -> Shape {
     let new = rebase::lines(text(&file.new).unwrap_or_default());
     let blocks = rebase::change_blocks(&old, &new);
     let (old_kinds, new_kinds) = line_kinds(file, &old, &new, &blocks, rebase_older);
-    shape_lines(&old, &new, &blocks, old_kinds, new_kinds)
+    shape_lines(&old, &new, blocks, old_kinds, new_kinds)
 }
 
 /// Works out the diff from `old` to `new` split into `blocks`, with the
@@ -630,12 +635,11 @@ fn shape(file: &FileData, rebase_older: bool) -> Shape {
 fn shape_lines(
     old: &[&str],
     new: &[&str],
-    blocks: &[rebase::Block],
+    blocks: Vec<rebase::Block>,
     old_kinds: Vec<rebase::Kind>,
     new_kinds: Vec<rebase::Kind>,
 ) -> Shape {
     let aligned: Vec<Vec<Aligned>> = blocks.iter().map(|b| inline::align(old, new, b)).collect();
-    let hunks = diff::hunks(blocks, &aligned, old.len(), new.len(), CONTEXT);
     let marks = aligned
         .iter()
         .flatten()
@@ -653,8 +657,10 @@ fn shape_lines(
         })
         .collect();
     Shape {
-        skipped_after: diff::skipped_after(&hunks, old.len()),
-        hunks,
+        blocks,
+        aligned,
+        old_len: old.len(),
+        new_len: new.len(),
         old_kinds,
         new_kinds,
         marks,
@@ -668,14 +674,20 @@ fn shape_texts(old: &str, new: &str) -> Shape {
     shape_lines(
         &old,
         &new,
-        &blocks,
+        blocks,
         vec![rebase::Kind::Pr; old.len()],
         vec![rebase::Kind::Pr; new.len()],
     )
 }
 
-/// Lays out `shape` with the given lines' HTML, highlighted or plain.
-fn layout(shape: Arc<Shape>, mut old_html: Vec<String>, mut new_html: Vec<String>) -> Layout {
+/// Lays out `shape` with the given lines' HTML, highlighted or plain, and
+/// the gaps' expansion state.
+fn layout(
+    shape: Arc<Shape>,
+    expand: &[diff::Expand],
+    mut old_html: Vec<String>,
+    mut new_html: Vec<String>,
+) -> Layout {
     for m in &shape.marks {
         if let Some(h) = old_html.get_mut(m.old) {
             *h = mark(h, &m.dels, "word-del");
@@ -684,8 +696,19 @@ fn layout(shape: Arc<Shape>, mut old_html: Vec<String>, mut new_html: Vec<String
             *h = mark(h, &m.inss, "word-add");
         }
     }
+    let hunks = diff::hunks(
+        &shape.blocks,
+        &shape.aligned,
+        shape.old_len,
+        shape.new_len,
+        CONTEXT,
+        expand,
+    );
+    let skipped_after = diff::skipped_after(&shape.blocks, expand, shape.old_len, CONTEXT);
     Layout {
         shape,
+        hunks,
+        skipped_after,
         old_html,
         new_html,
         old_start: 0,
@@ -967,13 +990,19 @@ fn FileView(
         .filter(|p| p.anchor == Anchor::File)
         .cloned()
         .collect();
+    // The lines revealed by the file's "expand" buttons, per gap.
+    let expand = RwSignal::new(vec![diff::Expand::default(); initial.blocks + 1]);
     let body = {
         let file = file.clone();
         let comments = comments.clone();
         let fc = fc.clone();
         // Laid out plain on first expansion, and again once both sides are
-        // highlighted or the rebase mode flips; the flags say which.
-        let cache = StoredValue::new_local(None::<(bool, bool, Arc<Layout>)>);
+        // highlighted, the rebase mode flips, or the gaps' expansion
+        // changes; the key says which.
+        let cache = StoredValue::new_local(None::<(bool, bool, Vec<diff::Expand>, Arc<Layout>)>);
+        // The mode the expansion belongs to; it resets when the mode
+        // changes the diff's blocks.
+        let expand_mode = StoredValue::new_local(None::<bool>);
         move || {
             if !expanded.get() {
                 return ().into_any();
@@ -991,6 +1020,12 @@ fn FileView(
                 return view! { <p class="binary muted">{format!("Binary file: {} → {} bytes", size(&file.old), size(&file.new))}</p> }.into_any();
             }
             let mode = rebase_older.get();
+            // The other mode reshapes the diff; the gaps' expansion
+            // doesn't carry over.
+            if expand_mode.get_value() != Some(mode) {
+                expand_mode.set_value(Some(mode));
+                expand.set(vec![diff::Expand::default(); file.stats(mode).blocks + 1]);
+            }
             // The left side is the rebased text in rebased mode, the older
             // version's own blob otherwise.
             let left_lines = match mode.then_some(rebased_lines.as_ref()).flatten() {
@@ -1002,15 +1037,16 @@ fn FileView(
                 left_lines.request(true);
                 new_lines.request(true);
             }
+            let exp = expand.get();
             let cached = cache.with_value(|c| {
                 c.as_ref()
-                    .filter(|(h, m, _)| *h == highlighted && *m == mode)
-                    .map(|(_, _, l)| l.clone())
+                    .filter(|(h, m, e, _)| *h == highlighted && *m == mode && *e == exp)
+                    .map(|(_, _, _, l)| l.clone())
             });
             let l = cached.unwrap_or_else(|| {
                 let shape = cached_shape(&file, &left_lines.id, &new_lines.id, mode);
-                let l = Arc::new(layout(shape, left_lines.html(), new_lines.html()));
-                cache.set_value(Some((highlighted, mode, l.clone())));
+                let l = Arc::new(layout(shape, &exp, left_lines.html(), new_lines.html()));
+                cache.set_value(Some((highlighted, mode, exp.clone(), l.clone())));
                 l
             });
             // In rebased mode the left side's lines are the merged text:
@@ -1020,9 +1056,25 @@ fn FileView(
                 .flatten();
             let (placed, dropped) = remap_left(&comments, map.as_deref());
             if side_by_side.get() {
-                split_view(&l, &placed, &dropped, inline_changes, fc.as_ref()).into_any()
+                split_view(
+                    &l,
+                    &placed,
+                    &dropped,
+                    inline_changes,
+                    fc.as_ref(),
+                    Some(expand),
+                )
+                .into_any()
             } else {
-                unified_view(&l, &placed, &dropped, inline_changes, fc.as_ref()).into_any()
+                unified_view(
+                    &l,
+                    &placed,
+                    &dropped,
+                    inline_changes,
+                    fc.as_ref(),
+                    Some(expand),
+                )
+                .into_any()
             }
         }
     };
@@ -1140,11 +1192,12 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
                     new_start: f.new_start,
                     ..layout(
                         Arc::new(shape_texts(&f.old, &f.new)),
+                        &[],
                         highlight_lines(&path, &f.old),
                         highlight_lines(&path, &f.new),
                     )
                 };
-                unified_view(&l, &[], &[], inline_changes, None)
+                unified_view(&l, &[], &[], inline_changes, None, None)
             }).collect_view()}
         </div>
     }
@@ -1219,12 +1272,47 @@ struct Row {
 }
 
 impl Row {
-    fn skip(n: usize, colspan: u32) -> Option<Row> {
-        (n > 0).then(|| Row {
-            class: "skip".to_owned(),
-            cells: format!("<td colspan=\"{colspan}\">⋯ {n} unchanged lines</td>"),
-            threads: Vec::new(),
-            lines: Vec::new(),
+    /// A hidden stretch's row: how many lines it hides and, unless
+    /// `expandable` is false, the buttons that reveal them. `gaps` is the
+    /// file's gap count, so the first and last gaps offer only the
+    /// direction that has lines to reveal.
+    fn skip(skip: &diff::Skip, gaps: usize, colspan: u32, expandable: bool) -> Option<Row> {
+        let n = skip.old.len();
+        (n > 0).then(|| {
+            let mut buttons = String::new();
+            if expandable {
+                let (first, last) = (skip.gap == 0, skip.gap == gaps - 1);
+                // Gap k is after block k - 1 and before block k; a file
+                // with no blocks only expands down from its start.
+                let dirs: &[&str] = if n <= EXPAND_LINES {
+                    &["all"]
+                } else if last {
+                    &["down"]
+                } else if first {
+                    &["up"]
+                } else {
+                    &["up", "down"]
+                };
+                for dir in dirs {
+                    let (glyph, label) = match *dir {
+                        "up" => ("↑", "Expand up"),
+                        "down" => ("↓", "Expand down"),
+                        _ => ("↕", "Expand all"),
+                    };
+                    let _ = write!(
+                        buttons,
+                        "<button type=\"button\" class=\"expand\" data-gap=\"{}\" data-dir=\"{dir}\" \
+                         title=\"{label}\" aria-label=\"{label}\">{glyph}</button>",
+                        skip.gap
+                    );
+                }
+            }
+            Row {
+                class: "skip".to_owned(),
+                cells: format!("<td colspan=\"{colspan}\">{buttons}⋯ {n} unchanged lines</td>"),
+                threads: Vec::new(),
+                lines: Vec::new(),
+            }
         })
     }
 
@@ -1315,13 +1403,18 @@ fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyVie
     }
 }
 
+/// The lines an "expand" button reveals per click.
+const EXPAND_LINES: usize = 20;
+
 /// A diff table of `rows`. Clicking a commentable line number opens a
-/// comment box under its row.
+/// comment box under its row; clicking an "expand" button reveals hidden
+/// lines through `expand`.
 fn diff_table(
     class: &'static str,
     rows: Vec<Row>,
     inline_changes: Signal<bool>,
     fc: Option<FileCommenting>,
+    expand: Option<RwSignal<Vec<diff::Expand>>>,
 ) -> impl IntoView + use<> {
     let rows = Arc::new(rows);
     let each = {
@@ -1337,6 +1430,31 @@ fn diff_table(
     let on_click = {
         let fc = fc.clone();
         move |ev: leptos::ev::MouseEvent| {
+            let button = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .and_then(|t| t.closest("button[data-gap]").ok().flatten());
+            if let (Some(expand), Some(button)) = (expand, button) {
+                if let Some(gap) = button
+                    .get_attribute("data-gap")
+                    .and_then(|g| g.parse::<usize>().ok())
+                {
+                    expand.update(|e| {
+                        if let Some(e) = e.get_mut(gap) {
+                            match button.get_attribute("data-dir").as_deref() {
+                                Some("up") => e.above_next += EXPAND_LINES,
+                                Some("down") => e.below_prev += EXPAND_LINES,
+                                _ => {
+                                    e.below_prev = usize::MAX;
+                                    e.above_next = usize::MAX;
+                                }
+                            }
+                        }
+                    });
+                }
+                ev.stop_propagation();
+                return;
+            }
             if let Some(fc) = &fc {
                 fc.open_clicked(&ev);
             }
@@ -1425,11 +1543,16 @@ fn unified_view(
     dropped: &[Placed],
     inline_changes: Signal<bool>,
     fc: Option<&FileCommenting>,
+    expand: Option<RwSignal<Vec<diff::Expand>>>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows = Vec::new();
-    for h in &l.shape.hunks {
-        rows.extend(Row::skip(h.skipped_before, 4));
+    let gaps = l.shape.blocks.len() + 1;
+    let expandable = expand.is_some();
+    for h in &l.hunks {
+        if let Some(skip) = &h.skipped_before {
+            rows.extend(Row::skip(skip, gaps, 4, expandable));
+        }
         for line in &h.lines {
             let (old, new, kind, line_kind, code) = match *line {
                 Line::Context { old, new } => (
@@ -1481,10 +1604,12 @@ fn unified_view(
             ));
         }
     }
-    rows.extend(Row::skip(l.shape.skipped_after, 4));
+    if let Some(skip) = &l.skipped_after {
+        rows.extend(Row::skip(skip, gaps, 4, expandable));
+    }
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
-        {diff_table("diff unified", rows, inline_changes, fc.cloned())}
+        {diff_table("diff unified", rows, inline_changes, fc.cloned(), expand)}
         {outside}
     }
 }
@@ -1495,11 +1620,16 @@ fn split_view(
     dropped: &[Placed],
     inline_changes: Signal<bool>,
     fc: Option<&FileCommenting>,
+    expand: Option<RwSignal<Vec<diff::Expand>>>,
 ) -> impl IntoView + use<> {
     let mut lc = LineComments::new(comments);
     let mut rows = Vec::new();
-    for h in &l.shape.hunks {
-        rows.extend(Row::skip(h.skipped_before, 4));
+    let gaps = l.shape.blocks.len() + 1;
+    let expandable = expand.is_some();
+    for h in &l.hunks {
+        if let Some(skip) = &h.skipped_before {
+            rows.extend(Row::skip(skip, gaps, 4, expandable));
+        }
         for r in &h.rows {
             // Each side's line has its own kind; a row is upstream when
             // every changed side is, and mixed when any side is.
@@ -1539,10 +1669,12 @@ fn split_view(
             ));
         }
     }
-    rows.extend(Row::skip(l.shape.skipped_after, 4));
+    if let Some(skip) = &l.skipped_after {
+        rows.extend(Row::skip(skip, gaps, 4, expandable));
+    }
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
-        {diff_table("diff split", rows, inline_changes, fc.cloned())}
+        {diff_table("diff split", rows, inline_changes, fc.cloned(), expand)}
         {outside}
     }
 }
