@@ -206,7 +206,9 @@ pub fn Topbar(
     view! {
         <header class="topbar">
             <span class="topbar-left">
-                <a class="topbar-brand" href="#/">"grenadine"</a>
+                <a class="topbar-brand" href="#/" title="grenadine">
+                    <img src="/favicon.svg" alt="grenadine" />
+                </a>
                 <nav class="topbar-tabs">
                     <a href=move || href(Tab::Inboxes) class:active=move || active(Tab::Inboxes)>
                         "Inboxes"
