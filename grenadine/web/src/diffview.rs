@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, NewThread, PrKey, Side, WorktreeFile};
 use grenadine_core::diff::{self, Hunk, Line};
@@ -425,6 +427,77 @@ fn file_id(path: &str) -> String {
 fn scroll_to(path: &str) {
     if let Some(el) = document().get_element_by_id(&file_id(path)) {
         el.scroll_into_view();
+    }
+}
+
+/// Scrolls `path`'s file to its scroll-margin offset and keeps scrolling
+/// until it stays there: for a while after a collapse the layout keeps
+/// moving the file, since files the browser skipped lay out at their real
+/// heights once they're near the viewport. User input stops it.
+fn rescroll_to(path: String) {
+    rescroll_step(path, 60, 0, Rc::new(RescrollGuard::new()));
+}
+
+fn rescroll_step(path: String, tries: u8, stable: u8, guard: Rc<RescrollGuard>) {
+    if guard.cancelled.get() {
+        return;
+    }
+    let Some(section) = document().get_element_by_id(&file_id(&path)) else {
+        return;
+    };
+    let Some(main) = section.closest(".main").ok().flatten() else {
+        return;
+    };
+    let margin = window()
+        .get_computed_style(&section)
+        .ok()
+        .flatten()
+        .and_then(|s| s.get_property_value("scroll-margin-top").ok())
+        .and_then(|v| v.strip_suffix("px").and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0);
+    let top = section.get_bounding_client_rect().top();
+    let target = main.get_bounding_client_rect().top() + margin;
+    let stable = if (top - target).abs() <= 1.0 {
+        stable + 1
+    } else {
+        section.scroll_into_view();
+        0
+    };
+    if stable >= 8 || tries == 0 {
+        return;
+    }
+    set_timeout(
+        move || rescroll_step(path, tries - 1, stable, guard),
+        Duration::from_millis(50),
+    );
+}
+
+/// The user scroll intents that stop a `rescroll_to` loop. Dropping the
+/// guard removes the listeners.
+struct RescrollGuard {
+    cancelled: Rc<Cell<bool>>,
+    handles: Vec<WindowListenerHandle>,
+}
+
+impl RescrollGuard {
+    fn new() -> Self {
+        let cancelled = Rc::new(Cell::new(false));
+        let handles = ["wheel", "touchstart", "keydown", "mousedown"]
+            .into_iter()
+            .map(|event| {
+                let cancelled = cancelled.clone();
+                window_event_listener_untyped(event, move |_| cancelled.set(true))
+            })
+            .collect();
+        Self { cancelled, handles }
+    }
+}
+
+impl Drop for RescrollGuard {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.remove();
+        }
     }
 }
 
@@ -961,9 +1034,27 @@ fn FileView(
             <header class="file-header" on:click={
                 let path = c.path().to_owned();
                 move |_| {
+                    // The header is stuck when the file's top has scrolled
+                    // above it. Collapsing such a file would leave the view
+                    // somewhere in the files below, so the collapsed file is
+                    // scrolled back to the top.
+                    let section = document().get_element_by_id(&file_id(&path));
+                    let stuck = section
+                        .as_ref()
+                        .and_then(|s| {
+                            s.query_selector(".file-header").ok().flatten().map(|h| {
+                                s.get_bounding_client_rect().top()
+                                    < h.get_bounding_client_rect().top()
+                            })
+                        })
+                        .unwrap_or(false);
+                    let collapsing = expanded.get_untracked();
                     expanded.update(|e| *e = !*e);
                     if let Some(folds) = &folds {
                         folds.set(&path, expanded.get_untracked());
+                    }
+                    if collapsing && stuck {
+                        rescroll_to(path.clone());
                     }
                 }
             }>

@@ -9,7 +9,7 @@ use grenadine_core::api::{
     Person, PrDetail, PrKey, Review, ReviewComment, ReviewInfo, Side, Stack, Version, VersionKind,
 };
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, closure::Closure};
 
 use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
 use crate::diffview::Commenting;
@@ -668,6 +668,55 @@ fn PrBody(
         }
     };
 
+    // File headers stick just below the toolbar, so its height is kept in
+    // a CSS variable. Wrapping and the review panel change that height. A
+    // sync rebuilds PrBody and the old instance's cleanup can run after
+    // the new one has set the variable, so it lives on the document root
+    // and is never removed; the CSS only reads it inside `.pr`.
+    let toolbar = NodeRef::<leptos::html::Div>::new();
+    let watching = StoredValue::new_local(None::<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>);
+    Effect::new(move |_| {
+        let Some(toolbar) = toolbar.get() else {
+            return;
+        };
+        if watching.with_value(|w| w.is_some()) {
+            return;
+        }
+        let el = toolbar.clone();
+        let root = || {
+            document()
+                .document_element()
+                .map(|e| e.unchecked_into::<web_sys::HtmlElement>())
+        };
+        let update = move || {
+            // A remounted PrBody's observer can still fire on its
+            // detached toolbar, which reports a height of 0.
+            if !el.is_connected() {
+                return;
+            }
+            if let Some(root) = root() {
+                let _ = root
+                    .style()
+                    .set_property("--toolbar-height", &format!("{}px", el.offset_height()));
+            }
+        };
+        // The observer's first callback is asynchronous; without this
+        // the variable stays unset until it fires.
+        update();
+        let on_resize = Closure::<dyn FnMut()>::new(update);
+        if let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+            observer.observe(&toolbar);
+            watching.set_value(Some((observer, on_resize)));
+        }
+    });
+    on_cleanup(move || {
+        watching.try_with_value(|w| {
+            if let Some((observer, _)) = w {
+                observer.disconnect();
+            }
+        });
+    });
+
     view! {
         <article class="pr">
             <header class="pr-header">
@@ -691,7 +740,7 @@ fn PrBody(
             {review.map(conversation)}
             {review.filter(|_| s.state == "OPEN").map(|info| merge_box(info, merge_target(&pr)))}
             {merge_warning()}
-            <div class="toolbar">
+            <div class="toolbar" node_ref=toolbar>
                 <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() reviewed=reviewed chosen=chosen selection=selection />
                 {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
                     <ReviewPanel

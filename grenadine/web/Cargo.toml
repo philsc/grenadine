@@ -43,6 +43,8 @@ web-sys = { workspace = true, features = [
   "BinaryType",
   "CloseEvent",
   "ResizeObserver",
+  "CssStyleDeclaration",
+  "DomRect",
   "ClipboardEvent",
   "DragEvent",
   "DataTransfer",
