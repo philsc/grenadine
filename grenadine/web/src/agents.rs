@@ -2776,6 +2776,22 @@ fn Transcript(
                 .collect::<HashMap<_, _>>()
         })
     });
+    // The `AskUserQuestion` answers the user gave, by tool use id.
+    let given_answers = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::ApprovalResolved {
+                        id,
+                        answers: Some(answers),
+                        ..
+                    } => Some((id.clone(), answers.clone())),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+    });
     // The plan the last turn ended on, unanswered. Only it can still be
     // answered: once a server restart cuts the turn off, by starting a new
     // turn.
@@ -3031,6 +3047,7 @@ fn Transcript(
                                     repo=repo.clone()
                                     questions=questions
                                     resolved=resolved
+                                    answers=given_answers
                                     waiting=waiting
                                 />
                             }.into_any()
@@ -3318,6 +3335,8 @@ fn QuestionCard(
     repo: String,
     questions: Vec<Question>,
     resolved: Memo<HashMap<String, bool>>,
+    /// The answers the user gave, by tool use id.
+    answers: Memo<HashMap<String, BTreeMap<String, Vec<String>>>>,
     waiting: Signal<bool>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
@@ -3329,7 +3348,7 @@ fn QuestionCard(
         .collect();
     let questions = StoredValue::new(questions);
     let picks = StoredValue::new(picks);
-    let answers = move || {
+    let collect_answers = move || {
         questions.with_value(|qs| {
             picks.with_value(|ps| {
                 qs.iter()
@@ -3342,7 +3361,7 @@ fn QuestionCard(
             })
         })
     };
-    let complete = move || answers().values().all(|a| !a.is_empty());
+    let complete = move || collect_answers().values().all(|a| !a.is_empty());
     let answer = {
         let tool = tool.clone();
         move |allow: bool| {
@@ -3352,7 +3371,7 @@ fn QuestionCard(
                 message: None,
                 mode: None,
                 option: None,
-                answers: allow.then(answers),
+                answers: allow.then(collect_answers),
             };
             send_approval(agent.clone(), approval, busy, error);
         }
@@ -3454,10 +3473,18 @@ fn QuestionCard(
                 questions.with_value(|qs| qs.iter().map(|q| {
                     let (title, body) = question_parts(&q.question);
                     let body = body.map(|b| markdown::to_html(b, &repo));
+                    let given = answers.with(|a| {
+                        a.get(&name.get_value())
+                            .and_then(|m| m.get(&q.question))
+                            .cloned()
+                    });
                     view! {
                         <p class="muted">{title.to_owned()}</p>
                         {body.map(|html| view! {
                             <div class="question-body markdown" inner_html=html></div>
+                        })}
+                        {given.filter(|v| !v.is_empty()).map(|v| view! {
+                            <p class="question-answer"><strong>{v.join(", ")}</strong></p>
                         })}
                     }
                 }).collect_view()).into_any()

@@ -1424,6 +1424,7 @@ pub fn interrupt(state: &State, id: &str) {
                 id: tool_use,
                 allow: false,
                 message: None,
+                answers: None,
             },
         );
     }
@@ -1580,6 +1581,7 @@ fn deny_unattended(
             id: tool_use.to_owned(),
             allow: false,
             message: Some(UNATTENDED_DENIAL.to_owned()),
+            answers: None,
         },
     ] {
         if let Err(e) = emit(state, id, kind) {
@@ -1609,6 +1611,11 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
     } else {
         decision.message.clone()
     };
+    let answers = if allow {
+        decision.answers.clone()
+    } else {
+        None
+    };
     if tx.send(decision).is_err() {
         return Ok(false);
     }
@@ -1619,6 +1626,7 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
             id: tool_use.to_owned(),
             allow,
             message,
+            answers,
         },
     )?;
     if !still_pending {

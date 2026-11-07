@@ -1775,6 +1775,10 @@ pub enum AgentEventKind {
         /// What the user wrote when sending the request back.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// For `AskUserQuestion`: the answers the user gave, as in
+        /// `Approval::answers`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<BTreeMap<String, Vec<String>>>,
     },
     /// A turn ended; `error` is set when it failed. `cost` is in the
     /// session's `cost_unit`.
@@ -1888,6 +1892,45 @@ mod tests {
         let back: Vec<RequestedReviewer> =
             serde_json::from_str(&serde_json::to_string(&reviewers).unwrap()).unwrap();
         assert_eq!(back, reviewers);
+    }
+
+    /// Events stored before `ApprovalResolved` carried answers still
+    /// parse, and answers round-trip.
+    #[test]
+    fn approval_resolved_answers() {
+        let legacy: AgentEventKind =
+            serde_json::from_str(r#"{"approval_resolved":{"id":"t","allow":true,"message":null}}"#)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            AgentEventKind::ApprovalResolved {
+                id: "t".into(),
+                allow: true,
+                message: None,
+                answers: None,
+            }
+        );
+        let answered = AgentEventKind::ApprovalResolved {
+            id: "t".into(),
+            allow: true,
+            message: None,
+            answers: Some(BTreeMap::from([(
+                "Pick one?".to_owned(),
+                vec!["Yes".to_owned()],
+            )])),
+        };
+        let back: AgentEventKind =
+            serde_json::from_str(&serde_json::to_string(&answered).unwrap()).unwrap();
+        assert_eq!(back, answered);
+        let plain = AgentEventKind::ApprovalResolved {
+            id: "t".into(),
+            allow: false,
+            message: Some("no".into()),
+            answers: None,
+        };
+        let back: AgentEventKind =
+            serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        assert_eq!(back, plain);
     }
 
     /// `PermissionMode::plan`, the pickers' starting values and plan
