@@ -822,12 +822,16 @@ class ServerTestCase(unittest.TestCase):
 
 
 class ChromeTest(ServerTestCase):
-    def test_shows_wordmark_top_left(self) -> None:
+    def test_shows_logo_top_left(self) -> None:
         self.page.goto(self.url)
-        brand = self.page.locator(".topbar-brand")
-        expect(brand).to_have_text("grenadine")
+        logo = self.page.locator(".topbar-brand img")
+        expect(logo).to_be_visible()
+        expect(logo).to_have_attribute("alt", "grenadine")
+        self.page.wait_for_function(
+            "() => document.querySelector('.topbar-brand img').naturalWidth > 0"
+        )
 
-        box = brand.bounding_box()
+        box = logo.bounding_box()
         viewport = self.page.viewport_size
         assert box is not None and viewport is not None
         self.assertLess(box["x"], viewport["width"] / 4)

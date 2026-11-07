@@ -202,8 +202,12 @@ input[type="text"] {
   gap: 12px;
 }
 .topbar-brand {
-  font-weight: 600;
-  color: var(--fg);
+  display: flex;
+  align-items: center;
+}
+.topbar-brand img {
+  height: 20px;
+  width: 20px;
 }
 .topbar-tabs {
   display: flex;
