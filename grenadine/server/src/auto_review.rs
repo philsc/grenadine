@@ -1309,6 +1309,7 @@ sleep 30
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
                 queue: None,
+                stack: None,
             },
         };
         // Someone else's review, or the viewer's from before, don't count.

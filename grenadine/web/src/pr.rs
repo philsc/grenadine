@@ -825,6 +825,7 @@ fn merge_target(pr: &PrDetail) -> MergeTarget {
         is_draft: pr.summary.is_draft,
         head_oid: pr.versions.last().map(|v| v.sha.clone()),
         base_ref: pr.base_ref.clone(),
+        head_ref: pr.head_ref.clone(),
         open_parent: stack
             .iter()
             .find(|p| p.number == n)
@@ -1556,6 +1557,7 @@ mod tests {
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
                 queue: None,
+                stack: None,
             },
             pending_review: None,
         }

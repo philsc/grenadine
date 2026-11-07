@@ -2342,6 +2342,7 @@ mod tests {
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
                 queue: None,
+                stack: None,
             },
         };
         let mut with_review = meta(&key);

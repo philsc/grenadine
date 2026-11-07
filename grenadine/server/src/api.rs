@@ -16,16 +16,16 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoMerge, AutoReviewEntry,
     BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GENERAL, InboxEdit, InboxWithPrs,
-    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
-    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ServerEvent, SubmitReview,
-    WorktreeChanges, WrapUp, submit_blocker,
+    MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment,
+    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ServerEvent,
+    SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{self, Decision};
-use crate::github::ReviewItem;
+use crate::github::{MergeAsync, ReviewItem};
 use crate::sync::State;
 use crate::{assets, auto_review, cleanup, mcp, terminal};
 
@@ -91,6 +91,10 @@ fn api_routes() -> Router<Arc<State>> {
             post(submit_review).delete(discard_review),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/merge/{uuid}",
+            get(merge_progress),
+        )
         .route("/api/pr/{owner}/{name}/{number}/agents", get(pr_agents))
         .route(
             "/api/pr/{owner}/{name}/{number}/queue",
@@ -459,6 +463,68 @@ async fn submit_review(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// An asynchronous merge the merge box started, so that the progress
+/// endpoint can report on it and clean up its branches. `State::merges`
+/// keeps them by the ID the page polls.
+pub struct PendingMerge {
+    /// The PR the merge was started on.
+    key: PrKey,
+    /// The head branches to delete once the merge lands — the PR's and
+    /// the open PRs' below it in its GitHub stack — as (branch, ref ID).
+    delete: Vec<(String, String)>,
+    /// GitHub's terminal answer when it came with the request itself;
+    /// `None` while the merge runs and the endpoint asks GitHub.
+    terminal: Option<MergeStatus>,
+    /// The landed merge's branches were deleted already.
+    cleaned: bool,
+    /// When the merge was started. GitHub forgets a merge's result after
+    /// a day, so grenadine does too.
+    started: std::time::Instant,
+}
+
+/// An ID the merge progress endpoint accepts: GitHub's merge-async
+/// UUIDs, or a synthesized `done-*` for merges that finished at once.
+fn is_merge_uuid(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// The next synthesized merge ID, for merge-async requests GitHub
+/// answered terminally already, which carry no UUID.
+static LOCAL_MERGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Remembers a merge under `uuid`, or under a synthesized ID when the
+/// request finished at once, and returns the ID the page polls.
+fn remember_merge(
+    state: &State,
+    key: PrKey,
+    delete: Vec<(String, String)>,
+    result: MergeAsync,
+) -> String {
+    let (uuid, terminal) = match result {
+        MergeAsync::Pending(uuid) => (uuid, None),
+        MergeAsync::Done(status) => (
+            format!(
+                "done-{}",
+                LOCAL_MERGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            Some(status),
+        ),
+    };
+    let mut merges = state.merges.lock().unwrap();
+    merges.retain(|_, p| p.started.elapsed() < std::time::Duration::from_secs(86400));
+    merges.insert(
+        uuid.clone(),
+        PendingMerge {
+            key,
+            delete,
+            terminal,
+            cleaned: false,
+            started: std::time::Instant::now(),
+        },
+    );
+    uuid
+}
+
 async fn merge(
     AxState(state): St,
     Path((owner, name, number)): Path<(String, String, u64)>,
@@ -468,11 +534,97 @@ async fn merge(
     if !is_sha(&m.head_oid) {
         return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
     }
-    let merged = state.github.merge(&key, &m).await;
+    let delete = match m.delete_branch {
+        true => state.github.merge_refs(&key).await?,
+        false => Vec::new(),
+    };
+    let commit = m.title.as_deref().zip(m.body.as_deref());
+    let merged = state
+        .github
+        .merge_async(
+            &key,
+            "direct_merge",
+            Some(m.method),
+            &m.head_oid,
+            commit,
+            m.bypass_rules,
+        )
+        .await;
     // A refused merge may be about a change the page doesn't show yet,
     // such as a push to the head.
+    state.resync(key.clone());
+    let uuid = remember_merge(&state, key, delete, merged?);
+    Ok(Json(Merged { uuid }))
+}
+
+/// How the merge GitHub runs as `uuid` is doing. A merged merge's
+/// branches are deleted on its first `merged` report.
+async fn merge_progress(
+    AxState(state): St,
+    Path((owner, name, number, uuid)): Path<(String, String, u64, String)>,
+) -> ApiResult<Json<MergeProgress>> {
+    let key = writable(owner, name, number, &state)?;
+    if !is_merge_uuid(&uuid) {
+        return Err(refuse(StatusCode::NOT_FOUND, "no such merge".into()));
+    }
+    let status = {
+        let pending = state
+            .merges
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .map(|p| (p.key.clone(), p.terminal.clone()));
+        match pending {
+            Some((k, _)) if k != key => {
+                return Err(refuse(StatusCode::NOT_FOUND, "no such merge".into()));
+            }
+            Some((_, Some(status))) => Some(status),
+            Some((_, None)) => None,
+            None => return Err(refuse(StatusCode::NOT_FOUND, "no such merge".into())),
+        }
+    };
+    let status = match status {
+        Some(status) => status,
+        None => state.github.merge_progress(&key, &uuid).await?,
+    };
+    if matches!(status, MergeStatus::Failed(_) | MergeStatus::Enqueued) {
+        state.resync(key.clone());
+    }
+    if status != MergeStatus::Merged {
+        return Ok(Json(MergeProgress {
+            status,
+            warning: None,
+        }));
+    }
+    // The merge landed: delete the remembered branches once, then keep
+    // reporting the result for later polls.
+    let delete = {
+        let mut merges = state.merges.lock().unwrap();
+        match merges.get_mut(&uuid) {
+            Some(p) if !p.cleaned => {
+                p.cleaned = true;
+                Some(std::mem::take(&mut p.delete))
+            }
+            _ => None,
+        }
+    };
+    let mut warning = None;
+    if let Some(delete) = delete {
+        let mut failed = Vec::new();
+        for (branch, ref_id) in delete {
+            if let Err(e) = state.github.delete_ref(&key.repo, &ref_id).await {
+                failed.push(format!("{branch}: {e:#}"));
+            }
+        }
+        if !failed.is_empty() {
+            warning = Some(format!(
+                "Merged, but the branch wasn't deleted: {}",
+                failed.join("; ")
+            ));
+        }
+    }
     state.resync(key);
-    Ok(Json(Merged { warning: merged? }))
+    Ok(Json(MergeProgress { status, warning }))
 }
 
 async fn enqueue(
@@ -484,10 +636,25 @@ async fn enqueue(
     if !is_sha(&e.head_oid) {
         return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
     }
+    if state.github.in_stack(&key).await? {
+        if e.jump {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "a stacked PR can't jump the queue".into(),
+            ));
+        }
+        let done = state
+            .github
+            .merge_async(&key, "merge_queue", None, &e.head_oid, None, false)
+            .await;
+        state.resync(key.clone());
+        let uuid = remember_merge(&state, key, Vec::new(), done?);
+        return Ok(Json(Some(Merged { uuid })).into_response());
+    }
     let done = state.github.enqueue(&key, &e).await;
     state.resync(key);
     done?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok(Json(None::<Merged>).into_response())
 }
 
 async fn dequeue(

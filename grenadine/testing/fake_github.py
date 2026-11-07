@@ -60,6 +60,13 @@ OPEN = "OPEN"
 CLOSED = "CLOSED"
 MERGED = "MERGED"
 
+# How GitHub's GraphQL mutations refuse a PR in a native stack.
+STACK_MERGE_ERROR = (
+    "This pull request is part of a stack and must be merged using the "
+    "asynchronous merge REST API. For more information, see "
+    "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request-asynchronously"
+)
+
 SCHEMA = build_schema(Path(__file__).with_name("github_schema.graphql").read_text())
 
 
@@ -283,6 +290,8 @@ class FakeRepo:
         # is a number mapped to its PRs, bottom first.
         self.stacks_enabled = True
         self.stacks: dict[int, list[int]] = {}
+        # The merge-async requests PUT started, by their UUID.
+        self.merge_asyncs: dict[str, dict[str, Any]] = {}
         self.undeletable_branches: set[str] = set()
         self.bare.parent.mkdir(parents=True, exist_ok=True)
         self.work.parent.mkdir(parents=True, exist_ok=True)
@@ -621,6 +630,9 @@ class FakeGitHub:
             def do_POST(self) -> None:
                 gh._handle(self, "POST")
 
+            def do_PUT(self) -> None:
+                gh._handle(self, "PUT")
+
             def log_message(self, format: str, *args: Any) -> None:
                 pass
 
@@ -699,6 +711,16 @@ class FakeGitHub:
         ):
             req = json.loads(body) if body else {}
             return self._change_stack(m[1], int(m[2]), m[3], req, api_version)
+        if method == "PUT" and (
+            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)/merge-async", path)
+        ):
+            return self._merge_async(m[1], int(m[2]), json.loads(body), api_version)
+        if method == "GET" and (
+            m := re.fullmatch(
+                r"/repos/([^/]+/[^/]+)/pulls/(\d+)/merge-async/([0-9A-Za-z-]+)", path
+            )
+        ):
+            return self._merge_async_status(m[1], int(m[2]), m[3], api_version)
         return 404, {"message": "Not Found"}
 
     def _create_issue_comment(
@@ -909,6 +931,138 @@ class FakeGitHub:
             for stack in pr.repo.stacks.values()
         )
 
+    def _merge_async(
+        self,
+        slug: str,
+        number: int,
+        req: dict[str, Any],
+        api_version: str | None,
+    ) -> tuple[int, Any]:
+        repo = self._stacks_repo(slug, api_version)
+        pr = repo.prs.get(number) if repo else None
+        if pr is None:
+            return 404, {"message": "Not Found"}
+        if pr.state == MERGED:
+            return 200, {
+                "status": "merged",
+                "details": {"message": "Already merged", "sha": pr.head_oid},
+            }
+        if pr.state != OPEN:
+            return 400, {"message": "Pull Request is not open"}
+        if pr.draft:
+            return 400, {"message": "Pull Request is still a draft"}
+        if req.get("sha") and req["sha"] != pr.head_oid:
+            return 400, {
+                "message": "Head branch was modified. Review and try the merge again."
+            }
+        if req.get("bypass_rules") and not pr.can_merge_as_admin:
+            return 403, {"message": "Must have admin rights to bypass rules"}
+        pending = next(
+            (
+                r
+                for r in repo.merge_asyncs.values()
+                if r["number"] == number and r["status"] == "pending"
+            ),
+            None,
+        )
+        if pending is not None:
+            return 409, {"status": "pending", "details": pending["details"]}
+        uuid = f"merge-{self.next_number()}"
+        details = {
+            "uuid": uuid,
+            "merge_method": req.get("merge_method"),
+            "merge_action": req.get("merge_action", "direct_merge"),
+            "expected_head_sha": req.get("sha"),
+            "message": "Merge request accepted",
+            "bypass_rules": bool(req.get("bypass_rules")),
+        }
+        repo.merge_asyncs[uuid] = {
+            "number": number,
+            "status": "pending",
+            "details": details,
+            "request": req,
+        }
+        return 202, {"status": "pending", "details": details}
+
+    def _merge_async_status(
+        self, slug: str, number: int, uuid: str, api_version: str | None
+    ) -> tuple[int, Any]:
+        repo = self._stacks_repo(slug, api_version)
+        if repo is None or uuid not in repo.merge_asyncs:
+            return 404, {"message": "Not Found"}
+        rec = repo.merge_asyncs[uuid]
+        if rec["status"] == "pending":
+            # The merge runs, atomically, when it's first asked about.
+            rec["status"], rec["details"] = self._run_merge_async(repo, rec)
+        return 200, {"status": rec["status"], "details": rec["details"]}
+
+    def _run_merge_async(
+        self, repo: FakeRepo, rec: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolves the pending merge request `rec`: every open PR of its
+        PR's stack from the bottom through it — just it when unstacked —
+        or none when one can't."""
+        pr = repo.prs[rec["number"]]
+        req = rec["request"]
+        stack = next((s for s in repo.stacks.values() if pr.number in s), [pr.number])
+        targets = [
+            repo.prs[n]
+            for n in stack[: stack.index(pr.number) + 1]
+            if repo.prs[n].state == OPEN
+        ]
+        bypass = bool(req.get("bypass_rules"))
+        if rec["details"]["merge_action"] == "merge_queue":
+            for p in targets:
+                if err := self._merge_error(p, bypass=bypass):
+                    return "failed", {"message": err}
+                if p.queued:
+                    return "failed", {
+                        "message": "Pull Request is already in the merge queue"
+                    }
+            for p in targets:
+                p.queued = True
+                p.queue_state = "QUEUED"
+                p.touch()
+            return "enqueued", {"message": "Added to the merge queue"}
+        method = (req.get("merge_method") or "merge").upper()
+        if method not in repo.merge_methods:
+            return "failed", {
+                "message": f"{method} merges are not allowed on this repository"
+            }
+        for p in targets:
+            if repo.merge_queue and not (p.can_merge_as_admin and bypass):
+                return "failed", {
+                    "message": "Changes must be made through the merge queue"
+                }
+            if err := self._merge_error(p, bypass=bypass):
+                return "failed", {"message": err}
+        single = len(targets) == 1
+        for p in targets:
+            p.merged_with = (
+                method,
+                req.get("commit_title") if single else None,
+                req.get("commit_message") if single else None,
+            )
+            repo.merge(p)
+        return "merged", {"message": "Merged", "sha": pr.head_oid}
+
+    def _merge_error(
+        self, pr: PullRequest, *, bypass: bool, jump: bool = False
+    ) -> str | None:
+        """Why `pr` may not merge or queue, as GitHub's message; None when
+        it may. `bypass` plays the role of merge_pr's admin override."""
+        if pr.state != OPEN:
+            return "Pull Request is not open"
+        if pr.draft:
+            return "Pull Request is still a draft"
+        if jump and not pr.can_merge_as_admin:
+            return "Only admins may jump the merge queue"
+        state = pr.merge_state_status()
+        override = ("BLOCKED", "BEHIND") if bypass and pr.can_merge_as_admin else ()
+        if state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE", *override):
+            return "Pull Request is not mergeable"
+        return None
+
     # GraphQL.
 
     def graphql(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -1084,6 +1238,8 @@ class FakeGitHub:
 
         def merge_pr(info: Any, input: dict[str, Any]) -> Any:
             pr = self._pr_by_id(input["pullRequestId"])
+            if self._in_open_stack(pr):
+                raise ValueError(STACK_MERGE_ERROR)
             if pr.state != OPEN:
                 raise ValueError("Pull Request is not open")
             expected = input.get("expectedHeadOid")
@@ -1115,16 +1271,8 @@ class FakeGitHub:
 
         def mergeable(pr: PullRequest, jump: bool = False) -> None:
             """Raises like GitHub when `pr` may not merge or queue."""
-            if pr.state != OPEN:
-                raise ValueError("Pull Request is not open")
-            if pr.draft:
-                raise ValueError("Pull Request is still a draft")
-            if jump and not pr.can_merge_as_admin:
-                raise ValueError("Only admins may jump the merge queue")
-            state = pr.merge_state_status()
-            bypass = ("BLOCKED", "BEHIND") if pr.can_merge_as_admin else ()
-            if state not in ("CLEAN", "HAS_HOOKS", "UNSTABLE", *bypass):
-                raise ValueError("Pull Request is not mergeable")
+            if err := self._merge_error(pr, bypass=True, jump=jump):
+                raise ValueError(err)
 
         def check_head(pr: PullRequest, input: dict[str, Any]) -> None:
             expected = input.get("expectedHeadOid")
@@ -1135,6 +1283,8 @@ class FakeGitHub:
 
         def enqueue_pr(info: Any, input: dict[str, Any]) -> Any:
             pr = self._pr_by_id(input["pullRequestId"])
+            if self._in_open_stack(pr):
+                raise ValueError(STACK_MERGE_ERROR)
             check_head(pr, input)
             jump = bool(input.get("jump"))
             mergeable(pr, jump)
@@ -1631,6 +1781,10 @@ class FakeGitHub:
                 else None
             ),
             "mergeQueueEntry": self._queue_entry(pr),
+            "stack": lambda info: self._stack_node(pr),
+            "stackEntry": (
+                {"position": found[1]} if (found := self._gh_stack(pr)) else None
+            ),
             "autoMergeRequest": (
                 {
                     "enabledAt": iso(pr.auto_merge_at),
@@ -1657,6 +1811,37 @@ class FakeGitHub:
                 )
             },
             "comments": comments,
+        }
+
+    def _gh_stack(self, pr: PullRequest) -> tuple[int, int] | None:
+        """The number of the stack `pr` is in and its position in it —
+        1 is closest to the base — or None when it isn't stacked."""
+        for number, stack in pr.repo.stacks.items():
+            if pr.number in stack:
+                return number, stack.index(pr.number) + 1
+        return None
+
+    def _stack_node(self, pr: PullRequest) -> dict[str, Any] | None:
+        """`pr`'s PullRequestStack: all of its PRs in stack order,
+        merged and closed ones included."""
+        found = self._gh_stack(pr)
+        if found is None:
+            return None
+        number, _ = found
+        stack = pr.repo.stacks[number]
+        return {
+            "number": number,
+            "baseRefName": pr.repo.prs[stack[0]].base,
+            "size": len(stack),
+            "entries": lambda info, first=None, **_: {
+                "nodes": [
+                    {
+                        "position": i + 1,
+                        "pullRequest": self._pr_node(pr.repo.prs[n]),
+                    }
+                    for i, n in enumerate(stack[: first or len(stack)])
+                ]
+            },
         }
 
     def _queue_entry(self, pr: PullRequest) -> dict[str, Any] | None:
