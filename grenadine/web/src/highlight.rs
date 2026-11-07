@@ -44,10 +44,19 @@ pub fn stylesheet() -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // Themes colour a whole Markdown list item, including its indented
+    // continuation lines, as `markup.list`. base16-ocean.dark colours it red,
+    // which turns whole paragraphs of prose red and makes them hard to read,
+    // so list text keeps the plain foreground. Tokens inside a list keep their
+    // own colours. The second selector matches the light theme's more
+    // specific rule.
+    const OVERRIDES: &str = ".sy-markup.sy-list, .sy-text.sy-html.sy-markdown .sy-markup.sy-list {\n color: inherit;\n}";
     format!(
-        "{}\n{}\n",
+        "{}\n{}\n{}\n{}\n",
         scope(&enforce(&strip(light), &LIGHT_THEME), LIGHT_THEME.scope),
-        scope(&enforce(&strip(dark), &DARK_THEME), DARK_THEME.scope)
+        scope(&enforce(&strip(dark), &DARK_THEME), DARK_THEME.scope),
+        scope(OVERRIDES, LIGHT_THEME.scope),
+        scope(OVERRIDES, DARK_THEME.scope)
     )
 }
 
@@ -727,6 +736,9 @@ mod tests {
                 theme = &LIGHT_THEME;
             } else if let Some(decl) = trimmed.strip_prefix("color:") {
                 let value = decl.trim().trim_end_matches(';');
+                if value == "inherit" {
+                    continue;
+                }
                 out.push((
                     theme,
                     parse_color(value).unwrap_or_else(|| panic!("unparseable {line}")),
@@ -820,6 +832,60 @@ mod tests {
                 .iter()
                 .all(|&b| contrast(comment, b) >= MIN_CONTRAST)
         );
+    }
+
+    #[test]
+    fn markdown_list_items_are_markup_list() {
+        let lines = highlight_lines("x.md", "- item\n  continued\n");
+        assert!(
+            lines.iter().all(|l| l.contains("sy-markup sy-list")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn stylesheet_shows_markdown_lists_in_the_plain_foreground() {
+        let css = stylesheet();
+        let lines: Vec<&str> = css.lines().collect();
+        for prefix in [LIGHT_THEME.scope, DARK_THEME.scope] {
+            // Every rule under `prefix` with a `.sy-markup.sy-list` selector,
+            // as (line index, its selectors).
+            let mut rules: Vec<(usize, Vec<&str>)> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                let Some(selectors) = line.trim_end().strip_suffix('{') else {
+                    continue;
+                };
+                let selectors: Vec<&str> = selectors
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| s.starts_with(prefix) && s.ends_with(".sy-markup.sy-list"))
+                    .collect();
+                if !selectors.is_empty() {
+                    rules.push((i, selectors));
+                }
+            }
+            // The theme must colour lists for the override to matter.
+            assert!(
+                rules.len() > 1,
+                "expected theme rules before the override under {prefix}:\n{css}"
+            );
+            let (i, override_selectors) = rules.last().unwrap();
+            let next = lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim());
+            assert_eq!(next, Some("color: inherit;"), "after line {}", lines[*i]);
+            // The last rule must repeat every earlier list selector so that
+            // no theme rule can outrank it.
+            for (_, selectors) in &rules[..rules.len() - 1] {
+                for selector in selectors {
+                    assert!(
+                        override_selectors.contains(selector),
+                        "{selector} has no equally specific override under {prefix}"
+                    );
+                }
+            }
+        }
     }
 
     const RUST: &str = "/* a comment\n   over lines */\nfn main() {\n    let s = \"a < b\";\n}\n";
