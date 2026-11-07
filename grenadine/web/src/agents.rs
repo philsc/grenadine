@@ -23,7 +23,7 @@ use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
 use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
-use crate::inboxes::storage;
+use crate::inboxes::{load_flag, save_flag, storage};
 use crate::settings::{Settings, SettingsButton};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
@@ -895,6 +895,12 @@ fn mode_key(id: &str) -> String {
     format!("grenadine.agent-permission-mode.{id}")
 }
 
+/// Where a session's "Show thinking" pick is kept. Each session has its
+/// own.
+fn show_thinking_key(id: &str) -> String {
+    format!("grenadine.agent-show-thinking.{id}")
+}
+
 /// The mode a draft's session starts in, kept until the session's page
 /// can take it over: the server shows the session before the start's
 /// answer reaches the page, which would otherwise lose the mode.
@@ -1567,6 +1573,8 @@ enum Streaming {
 struct Batch {
     events: Vec<Arc<AgentEvent>>,
     streaming: Streaming,
+    /// The same for the thinking being streamed.
+    thinking: Streaming,
     usage: Option<(Option<u64>, Option<u64>)>,
     model: Option<String>,
     /// The newest `at` the messages carried, stored or ephemeral.
@@ -1582,18 +1590,21 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
     let mut batch = Batch {
         events: Vec::new(),
         streaming: Streaming::Keep,
+        thinking: Streaming::Keep,
         usage: None,
         model: None,
         last_event: None,
     };
     let mut last = last_seq;
-    // Text appended since the last clear.
+    // Text and thinking appended since the last clear.
     let mut delta = String::new();
+    let mut thinking_delta = String::new();
     let mut cleared = false;
     for incoming in queue {
         match incoming {
             Incoming::Opened => {
                 delta.clear();
+                thinking_delta.clear();
                 cleared = true;
             }
             Incoming::Event(event) => {
@@ -1603,6 +1614,7 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
                 match event.seq {
                     None => match event.kind {
                         AgentEventKind::TextDelta(t) => delta.push_str(&t),
+                        AgentEventKind::ThinkingDelta(t) => thinking_delta.push_str(&t),
                         AgentEventKind::Usage { tokens, window } => {
                             let (t, w) = batch.usage.get_or_insert((None, None));
                             *t = tokens.or(*t);
@@ -1616,9 +1628,10 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
                             continue;
                         }
                         last = Some(seq);
-                        // The streamed text is complete once anything else
-                        // comes along.
+                        // The streamed text and thinking are complete once
+                        // anything else comes along.
                         delta.clear();
+                        thinking_delta.clear();
                         cleared = true;
                         batch.events.push(Arc::new(event));
                     }
@@ -1630,6 +1643,11 @@ fn drain(queue: Vec<Incoming>, last_seq: Option<u64>) -> Batch {
         (false, false) => Streaming::Append(delta),
         (false, true) => Streaming::Keep,
         (true, _) => Streaming::Replace(delta),
+    };
+    batch.thinking = match (cleared, thinking_delta.is_empty()) {
+        (false, false) => Streaming::Append(thinking_delta),
+        (false, true) => Streaming::Keep,
+        (true, _) => Streaming::Replace(thinking_delta),
     };
     batch
 }
@@ -1647,6 +1665,7 @@ fn follow(
     id: &str,
     events: RwSignal<Vec<Arc<AgentEvent>>>,
     streaming: RwSignal<String>,
+    thinking_streaming: RwSignal<String>,
     usage: RwSignal<(Option<u64>, Option<u64>)>,
     model: RwSignal<Option<String>>,
     last_event: RwSignal<Option<i64>>,
@@ -1669,6 +1688,11 @@ fn follow(
             Streaming::Keep => {}
             Streaming::Replace(s) => streaming.set(s),
             Streaming::Append(t) => streaming.update(|s| s.push_str(&t)),
+        }
+        match batch.thinking {
+            Streaming::Keep => {}
+            Streaming::Replace(s) => thinking_streaming.set(s),
+            Streaming::Append(t) => thinking_streaming.update(|s| s.push_str(&t)),
         }
         if let Some((tokens, window)) = batch.usage {
             usage.update(|(t, w)| {
@@ -1990,10 +2014,29 @@ pub fn AgentView(
     });
     let events = RwSignal::new(Vec::<Arc<AgentEvent>>::new());
     let streaming = RwSignal::new(String::new());
+    let thinking_streaming = RwSignal::new(String::new());
     let live_usage = RwSignal::new((None, None));
     let live_model = RwSignal::new(None);
     let last_event = RwSignal::new(None::<i64>);
-    follow(&id, events, streaming, live_usage, live_model, last_event);
+    follow(
+        &id,
+        events,
+        streaming,
+        thinking_streaming,
+        live_usage,
+        live_model,
+        last_event,
+    );
+    // Whether the transcript shows the agent's thinking; off until the
+    // session's own pick says otherwise. A read-only session has no
+    // toggle to turn it on.
+    let show_thinking = RwSignal::new(load_flag(&show_thinking_key(&id), false));
+    Effect::new({
+        let id = id.clone();
+        move |_| {
+            save_flag(&show_thinking_key(&id), show_thinking.get());
+        }
+    });
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
@@ -2112,7 +2155,7 @@ pub fn AgentView(
                                     } else {
                                         view! { <AgentHeader session=session /> }.into_any()
                                     }}
-                                    <Transcript session=session events=events streaming=streaming mode=mode model=model turn=turn now=now />
+                                    <Transcript session=session events=events streaming=streaming thinking_streaming=thinking_streaming show_thinking=show_thinking.into() mode=mode model=model turn=turn now=now />
                                     <div class="agent-footer">
                                         <ActivityBar session=session events=events streaming=streaming last_event=last_event turn=turn now=now />
                                         {if read_only {
@@ -2120,7 +2163,7 @@ pub fn AgentView(
                                         } else {
                                             view! {
                                                 <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                                <AgentActions session=session mode=mode model=model compact=compact />
+                                                <AgentActions session=session mode=mode model=model show_thinking=show_thinking compact=compact />
                                             }.into_any()
                                         }}
                                     </div>
@@ -2372,6 +2415,8 @@ fn AgentActions(
     session: Signal<AgentSession>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
+    /// Whether the transcript shows the agent's thinking.
+    show_thinking: RwSignal<bool>,
     /// Whether the session shows embedded in another page: deleting it
     /// mustn't navigate that page away.
     #[prop(optional)]
@@ -2427,6 +2472,14 @@ fn AgentActions(
                 >"Open PR"</button>
             </Show>
             <button class="link danger" on:click=delete>"Delete"</button>
+            <label class="show-thinking">
+                <input
+                    type="checkbox"
+                    prop:checked=show_thinking
+                    on:change=move |e| show_thinking.set(event_target_checked(&e))
+                />
+                "Show thinking"
+            </label>
         </div>
     }
 }
@@ -2733,6 +2786,10 @@ fn Transcript(
     session: Signal<AgentSession>,
     events: RwSignal<Vec<Arc<AgentEvent>>>,
     streaming: RwSignal<String>,
+    /// The thinking streaming in, kept apart from `streaming`.
+    thinking_streaming: RwSignal<String>,
+    /// Whether thinking shows at all.
+    show_thinking: Signal<bool>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
     turn: Memo<Option<Arc<AgentEvent>>>,
@@ -2853,6 +2910,8 @@ fn Transcript(
     Effect::new(move |_| {
         events.track();
         streaming.track();
+        thinking_streaming.track();
+        show_thinking.track();
         let Some(end) = end.get() else { return };
         let Some(el) = end.closest(".main").ok().flatten() else {
             return;
@@ -2908,6 +2967,17 @@ fn Transcript(
                         AgentEventKind::Text(t) => view! {
                             <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
                         }.into_any(),
+                        AgentEventKind::Thinking(t) => {
+                            let html = markdown::to_html(t, &repo);
+                            view! {
+                                {move || show_thinking.get().then(|| view! {
+                                    <div class="turn-thinking">
+                                        <span class="turn-thinking-label">"Thinking"</span>
+                                        <div class="markdown" inner_html=html.clone()></div>
+                                    </div>
+                                })}
+                            }.into_any()
+                        }
                         AgentEventKind::ToolUse { parent: Some(_), .. } => ().into_any(),
                         AgentEventKind::ToolUse { id: tool, name, input, .. } => {
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
@@ -3127,11 +3197,21 @@ fn Transcript(
                         AgentEventKind::ToolResult { .. }
                         | AgentEventKind::ApprovalResolved { .. }
                         | AgentEventKind::TextDelta(_)
+                        | AgentEventKind::ThinkingDelta(_)
                         | AgentEventKind::Usage { .. }
                         | AgentEventKind::Model(_) => ().into_any(),
                     }
                 }
             />
+            {move || {
+                let thinking = thinking_streaming.get();
+                (show_thinking.get() && !thinking.is_empty()).then(|| view! {
+                    <div class="turn-thinking streaming">
+                        <span class="turn-thinking-label">"Thinking"</span>
+                        {thinking}
+                    </div>
+                })
+            }}
             {move || {
                 let text = streaming.get();
                 (!text.is_empty()).then(|| view! { <div class="turn-text streaming">{text}</div> })
@@ -3854,6 +3934,30 @@ mod tests {
         );
         assert!(matches!(batch.streaming, Streaming::Append(s) if s == "ab"));
         assert!(matches!(drain(vec![], None).streaming, Streaming::Keep));
+    }
+
+    #[test]
+    fn drain_collects_thinking_deltas() {
+        // Thinking deltas get their own buffer; a stored event clears it
+        // like the text's.
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::ThinkingDelta("a".into())),
+                event(None, AgentEventKind::ThinkingDelta("b".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.thinking, Streaming::Append(s) if s == "ab"));
+        assert!(matches!(batch.streaming, Streaming::Keep));
+        let batch = drain(
+            vec![
+                event(None, AgentEventKind::ThinkingDelta("a".into())),
+                event(Some(1), AgentEventKind::Thinking("ab".into())),
+                event(None, AgentEventKind::ThinkingDelta("c".into())),
+            ],
+            None,
+        );
+        assert!(matches!(batch.thinking, Streaming::Replace(s) if s == "c"));
     }
 
     #[test]

@@ -247,6 +247,27 @@ def devin_scenario(tmp: Path) -> dict:
                 ],
             },
             {
+                "match": "ponder",
+                "steps": [
+                    update(
+                        {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": "Pondering the answer",
+                            },
+                        }
+                    ),
+                    update(
+                        {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "Pondered."},
+                        }
+                    ),
+                    end,
+                ],
+            },
+            {
                 "match": "question",
                 "steps": [
                     tool_call("ask_user_question", {"questions": [question]}),
@@ -3442,6 +3463,31 @@ class AgentTest(ServerTestCase):
         sessions = self.section("General").locator(".agent-entry")
         expect(sessions.filter(has_text="A Devin task")).to_have_count(1)
         self.delete_session()
+
+    def test_devin_thinking_toggle(self) -> None:
+        transcript = self.start_devin_session("Code", "ponder it")
+        first_id = self.page.url.split("/")[-1]
+        expect(transcript.locator(".turn-text")).to_contain_text("Pondered.")
+        # Thinking stays hidden until the session's toggle says so.
+        expect(transcript.locator(".turn-thinking")).to_have_count(0)
+        expect(transcript).not_to_contain_text("Pondering the answer")
+        self.page.get_by_label("Show thinking").check()
+        expect(transcript.locator(".turn-thinking")).to_contain_text(
+            "Pondering the answer"
+        )
+        # The pick is the session's own: it survives a reload, and a
+        # different session still starts with thinking hidden.
+        self.page.reload()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-thinking")).to_contain_text(
+            "Pondering the answer"
+        )
+        expect(self.page.get_by_label("Show thinking")).to_be_checked()
+        transcript = self.start_devin_session("Code", "ponder again")
+        expect(transcript.locator(".turn-text")).to_contain_text("Pondered.")
+        expect(transcript.locator(".turn-thinking")).to_have_count(0)
+        self.delete_session()
+        self.delete_session_via_api(first_id)
 
     def test_composer_wraps_long_model_names(self) -> None:
         # Long model names make the composer's button row wrap onto a

@@ -1729,6 +1729,11 @@ pub enum AgentEventKind {
     TextDelta(String),
     /// A complete block of assistant text, in Markdown.
     Text(String),
+    /// A piece of the agent's thinking while it streams in. Never
+    /// stored; the complete `Thinking` follows.
+    ThinkingDelta(String),
+    /// A complete block of the agent's thinking, in Markdown.
+    Thinking(String),
     ToolUse {
         id: String,
         name: String,
@@ -1820,7 +1825,10 @@ impl AgentEventKind {
     pub fn is_ephemeral(&self) -> bool {
         matches!(
             self,
-            AgentEventKind::TextDelta(_) | AgentEventKind::Usage { .. } | AgentEventKind::Model(_)
+            AgentEventKind::TextDelta(_)
+                | AgentEventKind::ThinkingDelta(_)
+                | AgentEventKind::Usage { .. }
+                | AgentEventKind::Model(_)
         )
     }
 }

@@ -380,12 +380,21 @@ fn parse_line(line: &str) -> Parsed {
                     .map(|t| AgentEventKind::TextDelta(t.to_owned()))
                     .into_iter()
                     .collect(),
+                (Some("content_block_delta"), Some("thinking_delta")) => delta["thinking"]
+                    .as_str()
+                    .map(|t| AgentEventKind::ThinkingDelta(t.to_owned()))
+                    .into_iter()
+                    .collect(),
                 _ => Vec::new(),
             }
         }
         Some("assistant") => blocks()
             .filter_map(|b| match b["type"].as_str()? {
                 "text" => Some(AgentEventKind::Text(b["text"].as_str()?.to_owned())),
+                "thinking" => b["thinking"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| AgentEventKind::Thinking(t.to_owned())),
                 "tool_use" => Some(AgentEventKind::ToolUse {
                     id: b["id"].as_str()?.to_owned(),
                     name: b["name"].as_str()?.to_owned(),
@@ -589,6 +598,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             events(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Pon"}},"parent_tool_use_id":null}"#
+            ),
+            [AgentEventKind::ThinkingDelta("Pon".into())]
+        );
+        assert_eq!(
+            events(
                 r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}},"parent_tool_use_id":null}"#
             ),
             []
@@ -610,6 +625,13 @@ pub(crate) mod tests {
                     window: None,
                 },
             ]
+        );
+        // A non-empty thinking block is kept; an empty one is dropped.
+        assert_eq!(
+            events(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Pondering"},{"type":"thinking","thinking":""}]},"parent_tool_use_id":null,"session_id":"s"}"#
+            ),
+            [AgentEventKind::Thinking("Pondering".into())]
         );
         assert_eq!(
             events(

@@ -206,11 +206,15 @@ enum SessionUpdate {
         #[serde(rename = "_meta", default)]
         meta: Value,
     },
+    AgentThoughtChunk {
+        content: ContentBlock,
+        #[serde(rename = "_meta", default)]
+        meta: Value,
+    },
     ToolCall(ToolCall),
     ToolCallUpdate(ToolCallUpdate),
     UsageUpdate(UsageUpdate),
-    /// Thoughts, plans, mode changes and whatever else the transcript
-    /// doesn't show.
+    /// Plans, mode changes and whatever else the transcript doesn't show.
     #[serde(other)]
     Other,
 }
@@ -218,7 +222,8 @@ enum SessionUpdate {
 impl SessionUpdate {
     fn meta(&self) -> Option<&Value> {
         match self {
-            SessionUpdate::AgentMessageChunk { meta, .. } => Some(meta),
+            SessionUpdate::AgentMessageChunk { meta, .. }
+            | SessionUpdate::AgentThoughtChunk { meta, .. } => Some(meta),
             SessionUpdate::ToolCall(c) => Some(&c.meta),
             SessionUpdate::ToolCallUpdate(u) => Some(&u.meta),
             SessionUpdate::UsageUpdate(u) => Some(&u.meta),
@@ -763,6 +768,9 @@ struct Updates {
     /// The agent's answer so far, flushed as one Text when something else
     /// happens.
     text: String,
+    /// The agent's thinking so far, flushed as one Thinking when the
+    /// answer or something else follows it.
+    thought: String,
     tools: Tools,
     /// The turn process's running ACU total, from the root's latest
     /// usage; it leaves out what subagents spent.
@@ -778,6 +786,7 @@ impl Updates {
     fn new() -> Updates {
         Updates {
             text: String::new(),
+            thought: String::new(),
             tools: Tools::default(),
             acu: None,
             stopped: None,
@@ -794,13 +803,18 @@ impl Updates {
         }
     }
 
-    /// Ends the answer in progress; the `Text` event if it says anything.
+    /// Ends the thinking and answer in progress; the `Thinking` and
+    /// `Text` events for whatever they hold. Only one can hold anything,
+    /// since each flush ends both.
     fn flush(&mut self) -> Vec<AgentEventKind> {
-        if self.text.is_empty() {
-            Vec::new()
-        } else {
-            vec![AgentEventKind::Text(std::mem::take(&mut self.text))]
+        let mut events = Vec::new();
+        if !self.thought.is_empty() {
+            events.push(AgentEventKind::Thinking(std::mem::take(&mut self.thought)));
         }
+        if !self.text.is_empty() {
+            events.push(AgentEventKind::Text(std::mem::take(&mut self.text)));
+        }
+        events
     }
 
     /// The events one `session/update` means; updates of subagents are
@@ -816,8 +830,29 @@ impl Updates {
                 content: ContentBlock::Text { text },
                 ..
             } => {
+                // An answer after thinking ends the thought in progress.
+                let mut events = if self.thought.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![AgentEventKind::Thinking(std::mem::take(&mut self.thought))]
+                };
                 self.text += text;
-                vec![AgentEventKind::TextDelta(text.clone())]
+                events.push(AgentEventKind::TextDelta(text.clone()));
+                events
+            }
+            SessionUpdate::AgentThoughtChunk {
+                content: ContentBlock::Text { text },
+                ..
+            } => {
+                // Thinking after an answer ends the answer in progress.
+                let mut events = if self.text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![AgentEventKind::Text(std::mem::take(&mut self.text))]
+                };
+                self.thought += text;
+                events.push(AgentEventKind::ThinkingDelta(text.clone()));
+                events
             }
             SessionUpdate::ToolCall(call) => {
                 let inference = extension(&call.meta, "inferenceToolName")
@@ -898,7 +933,9 @@ impl Updates {
                     window: usage.size,
                 }]
             }
-            SessionUpdate::AgentMessageChunk { .. } | SessionUpdate::Other => Vec::new(),
+            SessionUpdate::AgentMessageChunk { .. }
+            | SessionUpdate::AgentThoughtChunk { .. }
+            | SessionUpdate::Other => Vec::new(),
         }
     }
 }
@@ -1814,6 +1851,8 @@ mod tests {
                 AgentEventKind::TextDelta("I'll do".into()),
                 AgentEventKind::TextDelta(" it.".into()),
                 AgentEventKind::Text("I'll do it.".into()),
+                AgentEventKind::ThinkingDelta("secret".into()),
+                AgentEventKind::Thinking("secret".into()),
                 AgentEventKind::ToolUse {
                     id: "exec:0#abc".into(),
                     name: "Bash".into(),
@@ -1833,6 +1872,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A thought between answers flushes the answer first, and the
+    /// answer after it flushes the thought: the events keep the order
+    /// the chunks came in.
+    #[test]
+    fn thoughts_and_text_interleave() {
+        assert_eq!(
+            events(&[
+                r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"hmm"}}"#,
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"First."}}"#,
+                r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"wait"}}"#,
+                r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Second."}}"#,
+            ]),
+            [
+                AgentEventKind::ThinkingDelta("hmm".into()),
+                AgentEventKind::Thinking("hmm".into()),
+                AgentEventKind::TextDelta("First.".into()),
+                AgentEventKind::Text("First.".into()),
+                AgentEventKind::ThinkingDelta("wait".into()),
+                AgentEventKind::Thinking("wait".into()),
+                AgentEventKind::TextDelta("Second.".into()),
+                AgentEventKind::Text("Second.".into()),
+            ]
+        );
+    }
+
+    /// A subagent's thoughts are skipped like its messages.
+    #[test]
+    fn a_subagents_thoughts_are_skipped() {
+        let events = events(&[
+            r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"sub"},"_meta":{"cognition.ai/subagent_context":{"parentAgentId":"sub-1"}}}"#,
+        ]);
+        assert_eq!(events, []);
     }
 
     /// Devin's messages sort into requests, responses and notifications
