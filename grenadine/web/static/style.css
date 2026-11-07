@@ -1618,6 +1618,37 @@ textarea {
 .turn-text.streaming {
   white-space: pre-wrap;
 }
+.turn-thinking {
+  color: var(--fg-muted);
+  font-style: italic;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+.turn-thinking p:first-child {
+  margin-top: 0;
+}
+.turn-thinking p:last-child {
+  margin-bottom: 0;
+}
+.turn-thinking.streaming {
+  white-space: pre-wrap;
+}
+.turn-thinking-label {
+  display: block;
+  font-style: normal;
+  font-size: 0.75em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+.show-thinking {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg-muted);
+  font-size: 0.85em;
+  cursor: pointer;
+}
 .turn-end {
   margin: 0;
   font-size: 12px;
