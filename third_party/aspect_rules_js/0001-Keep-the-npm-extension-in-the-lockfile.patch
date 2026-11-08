@@ -1,0 +1,14 @@
+--- a/npm/extensions.bzl
++++ b/npm/extensions.bzl
+@@ -89,7 +89,10 @@
+         for i in mod.tags.npm_import:
+             _npm_import_bzlmod(i)
+ 
+-    return module_ctx.extension_metadata(reproducible = True)
++    # Not reproducible, even though it is, so that MODULE.bazel.lock keeps the
++    # result. Otherwise every fresh output base evaluates the extension again,
++    # which fetches coreutils to copy .npmrc.
++    return module_ctx.extension_metadata(reproducible = False)
+ 
+ def _build_exclude_package_contents_config(module_ctx):
+     """Build exclude_package_contents configuration from tags across all modules."""

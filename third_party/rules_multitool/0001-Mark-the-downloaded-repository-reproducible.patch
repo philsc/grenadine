@@ -1,0 +1,15 @@
+--- a/multitool/private/multitool.bzl
++++ b/multitool/private/multitool.bzl
+@@ -209,6 +209,12 @@
+     templates.env(rctx, "tools/BUILD.bazel")
+     templates.env(rctx, "BUILD.bazel")
+ 
++    # Its downloads are pinned by checksum, so the repo can be shared through
++    # Bazel's (remote) repo contents cache.
++    if hasattr(rctx, "repo_metadata"):
++        return rctx.repo_metadata(reproducible = True)
++    return None
++
+ _env_specific_tools = repository_rule(
+     attrs = {
+         "lockfiles": attr.label_list(mandatory = True, allow_files = True),

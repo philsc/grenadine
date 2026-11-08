@@ -1,0 +1,14 @@
+--- a/crate_universe/extensions.bzl
++++ b/crate_universe/extensions.bzl
+@@ -1221,7 +1221,10 @@
+ 
+     metadata_kwargs = {}
+     if bazel_features.external_deps.extension_metadata_has_reproducible:
+-        metadata_kwargs["reproducible"] = reproducible
++        # Not reproducible, even when it is, so that MODULE.bazel.lock keeps
++        # the result. Otherwise every fresh output base evaluates the
++        # extension again, which needs the host's cargo and rustc.
++        metadata_kwargs["reproducible"] = False
+ 
+     return module_ctx.extension_metadata(**metadata_kwargs)
+ 
