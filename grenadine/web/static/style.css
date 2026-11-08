@@ -2415,11 +2415,19 @@ body.resizing-sidebar * {
   display: none;
 }
 /* The embedded session fills the panel; its transcript scrolls in the
-   pane while the header and footer stick to its edges. */
+   pane while the header and footer stick to its edges, and the
+   terminal panel under it takes the room it was dragged to. */
 .pr-agents-body .agent-page,
-.pr-agents-body .agent-panes,
 .pr-agents-body .agents {
   height: 100%;
+}
+.pr-agents-body .terminal-bar {
+  padding: 0 4px;
+}
+.pr-agents-body .terminal-toggle,
+.pr-agents-body .terminal-new,
+.pr-agents-body .terminal-full-screen {
+  flex: none;
 }
 .pr-agents-body .agent-panes > .main {
   flex: 1;

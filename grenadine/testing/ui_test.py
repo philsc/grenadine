@@ -5156,6 +5156,47 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
         expect(follow_up).to_have_value("half a thought")
 
+    def test_pr_agents_panel_terminals(self) -> None:
+        self.start_pr_session("say one")
+        session = Path(self.page.locator(".agent-worktree").inner_text()).name
+
+        panel = self.pr_page()
+        panel.locator(".pr-agents-toggle").click()
+        expect(panel.locator(".transcript .turn-end")).to_have_count(1)
+        terminals = panel.locator(".terminal-panel")
+        toggle = terminals.get_by_role("button", name="Terminal", exact=True)
+        tabs = terminals.get_by_role("tab")
+        screen = terminals.locator(".terminal-host:not([hidden]) .xterm-rows")
+
+        # The session's terminal panel starts collapsed under its chat;
+        # opening it starts a shell in the session's worktree.
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+        toggle.click()
+        expect(tabs).to_have_text(["Terminal 1"])
+        self.page.keyboard.type('echo in-$(basename "$PWD")\n')
+        expect(screen).to_contain_text(f"in-{session}")
+
+        # The terminal shares the panel with the chat, which keeps room.
+        body = panel.locator(".pr-agents-body").bounding_box()
+        shell = terminals.locator(".terminal-body").bounding_box()
+        assert body is not None and shell is not None
+        self.assertLess(shell["height"], body["height"] * 0.9)
+        expect(panel.get_by_label("Follow-up")).to_be_visible()
+
+        # The shell outlives the page, and the panel comes back open.
+        self.page.reload()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(tabs).to_have_text(["Terminal 1"])
+        expect(screen).to_contain_text(f"in-{session}")
+
+        # It's the same shell the session's own page shows.
+        self.page.get_by_role("link", name="Open in Agents tab").click()
+        page_tabs = self.page.locator(".terminal-panel").get_by_role("tab")
+        expect(page_tabs).to_have_text(["Terminal 1"])
+        expect(
+            self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+        ).to_contain_text(f"in-{session}")
+
     def test_wrap_up(self) -> None:
         # The server's clone has main checked out, which the work lands on.
         clone = self.clones[self.OTHER_REPO]
