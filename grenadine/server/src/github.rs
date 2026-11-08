@@ -95,6 +95,12 @@ pub struct PrData {
     pub created_at: String,
     pub updated_at: String,
     pub base_ref: String,
+    /// The commit the base branch pointed at: its tip while the PR is open,
+    /// and the tip when it was merged or closed afterwards.
+    pub base_oid: String,
+    /// The base branch no longer exists, as after a stack's merge deleted
+    /// the head branch of the PR below.
+    pub base_deleted: bool,
     pub head_ref: String,
     pub head_oid: String,
     /// `owner/name` of the repository the head branch lives in; `None` when
@@ -407,7 +413,8 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       title body url state isDraft isInMergeQueue createdAt updatedAt
       author { login }
-      baseRefName headRefName headRefOid
+      baseRefName baseRefOid headRefName headRefOid
+      baseBranch: baseRef { name }
       baseRef {
         refUpdateRule { requiresConversationResolution }
         rules(first: 100) {
@@ -2069,6 +2076,10 @@ impl GitHub {
             created_at: str_at(pr, "/createdAt").to_owned(),
             updated_at: str_at(pr, "/updatedAt").to_owned(),
             base_ref: str_at(pr, "/baseRefName").to_owned(),
+            base_oid: str_at(pr, "/baseRefOid").to_owned(),
+            // Its own alias, so that an error in the base's rules, which
+            // nulls `baseRef`, doesn't look like a deleted branch.
+            base_deleted: pr["baseBranch"].is_null(),
             head_ref: str_at(pr, "/headRefName").to_owned(),
             head_oid: str_at(pr, "/headRefOid").to_owned(),
             head_repo: Some(str_at(pr, "/headRepository/nameWithOwner"))
@@ -3169,6 +3180,8 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-02T00:00:00Z".into(),
             base_ref: "main".into(),
+            base_oid: "def".into(),
+            base_deleted: false,
             head_ref: "branch".into(),
             head_oid: "abc".into(),
             head_repo: Some("o/r".into()),

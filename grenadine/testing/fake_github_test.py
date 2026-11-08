@@ -622,6 +622,34 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertNotIn("errors", out)
         self.assertIn(pr.head, self.repo.deleted_branches)
 
+    def test_a_deleted_base_keeps_its_last_commit(self) -> None:
+        low = self.inboxes.prs["Wait for reviewers"]
+        self.repo.checkout("on-top", low.head)
+        self.repo.commit("On top", {"inbox/on-top.md": "x\n"})
+        self.repo.push("on-top")
+        top = self.repo.open_pr("On top", head="on-top", base=low.head)
+        query = (
+            'query { repository(owner: "test", name: "test") {'
+            f" pullRequest(number: {top.number}) {{"
+            " baseRefOid baseBranch: baseRef { id } } } }"
+        )
+        data = self.query(query)["data"]["repository"]["pullRequest"]
+        self.assertEqual(data["baseRefOid"], low.head_oid)
+        self.assertIsNotNone(data["baseBranch"])
+
+        self.repo.merge(top)
+        self.repo.merge(low)
+        out = self.query(
+            "mutation($r: ID!) { deleteRef(input: {refId: $r}) { clientMutationId } }",
+            r=data["baseBranch"]["id"],
+        )
+        self.assertNotIn("errors", out)
+        data = self.query(query)["data"]["repository"]["pullRequest"]
+        self.assertEqual(data, {"baseRefOid": low.head_oid, "baseBranch": None})
+        # The branch is gone from fetches too.
+        refs = self.gh.git("-C", str(self.repo.bare), "for-each-ref", "refs/heads/")
+        self.assertNotIn(f"refs/heads/{low.head}", refs)
+
     def test_merging_needs_a_mergeable_pr(self) -> None:
         def merge(pr: PullRequest) -> dict:
             pr_id = self.query(

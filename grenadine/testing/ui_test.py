@@ -2734,6 +2734,11 @@ class StackMergeTest(ServerTestCase):
         # The stack's commits each land on main, in order.
         self.assertEqual(top.merged_with, ("SQUASH", None, None))
         self.assertEqual(low.merged_with, ("SQUASH", None, None))
+        # The top PR's base branch is gone, and it still syncs from the
+        # commit GitHub remembers for it.
+        self.page.reload()
+        expect(self.page.locator(".pr-header .state")).to_have_text("merged")
+        expect(self.page.locator(".banner.error")).to_have_count(0)
 
     def test_merging_the_stack_bottom_leaves_the_top(self) -> None:
         low = self.prs[scenarios.GH_LOW]

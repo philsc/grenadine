@@ -160,6 +160,9 @@ class PullRequest:
     state: str = OPEN
     draft: bool = False
     merged_at: int | None = None
+    # The base branch's tip when the PR was merged or closed; GitHub's
+    # baseRefOid stops following the branch then.
+    base_oid: str | None = None
     # Conflicts with its base.
     conflicting: bool = False
     # In a merge queue: its MergeQueueEntryState and whether it jumped
@@ -446,11 +449,13 @@ class FakeRepo:
     def merge(self, pr: PullRequest) -> None:
         """Marks `pr` merged. The base branch doesn't change."""
         pr.state = MERGED
+        pr.base_oid = self.tip(pr.base)
         pr.merged_at = self.gh.tick()
         pr.updated_at = pr.merged_at
 
     def close(self, pr: PullRequest) -> None:
         pr.state = CLOSED
+        pr.base_oid = self.tip(pr.base)
         pr.touch()
 
     def review(
@@ -1366,6 +1371,15 @@ class FakeGitHub:
                                 f"Cannot delete protected branch {branch}"
                             )
                         repo.deleted_branches.add(branch)
+                        # Gone from fetches too; its commits stay
+                        # fetchable by SHA.
+                        self.git(
+                            "-C",
+                            str(repo.bare),
+                            "update-ref",
+                            "-d",
+                            f"refs/heads/{branch}",
+                        )
                         return {"clientMutationId": None}
             raise LookupError(
                 f"Could not resolve to a node with the global id of '{input['refId']}'"
@@ -1741,7 +1755,10 @@ class FakeGitHub:
             "author": self._user_node(pr.author),
             "repository": lambda info: self._repo_node(repo),
             "baseRefName": pr.base,
-            "baseRef": {
+            "baseRefOid": pr.base_oid or repo.tip(pr.base),
+            "baseRef": None
+            if pr.base in repo.deleted_branches
+            else {
                 "id": _ref_id(repo, pr.base),
                 "name": pr.base,
                 "refUpdateRule": {

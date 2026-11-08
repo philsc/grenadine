@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use grenadine_core::api::{
     CiStatus, Inbox, MergeState, Person, PrDetail, PrKey, RequestPriority, ReviewComment,
@@ -747,15 +747,17 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
     let old = state.db.versions(key)?;
 
     let number = key.number;
-    let base_ref = data.base_ref.clone();
+    let base = Base {
+        branch: data.base_ref.clone(),
+        oid: data.base_oid.clone(),
+        deleted: data.base_deleted,
+    };
     let (computed, mut versions) = {
         let _guard = repo.git_lock.lock().await;
         let repo = repo.repo.clone();
         let old = old.clone();
-        tokio::task::spawn_blocking(move || {
-            compute_and_store(&repo, number, &base_ref, &history, &old)
-        })
-        .await??
+        tokio::task::spawn_blocking(move || compute_and_store(&repo, number, &base, &history, &old))
+            .await??
     };
     // Who pushed is only shown, so failing to look it up doesn't fail the
     // sync.
@@ -921,12 +923,45 @@ async fn fill_pushers(
     Ok(())
 }
 
+/// The branch a PR wants to merge into, as GitHub reports it.
+struct Base {
+    branch: String,
+    /// The commit the branch pointed at, which GitHub keeps after the
+    /// branch is deleted.
+    oid: String,
+    deleted: bool,
+}
+
+/// Fetches the tip of the PR's base into `local_ref` and returns it. A
+/// merged or closed PR keeps its base even after the branch is deleted, so
+/// then it's the commit GitHub remembers for it.
+fn fetch_target(repo: &Repo, base: &Base, local_ref: &str) -> Result<String> {
+    if !base.deleted {
+        return repo
+            .fetch_branch(&base.branch, local_ref)
+            .with_context(|| format!("can't fetch the target branch {}", base.branch));
+    }
+    if base.oid.is_empty()
+        || !repo
+            .fetch_commits(std::slice::from_ref(&base.oid))
+            .is_empty()
+    {
+        bail!(
+            "the target branch {} was deleted and its last commit {} can't be fetched",
+            base.branch,
+            base.oid
+        );
+    }
+    repo.update_refs(&[(local_ref.to_owned(), base.oid.clone())], &[])?;
+    Ok(base.oid.clone())
+}
+
 /// Fetches the commits the history mentions, computes the versions and
 /// points the PR's refs at them.
 fn compute_and_store(
     repo: &Repo,
     number: u64,
-    base_ref: &str,
+    base: &Base,
     history: &History,
     old: &[Version],
 ) -> Result<(versions::Computed, Vec<Version>)> {
@@ -947,9 +982,7 @@ fn compute_and_store(
 
     let prefix = format!("{REF_PREFIX}/{number}");
     let target_ref = format!("{prefix}/target");
-    let target = repo
-        .fetch_branch(base_ref, &target_ref)
-        .with_context(|| format!("can't fetch the target branch {base_ref}"))?;
+    let target = fetch_target(repo, base, &target_ref)?;
 
     let computed = versions::compute(history, repo);
     let versions: Vec<Version> = computed
@@ -1294,6 +1327,46 @@ mod tests {
         .expect("the follow-ups did not stop after shutdown");
         // It stopped before syncing, which would have failed.
         assert_eq!(state.db.pr_sync_error(&key).unwrap(), None);
+    }
+
+    /// A deleted base branch, as after merging a stack, falls back to the
+    /// commit GitHub remembers for it.
+    #[test]
+    fn fetch_target_falls_back_to_the_deleted_base_s_commit() {
+        use crate::git::tests::{commit, fixture, run};
+
+        let f = fixture();
+        run(&f.upstream, &["checkout", "-q", "-b", "low"]);
+        let low = commit(&f.upstream, "b", "1\n");
+        run(&f.upstream, &["checkout", "-q", "main"]);
+        run(&f.upstream, &["branch", "-q", "-D", "low"]);
+        assert!(!f.clone.has_commit(&low));
+        let target = format!("{REF_PREFIX}/1/target");
+        let mut base = Base {
+            branch: "low".into(),
+            oid: low.clone(),
+            deleted: false,
+        };
+        let err = fetch_target(&f.clone, &base, &target).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("can't fetch the target branch low"),
+            "{err:#}"
+        );
+
+        // The commit is fetched by its SHA.
+        base.deleted = true;
+        assert_eq!(fetch_target(&f.clone, &base, &target).unwrap(), low);
+        assert_eq!(f.clone.refs(&target).unwrap().get(&target), Some(&low));
+
+        base.oid = "0".repeat(40);
+        let err = fetch_target(&f.clone, &base, &target).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "the target branch low was deleted and its last commit {} can't be fetched",
+                base.oid
+            )
+        );
     }
 
     #[test]
