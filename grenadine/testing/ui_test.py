@@ -4921,10 +4921,17 @@ class AgentTest(ServerTestCase):
         tabs = self.page.get_by_role("tab")
         screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
 
+        def wait_for_shell(tab: Locator) -> None:
+            # Keys typed while a tab parses its replay never reach the
+            # shell, so wait until it's done and the prompt shows.
+            expect(tab).to_have_attribute("aria-busy", "false")
+            expect(screen).to_contain_text("$")
+
         # Opening the panel starts a shell in the worktree. The output
         # differs from the command line it echoes.
         self.page.get_by_role("button", name="Terminal", exact=True).click()
         expect(tabs).to_have_text(["Terminal 1"])
+        wait_for_shell(tabs.nth(0))
         self.page.keyboard.type('echo in-$(basename "$PWD")\n')
         expect(screen).to_contain_text(f"in-{session}")
 
@@ -4932,6 +4939,7 @@ class AgentTest(ServerTestCase):
         self.page.get_by_role("button", name="New terminal").click()
         expect(tabs).to_have_text(["Terminal 1", "Terminal 2"])
         expect(tabs.nth(1)).to_have_attribute("aria-selected", "true")
+        wait_for_shell(tabs.nth(1))
         self.page.keyboard.type("echo second-$((6 * 7))\n")
         expect(screen).to_contain_text("second-42")
         tabs.nth(0).click()
