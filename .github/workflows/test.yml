@@ -25,35 +25,26 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.19.1
         with:
           bazelisk-cache: true
-          # The disk cache only helps runs without BuildBuddy's remote cache.
+          # With BuildBuddy, its remote cache, Remote Asset API, and remote repo
+          # contents cache take the place of these, and restoring them would
+          # only cost time.
           disk-cache: ${{ env.BUILDBUDDY_API_KEY == '' && github.workflow }}
-          repository-cache: true
+          repository-cache: ${{ env.BUILDBUDDY_API_KEY == '' }}
       - if: env.BUILDBUDDY_API_KEY != ''
         run: |
           cat > .bazelrc.user <<EOF
+          startup --experimental_remote_repo_contents_cache
           build --config=remote
           build --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build --remote_downloader_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
           build --bes_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
           EOF
-      # The step below reads local file:// paths from bep.json. With
-      # BuildBuddy, Bazel would write bytestream:// URIs there instead.
-      - run: bazel test --build_event_json_file=bep.json --nobuild_event_json_file_path_conversion //...
-      # Collect the logs and outputs of the tests that didn't pass.
-      - if: failure()
-        run: |
-          testlogs=$(bazel info bazel-testlogs)
-          jq -r 'select(.id.testResult and .testResult.status != "PASSED")
-              | .testResult.testActionOutput[] | select(.name == "test.log") | .uri' bep.json \
-            | sed 's|^file://||' \
-            | while read -r log; do
-                dir=$(dirname "$log")
-                dest="failed-testlogs/${dir#"$testlogs"/}"
-                mkdir -p "$dest"
-                cp -rL "$dir"/. "$dest"
-              done
-      - if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: failed-testlogs
-          path: failed-testlogs
-          if-no-files-found: ignore
+      # Lint in the same invocation, which shares the analysis with the tests.
+      # The invocation's page on BuildBuddy has every test's log and outputs;
+      # --test_output=errors also prints the failing ones' logs here.
+      - run: |
+          id=$(cat /proc/sys/kernel/random/uuid)
+          if [[ -n "$BUILDBUDDY_API_KEY" ]]; then
+            echo "Build results: https://app.buildbuddy.io/invocation/$id" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          bazel test --config=lint --invocation_id="$id" //...

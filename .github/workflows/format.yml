@@ -25,14 +25,18 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.19.1
         with:
           bazelisk-cache: true
-          # The disk cache only helps runs without BuildBuddy's remote cache.
+          # With BuildBuddy, its remote cache, Remote Asset API, and remote repo
+          # contents cache take the place of these, and restoring them would
+          # only cost time.
           disk-cache: ${{ env.BUILDBUDDY_API_KEY == '' && github.workflow }}
-          repository-cache: true
+          repository-cache: ${{ env.BUILDBUDDY_API_KEY == '' }}
       - if: env.BUILDBUDDY_API_KEY != ''
         run: |
           cat > .bazelrc.user <<EOF
+          startup --experimental_remote_repo_contents_cache
           build --config=remote
           build --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build --remote_downloader_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
           build --bes_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
           EOF
       - run: bazel run //:format

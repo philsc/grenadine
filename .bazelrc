@@ -45,26 +45,48 @@ build:lint --aspects=//tools/lint:linters.bzl%ruff
 build:lint --output_groups=+rules_lint_human
 build:lint --@aspect_rules_lint//lint:fail_on_violation
 
-# BuildBuddy's remote cache and build results UI: bazel build --config=remote
+# BuildBuddy's remote execution, remote cache, and build results UI:
+#   bazel test --config=remote //...
 # The API key isn't here because the repository is public. CI passes it from
 # a secret, and locally it goes in .bazelrc.user:
+#   startup --experimental_remote_repo_contents_cache
 #   build --config=remote
 #   build --remote_header=x-buildbuddy-api-key=KEY
+#   build --remote_downloader_header=x-buildbuddy-api-key=KEY
 #   build --bes_header=x-buildbuddy-api-key=KEY
-build:remote --remote_cache=grpcs://remote.buildbuddy.io
-build:remote --bes_backend=grpcs://remote.buildbuddy.io
-build:remote --bes_results_url=https://app.buildbuddy.io/invocation/
-build:remote --remote_timeout=10m
-build:remote --remote_cache_compression
+# The startup option keeps the contents of external repositories in the
+# remote cache, so that a fresh output base materializes only what Bazel
+# itself reads. It can't go in a config because it's a startup option.
+#
+# --config=remote-cache only uses the cache and runs actions locally, e.g. on
+# a slow or metered link.
+build:remote-cache --remote_cache=grpcs://remote.buildbuddy.io
+build:remote-cache --bes_backend=grpcs://remote.buildbuddy.io
+build:remote-cache --bes_results_url=https://app.buildbuddy.io/invocation/
+build:remote-cache --remote_timeout=10m
+build:remote-cache --remote_cache_compression
+# Download through BuildBuddy's Remote Asset API, which caches the archives
+# that repository rules fetch by their checksums.
+build:remote-cache --experimental_remote_downloader=grpcs://remote.buildbuddy.io
 # --jobs defaults to the number of cores, which also caps how many actions
 # are looked up in the cache at once. Local actions stay limited by
 # --local_resources.
-build:remote --jobs=64
+build:remote-cache --jobs=64
 # Leave outputs in the cache unless they're needed locally, which keeps the
-# free plan's monthly transfer in bounds. Test logs are always fetched so that
-# CI can collect the ones of failed tests.
-build:remote --remote_download_minimal
-build:remote --remote_download_regex=.*/testlogs/.*
+# free plan's monthly transfer in bounds. `bazel run` still fetches what the
+# binary needs.
+build:remote-cache --remote_download_minimal
+
+build:remote --config=remote-cache
+build:remote --remote_executor=grpcs://remote.buildbuddy.io
+build:remote --extra_execution_platforms=//tools/platforms:rbe
+# Actions mostly wait on the executors, so many more can be in flight than
+# there are local cores.
+build:remote --jobs=200
+# Remote actions receive their runfiles as inputs, so the local symlink
+# trees would be wasted work. Bazel still creates the ones that local actions
+# and `bazel run` need.
+build:remote --nobuild_runfile_links
 
 # Opt out of the usage reports that Aspect's rulesets (rules_lint, rules_js)
 # send. See https://github.com/aspect-build/tools_telemetry
