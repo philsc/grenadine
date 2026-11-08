@@ -367,6 +367,7 @@ type PullRequest {
   author: Actor
   repository: Repository!
   baseRefName: String!
+  baseRefOid: GitObjectID!
   baseRef: Ref
   headRefName: String!
   headRefOid: GitObjectID!
