@@ -155,6 +155,12 @@ pub fn forget(id: &str) {
 
 /// The panel's height in pixels, for all sessions.
 const HEIGHT_KEY: &str = "grenadine.terminal-height";
+/// The panel's height in pixels in a PR sidebar's Agents panel, for all
+/// sessions. It's kept apart because the sidebar has far less room.
+const COMPACT_HEIGHT_KEY: &str = "grenadine.pr-terminal-height";
+/// What the sidebar's Agents panel body holds that the terminal panel's
+/// height is bounded by.
+const COMPACT_BODY: &str = ".pr-agents-body";
 const DEFAULT_HEIGHT: f64 = 320.0;
 const MIN_HEIGHT: f64 = 120.0;
 
@@ -549,21 +555,58 @@ fn TerminalView(
 
 /// The session's terminals as tabs in a panel that can be collapsed to its
 /// tab bar and dragged taller.
+/// `compact` is for a session embedded in a PR's sidebar, where the panel
+/// keeps its own height and shares the Agents panel with the transcript.
 #[component]
-pub fn TerminalPanel(id: String) -> impl IntoView {
+pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let open_key = open_key(&id);
     let open = RwSignal::new(load_flag(&open_key, false));
     Effect::new(move |_| save_flag(&open_key, open.get()));
-    let height = RwSignal::new(
-        storage()
-            .and_then(|s| s.get_item(HEIGHT_KEY).ok().flatten())
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(DEFAULT_HEIGHT),
-    );
+    let height_key = if compact {
+        COMPACT_HEIGHT_KEY
+    } else {
+        HEIGHT_KEY
+    };
+    let stored_height = storage()
+        .and_then(|s| s.get_item(height_key).ok().flatten())
+        .and_then(|h| h.parse::<f64>().ok());
+    let height = RwSignal::new(stored_height.unwrap_or(DEFAULT_HEIGHT));
+    let panel = NodeRef::<leptos::html::Section>::new();
+    // What the panel's height is bounded by: the sidebar's Agents panel
+    // body when compact, else the window.
+    let available = move |el: Option<web_sys::Element>| -> f64 {
+        if compact {
+            el.and_then(|e| e.closest(COMPACT_BODY).ok().flatten())
+                .map(|b| f64::from(b.client_height()))
+                .unwrap_or(1000.0)
+        } else {
+            window()
+                .inner_height()
+                .ok()
+                .and_then(|h| h.as_f64())
+                .unwrap_or(1000.0)
+        }
+    };
+    // Without a dragged height, the compact panel takes half the Agents
+    // panel body, measured once it first opens and has a size.
+    let measured = Cell::new(stored_height.is_some() || !compact);
+    Effect::new(move |_| {
+        if !open.get() || measured.get() {
+            return;
+        }
+        let Some(el) = panel.get() else {
+            return;
+        };
+        let body = available(Some(el.into()));
+        if body > 0.0 {
+            measured.set(true);
+            height.set(clamp_height(body * 0.5, body));
+        }
+    });
     Effect::new(move |_| {
         if let Some(s) = storage() {
-            let _ = s.set_item(HEIGHT_KEY, &height.get().to_string());
+            let _ = s.set_item(height_key, &height.get().to_string());
         }
     });
     let listed = {
@@ -651,13 +694,14 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
     let start_drag = move |e: web_sys::MouseEvent| {
         e.prevent_default();
         let (y, h) = (e.client_y() as f64, height.get_untracked());
+        let target = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
         let on_move = window_event_listener(ev::mousemove, move |e| {
-            let window_height = window()
-                .inner_height()
-                .ok()
-                .and_then(|h| h.as_f64())
-                .unwrap_or(1000.0);
-            height.set(clamp_height(h + y - e.client_y() as f64, window_height));
+            height.set(clamp_height(
+                h + y - e.client_y() as f64,
+                available(target.clone()),
+            ));
         });
         let on_up = window_event_listener(ev::mouseup, move |_| {
             drag.update_value(|d| {
@@ -678,7 +722,7 @@ pub fn TerminalPanel(id: String) -> impl IntoView {
 
     let session = id;
     view! {
-        <section class="terminal-panel" class:open=open>
+        <section class="terminal-panel" class:open=open class:compact=compact node_ref=panel>
             {move || open.get().then(|| view! {
                 <div class="terminal-resize" title="Drag to resize" on:mousedown=start_drag></div>
             })}

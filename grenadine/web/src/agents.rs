@@ -2174,8 +2174,8 @@ pub fn AgentView(
                     (load.get() == Load::Ready && !general.get() && !compact).then(|| view! { <ChangesPane id=id.clone() repo=repo.get_untracked() events=events /> })
                 }}
             </div>
-            {move || (load.get() == Load::Ready && !compact).then(|| view! {
-                <crate::terminal::TerminalPanel id=terminal_id.clone() />
+            {move || (load.get() == Load::Ready).then(|| view! {
+                <crate::terminal::TerminalPanel id=terminal_id.clone() compact=compact />
             })}
         </div>
     }
