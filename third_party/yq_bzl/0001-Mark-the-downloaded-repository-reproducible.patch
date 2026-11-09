@@ -1,0 +1,15 @@
+--- a/yq/toolchain/platforms.bzl
++++ b/yq/toolchain/platforms.bzl
+@@ -87,6 +87,12 @@
+     # Base BUILD file for this repository
+     rctx.file("BUILD.bazel", build_content)
+ 
++    # Its downloads are pinned by checksum, so the repo can be shared through
++    # Bazel's (remote) repo contents cache.
++    if hasattr(rctx, "repo_metadata"):
++        return rctx.repo_metadata(reproducible = True)
++    return None
++
+ yq_platform_repo = repository_rule(
+     implementation = _yq_platform_repo_impl,
+     doc = "Fetch external tools needed for yq toolchain",

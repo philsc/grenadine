@@ -46,6 +46,10 @@ alias(
 exports_files(["usr/lib/x86_64-linux-gnu/.lib_dir"])
 """)
 
+    # The .debs are pinned by checksum, so the repo can be shared through
+    # Bazel's (remote) repo contents cache.
+    return rctx.repo_metadata(reproducible = True)
+
 chrome_deps = repository_rule(
     implementation = _chrome_deps_impl,
     attrs = {

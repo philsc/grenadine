@@ -29,6 +29,64 @@ single_version_override(
     patches = ["//third_party/rules_python:0001-Remove-superfluous-copies-of-the-runtime.patch"],
 )
 
+# These modules download tools pinned by checksum but don't say that the
+# result is reproducible, so Bazel fetched them again on every fresh output
+# base instead of taking them from the remote repo contents cache. The patches
+# say so.
+single_version_override(
+    module_name = "rules_multitool",
+    patch_strip = 1,
+    patches = ["//third_party/rules_multitool:0001-Mark-the-downloaded-repository-reproducible.patch"],
+)
+
+single_version_override(
+    module_name = "rules_nodejs",
+    patch_strip = 1,
+    patches = ["//third_party/rules_nodejs:0001-Mark-the-downloaded-repository-reproducible.patch"],
+)
+
+single_version_override(
+    module_name = "yq.bzl",
+    patch_strip = 1,
+    patches = ["//third_party/yq_bzl:0001-Mark-the-downloaded-repository-reproducible.patch"],
+)
+
+# MODULE.bazel.lock only keeps the results of module extensions that aren't
+# reproducible, so every fresh output base evaluated these two again: the
+# crate extension materialized the host's cargo and rustc (~800MB), and the
+# npm extension fetched coreutils. The patches have the lockfile keep them.
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = ["//third_party/rules_rust:0001-Keep-the-crate-extension-in-the-lockfile.patch"],
+)
+
+single_version_override(
+    module_name = "aspect_rules_js",
+    patch_strip = 1,
+    patches = ["//third_party/aspect_rules_js:0001-Keep-the-npm-extension-in-the-lockfile.patch"],
+)
+
+# rules_buf, via aspect_rules_lint, registers a buf toolchain for every
+# build. Resolving any toolchain then fetched its 72MB repo, which picks the
+# host's binary and so can't come from the remote repo contents cache. Nothing
+# here lints protobufs, so an empty repo stands in for it.
+bazel_dep(name = "rules_buf", version = "0.5.2")
+
+buf = use_extension("@rules_buf//buf:extensions.bzl", "buf")
+
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+local_repository(
+    name = "no_buf_toolchains",
+    path = "third_party/no_buf_toolchains",
+)
+
+override_repo(
+    buf,
+    rules_buf_toolchains = "no_buf_toolchains",
+)
+
 # Opt out of the deprecated implicit __init__.py creation. Every package that
 # needs one must list it explicitly in srcs/deps.
 # See https://github.com/bazel-contrib/rules_python/issues/2945

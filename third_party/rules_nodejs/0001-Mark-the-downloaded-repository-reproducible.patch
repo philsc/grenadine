@@ -1,0 +1,15 @@
+--- a/nodejs/repositories.bzl
++++ b/nodejs/repositories.bzl
+@@ -312,6 +312,12 @@
+     _download_node(repository_ctx)
+     _prepare_node(repository_ctx)
+ 
++    # Its downloads are pinned by checksum, so the repo can be shared through
++    # Bazel's (remote) repo contents cache.
++    if hasattr(repository_ctx, "repo_metadata"):
++        return repository_ctx.repo_metadata(reproducible = True)
++    return None
++
+ _nodejs_repositories = repository_rule(
+     _nodejs_repositories_impl,
+     attrs = _ATTRS,
