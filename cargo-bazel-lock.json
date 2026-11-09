@@ -1,5 +1,5 @@
 {
-  "checksum": "edddae8ab39ea379e976d70ed1311e7221afe3bb86c5ef770b6606f33fb3c207",
+  "checksum": "53e4ea1b9392db3302da0f9128d05a99636b8cd7ddb831176ef9de5a97068d38",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -4790,9 +4790,17 @@
         ],
         "edition": "2024"
       },
+      "library_target_name": "grenadine_server",
       "name": "grenadine_server",
       "repository": null,
-      "targets": [],
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "grenadine_server",
+            "crate_root": "src/lib.rs"
+          }
+        }
+      ],
       "version": "0.0.0"
     },
     "grenadine_web 0.0.0": {
