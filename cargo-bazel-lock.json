@@ -1,5 +1,5 @@
 {
-  "checksum": "97dab79f889428518f3090924acc74c0e381c9982182e817c06a179b3f5552fe",
+  "checksum": "615216b62e746fca4e29d52ff7b1d996ced73b4380347bc50be1ed7052704e03",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16558,6 +16558,7 @@
             "CssStyleDeclaration",
             "CustomEvent",
             "DataTransfer",
+            "DedicatedWorkerGlobalScope",
             "DeviceMotionEvent",
             "DeviceOrientationEvent",
             "Document",
@@ -16666,6 +16667,7 @@
             "MessageEvent",
             "MouseEvent",
             "Node",
+            "NodeList",
             "ObserverCallback",
             "PageTransitionEvent",
             "PointerEvent",
@@ -16718,6 +16720,10 @@
             "WebSocket",
             "WheelEvent",
             "Window",
+            "Worker",
+            "WorkerGlobalScope",
+            "WorkerOptions",
+            "WorkerType",
             "WritableStream",
             "WritableStreamDefaultController",
             "WritableStreamDefaultWriter",
@@ -16728,8 +16734,7 @@
           "selects": {
             "wasm32-unknown-unknown": [
               "BlobPropertyBag",
-              "ServiceWorkerGlobalScope",
-              "WorkerGlobalScope"
+              "ServiceWorkerGlobalScope"
             ]
           }
         },

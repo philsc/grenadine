@@ -1,8 +1,10 @@
 //! Syntax highlighting with syntect, emitting CSS classes so that the light
 //! and dark themes are pure CSS.
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{OnceCell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,6 +15,8 @@ use syntect::html::{
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 
 const CLASS_STYLE: ClassStyle = ClassStyle::SpacedPrefixed { prefix: "sy-" };
 
@@ -348,6 +352,7 @@ pub fn plain_lines(text: &str) -> Vec<String> {
 /// Highlights `text` and returns one HTML fragment per line (without the
 /// line terminator), or escaped plain text when the language is unknown or
 /// the file is too big.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn highlight_lines(path: &str, text: &str) -> Vec<String> {
     let mut lines = Lines::new(path, text);
     while !lines.step(text, usize::MAX) {}
@@ -420,11 +425,8 @@ pub type Highlighted = Arc<Vec<String>>;
 /// How many highlighted blobs are kept.
 const CACHE_SIZE: usize = 500;
 
-/// How long the background highlighter works before letting the page
-/// paint and handle input, in milliseconds.
-const SLICE_MS: f64 = 12.0;
-
-/// How many lines are highlighted between looks at the clock.
+/// How many lines the worker highlights between progress messages.
+#[cfg(target_arch = "wasm32")]
 const LINES_PER_CHECK: usize = 16;
 
 /// A blob as `request` knows it: its path, for the language, and an ID
@@ -434,8 +436,12 @@ type Key = (String, String);
 struct Job {
     key: Key,
     urgent: bool,
+    /// `true` for a fenced code block, where `spec` is a language token
+    /// like "rust" rather than a path.
+    lang: bool,
+    /// The path or language token the worker highlights `blob` as.
+    spec: String,
     blob: Arc<Blob>,
-    lines: Lines,
     done: Vec<Box<dyn FnOnce(Highlighted)>>,
 }
 
@@ -448,12 +454,32 @@ struct Cache {
 thread_local! {
     static CACHE: RefCell<Cache> = RefCell::default();
     static QUEUE: RefCell<VecDeque<Job>> = RefCell::default();
-    static RUNNING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The blob's highlighted lines, if they are ready.
 pub fn cached(path: &str, id: &str) -> Option<Highlighted> {
     CACHE.with_borrow(|c| c.blobs.get(&(path.to_owned(), id.to_owned())).cloned())
+}
+
+/// The code block's highlighting under `id`, if it is ready. `id` is a
+/// `code_id` hash.
+pub fn cached_code(lang: &str, id: &str) -> Option<Highlighted> {
+    cached(&code_key(lang), id)
+}
+
+/// The cache key's path part for a fenced code block's language token.
+/// Real paths never start with a NUL.
+fn code_key(lang: &str) -> String {
+    format!("\0{lang}")
+}
+
+/// A code block's ID: a hash covering the language token and the code,
+/// so the same code in different languages doesn't collide.
+pub fn code_id(lang: &str, code: &str) -> String {
+    let mut h = DefaultHasher::new();
+    lang.hash(&mut h);
+    code.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Highlights a blob in the background and calls `done` with its lines.
@@ -466,43 +492,91 @@ pub fn request(
     urgent: bool,
     done: impl FnOnce(Highlighted) + 'static,
 ) {
-    if let Some(h) = cached(path, id) {
+    enqueue(
+        (path.to_owned(), id.to_owned()),
+        false,
+        path.to_owned(),
+        blob,
+        urgent,
+        done,
+    );
+}
+
+/// Highlights a fenced code block's `code` as language `lang` and calls
+/// `done` with its HTML — a single line for a known language, an empty
+/// list for an unknown one.
+pub fn request_code(
+    lang: &str,
+    id: &str,
+    code: &str,
+    urgent: bool,
+    done: impl FnOnce(Highlighted) + 'static,
+) {
+    let blob = Arc::new(Blob {
+        text: Some(code.to_owned()),
+        size: code.len() as u64,
+    });
+    enqueue(
+        (code_key(lang), id.to_owned()),
+        true,
+        lang.to_owned(),
+        blob,
+        urgent,
+        done,
+    );
+}
+
+fn enqueue(
+    key: Key,
+    lang: bool,
+    spec: String,
+    blob: Arc<Blob>,
+    urgent: bool,
+    done: impl FnOnce(Highlighted) + 'static,
+) {
+    if let Some(h) = CACHE.with_borrow(|c| c.blobs.get(&key).cloned()) {
         done(h);
         return;
     }
-    let key = (path.to_owned(), id.to_owned());
-    QUEUE.with_borrow_mut(|q| {
-        let job = match q.iter().position(|j| j.key == key) {
-            Some(i) if urgent && !q[i].urgent => q.remove(i),
-            Some(i) => {
-                q[i].done.push(Box::new(done));
-                return;
-            }
-            None => {
-                let text = blob.text.as_deref().unwrap_or_default();
-                let lines = Lines::new(path, text);
-                Some(Job {
-                    key,
-                    urgent,
-                    blob,
-                    lines,
-                    done: Vec::new(),
-                })
-            }
-        };
-        let Some(mut job) = job else { return };
-        job.done.push(Box::new(done));
-        job.urgent = urgent;
-        let at = if urgent {
-            q.iter().position(|j| !j.urgent).unwrap_or(q.len())
-        } else {
-            q.len()
-        };
-        q.insert(at, job);
-    });
-    if !RUNNING.replace(true) {
-        leptos::task::spawn_local(work());
+    let job = Job {
+        key,
+        urgent,
+        lang,
+        spec,
+        blob,
+        done: vec![Box::new(done)],
+    };
+    #[cfg(target_arch = "wasm32")]
+    if worker::broken() {
+        finish(job, None);
+        return;
     }
+    QUEUE.with_borrow_mut(|q| insert(q, job));
+    dispatch();
+}
+
+/// Puts `job` in the queue: after all urgent jobs when it is urgent, at
+/// the back otherwise. A job already queued under its key takes the new
+/// callbacks and, when the new request is urgent, the old job's place
+/// among the urgent ones.
+fn insert(q: &mut VecDeque<Job>, mut job: Job) {
+    let at = match q.iter().position(|j| j.key == job.key) {
+        Some(i) => {
+            let old = &mut q[i];
+            job.done.extend(std::mem::take(&mut old.done));
+            job.urgent |= old.urgent;
+            let at = if job.urgent && !old.urgent {
+                q.iter().position(|j| !j.urgent).unwrap_or(q.len())
+            } else {
+                i
+            };
+            q.remove(i);
+            at
+        }
+        None if job.urgent => q.iter().position(|j| !j.urgent).unwrap_or(q.len()),
+        None => q.len(),
+    };
+    q.insert(at, job);
 }
 
 /// Lets the requests made from now on go before all queued ones, e.g.
@@ -515,42 +589,299 @@ pub fn demote() {
     });
 }
 
-/// Works through the queue, a slice at a time.
-async fn work() {
-    loop {
-        let deadline = js_sys::Date::now() + SLICE_MS;
-        while js_sys::Date::now() < deadline {
-            let Some(job) = QUEUE.with_borrow_mut(|q| {
-                let job = q.front_mut()?;
-                let text = job.blob.text.as_deref().unwrap_or_default();
-                job.lines
-                    .step(text, LINES_PER_CHECK)
-                    .then(|| q.pop_front())
-                    .flatten()
-            }) else {
-                if QUEUE.with_borrow(VecDeque::is_empty) {
-                    RUNNING.set(false);
-                    return;
-                }
-                continue;
+/// Puts `lines` in the cache for `key`, evicting the oldest entry when
+/// the cache is full.
+fn store(key: &Key, lines: Highlighted) {
+    CACHE.with_borrow_mut(|c| {
+        if c.order.len() >= CACHE_SIZE
+            && let Some(old) = c.order.pop_front()
+        {
+            c.blobs.remove(&old);
+        }
+        c.order.push_back(key.clone());
+        c.blobs.insert(key.clone(), lines);
+    });
+}
+
+/// Caches the job's lines and hands them to its callbacks. `None` means
+/// plain text: the blob's escaped lines, or the empty list that code
+/// blocks take as "not highlighted".
+fn finish(job: Job, lines: Option<Vec<String>>) {
+    let h: Highlighted = Arc::new(match lines {
+        Some(lines) => lines,
+        None if job.lang => Vec::new(),
+        None => plain_lines(job.blob.text.as_deref().unwrap_or_default()),
+    });
+    store(&job.key, h.clone());
+    // Outside the borrows: callbacks may request more.
+    for done in job.done {
+        done(h.clone());
+    }
+}
+
+/// Gives every queued job its plain lines, e.g. when no worker can run.
+#[cfg(target_arch = "wasm32")]
+fn drain_plain() {
+    while let Some(job) = QUEUE.with_borrow_mut(|q| q.pop_front()) {
+        finish(job, None);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch() {
+    worker::dispatch();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch() {
+    while let Some(job) = QUEUE.with_borrow_mut(|q| q.pop_front()) {
+        let text = job.blob.text.as_deref().unwrap_or_default();
+        let lines = match job.lang {
+            true => highlight_code(&job.spec, text).map(|h| vec![h]),
+            false => Some(highlight_lines(&job.spec, text)),
+        };
+        finish(job, lines);
+    }
+}
+
+/// The highlight worker and the job it is on. All highlighting happens
+/// off the page's thread because a pathological input can stall syntect
+/// forever; the watchdog shows such a job plain and starts a new worker.
+#[cfg(target_arch = "wasm32")]
+mod worker {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// How long a job may take without a progress message before the
+    /// worker is killed and the job shown plain.
+    const WATCHDOG_MS: i32 = 3_000;
+
+    /// A running worker and the job it was sent.
+    struct Active {
+        worker: web_sys::Worker,
+        /// Whether the worker loaded the syntaxes and said "ready".
+        ready: bool,
+        /// The job sent but not answered yet, with its message ID.
+        current: Option<(u32, Job)>,
+        /// The watchdog's timeout, armed only while `current` is set.
+        timer: Option<i32>,
+        // Kept so their closures stay alive.
+        _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+        _onerror: Closure<dyn FnMut(web_sys::Event)>,
+        _watchdog: Closure<dyn FnMut()>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
+        /// Set once a worker could not be started or crashed: every job is
+        /// plain from then on; highlighting never returns to the page's
+        /// thread, which is the thread a stall would freeze.
+        static BROKEN: Cell<bool> = const { Cell::new(false) };
+        static NEXT_ID: Cell<u32> = const { Cell::new(1) };
+    }
+
+    /// Whether highlighting is off for good: jobs resolve plain.
+    pub fn broken() -> bool {
+        BROKEN.get()
+    }
+
+    /// Sends the queue's front job to the worker, creating it first.
+    pub fn dispatch() {
+        if BROKEN.get() {
+            drain_plain();
+            return;
+        }
+        if ACTIVE.with_borrow(Option::is_none) && !spawn() {
+            BROKEN.set(true);
+            drain_plain();
+            return;
+        }
+        enum Next {
+            Sent,
+            Waiting,
+            PostFailed,
+        }
+        let next = ACTIVE.with_borrow_mut(|a| {
+            let Some(active) = a.as_mut() else {
+                return Next::Waiting;
             };
-            let text = job.blob.text.as_deref().unwrap_or_default();
-            let lines: Highlighted = Arc::new(job.lines.finish(text));
-            CACHE.with_borrow_mut(|c| {
-                if c.order.len() >= CACHE_SIZE
-                    && let Some(old) = c.order.pop_front()
-                {
-                    c.blobs.remove(&old);
+            if !active.ready || active.current.is_some() {
+                return Next::Waiting;
+            }
+            let Some(job) = QUEUE.with_borrow_mut(|q| q.pop_front()) else {
+                return Next::Waiting;
+            };
+            let id = NEXT_ID.replace(NEXT_ID.get() + 1);
+            let msg = js_sys::Object::new();
+            for (k, v) in [
+                ("id", JsValue::from(id)),
+                (
+                    if job.lang { "lang" } else { "path" },
+                    JsValue::from(&*job.spec),
+                ),
+                (
+                    "text",
+                    JsValue::from(job.blob.text.as_deref().unwrap_or_default()),
+                ),
+            ] {
+                let _ = js_sys::Reflect::set(&msg, &k.into(), &v);
+            }
+            match active.worker.post_message(&msg) {
+                Ok(()) => {
+                    active.current = Some((id, job));
+                    Next::Sent
                 }
-                c.order.push_back(job.key.clone());
-                c.blobs.insert(job.key, lines.clone());
-            });
-            // Outside the borrows: callbacks may request more.
-            for done in job.done {
-                done(lines.clone());
+                Err(_) => {
+                    QUEUE.with_borrow_mut(|q| q.push_front(job));
+                    Next::PostFailed
+                }
+            }
+        });
+        match next {
+            Next::Sent => arm(),
+            Next::Waiting => {}
+            Next::PostFailed => {
+                BROKEN.set(true);
+                drain_plain();
             }
         }
-        next_task().await;
+    }
+
+    /// Starts a worker and hands it the compiled module; the worker
+    /// announces "ready" once its syntaxes are loaded. `false` when no
+    /// worker could be started.
+    fn spawn() -> bool {
+        let options = web_sys::WorkerOptions::new();
+        options.set_type(web_sys::WorkerType::Module);
+        let Ok(worker) = web_sys::Worker::new_with_options("/highlight_worker.js", &options) else {
+            return false;
+        };
+        let onmessage: Closure<dyn FnMut(web_sys::MessageEvent)> = Closure::new(on_message);
+        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        let onerror: Closure<dyn FnMut(web_sys::Event)> = Closure::new(on_error);
+        worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        let watchdog: Closure<dyn FnMut()> = Closure::new(on_stall);
+        let active = Active {
+            worker,
+            ready: false,
+            current: None,
+            timer: None,
+            _onmessage: onmessage,
+            _onerror: onerror,
+            _watchdog: watchdog,
+        };
+        // The page's own module, transferred so the worker neither
+        // fetches nor compiles it.
+        let posted = active.worker.post_message(&wasm_bindgen::module()).is_ok();
+        ACTIVE.with_borrow_mut(|a| *a = posted.then_some(active));
+        posted
+    }
+
+    /// (Re)arms the watchdog: WATCHDOG_MS without a message from the
+    /// worker stalls it. Only armed while a job is in flight, so loading
+    /// the syntaxes before "ready" doesn't count.
+    fn arm() {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        ACTIVE.with_borrow_mut(|a| {
+            let Some(active) = a.as_mut() else { return };
+            if let Some(timer) = active.timer.take() {
+                window.clear_timeout_with_handle(timer);
+            }
+            if active.current.is_none() {
+                return;
+            }
+            active.timer = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    active._watchdog.as_ref().unchecked_ref(),
+                    WATCHDOG_MS,
+                )
+                .ok();
+        });
+    }
+
+    /// The watchdog fired: kill the worker, show its job plain — the
+    /// cached result means the job is never tried again — and start over
+    /// with a fresh worker for the rest of the queue.
+    fn on_stall() {
+        // A stale timer can fire after its job finished; leave a healthy
+        // worker alone.
+        if !ACTIVE.with_borrow(|a| a.as_ref().is_some_and(|a| a.current.is_some())) {
+            return;
+        }
+        let Some(active) = ACTIVE.with_borrow_mut(|a| a.take()) else {
+            return;
+        };
+        let Some((_, job)) = active.current else {
+            return;
+        };
+        active.worker.terminate();
+        web_sys::console::warn_1(
+            &format!("Highlighting stalled on {}; showing it plain.", job.spec).into(),
+        );
+        finish(job, None);
+        dispatch();
+    }
+
+    /// The worker failed to start or crashed: every job is plain.
+    fn on_error(_: web_sys::Event) {
+        BROKEN.set(true);
+        if let Some(active) = ACTIVE.with_borrow_mut(|a| a.take())
+            && let Some((_, job)) = active.current
+        {
+            finish(job, None);
+        }
+        drain_plain();
+    }
+
+    fn on_message(event: web_sys::MessageEvent) {
+        let Some(text) = event.data().as_string() else {
+            return;
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        if msg.get("type").and_then(|t| t.as_str()) == Some("ready") {
+            ACTIVE.with_borrow_mut(|a| {
+                if let Some(active) = a.as_mut() {
+                    active.ready = true;
+                }
+            });
+            dispatch();
+            return;
+        }
+        // A progress message is just proof of life for the watchdog.
+        if msg.get("progress").is_some() {
+            arm();
+            return;
+        }
+        let id = msg.get("id").and_then(|i| i.as_u64()).unwrap_or_default() as u32;
+        let lines = msg
+            .get("lines")
+            .filter(|l| !l.is_null())
+            .and_then(|l| serde_json::from_value::<Vec<String>>(l.clone()).ok());
+        let job = ACTIVE.with_borrow_mut(|a| {
+            let active = a.as_mut()?;
+            match &active.current {
+                Some((current, _)) if *current == id => {}
+                _ => return None,
+            }
+            active.current.take().map(|(_, job)| job)
+        });
+        let Some(job) = job else {
+            return;
+        };
+        // Done in time: disarm the watchdog; the next job arms it again.
+        arm();
+        finish(job, lines);
+        dispatch();
+    }
+
+    /// Creates the worker ahead of the first request.
+    pub fn warm() {
+        dispatch();
     }
 }
 
@@ -564,12 +895,12 @@ pub async fn next_task() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// Loads the syntaxes ahead of the first highlight.
+/// Starts the highlight worker ahead of the first request.
 pub fn warm() {
-    leptos::task::spawn_local(async {
-        next_task().await;
-        with_syntaxes(|_| ());
-    });
+    #[cfg(target_arch = "wasm32")]
+    worker::warm();
+    #[cfg(not(target_arch = "wasm32"))]
+    with_syntaxes(|_| ());
 }
 
 /// Highlights a fenced code block's `code`; `None` when the language token
@@ -592,6 +923,44 @@ pub fn highlight_code(lang: &str, code: &str) -> Option<String> {
         }
         Some(generator.finalize())
     })
+}
+
+/// The worker's entry points, exported to /highlight_worker.js. The
+/// first takes the syntax-loading time out of every job's watchdog
+/// window; the second does one job and reports its progress.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn highlight_load_syntaxes() {
+    with_syntaxes(|_| ());
+}
+
+/// Highlights `text` as path or language token `name` and returns the
+/// lines' HTML — for a language token, the whole block's HTML as one
+/// line — or null for plain text. A progress message goes out every
+/// LINES_PER_CHECK lines so the page's watchdog can tell a slow job
+/// from a stalled one.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn highlight_job(id: u32, name: &str, is_path: bool, text: &str) -> JsValue {
+    let answer = |lines: Option<Vec<String>>| match lines {
+        Some(lines) => lines
+            .iter()
+            .map(|l| JsValue::from(l.as_str()))
+            .collect::<js_sys::Array>()
+            .into(),
+        None => JsValue::NULL,
+    };
+    if !is_path {
+        return answer(highlight_code(name, text).map(|h| vec![h]));
+    }
+    let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    let mut lines = Lines::new(name, text);
+    while !lines.step(text, LINES_PER_CHECK) {
+        let _ = scope.post_message(&JsValue::from_str(&format!(
+            "{{\"id\":{id},\"progress\":1}}"
+        )));
+    }
+    answer(lines.state.is_some().then(|| lines.finish(text)))
 }
 
 /// Wraps the chars of a highlighted line that fall in `ranges` (char
@@ -685,6 +1054,8 @@ fn split_lines(html: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
 
     #[test]
@@ -911,6 +1282,112 @@ mod tests {
         }
         assert_eq!(steps, RUST.lines().count());
         assert_eq!(lines.finish(RUST), expected);
+    }
+
+    fn blob(text: &str) -> Arc<Blob> {
+        Arc::new(Blob {
+            text: Some(text.to_owned()),
+            size: text.len() as u64,
+        })
+    }
+
+    /// A `done` callback's result slot and the callback taking it.
+    fn slot() -> (Rc<RefCell<Option<Highlighted>>>, impl FnOnce(Highlighted)) {
+        let slot = Rc::new(RefCell::new(None));
+        let set = slot.clone();
+        (slot, move |h| *set.borrow_mut() = Some(h))
+    }
+
+    #[test]
+    fn request_resolves_and_caches() {
+        let (got, done) = slot();
+        request("x.rs", "1", blob(RUST), false, done);
+        let h = got.borrow().clone().unwrap();
+        assert!(h.iter().any(|l| l.contains("sy-")), "{h:?}");
+        assert_eq!(
+            cached("x.rs", "1").as_deref().map(Vec::as_slice),
+            Some(h.as_slice())
+        );
+    }
+
+    #[test]
+    fn request_code_returns_one_line_or_none() {
+        let (got, done) = slot();
+        request_code("rust", "1", "fn f() {}", false, done);
+        let h = got.borrow().clone().unwrap();
+        assert_eq!(h.len(), 1);
+        assert!(h[0].contains("sy-"));
+        // An unknown language resolves to the empty list, cached too.
+        let (got, done) = slot();
+        request_code("nolang", "2", "x", false, done);
+        assert!(got.borrow().clone().unwrap().is_empty());
+        assert!(cached_code("nolang", "2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn urgent_requests_go_first_and_duplicates_merge() {
+        let job = |key: &str, urgent: bool| Job {
+            key: (key.to_owned(), "1".into()),
+            urgent,
+            lang: false,
+            spec: key.to_owned(),
+            blob: blob(""),
+            done: Vec::new(),
+        };
+        let mut q = VecDeque::from([job("u", true), job("a", false), job("b", false)]);
+        insert(&mut q, job("c", true));
+        assert_eq!(
+            q.iter().map(|j| j.key.0.as_str()).collect::<Vec<_>>(),
+            ["u", "c", "a", "b"]
+        );
+        // A duplicate non-urgent key keeps its place and merges callbacks.
+        insert(&mut q, job("b", false));
+        assert_eq!(
+            q.iter().map(|j| j.key.0.as_str()).collect::<Vec<_>>(),
+            ["u", "c", "a", "b"]
+        );
+        // An urgent duplicate jumps ahead of the other non-urgent jobs.
+        insert(&mut q, job("a", true));
+        assert_eq!(
+            q.iter().map(|j| j.key.0.as_str()).collect::<Vec<_>>(),
+            ["u", "c", "a", "b"]
+        );
+        assert!(q[2].urgent);
+        // A non-urgent duplicate of an urgent job stays urgent.
+        insert(&mut q, job("a", false));
+        assert!(q[2].urgent);
+    }
+
+    #[test]
+    fn a_stalled_job_is_cached_plain() {
+        // What the watchdog leaves behind for a job that stalled the
+        // worker: plain lines that are never retried.
+        let job = Job {
+            key: ("x.py".into(), "9".into()),
+            urgent: false,
+            lang: false,
+            spec: "x.py".into(),
+            blob: blob("a < b\n"),
+            done: Vec::new(),
+        };
+        finish(job, None);
+        assert_eq!(
+            cached("x.py", "9").as_deref().map(Vec::as_slice),
+            Some(&["a &lt; b".to_owned()][..])
+        );
+        // A later request for the same key gets the plain lines.
+        let (got, done) = slot();
+        request("x.py", "9", blob("a < b\n"), false, done);
+        assert_eq!(got.borrow().clone().unwrap().as_slice(), ["a &lt; b"]);
+    }
+
+    #[test]
+    fn the_cache_evicts_its_oldest_entry() {
+        for i in 0..=CACHE_SIZE {
+            store(&("p".into(), i.to_string()), Arc::new(vec![i.to_string()]));
+        }
+        assert!(cached("p", "0").is_none());
+        assert!(cached("p", &CACHE_SIZE.to_string()).is_some());
     }
 
     #[test]

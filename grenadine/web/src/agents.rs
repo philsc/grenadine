@@ -1925,18 +1925,31 @@ fn bash_view(input: &serde_json::Value) -> Option<(String, Option<String>)> {
 /// and highlighted as JSON.
 #[component]
 fn ToolInput(name: String, input: String) -> impl IntoView {
-    let json = {
-        let text = pretty(&input);
-        highlight::highlight_code("json", &text).unwrap_or_else(|| highlight::escape(&text))
+    // Highlighted by the worker when its answer comes; escaped until
+    // then and for languages it doesn't know.
+    let code = |lang: &str, text: &str| {
+        let html = RwSignal::new(highlight::escape(text));
+        highlight::request_code(
+            lang,
+            &highlight::code_id(lang, text),
+            text,
+            true,
+            move |h| {
+                if let Some(h) = h.first() {
+                    html.set(h.clone());
+                }
+            },
+        );
+        html
     };
+    let json = code("json", &pretty(&input));
     let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
     let view = (name == "Bash").then(|| bash_view(&value)).flatten();
     let Some((command, fields)) = view else {
-        return view! { <pre class="tool-input" inner_html=json></pre> }.into_any();
+        return view! { <pre class="tool-input" inner_html=move || json.get()></pre> }.into_any();
     };
     let raw = RwSignal::new(false);
-    let command =
-        highlight::highlight_code("bash", &command).unwrap_or_else(|| highlight::escape(&command));
+    let command = code("bash", &command);
     view! {
         <div class="tool-input-wrap">
             <button
@@ -1949,10 +1962,10 @@ fn ToolInput(name: String, input: String) -> impl IntoView {
             </button>
             {move || {
                 if raw.get() {
-                    view! { <pre class="tool-input" inner_html=json.clone()></pre> }.into_any()
+                    view! { <pre class="tool-input" inner_html=json.get()></pre> }.into_any()
                 } else {
                     view! {
-                        <pre class="tool-input" inner_html=command.clone()></pre>
+                        <pre class="tool-input" inner_html=command.get()></pre>
                         {fields.clone().map(|f| view! { <p class="tool-fields muted">{f}</p> })}
                     }
                         .into_any()

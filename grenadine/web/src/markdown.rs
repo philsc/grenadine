@@ -4,6 +4,8 @@ use std::borrow::Cow;
 
 use linkify::{LinkFinder, LinkKind};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 use crate::highlight;
 
@@ -328,12 +330,59 @@ fn repo_ref_boundary(prev: Option<char>) -> bool {
 /// is highlighted like the diff is.
 fn code_block_html(lang: &str, code: &str) -> String {
     let token = lang.split_whitespace().next().unwrap_or_default();
-    match highlight::highlight_code(token, code) {
-        Some(spans) => format!(
-            "<pre><code class=\"language-{}\">{spans}</code></pre>",
-            escape_attr(token)
-        ),
-        None => format!("<pre><code>{}</code></pre>", escape(code)),
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match highlight::highlight_code(token, code) {
+            Some(spans) => format!(
+                "<pre><code class=\"language-{}\">{spans}</code></pre>",
+                escape_attr(token)
+            ),
+            None => format!("<pre><code>{}</code></pre>", escape(code)),
+        }
+    }
+    // In the browser highlighting runs in the worker, so a block starts
+    // out escaped and its `data-hl` elements are filled in when the
+    // answer comes; re-renders hit the cache instead.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let plain = || format!("<pre><code>{}</code></pre>", escape(code));
+        if token.is_empty() {
+            return plain();
+        }
+        let id = highlight::code_id(token, code);
+        if let Some(h) = highlight::cached_code(token, &id) {
+            return match h.first() {
+                Some(spans) => format!(
+                    "<pre><code class=\"language-{}\">{spans}</code></pre>",
+                    escape_attr(token)
+                ),
+                None => plain(),
+            };
+        }
+        let find = id.clone();
+        highlight::request_code(token, &id, code, true, move |h| {
+            let Some(spans) = h.first() else {
+                return;
+            };
+            let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+                return;
+            };
+            let nodes = document.query_selector_all(&format!("code[data-hl=\"{find}\"]"));
+            let Ok(nodes) = nodes else { return };
+            for i in 0..nodes.length() {
+                if let Some(el) = nodes
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                {
+                    el.set_inner_html(spans);
+                }
+            }
+        });
+        format!(
+            "<pre><code class=\"language-{}\" data-hl=\"{id}\">{}</code></pre>",
+            escape_attr(token),
+            escape(code)
+        )
     }
 }
 
@@ -437,7 +486,7 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
         .add_tag_attributes("input", ["type", "checked", "disabled"])
         .add_tag_attributes("a", ["aria-label", "class", "target"])
         .add_tag_attributes("span", ["class"])
-        .add_tag_attributes("code", ["class"])
+        .add_tag_attributes("code", ["class", "data-hl"])
         .add_tags(["input", "details", "summary"])
         .link_rel(Some("noopener noreferrer"))
         .attribute_filter(|tag, attr, value| match (tag, attr) {
@@ -456,7 +505,17 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             }
             ("a", "target") if value == "_blank" => Some(Cow::Borrowed(value)),
             ("a", "href") if value.starts_with("#/") => None,
-            ("span" | "code", "class") | ("a", "class" | "target") => None,
+            // The attribute that the deferred code-block highlighting
+            // looks its element up by: a `code_id` hash.
+            ("code", "data-hl")
+                if value.len() == 16
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) =>
+            {
+                Some(Cow::Borrowed(value))
+            }
+            ("span" | "code", "class") | ("a", "class" | "target") | ("code", "data-hl") => None,
             _ => Some(Cow::Borrowed(value)),
         })
         .clean(&out)

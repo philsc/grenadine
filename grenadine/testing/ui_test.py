@@ -3894,6 +3894,51 @@ class VersionsTest(ServerTestCase):
         height = self.settle()
         self.scroll_through(height)
 
+    def test_stalled_highlighter_leaves_the_page_alive(self) -> None:
+        # A worker whose job never finishes: the page's watchdog shows the
+        # file plain, kills the worker, and highlights the rest.
+        stuck = scenarios.BIG_FILES[2]
+        wrapper = f"""
+import init, {{highlight_load_syntaxes, highlight_job}} from "/grenadine_web.js";
+
+self.onmessage = async (event) => {{
+  const data = event.data;
+  if (data instanceof WebAssembly.Module) {{
+    await init({{module_or_path: data}});
+    highlight_load_syntaxes();
+    self.postMessage(JSON.stringify({{type: "ready"}}));
+    return;
+  }}
+  if (data.path === {json.dumps(stuck)}) {{
+    for (;;) {{}}
+  }}
+  const lines = highlight_job(data.id, data.path ?? data.lang, data.path !== undefined, data.text);
+  self.postMessage(JSON.stringify({{id: data.id, lines}}));
+}};
+"""
+        self.page.context.route(
+            "**/highlight_worker.js",
+            lambda route: route.fulfill(body=wrapper, content_type="text/javascript"),
+        )
+        self.open(scenarios.BIG_DIFF)
+        for path in scenarios.BIG_FILES:
+            if path == stuck:
+                continue
+            with self.subTest(path=path):
+                expect(
+                    self.file(path).locator("td.code .sy-storage").first
+                ).to_have_text("def")
+        # The stuck file's job hits the 3s watchdog after the others
+        # finished; its 300 rows render without any highlighted spans.
+        file = self.file(stuck)
+        expect(file.locator("tr.line td.code.add")).to_have_count(300, timeout=15_000)
+        self.page.wait_for_timeout(4000)
+        expect(file.locator('[class*="sy-"]')).to_have_count(0)
+        # The page itself stayed responsive the whole time.
+        self.assertEqual(self.page.evaluate("1 + 1"), 2)
+        file.locator(".file-header").click()
+        expect(file.locator("table.diff")).to_have_count(0)
+
     def toolbar_bottom(self) -> float:
         box = self.page.locator(".toolbar").bounding_box()
         return box["y"] + box["height"]
@@ -3942,6 +3987,14 @@ class VersionsTest(ServerTestCase):
 
     def test_pinning_the_toolbar_does_not_jump_the_diff(self) -> None:
         self.open(scenarios.BIG_DIFF)
+        # The background highlighter re-renders the file when it answers;
+        # measure the steady, highlighted layout.
+        file = self.file(scenarios.BIG_FILES[0])
+        expect(file.locator("tr.line td.code.add")).to_have_count(300)
+        expect(file.locator("td.code .sy-storage").first).to_have_text("def")
+        # Scroll positions and row boxes only mean something once the
+        # measuring pass is done and the scroll height steady.
+        self.settle()
         main = self.page.locator(".pr-page .main")
         # The scrollTop at which the marker reaches the scroller's top and
         # the toolbar pins.

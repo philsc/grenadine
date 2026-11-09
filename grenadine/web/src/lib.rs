@@ -369,6 +369,11 @@ fn App() -> impl IntoView {
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+    // The highlight worker's init runs this too; only a page has a
+    // window.
+    if web_sys::window().is_none() {
+        return;
+    }
     // The syntax colors for both themes.
     let document = document();
     if let Ok(style) = document.create_element("style") {
