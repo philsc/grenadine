@@ -759,6 +759,64 @@ fn PrBody(
         });
     });
 
+    // A zero-height marker just above the toolbar reports when the
+    // toolbar is pinned: while the marker sits above the scroller's top
+    // edge, the toolbar below it is stuck. The title row only renders
+    // then; above it the real h1 is still visible.
+    let stuck = RwSignal::new(false);
+    let marker = NodeRef::<leptos::html::Div>::new();
+    let observing = StoredValue::new_local(
+        None::<(
+            web_sys::IntersectionObserver,
+            Closure<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>,
+        )>,
+    );
+    Effect::new(move |_| {
+        let Some(marker) = marker.get() else {
+            return;
+        };
+        if observing.with_value(|o| o.is_some()) {
+            return;
+        }
+        let Ok(Some(root)) = marker.closest(".main") else {
+            return;
+        };
+        let options = web_sys::IntersectionObserverInit::new();
+        options.set_root(Some(&root));
+        options.set_threshold_f64(0.0);
+        let on_intersect = Closure::<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>::new(
+            move |entries: js_sys::Array, _| {
+                let Some(entry) = entries
+                    .get(0)
+                    .dyn_into::<web_sys::IntersectionObserverEntry>()
+                    .ok()
+                else {
+                    return;
+                };
+                // Out of view both ways is possible: above the scroller once
+                // scrolled into the diff, below it before the toolbar pins.
+                let above = entry
+                    .root_bounds()
+                    .is_some_and(|root| entry.bounding_client_rect().top() < root.top());
+                stuck.set(!entry.is_intersecting() && above);
+            },
+        );
+        if let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
+            on_intersect.as_ref().unchecked_ref(),
+            &options,
+        ) {
+            observer.observe(&marker);
+            observing.set_value(Some((observer, on_intersect)));
+        }
+    });
+    on_cleanup(move || {
+        observing.try_with_value(|o| {
+            if let Some((observer, _)) = o {
+                observer.disconnect();
+            }
+        });
+    });
+
     view! {
         <article class="pr">
             {move || {
@@ -811,7 +869,21 @@ fn PrBody(
                     .map(|info| merge_box(&info, merge_target(&pr, pinned.get())).into_any())
             }}
             {merge_warning()}
+            <div class="toolbar-marker" aria-hidden="true" node_ref=marker></div>
             <div class="toolbar" node_ref=toolbar>
+                {move || {
+                    stuck.get().then(|| {
+                        let pr = pr.get();
+                        let s = &pr.summary;
+                        view! {
+                            <div class="toolbar-title">
+                                <span class=format!("state state-{}", state_label(&s.state, s.queued))>{state_label(&s.state, s.queued)}</span>
+                                {s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() />
+                            </div>
+                        }
+                        .into_any()
+                    })
+                }}
                 <VersionPicker versions=versions comments=comments reviewed=reviewed chosen=chosen selection=selection />
                 {move || {
                     has_review.get().then(|| {

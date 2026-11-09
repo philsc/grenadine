@@ -3487,6 +3487,58 @@ class VersionsTest(ServerTestCase):
             header.bounding_box()["y"], self.toolbar_bottom(), delta=1
         )
 
+    def test_toolbar_shows_the_title_only_while_pinned(self) -> None:
+        pr = self.cases.prs[scenarios.BIG_DIFF]
+        self.open(scenarios.BIG_DIFF)
+        title = self.page.locator(".toolbar-title")
+        # The real h1 covers the top of the page, so no title row.
+        expect(title).to_have_count(0)
+
+        file = self.file(scenarios.BIG_FILES[0])
+        # Scrolling mid-file only sticks the header once the rows are laid
+        # out at their real height.
+        expect(file.locator("tr.line td.code.add")).to_have_count(300)
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        expect(title).to_be_visible()
+        expect(title.locator(".state")).to_have_text(
+            self.page.locator(".pr-header .state").inner_text()
+        )
+        expect(title).to_contain_text(pr.title)
+        expect(title.locator(".pr-number")).to_have_text(f"#{pr.number}")
+        # The row grew the toolbar; the stuck file header follows it.
+        header = file.locator(".file-header")
+        self.assertAlmostEqual(
+            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
+        )
+
+        main = self.page.locator(".pr-page .main")
+        main.evaluate("el => el.scrollTop = 0")
+        expect(title).to_have_count(0)
+
+    def test_pinning_the_toolbar_does_not_jump_the_diff(self) -> None:
+        self.open(scenarios.BIG_DIFF)
+        main = self.page.locator(".pr-page .main")
+        # The scrollTop at which the marker reaches the scroller's top and
+        # the toolbar pins.
+        pin_top = main.evaluate(
+            "el => el.scrollTop"
+            " + document.querySelector('.toolbar-marker').getBoundingClientRect().top"
+            " - el.getBoundingClientRect().top"
+        )
+        # Stop just short of pinning; a diff line sits just below the
+        # toolbar in normal flow.
+        gap = 40
+        main.evaluate("(el, y) => el.scrollTop = y", pin_top - gap)
+        line = self.file(scenarios.BIG_FILES[0]).locator("tr.line").nth(2)
+        y_before = line.bounding_box()["y"]
+        # Pinning adds the title row to the in-flow toolbar; scroll
+        # anchoring should keep the diff under the cursor steady, so the
+        # line moves up by exactly the scrolled amount.
+        past = 30
+        main.evaluate("(el, y) => el.scrollTop = y", pin_top + past)
+        expect(self.page.locator(".toolbar-title")).to_have_count(1)
+        self.assertAlmostEqual(line.bounding_box()["y"], y_before - gap - past, delta=6)
+
     def test_file_index_scrolls_files_below_the_toolbar(self) -> None:
         self.open(scenarios.BIG_DIFF)
         path = scenarios.BIG_FILES[4]

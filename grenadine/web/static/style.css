@@ -761,12 +761,27 @@ input[type="text"] {
   top: 0;
   z-index: 2;
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   gap: 16px;
   padding: 8px 0;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
   margin-bottom: 12px;
+}
+/* A compact copy of the PR title, rendered only while the toolbar is
+   pinned; the marker above the toolbar tells the page when that is. */
+.toolbar-marker {
+  height: 0;
+}
+.toolbar-title {
+  flex: 0 0 100%;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .toggle {
   padding-top: 4px;

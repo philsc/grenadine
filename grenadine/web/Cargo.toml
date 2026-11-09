@@ -38,6 +38,8 @@ web-sys = { workspace = true, features = [
   "MediaQueryList",
   "IntersectionObserver",
   "IntersectionObserverEntry",
+  "IntersectionObserverInit",
+  "DomRectReadOnly",
   "Storage",
   "WebSocket",
   "BinaryType",
