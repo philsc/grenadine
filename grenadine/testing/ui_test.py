@@ -22,6 +22,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -33,6 +34,7 @@ from grenadine.testing.fake_github import (
     APPROVED,
     COMMENTED,
     TEAM,
+    TEAM_SLUG,
     TOKEN,
     CheckRun,
     FakeGitHub,
@@ -1257,7 +1259,7 @@ class InboxTest(ServerTestCase):
             "Changes requested"
         )
         rows = sidebar.locator(".reviewers > span")
-        expect(rows).to_have_count(6)
+        expect(rows).to_have_count(7)
         expect(sidebar.locator(".reviewer-name")).to_have_text(
             ["Other Person", "third"]
         )
@@ -1410,7 +1412,51 @@ class InboxTest(ServerTestCase):
         expect(self.sidebar()).to_have_count(1)
         expect(self.sidebar()).not_to_have_class(re.compile(r"\boverlay\b"))
 
-    def pr_page(self, title: str, width: int) -> None:
+    def collaborators(self, users: set[str], team: set[str] | None = None) -> None:
+        """Makes `users` assignable on the scenario repo and its owner an
+        organization with the team, and undoes it all on cleanup."""
+        repo = self.gh.repo(scenarios.REPO)
+        saved = (
+            dict(self.gh.users),
+            set(repo.collaborators),
+            {s: set(m) for s, m in repo.teams.items()},
+        )
+        for u in users:
+            self.gh.users.setdefault(u, u)
+        repo.collaborators |= users
+        if team is not None:
+            repo.teams[TEAM_SLUG] = team
+
+        def restore() -> None:
+            self.gh.users.clear()
+            self.gh.users.update(saved[0])
+            repo.collaborators.clear()
+            repo.collaborators.update(saved[1])
+            repo.teams.clear()
+            repo.teams.update(saved[2])
+
+        self.addCleanup(restore)
+
+    def synced(self, pr: PullRequest) -> None:
+        """Asks the server to sync and waits until it re-fetched `pr`."""
+        seen = f"graphql pr {pr.repo.slug}#{pr.number}"
+        n = self.gh.requests.count(seen)
+        self.refresh()
+        deadline = time.monotonic() + 15
+        while self.gh.requests.count(seen) == n:
+            if time.monotonic() > deadline:
+                self.fail(f"the server never re-synced {seen}")
+            time.sleep(0.05)
+
+    def wait_until(self, check: Callable[[], bool], what: str) -> None:
+        """Polls `check` until it holds, with the usual deadline."""
+        deadline = time.monotonic() + 15
+        while not check():
+            if time.monotonic() > deadline:
+                self.fail(f"timed out waiting for {what}")
+            time.sleep(0.05)
+
+    def pr_page(self, title: str, width: int = 1800) -> None:
         """Opens a PR's page at a window width, without a saved sidebar
         width."""
         pr = self.cases.prs[title]
@@ -1421,6 +1467,170 @@ class InboxTest(ServerTestCase):
         )
         self.page.reload()
         expect(self.sidebar()).to_be_visible()
+
+    def test_picker_requests_users_and_a_team(self) -> None:
+        pr = self.cases.prs["Wait for reviewers"]
+
+        def restore() -> None:
+            pr.review_requests.discard(scenarios.OTHER)
+            pr.team_review_requests.discard(scenarios.OTHER)
+            # The server holds the requests the test made until a sync.
+            pr.touch()
+            self.synced(pr)
+
+        self.addCleanup(restore)
+        self.collaborators({scenarios.OTHER}, team={scenarios.OTHER})
+        self.pr_page("Wait for reviewers")
+
+        sidebar = self.sidebar()
+        sidebar.get_by_role("button", name="Edit reviewers").click()
+        popover = self.page.locator(".reviewer-popover")
+        other = popover.locator(".picker-row").filter(has_text="Other Person")
+        team = popover.locator(".picker-row").filter(has_text=TEAM)
+        expect(popover.locator(".picker-row")).to_have_count(2)
+        other.click()
+        team.click()
+        # Closing the picker sends the ticks as one request.
+        self.page.locator(".pr-header h1").click()
+        expect(sidebar.locator(".reviewer-name")).to_have_text(["Other Person", TEAM])
+        self.wait_until(
+            lambda: (
+                pr.review_requests == {scenarios.OTHER}
+                and pr.team_review_requests == {scenarios.OTHER}
+            ),
+            "the reviewer requests to reach GitHub",
+        )
+
+    def test_picker_unticks_a_pending_request(self) -> None:
+        pr = self.cases.prs["Get changes requested"]
+
+        def restore() -> None:
+            pr.review_requests.add("third")
+            pr.touch()
+            self.synced(pr)
+
+        self.addCleanup(restore)
+        # "third" is requested but not a collaborator, so the picker
+        # lists it as an extra ticked row.
+        self.collaborators({"third"})
+        self.pr_page("Get changes requested")
+
+        sidebar = self.sidebar()
+        expect(sidebar.locator(".reviewer-name")).to_have_text(
+            ["Other Person", "third"]
+        )
+        sidebar.get_by_role("button", name="Edit reviewers").click()
+        popover = self.page.locator(".reviewer-popover")
+        expect(popover.locator(".picker-row")).to_have_count(1)
+        popover.locator(".picker-row").click()
+        self.page.keyboard.press("Escape")
+        expect(sidebar.locator(".reviewer-name")).to_have_text(["Other Person"])
+        self.wait_until(
+            lambda: pr.review_requests == set(), "the request to be removed"
+        )
+
+    def test_rerequest_asks_a_reviewer_again(self) -> None:
+        pr = self.cases.prs["Get approved"]
+
+        def restore() -> None:
+            pr.review_requests.discard(scenarios.OTHER)
+            pr.touch()
+            self.synced(pr)
+
+        self.addCleanup(restore)
+        self.pr_page("Get approved")
+
+        sidebar = self.sidebar()
+        expect(sidebar.locator(".review-state")).to_have_text(["Approved"])
+        sidebar.get_by_role("button", name="Re-request review").click()
+        expect(sidebar.locator(".review-state")).to_have_text(["Pending"])
+        self.wait_until(
+            lambda: pr.review_requests == {scenarios.OTHER},
+            "the re-request to reach GitHub",
+        )
+
+    def test_reviewer_controls_only_when_editable(self) -> None:
+        sidebar = self.sidebar()
+        # A merged PR keeps the read-only list.
+        pr = self.cases.prs["Get merged"]
+        self.pr_page("Get merged")
+        expect(sidebar.locator(".reviewer-name")).to_have_text(["Other Person"])
+        expect(sidebar.get_by_role("button", name="Edit reviewers")).to_have_count(0)
+        expect(sidebar.get_by_role("button", name="Re-request review")).to_have_count(0)
+
+        # So does a PR the viewer may not update.
+        pr = self.cases.prs["Get approved"]
+        pr.viewer_can_update = False
+        pr.touch()
+
+        def restore() -> None:
+            pr.viewer_can_update = True
+            pr.touch()
+            self.synced(pr)
+
+        self.addCleanup(restore)
+        self.synced(pr)
+        self.pr_page("Get approved")
+        expect(sidebar.locator(".reviewer-name")).to_have_text(["Other Person"])
+        expect(sidebar.get_by_role("button", name="Edit reviewers")).to_have_count(0)
+        expect(sidebar.get_by_role("button", name="Re-request review")).to_have_count(0)
+
+    def test_a_failed_reviewer_change_reverts_the_list(self) -> None:
+        pr = self.cases.prs["Get changes requested"]
+        self.collaborators({"third"})
+        self.gh.fail_next_reviewers = "can't reach GitHub"
+        self.pr_page("Get changes requested")
+
+        sidebar = self.sidebar()
+        sidebar.get_by_role("button", name="Edit reviewers").click()
+        popover = self.page.locator(".reviewer-popover")
+        popover.locator(".picker-row").click()
+        # The row goes optimistically, then the refusal reverts it and
+        # shows the error.
+        self.page.keyboard.press("Escape")
+        expect(sidebar.locator(".reviewer-name")).to_have_text(
+            ["Other Person", "third"]
+        )
+        expect(sidebar.locator(".sidebar-review .error")).to_contain_text(
+            "can't reach GitHub"
+        )
+        self.assertEqual(pr.review_requests, {"third"})
+
+    def test_picker_survives_ticks_and_syncs(self) -> None:
+        pr = self.cases.prs["Wait for reviewers"]
+
+        def restore() -> None:
+            pr.review_requests.discard(scenarios.OTHER)
+            pr.title = "Wait for reviewers"
+            pr.touch()
+            self.synced(pr)
+
+        self.addCleanup(restore)
+        self.collaborators({scenarios.OTHER})
+        self.pr_page("Wait for reviewers")
+
+        self.sidebar().get_by_role("button", name="Edit reviewers").click()
+        box = self.page.locator(".picker-search")
+        box.fill("other")
+        popover = self.page.locator(".reviewer-popover")
+        popover.locator(".picker-row").wait_for()
+        # A tick doesn't rebuild the popover: the search box keeps its
+        # text and stays the same element.
+        same = "el => el === document.querySelector('.picker-search')"
+        self.assertTrue(box.evaluate(same))
+        popover.locator(".picker-row").filter(has_text="Other Person").click()
+        self.assertTrue(box.evaluate(same))
+        expect(box).to_have_value("other")
+        box.focus()
+        # A sync rebuilding the rest of the sidebar doesn't remount the
+        # picker: it's still open, focused and unchanged.
+        pr.title = "Wait for reviewers!"
+        pr.touch()
+        self.synced(pr)
+        expect(popover).to_have_count(1)
+        self.assertTrue(box.evaluate(same))
+        expect(box).to_have_value("other")
+        expect(box).to_be_focused()
 
     def drag_sidebar(self, dx: float) -> None:
         """Drags the sidebar's divider `dx` pixels to the right."""

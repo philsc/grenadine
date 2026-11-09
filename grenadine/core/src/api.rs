@@ -740,16 +740,111 @@ pub struct StackMergePr {
     pub ci: Option<CiStatus>,
 }
 
+/// A team asked to review a PR, as GitHub names and addresses it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TeamRef {
+    pub name: String,
+    /// The name removing the team's request takes; empty when the data
+    /// predates slugs — the next sync fills it in.
+    #[serde(default)]
+    pub slug: String,
+}
+
+/// Saved rows wrote a team as its plain name; accept that too.
+impl<'de> Deserialize<'de> for TeamRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TeamRef, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Full {
+                name: String,
+                #[serde(default)]
+                slug: String,
+            },
+        }
+        match Repr::deserialize(d)? {
+            Repr::Name(name) => Ok(TeamRef {
+                name,
+                slug: String::new(),
+            }),
+            Repr::Full { name, slug } => Ok(TeamRef { name, slug }),
+        }
+    }
+}
+
 /// Someone asked to review a PR who hasn't yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestedReviewer {
     /// A user or a bot.
     Person(Person),
-    Team(String),
+    Team(TeamRef),
     /// A reviewer from PR data saved before reviewers had kinds. The next
     /// sync replaces it.
     #[serde(untagged)]
     Legacy(String),
+}
+
+/// The reviewers a picker's edits add and remove; teams by slug.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerChange {
+    #[serde(default)]
+    pub add_users: Vec<String>,
+    #[serde(default)]
+    pub add_teams: Vec<String>,
+    #[serde(default)]
+    pub remove_users: Vec<String>,
+    #[serde(default)]
+    pub remove_teams: Vec<String>,
+}
+
+/// The adds and removes that take the review requests from the picker's
+/// initial selection to `chosen`: each a (user logins, team slugs) pair.
+/// The empty change means nothing to send.
+pub fn reviewer_change(
+    initial_users: &[String],
+    initial_teams: &[String],
+    users: &[String],
+    teams: &[String],
+) -> ReviewerChange {
+    let diff = |initial: &[String], chosen: &[String]| {
+        let initial: std::collections::BTreeSet<&str> =
+            initial.iter().map(String::as_str).collect();
+        let chosen: std::collections::BTreeSet<&str> = chosen.iter().map(String::as_str).collect();
+        (
+            chosen
+                .difference(&initial)
+                .map(|s| (*s).to_owned())
+                .collect(),
+            initial
+                .difference(&chosen)
+                .map(|s| (*s).to_owned())
+                .collect(),
+        )
+    };
+    let (add_users, remove_users) = diff(initial_users, users);
+    let (add_teams, remove_teams) = diff(initial_teams, teams);
+    ReviewerChange {
+        add_users,
+        add_teams,
+        remove_users,
+        remove_teams,
+    }
+}
+
+/// Who the reviewer picker can offer on a PR.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerCandidates {
+    /// GitHub's suggested reviewers, first.
+    #[serde(default)]
+    pub suggested: Vec<Person>,
+    /// Users assignable on the repository, minus the suggested and the
+    /// PR's author.
+    #[serde(default)]
+    pub users: Vec<Person>,
+    /// The owning organization's teams.
+    #[serde(default)]
+    pub teams: Vec<TeamRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +858,10 @@ pub struct ReviewInfo {
     pub reviews: Vec<Review>,
     /// Users and teams asked to review who haven't yet.
     pub requested: Vec<RequestedReviewer>,
+    /// The viewer may change who's asked to review, GitHub's
+    /// `viewerCanUpdate`.
+    #[serde(default)]
+    pub can_edit_reviewers: bool,
     /// Comments on the PR itself, oldest first.
     pub comments: Vec<IssueComment>,
     /// The checks on the PR's head and their combined state.
@@ -1948,17 +2047,63 @@ mod tests {
                 RequestedReviewer::Legacy("team".into()),
             ]
         );
+        let team = RequestedReviewer::Team(TeamRef {
+            name: "team".into(),
+            slug: "team-slug".into(),
+        });
         let reviewers = vec![
             RequestedReviewer::Person(Person {
                 login: Some("a".into()),
                 name: None,
                 avatar_url: Some("av".into()),
             }),
-            RequestedReviewer::Team("team".into()),
+            team.clone(),
         ];
         let back: Vec<RequestedReviewer> =
             serde_json::from_str(&serde_json::to_string(&reviewers).unwrap()).unwrap();
         assert_eq!(back, reviewers);
+        // Teams saved before slugs still parse, with an empty slug.
+        let old: Vec<RequestedReviewer> =
+            serde_json::from_str(r#"[{"Team":"team"},{"Team":{"name":"t"}}]"#).unwrap();
+        assert_eq!(
+            old,
+            [
+                RequestedReviewer::Team(TeamRef {
+                    name: "team".into(),
+                    slug: String::new(),
+                }),
+                RequestedReviewer::Team(TeamRef {
+                    name: "t".into(),
+                    slug: String::new(),
+                }),
+            ]
+        );
+    }
+
+    /// The picker diff: what changed between the initial and the final
+    /// selection is what gets sent.
+    #[test]
+    fn reviewer_change_diffs_the_selection() {
+        let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let change = reviewer_change(
+            &s(&["a", "b"]),
+            &s(&["t1", "t2"]),
+            &s(&["b", "c"]),
+            &s(&["t2"]),
+        );
+        assert_eq!(
+            change,
+            ReviewerChange {
+                add_users: s(&["c"]),
+                add_teams: s(&[]),
+                remove_users: s(&["a"]),
+                remove_teams: s(&["t1"]),
+            }
+        );
+        assert_eq!(
+            reviewer_change(&s(&["a"]), &s(&[]), &s(&["a"]), &s(&[])),
+            ReviewerChange::default()
+        );
     }
 
     /// Events stored before `ApprovalResolved` carried answers still

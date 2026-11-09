@@ -1,11 +1,13 @@
 //! A PR's reviews, its conversation and whether it can be merged.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::time::Duration;
 
 use grenadine_core::api::{
     AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
     MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision,
-    ReviewEvent, ReviewInfo, ReviewState, StackMergePr, SubmitReview, submit_blocker,
+    ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, ReviewerChange, StackMergePr,
+    SubmitReview, TeamRef, reviewer_change, submit_blocker,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -159,14 +161,20 @@ enum Reviewer<'a> {
 }
 
 /// The sidebar's reviewers: everyone who reviewed, in first-review
-/// order, then everyone asked who hasn't. A person asked again after
-/// reviewing shows once, as pending, since a new verdict is awaited.
-fn reviewers<'a>(info: &'a ReviewInfo, author: &str) -> Vec<Reviewer<'a>> {
-    let mut out: Vec<Reviewer> = latest_reviews(&info.reviews, author)
+/// order, then everyone asked who hasn't. `requested` is what shows as
+/// asked, which differs from the PR's while a change is in flight. A
+/// person asked again after reviewing shows once, as pending, since a
+/// new verdict is awaited.
+fn reviewers<'a>(
+    reviews: &'a [Review],
+    requested: &'a [RequestedReviewer],
+    author: &str,
+) -> Vec<Reviewer<'a>> {
+    let mut out: Vec<Reviewer> = latest_reviews(reviews, author)
         .into_iter()
         .map(Reviewer::Reviewed)
         .collect();
-    for r in &info.requested {
+    for r in requested {
         if let RequestedReviewer::Person(p) = r
             && let Some(login) = p.login.as_deref()
             && let Some(i) = out.iter().position(
@@ -292,9 +300,14 @@ fn TeamIcon() -> impl IntoView {
     }
 }
 
-/// One reviewer row's three grid cells: the icon (avatar, team icon or
-/// nothing), the name and the verdict.
-fn reviewer_row(reviewer: &Reviewer) -> impl IntoView + use<> {
+/// One reviewer row's four grid cells: the icon (avatar, team icon or
+/// nothing), the name, the verdict and the re-request button. Only a
+/// reviewer who already reviewed, on a PR the viewer can edit, gets one.
+fn reviewer_row(
+    reviewer: &Reviewer,
+    editable: bool,
+    rerequest: Callback<Person>,
+) -> impl IntoView + use<> {
     let (icon, name, text, class) = match reviewer {
         Reviewer::Reviewed(r) => (
             avatar(&r.author),
@@ -308,9 +321,9 @@ fn reviewer_row(reviewer: &Reviewer) -> impl IntoView + use<> {
             "Pending",
             "review-state pending",
         ),
-        Reviewer::Requested(RequestedReviewer::Team(name)) => (
+        Reviewer::Requested(RequestedReviewer::Team(t)) => (
             view! { <TeamIcon /> }.into_any(),
-            Some(name.clone()),
+            Some(t.name.clone()),
             "Pending",
             "review-state pending",
         ),
@@ -321,36 +334,555 @@ fn reviewer_row(reviewer: &Reviewer) -> impl IntoView + use<> {
             "review-state pending",
         ),
     };
+    let action = match (editable, reviewer) {
+        (true, Reviewer::Reviewed(r)) => {
+            let p = r.author.clone();
+            view! {
+                <button type="button" class="reviewer-rerequest" title="Re-request review"
+                    aria-label="Re-request review"
+                    on:click=move |_| rerequest.run(p.clone())>
+                    <svg
+                        viewBox="0 0 16 16"
+                        width="13"
+                        height="13"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
+                        <path d="M13.5 1.5v3h-3" />
+                    </svg>
+                </button>
+            }
+            .into_any()
+        }
+        _ => view! { <span></span> }.into_any(),
+    };
     view! {
         <span class="reviewer-icon">{icon}</span>
         <span class="reviewer-name">{name.unwrap_or_default()}</span>
         <span class=class>{text}</span>
+        {action}
+    }
+}
+
+/// What the reviewer picker has ticked.
+#[derive(Clone, Default)]
+pub struct Picks {
+    /// What was ticked when it opened.
+    pub initial_users: BTreeSet<String>,
+    pub initial_teams: BTreeSet<String>,
+    /// What's ticked now.
+    pub users: BTreeSet<String>,
+    pub teams: BTreeSet<String>,
+}
+
+/// The reviewer change the sidebar has in flight: the picker's
+/// selection, the optimistic list and the last error. Provided in
+/// `PrView` so they survive the sidebar body's rebuilds when the PR's
+/// detail changes.
+#[derive(Clone, Copy)]
+pub(crate) struct ReviewerEdit {
+    /// The picker's ticks while it's open; `None` while it's closed.
+    pub picks: RwSignal<Option<Picks>>,
+    /// The search text the picker's box last emitted.
+    pub search: RwSignal<String>,
+    /// The request the last change shows: the synced list it was made
+    /// against, and the list to show until a sync brings new data.
+    /// `None` shows the synced list.
+    pub optimistic: RwSignal<Option<(Vec<RequestedReviewer>, Vec<RequestedReviewer>)>>,
+    /// Why the last change failed, until the next one starts.
+    pub error: RwSignal<Option<String>>,
+}
+
+/// The ticks the picker opens with: what's asked for already.
+fn picks_from(requested: &[RequestedReviewer]) -> Picks {
+    let users: BTreeSet<String> = requested
+        .iter()
+        .filter_map(|r| match r {
+            RequestedReviewer::Person(p) => p.login.clone(),
+            _ => None,
+        })
+        .collect();
+    let teams: BTreeSet<String> = requested
+        .iter()
+        .filter_map(|r| match r {
+            // A team without a slug can't be removed; it's not ticked,
+            // so the picker shows it only as a disabled extra row.
+            RequestedReviewer::Team(t) if !t.slug.is_empty() => Some(t.slug.clone()),
+            _ => None,
+        })
+        .collect();
+    Picks {
+        initial_users: users.clone(),
+        initial_teams: teams.clone(),
+        users,
+        teams,
+    }
+}
+
+/// Asks the server for `change`, showing `overlay` as the PR's
+/// requested reviewers meanwhile. `synced` is the list the change was
+/// made against; a sync that brings a different one ends the overlay.
+/// A failure reverts to the synced list and shows why.
+fn send_reviewer_change(
+    edit: ReviewerEdit,
+    key: PrKey,
+    synced: Vec<RequestedReviewer>,
+    overlay: Vec<RequestedReviewer>,
+    change: ReviewerChange,
+) {
+    edit.error.set(None);
+    edit.optimistic.set(Some((synced, overlay)));
+    leptos::task::spawn_local(async move {
+        if let Err(e) = api::change_reviewers(&key, &change).await {
+            edit.optimistic.set(None);
+            edit.error.set(Some(e));
+        }
+    });
+}
+
+/// Sends the change the picker's ticks make, in one request; sends
+/// nothing when nothing changed. `synced` is the requested list the
+/// ticks started from, `lookup` turns an added login or slug back into
+/// what shows for it.
+fn apply_picks(
+    edit: ReviewerEdit,
+    key: PrKey,
+    synced: Vec<RequestedReviewer>,
+    person: impl Fn(&str) -> Person,
+    team: impl Fn(&str) -> TeamRef,
+) {
+    let Some(picks) = edit.picks.get_untracked() else {
+        return;
+    };
+    edit.picks.set(None);
+    let list = |s: &BTreeSet<String>| s.iter().cloned().collect::<Vec<String>>();
+    let change = reviewer_change(
+        &list(&picks.initial_users),
+        &list(&picks.initial_teams),
+        &list(&picks.users),
+        &list(&picks.teams),
+    );
+    if change == ReviewerChange::default() {
+        return;
+    }
+    let remove_users: BTreeSet<&str> = change.remove_users.iter().map(String::as_str).collect();
+    let remove_teams: BTreeSet<&str> = change.remove_teams.iter().map(String::as_str).collect();
+    let mut overlay: Vec<RequestedReviewer> = synced
+        .iter()
+        .filter(|r| match r {
+            RequestedReviewer::Person(p) => {
+                !p.login.as_deref().is_some_and(|l| remove_users.contains(l))
+            }
+            RequestedReviewer::Team(t) => !remove_teams.contains(t.slug.as_str()),
+            RequestedReviewer::Legacy(_) => true,
+        })
+        .cloned()
+        .collect();
+    overlay.extend(
+        change
+            .add_users
+            .iter()
+            .map(|l| RequestedReviewer::Person(person(l))),
+    );
+    overlay.extend(
+        change
+            .add_teams
+            .iter()
+            .map(|s| RequestedReviewer::Team(team(s))),
+    );
+    send_reviewer_change(edit, key, synced, overlay, change);
+}
+
+/// The gear and the popover it opens for changing who's asked to
+/// review: GitHub's suggested reviewers first, then the assignable
+/// users and the organization's teams matching the search. Ticks
+/// collect in `ReviewerEdit::picks`; closing — Escape, a click
+/// outside or the gear again — sends the change they make.
+#[component]
+fn ReviewerPicker(
+    key: PrKey,
+    /// The requested reviewers the ticks start from.
+    requested: Signal<Vec<RequestedReviewer>>,
+) -> impl IntoView {
+    let edit = expect_context::<ReviewerEdit>();
+    let stored_key = StoredValue::new(key);
+    let synced = move || {
+        edit.optimistic
+            .get_untracked()
+            .map(|(base, _)| base)
+            .unwrap_or_else(|| requested.get_untracked())
+    };
+    // What an added login or slug shows as: the candidates' data when
+    // known, else what's already listed, else the bare login or slug.
+    let candidates = LocalResource::new(move || {
+        let key = stored_key.get_value();
+        let q = edit.search.get();
+        async move { api::reviewer_candidates(&key, &q).await }
+    });
+    let lookup_person = {
+        move |login: &str| {
+            let found = |c: &ReviewerCandidates| {
+                c.suggested
+                    .iter()
+                    .chain(&c.users)
+                    .find(|p| p.login.as_deref() == Some(login))
+                    .cloned()
+            };
+            candidates
+                .get_untracked()
+                .and_then(|r| r.ok().and_then(|c| found(&c)))
+                .or_else(|| {
+                    requested.get_untracked().iter().find_map(|r| match r {
+                        RequestedReviewer::Person(p) if p.login.as_deref() == Some(login) => {
+                            Some(p.clone())
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or(Person {
+                    login: Some(login.to_owned()),
+                    ..Person::default()
+                })
+        }
+    };
+    let lookup_team = {
+        move |slug: &str| {
+            let found = |c: &ReviewerCandidates| c.teams.iter().find(|t| t.slug == slug).cloned();
+            candidates
+                .get_untracked()
+                .and_then(|r| r.ok().and_then(|c| found(&c)))
+                .or_else(|| {
+                    requested.get_untracked().iter().find_map(|r| match r {
+                        RequestedReviewer::Team(t) if t.slug == slug => Some(t.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(TeamRef {
+                    name: slug.to_owned(),
+                    slug: slug.to_owned(),
+                })
+        }
+    };
+    let apply = move || {
+        apply_picks(
+            edit,
+            stored_key.get_value(),
+            synced(),
+            lookup_person,
+            lookup_team,
+        )
+    };
+    let apply_outside = apply;
+    let apply_close = apply;
+    // Escape and clicks outside close the picker and apply the ticks.
+    let root = NodeRef::<leptos::html::Div>::new();
+    let on_click = window_event_listener(leptos::ev::click, move |ev| {
+        if edit.picks.with_untracked(|p| p.is_none()) {
+            return;
+        }
+        let inside = root.get_untracked().is_some_and(|el| {
+            ev.target()
+                .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+                .is_some_and(|t| el.contains(Some(&t)))
+        });
+        if !inside {
+            apply_outside();
+        }
+    });
+    let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" && edit.picks.with_untracked(|p| p.is_some()) {
+            apply_close();
+        }
+    });
+    on_cleanup(move || {
+        on_click.remove();
+        on_key.remove();
+    });
+    // The search text is debounced: only a pause refetches candidates.
+    let seq = RwSignal::new(0u64);
+    let on_input = move |ev| {
+        let text = event_target_value(&ev);
+        seq.update(|s| *s += 1);
+        let s = seq.get_untracked();
+        set_timeout(
+            move || {
+                if seq.get_untracked() == s {
+                    edit.search.set(text);
+                }
+            },
+            Duration::from_millis(250),
+        );
+    };
+    // The popover mounts and unmounts only on `is_open` flips; its DOM
+    // — search box, list and scroll — survives every tick.
+    let is_open = Memo::new(move |_| edit.picks.with(|p| p.is_some()));
+    let user_row = {
+        move |p: Person| {
+            let login = p.login.clone().unwrap_or_default();
+            let ticked = login.clone();
+            view! {
+                <label class="picker-row">
+                    <input type="checkbox"
+                        prop:checked=move || {
+                            edit.picks.with(|p| {
+                                p.as_ref().is_some_and(|p| p.users.contains(&ticked))
+                            })
+                        }
+                        on:change={
+                            let login = login.clone();
+                            move |_| edit.picks.update(|p| {
+                                if let Some(p) = p.as_mut()
+                                    && !p.users.remove(&login)
+                                {
+                                    p.users.insert(login.clone());
+                                }
+                            })
+                        } />
+                    {avatar(&p)}
+                    <span class="picker-name">
+                        {p.name.clone().or(p.login.clone()).unwrap_or_default()}
+                    </span>
+                </label>
+            }
+        }
+    };
+    let team_row = move |t: TeamRef, removable: bool| {
+        let slug = t.slug.clone();
+        let ticked = slug.clone();
+        view! {
+            <label class="picker-row" class:disabled=!removable>
+                <input type="checkbox" disabled=!removable
+                    prop:checked=move || {
+                        edit.picks.with(|p| {
+                            p.as_ref().is_some_and(|p| p.teams.contains(&ticked))
+                        })
+                    }
+                    on:change=move |_| edit.picks.update(|p| {
+                        if let Some(p) = p.as_mut()
+                            && !p.teams.remove(&slug)
+                        {
+                            p.teams.insert(slug.clone());
+                        }
+                    }) />
+                {view! { <TeamIcon /> }.into_any()}
+                <span class="picker-name">{t.name.clone()}</span>
+            </label>
+        }
+    };
+    view! {
+        <div class="reviewer-edit" node_ref=root>
+            <button type="button" class="reviewer-gear" title="Edit reviewers"
+                aria-label="Edit reviewers"
+                on:click=move |_| {
+                    if edit.picks.with_untracked(|p| p.is_some()) {
+                        apply();
+                    } else {
+                        edit.error.set(None);
+                        edit.search.set(String::new());
+                        edit.picks.set(Some(picks_from(&requested.get_untracked())));
+                    }
+                }>
+                <svg
+                    viewBox="0 0 16 16"
+                    width="13"
+                    height="13"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    aria-hidden="true"
+                >
+                    <circle cx="8" cy="8" r="2.5" />
+                    <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5 13 13M13 3l-1.5 1.5M4.5 11.5 3 13" />
+                </svg>
+            </button>
+            {move || is_open.get().then(|| view! {
+                <div class="reviewer-popover">
+                    <input type="text" class="picker-search" placeholder="Find reviewers…"
+                        prop:value=move || edit.search.get()
+                        on:input=on_input />
+                    <div class="picker-list">
+                    {move || match candidates.get() {
+                        None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                        Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                        Some(Ok(c)) => {
+                            let c = c.clone();
+                            let requested = requested.get();
+                            // The suggested reviewers first, then the
+                            // assignable users and the teams; requested
+                            // ones the query missed stay listed, ticked.
+                            let shown_users: BTreeSet<&str> = c
+                                .suggested
+                                .iter()
+                                .chain(&c.users)
+                                .filter_map(|p| p.login.as_deref())
+                                .collect();
+                            let shown_teams: BTreeSet<&str> =
+                                c.teams.iter().map(|t| t.slug.as_str()).collect();
+                            let extra_users = requested.iter().filter_map(|r| match r {
+                                RequestedReviewer::Person(p)
+                                    if !p.login.as_deref().is_some_and(|l| shown_users.contains(l)) =>
+                                {
+                                    Some(p.clone())
+                                }
+                                _ => None,
+                            });
+                            let extra_teams = requested.iter().filter_map(|r| match r {
+                                RequestedReviewer::Team(t)
+                                    if !shown_teams.contains(t.slug.as_str()) =>
+                                {
+                                    Some((t.clone(), !t.slug.is_empty()))
+                                }
+                                _ => None,
+                            });
+                            view! {
+                                {c.suggested.iter().cloned().map(&user_row).collect_view()}
+                                {c.users.iter().cloned().map(&user_row).collect_view()}
+                                {extra_users.map(&user_row).collect_view()}
+                                {c.teams.iter().cloned().map(|t| team_row(t, true)).collect_view()}
+                                {extra_teams.map(|(t, removable)| team_row(t, removable)).collect_view()}
+                                {(c.suggested.is_empty() && c.users.is_empty() && c.teams.is_empty())
+                                    .then(|| view! { <p class="muted">"No reviewers found"</p> })}
+                            }.into_any()
+                        }
+                    }}
+                    </div>
+                </div>
+            })}
+        </div>
     }
 }
 
 /// The review decision and the reviewers, the sidebar's top section.
-fn sidebar_review(info: &ReviewInfo, author: &str) -> impl IntoView + use<> {
-    // A decision grenadine doesn't know says nothing useful.
-    let decision = info
-        .decision
-        .filter(|d| *d != ReviewDecision::Unknown)
-        .map(|d| view! { <p class=format!("review-decision {}", d.class())>{d.label()}</p> });
-    let rows = reviewers(info, author);
-    let list = if rows.is_empty() {
-        view! { <p class="muted">"No reviewers"</p> }.into_any()
-    } else {
-        view! {
-            <div class="reviewers">
-                {rows.iter().map(reviewer_row).collect_view()}
-            </div>
+/// Unlike the checks — `sidebar_body` rebuilds them with the detail —
+/// it mounts once per `PrView`, so the reviewer picker keeps its open
+/// state, listeners and input focus across syncs. On an open PR the
+/// viewer may update, a gear opens the picker and who already reviewed
+/// gets a re-request button. Renders nothing without review data.
+#[component]
+pub fn SidebarReview(
+    /// The PR's detail, or `None` while it loads.
+    pr: Signal<Option<PrDetail>>,
+    key: PrKey,
+) -> impl IntoView {
+    let edit = expect_context::<ReviewerEdit>();
+    let key = StoredValue::new(key);
+    let info = Memo::new(move |_| pr.get().and_then(|d| d.review));
+    let author = Memo::new(move |_| pr.get().map(|d| d.summary.author).unwrap_or_default());
+    let has_review = Memo::new(move |_| info.with(|i| i.is_some()));
+    let editable = Memo::new(move |_| {
+        pr.with(|d| {
+            d.as_ref().is_some_and(|d| {
+                d.summary.state == "OPEN" && d.review.as_ref().is_some_and(|i| i.can_edit_reviewers)
+            })
+        })
+    });
+    // A sync that brings a different requested list ends the overlay.
+    Effect::new(move |_| {
+        let clear = edit.optimistic.with(|o| {
+            o.as_ref().is_some_and(|(base, _)| {
+                info.with(|i| i.as_ref().is_some_and(|i| i.requested != *base))
+            })
+        });
+        if clear {
+            edit.optimistic.set(None);
         }
-        .into_any()
+    });
+    // A PR the picker can't act on anymore loses it without sending.
+    Effect::new(move |_| {
+        if !editable.get() && edit.picks.with_untracked(|p| p.is_some()) {
+            edit.picks.set(None);
+        }
+    });
+    // The list shows the optimistic overlay while its change is in
+    // flight, else the synced requests.
+    let requested = Memo::new(move |_| {
+        edit.optimistic
+            .get()
+            .map(|(_, overlay)| overlay)
+            .unwrap_or_else(|| {
+                info.with(|i| i.as_ref().map(|i| i.requested.clone()).unwrap_or_default())
+            })
+    });
+    let synced = move || {
+        edit.optimistic
+            .get_untracked()
+            .map(|(base, _)| base)
+            .unwrap_or_else(|| {
+                info.with_untracked(|i| i.as_ref().map(|i| i.requested.clone()).unwrap_or_default())
+            })
     };
+    let rerequest = Callback::new(move |p: Person| {
+        let login = p.login.clone().unwrap_or_default();
+        let base = synced();
+        let mut overlay = base.clone();
+        overlay.push(RequestedReviewer::Person(p));
+        send_reviewer_change(
+            edit,
+            key.get_value(),
+            base,
+            overlay,
+            ReviewerChange {
+                add_users: vec![login],
+                ..ReviewerChange::default()
+            },
+        );
+    });
     view! {
-        <section class="sidebar-review">
-            {decision}
-            {list}
-        </section>
+        {move || has_review.get().then(move || {
+            let picker = move || {
+                editable.get().then(move || {
+                    view! { <ReviewerPicker key=key.get_value() requested=requested.into() /> }
+                })
+            };
+            let list = move || match info.get() {
+                Some(i) => {
+                    let requested = requested.get();
+                    let author = author.get();
+                    let rows = reviewers(&i.reviews, &requested, &author);
+                    if rows.is_empty() {
+                        view! { <p class="muted">"No reviewers"</p> }.into_any()
+                    } else {
+                        let editable = editable.get();
+                        view! {
+                            <div class="reviewers">
+                                {rows.iter().map(|r| reviewer_row(r, editable, rerequest)).collect_view()}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                }
+                None => view! { <p class="muted">"No reviewers"</p> }.into_any(),
+            };
+            // A decision grenadine doesn't know says nothing useful.
+            let decision = move || {
+                info.with(|i| {
+                    i.as_ref().and_then(|i| {
+                        i.decision
+                            .filter(|d| *d != ReviewDecision::Unknown)
+                            .map(|d| {
+                                view! { <p class=format!("review-decision {}", d.class())>{d.label()}</p> }
+                            })
+                    })
+                })
+            };
+            view! {
+                <section class="sidebar-review">
+                    <div class="sidebar-head">
+                        <h2>"Reviewers"</h2>
+                        {picker}
+                    </div>
+                    {decision}
+                    {move || edit.error.get().map(|e| view! { <p class="error">{e}</p> })}
+                    {list}
+                </section>
+            }
+        })}
     }
 }
 
@@ -413,15 +945,12 @@ fn sidebar_checks(info: &ReviewInfo) -> AnyView {
     .into_any()
 }
 
-/// The sidebar's scrolling body: the review decision, the reviewers and
-/// the checks, for open, closed and merged PRs alike.
+/// The sidebar body's checks, for open, closed and merged PRs alike.
+/// The review section above them is `SidebarReview`, mounted once so
+/// the reviewer picker survives these rebuilds.
 pub fn sidebar_body(pr: &PrDetail) -> AnyView {
     match &pr.review {
-        Some(info) => view! {
-            {sidebar_review(info, &pr.summary.author)}
-            {sidebar_checks(info)}
-        }
-        .into_any(),
+        Some(info) => sidebar_checks(info),
         None => view! { <p class="muted">"No review information yet."</p> }.into_any(),
     }
 }
@@ -1476,6 +2005,7 @@ mod tests {
             decision: None,
             reviews: vec![],
             requested: vec![],
+            can_edit_reviewers: false,
             comments: vec![],
             checks: vec![],
             ci: None,
@@ -1785,18 +2315,28 @@ mod tests {
             person("c"),
             // Reviewed, then asked again: shows once, as pending.
             person("a"),
-            RequestedReviewer::Team("team".into()),
+            RequestedReviewer::Team(TeamRef {
+                name: "team".into(),
+                slug: "team-slug".into(),
+            }),
             RequestedReviewer::Legacy("old".into()),
         ];
-        let rows: Vec<(Option<String>, &'static str)> = reviewers(&i, "author")
-            .into_iter()
-            .map(|r| match r {
-                Reviewer::Reviewed(v) => (v.author.login.clone(), verdict(v.state)),
-                Reviewer::Requested(RequestedReviewer::Person(p)) => (p.login.clone(), "Pending"),
-                Reviewer::Requested(RequestedReviewer::Team(n))
-                | Reviewer::Requested(RequestedReviewer::Legacy(n)) => (Some(n.clone()), "Pending"),
-            })
-            .collect();
+        let rows: Vec<(Option<String>, &'static str)> =
+            reviewers(&i.reviews, &i.requested, "author")
+                .into_iter()
+                .map(|r| match r {
+                    Reviewer::Reviewed(v) => (v.author.login.clone(), verdict(v.state)),
+                    Reviewer::Requested(RequestedReviewer::Person(p)) => {
+                        (p.login.clone(), "Pending")
+                    }
+                    Reviewer::Requested(RequestedReviewer::Team(t)) => {
+                        (Some(t.name.clone()), "Pending")
+                    }
+                    Reviewer::Requested(RequestedReviewer::Legacy(n)) => {
+                        (Some(n.clone()), "Pending")
+                    }
+                })
+                .collect();
         assert_eq!(
             rows,
             [
@@ -1808,7 +2348,8 @@ mod tests {
             ]
         );
         // With neither reviews nor requests the list is empty.
-        assert!(reviewers(&info(), "author").is_empty());
+        let empty = info();
+        assert!(reviewers(&empty.reviews, &empty.requested, "author").is_empty());
     }
 
     #[test]

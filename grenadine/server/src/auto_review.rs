@@ -1285,6 +1285,7 @@ sleep 30
             decision: None,
             reviews: vec![],
             requested: vec![],
+            can_edit_reviewers: false,
             comments: vec![],
             checks: vec![],
             ci: None,

@@ -17,8 +17,9 @@ use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoMerge, AutoReviewEntry,
     BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GENERAL, InboxEdit, InboxWithPrs,
     MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment,
-    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ServerEvent,
-    SubmitReview, WorktreeChanges, WrapUp, submit_blocker,
+    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings,
+    ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges, WrapUp,
+    submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -89,6 +90,14 @@ fn api_routes() -> Router<Arc<State>> {
         .route(
             "/api/pr/{owner}/{name}/{number}/review",
             post(submit_review).delete(discard_review),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/reviewers",
+            post(change_reviewers),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/reviewers/candidates",
+            get(reviewer_candidates),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
         .route(
@@ -461,6 +470,52 @@ async fn submit_review(
     }
     state.resync(key);
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// The reviewer picker's changes: adds, then removes, then a resync
+/// even when GitHub refused so the page settles on what's true. The
+/// first error comes back to the page.
+async fn change_reviewers(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(c): Json<ReviewerChange>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let mut result = Ok(());
+    if !c.add_users.is_empty() || !c.add_teams.is_empty() {
+        result = state
+            .github
+            .request_reviewers(&key, &c.add_users, &c.add_teams)
+            .await;
+    }
+    if !c.remove_users.is_empty() || !c.remove_teams.is_empty() {
+        let removed = state
+            .github
+            .remove_review_requests(&key, &c.remove_users, &c.remove_teams)
+            .await;
+        if result.is_ok() {
+            result = removed;
+        }
+    }
+    state.resync(key);
+    result?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct CandidatesQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Who the reviewer picker can offer on the PR.
+async fn reviewer_candidates(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Query(q): Query<CandidatesQuery>,
+) -> ApiResult<Json<ReviewerCandidates>> {
+    let key = writable(owner, name, number, &state)?;
+    Ok(Json(state.github.reviewer_candidates(&key, &q.q).await?))
 }
 
 /// An asynchronous merge the merge box started, so that the progress
