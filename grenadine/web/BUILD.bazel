@@ -27,6 +27,10 @@ rust_test(
 
 rust_wasm_bindgen(
     name = "web_bindgen",
+    # The function names are 60% of the WebAssembly and only make the
+    # browser's stack traces readable. Without them every page load, the
+    # UI tests' included, fetches and compiles 12MB less.
+    bindgen_flags = ["--remove-name-section"],
     out_name = "grenadine_web",
     target = "web",
     wasm_file = ":web_lib",
