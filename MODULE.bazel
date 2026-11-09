@@ -6,6 +6,7 @@ module(
 bazel_dep(name = "aspect_rules_js", version = "3.5.1")
 bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "bazel_lib", version = "3.7.2")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
 bazel_dep(name = "llvm", version = "0.8.24")
 bazel_dep(name = "platforms", version = "1.1.0")
@@ -242,6 +243,29 @@ exports_files(["chrome-headless-shell"])
         "https://cdn.playwright.dev/builds/cft/153.0.8010.12/linux64/chrome-headless-shell-linux64.zip",
     ],
 )
+
+# The prebuilt wasm-bindgen CLI. rules_rust_wasm_bindgen builds it from source
+# by default, which put ~8k more targets into every build's analysis, and
+# fetched Chrome and chromedriver for its test runner, which nothing here
+# uses. Keep the version at the wasm-bindgen crate's in Cargo.lock; the CLI
+# refuses WebAssembly from any other.
+http_archive(
+    name = "wasm_bindgen_cli",
+    build_file_content = """
+load("@bazel_skylib//rules:native_binary.bzl", "native_binary")
+
+native_binary(
+    name = "wasm_bindgen",
+    src = "wasm-bindgen",
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "3039f38f65fe237b640cf06a140c919ca8d717ec5012146d145d3f27bb4d6b28",
+    strip_prefix = "wasm-bindgen-0.2.121-x86_64-unknown-linux-musl",
+    urls = ["https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.121/wasm-bindgen-0.2.121-x86_64-unknown-linux-musl.tar.gz"],
+)
+
+register_toolchains("//tools/wasm_bindgen:toolchain")
 
 # Chrome loads these shared libraries from the host, but the stock images on
 # remote executors don't have them.
