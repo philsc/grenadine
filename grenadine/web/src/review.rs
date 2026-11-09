@@ -259,7 +259,7 @@ fn check_groups(checks: &[Check]) -> Vec<(CheckGroup, Vec<Check>)> {
 
 /// The check groups the user expanded or collapsed, keyed by group.
 /// Groups not in here use their default. Provided in `PrView` so it
-/// survives the rebuilds a sync causes.
+/// survives the sidebar body's rebuilds when the PR's detail changes.
 #[derive(Clone, Copy)]
 pub(crate) struct CheckFolds(pub RwSignal<HashMap<CheckGroup, bool>>);
 
@@ -429,7 +429,7 @@ pub fn sidebar_body(pr: &PrDetail) -> AnyView {
 /// The PR page's right sidebar. `overlay` floats it over the content on
 /// windows too narrow for a column. The body's children are what the PR
 /// shows; anything pinned under it is the caller's, so that it survives
-/// the body's rebuild on a sync.
+/// the body's rebuilds when the PR's detail changes.
 #[component]
 pub fn PrSidebar(
     #[prop(into)] overlay: Signal<bool>,
@@ -544,8 +544,8 @@ fn NewComment() -> impl IntoView {
     }
 }
 
-/// What the review panel shows, kept above the parts of the page that a
-/// refetch rebuilds. Its summary's draft and preview are in `OpenBoxes`.
+/// What the review panel shows, kept outside the views the PR's detail
+/// drives. Its summary's draft and preview are in `OpenBoxes`.
 #[derive(Clone, Copy)]
 pub struct ReviewChoice {
     event: RwSignal<ReviewEvent>,
@@ -571,7 +571,7 @@ fn summary_draft(key: &PrKey) -> String {
 /// comments in their pending review; `own` says the PR is the viewer's,
 /// which they can't approve or request changes on.
 #[component]
-pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
+pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
     let ReviewTarget { key, reviewing } = expect_context::<ReviewTarget>();
     let links = expect_context::<PrLinks>();
     let boxes = expect_context::<OpenBoxes>();
@@ -586,7 +586,7 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
         let draft = draft.clone();
         Signal::derive(move || boxes.error(&draft))
     };
-    let blocker = move || body.with(|b| submit_blocker(event.get(), b, pending));
+    let blocker = move || body.with(|b| submit_blocker(event.get(), b, pending.get()));
     let (key, name) = (StoredValue::new(key), StoredValue::new(draft.clone()));
     let submit = move |_| {
         if blocker().is_some() {
@@ -601,8 +601,8 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
         boxes.send(
             &name.clone(),
             async move { api::submit_review(&key, &review).await },
-            // The panel may have been rebuilt meanwhile; the summary's
-            // draft goes either way.
+            // The panel may be gone meanwhile; the summary's draft goes
+            // either way.
             move || {
                 body.try_set(String::new());
                 boxes.close(&name);
@@ -624,7 +624,7 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
         });
     };
     let choice = move |value: ReviewEvent, label: &'static str, hint: &'static str| {
-        let disabled = own && value != ReviewEvent::Comment;
+        let disabled = own.get() && value != ReviewEvent::Comment;
         view! {
             <label class="review-choice" class:disabled=disabled title=if disabled { "You can't approve or request changes on your own PR" } else { hint }>
                 <input type="radio" name="review-event" disabled=disabled
@@ -662,13 +662,13 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
         on_key.remove();
     });
     view! {
-        // Not a <details>: its toggle events race with the page being
-        // rebuilt when the PR is refetched.
+        // Not a <details>: the panel remounts when the review comes or
+        // goes, and a <details>' open state lives in the DOM.
         <div class="review-panel" class:open=move || open.get()>
             <button type="button" class="review-button" aria-expanded=move || open.get().to_string()
                 on:click=move |_| open.update(|o| *o = !*o)>
                 "Review"
-                {(pending > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending}</span> })}
+                {move || (pending.get() > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending.get()}</span> })}
             </button>
             <div class="review-popup" class:hidden=move || !open.get()>
                 <MarkdownEditor
@@ -690,7 +690,7 @@ pub fn ReviewPanel(pending: usize, own: bool) -> impl IntoView {
                         disabled=move || busy.get() || blocker().is_some() on:click=submit>
                         {move || if busy.get() { "Submitting…" } else { "Submit review" }}
                     </button>
-                    {reviewing.then(|| view! {
+                    {move || reviewing.get().then(|| view! {
                         <button type="button" class="danger" disabled=move || busy.get() on:click=discard>"Discard review"</button>
                     })}
                 </div>
@@ -860,7 +860,8 @@ fn method_label(m: MergeMethod) -> &'static str {
 }
 
 /// What the merge box shows and what came of merging, kept above the
-/// parts of the page that a refetch rebuilds. `None` means the default.
+/// parts of the page that mount and unmount with it. `None` means the
+/// default.
 /// Sending the merge and why it failed are in `OpenBoxes`, under
 /// `merge_name`.
 #[derive(Clone, Copy)]

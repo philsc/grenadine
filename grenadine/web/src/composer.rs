@@ -67,9 +67,9 @@ fn drop_draft(id: &str) {
 /// The comment boxes on the page, and the other changes started from it,
 /// by draft name: which boxes are open and show their preview, which
 /// changes are being sent and why a send failed. Provided above the parts
-/// of the page that are rebuilt when the PR is refetched, so that all of
-/// that survives it: an open box even before anything was typed into it,
-/// and a send that a sync of another change interrupts.
+/// of the page that mount and unmount with its views, so that all of
+/// that survives them: an open box even before anything was typed into
+/// it, and a send that a sync of another change interrupts.
 #[derive(Clone, Copy)]
 pub struct OpenBoxes {
     open: RwSignal<HashSet<String>>,
@@ -140,8 +140,8 @@ impl OpenBoxes {
     /// Sends `change`, named `name`, unless a change by that name is being
     /// sent already. Notes that it's being sent meanwhile and why it
     /// failed if it does, and runs `on_ok` once it succeeded. The component
-    /// that started it may be gone by then, its thread folded or the page
-    /// rebuilt by a sync, so `on_ok` must not need it.
+    /// that started it may be gone by then, its thread folded or its view
+    /// re-rendered on a sync, so `on_ok` must not need it.
     pub fn send(
         self,
         name: &str,

@@ -773,6 +773,14 @@ input[type="text"] {
   user-select: none;
   cursor: pointer;
 }
+.new-version-notice {
+  margin: 0;
+  padding: 3px 12px;
+  border: 1px solid var(--warn-border);
+  border-radius: 6px;
+  background: var(--warn-bg);
+  font-size: 13px;
+}
 
 .picker {
   position: relative;

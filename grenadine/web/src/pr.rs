@@ -216,7 +216,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
     let rebase_older = RwSignal::new(load_flag("rebase-older-version", false));
     let github = github_url(&key);
-    // Kept here, outside what syncs and version changes rebuild.
+    // Kept here, outside what version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(CheckFolds(RwSignal::new(HashMap::new())));
     provide_context(OpenBoxes::new());
@@ -335,10 +335,22 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         on_click.remove();
     });
 
-    // Whether the PR loaded. A Memo, so a refetch that leaves it true
-    // doesn't remount the sidebar: the agents panel pinned under its
-    // body holds the sessions' live event streams.
-    let ready = Memo::new(move |_| matches!(pr.get(), Some(Ok(api::PrResponse::Ready(_)))));
+    // The PR's detail once it's ready. A Memo, so a refetch that holds
+    // the same data — most syncs change nothing a page shows — fires
+    // nothing downstream.
+    let detail = Memo::new(move |_| match pr.get() {
+        Some(Ok(api::PrResponse::Ready(d))) => Some(Arc::new(*d)),
+        _ => None,
+    });
+    // A refetch that leaves it true remounts nothing gated on it: the
+    // main column's scroll and the agents panel's live event streams
+    // both live under it.
+    let ready = Memo::new(move |_| detail.get().is_some());
+    Effect::new(move |_| {
+        if let Some(d) = detail.get() {
+            prefetch(&d);
+        }
+    });
     // While the sidebar shows, its toggle sits in the sidebar's header;
     // while hidden, it floats clear of `.main`'s scrollbar at the page's
     // top-right.
@@ -365,33 +377,50 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         }
     };
     let panel_key = key.clone();
+    // The latest detail, for PrBody: while it stays mounted a refetch
+    // that leaves the PR unready keeps the last one rather than a gap.
+    let current = Memo::new(move |prev| {
+        detail
+            .get()
+            .or_else(|| prev.cloned())
+            .expect("PrBody only mounts once the PR is ready")
+    });
 
     view! {
+        // `.main` outlives the states the PR moves through; unmounting
+        // it would lose the scroll position.
+        <main class="main">
         {move || {
-            match pr.get() {
-            None => view! { <main class="main"><div class="empty">"Loading…"</div></main> }.into_any(),
-            Some(Err(e)) => view! { <main class="main"><div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div></main> }.into_any(),
-            Some(Ok(api::PrResponse::Pending)) => {
-                // The closure reads `updates.sync` so only this text, not the
-                // whole view, re-renders when the sync status changes.
-                let key = key.clone();
-                view! { <main class="main"><div class="empty">{move || pending_message(&key, updates.sync.with(|s| s.paused_until), (js_sys::Date::now() / 1000.0) as i64)}</div></main> }.into_any()
+            if ready.get() {
+                ().into_any()
+            } else {
+                match pr.get() {
+                None => view! { <div class="empty">"Loading…"</div> }.into_any(),
+                Some(Err(e)) => view! { <div class="empty error">{format!("Can't load {}#{}: {e}", key.repo, key.number)}</div> }.into_any(),
+                Some(Ok(api::PrResponse::Pending)) => {
+                    // The closure reads `updates.sync` so only this text, not the
+                    // whole view, re-renders when the sync status changes.
+                    let key = key.clone();
+                    view! { <div class="empty">{move || pending_message(&key, updates.sync.with(|s| s.paused_until), (js_sys::Date::now() / 1000.0) as i64)}</div> }.into_any()
+                }
+                Some(Ok(api::PrResponse::NotConfigured)) => view! {
+                    <div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+                }.into_any(),
+                Some(Ok(api::PrResponse::Failed(e))) => view! {
+                    <div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div>
+                }.into_any(),
+                Some(Ok(api::PrResponse::Ready(_))) => ().into_any(),
             }
-            Some(Ok(api::PrResponse::NotConfigured)) => view! {
-                <main class="main"><div class="empty">{format!("{} isn't configured in grenadine. ", key.repo)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
-            }.into_any(),
-            Some(Ok(api::PrResponse::Failed(e))) => view! {
-                <main class="main"><div class="empty error">{format!("Can't sync {}#{}: {e}. ", key.repo, key.number)}<a href=github.clone() target="_blank" rel="noopener">"See it on GitHub"</a></div></main>
-            }.into_any(),
-            Some(Ok(api::PrResponse::Ready(pr))) => {
-                let pr = Arc::new(*pr);
-                prefetch(&pr);
-                view! {
-                    <main class="main"><PrBody pr=pr.clone() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older /></main>
-                }.into_any()
             }
-        }
         }}
+        {move || {
+            ready.get().then(|| {
+                view! {
+                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older />
+                }
+            })
+        }}
+        </main>
         {move || {
             let panel_key = panel_key.clone();
             if !ready.get() {
@@ -496,8 +525,9 @@ pub(crate) struct PrLinks {
 #[derive(Clone)]
 pub(crate) struct ReviewTarget {
     pub(crate) key: PrKey,
-    /// The viewer has a pending review on the PR.
-    pub(crate) reviewing: bool,
+    /// The viewer has a pending review on the PR; tracked, since a sync
+    /// can flip it.
+    pub(crate) reviewing: Signal<bool>,
 }
 
 /// Warms the caches for the diffs most likely to be looked at next, down
@@ -541,138 +571,151 @@ fn prefetch(pr: &PrDetail) {
 
 #[component]
 fn PrBody(
-    pr: Arc<PrDetail>,
+    pr: Signal<Arc<PrDetail>>,
     chosen: RwSignal<Option<Selection>>,
     side_by_side: RwSignal<bool>,
     inline_changes: RwSignal<bool>,
     rebase_older: RwSignal<bool>,
 ) -> impl IntoView {
-    provide_context(PrLinks {
-        repo: pr.summary.key.repo.clone(),
-    });
+    let first = pr.get_untracked();
+    let repo = first.summary.key.repo.clone();
+    provide_context(PrLinks { repo: repo.clone() });
     provide_context(ReviewTarget {
-        key: pr.summary.key.clone(),
-        reviewing: pr
-            .review
-            .as_ref()
-            .is_some_and(|r| r.pending_review.is_some()),
+        key: first.summary.key.clone(),
+        reviewing: Memo::new(move |_| {
+            pr.get()
+                .review
+                .as_ref()
+                .is_some_and(|r| r.pending_review.is_some())
+        })
+        .into(),
     });
     // Edits of comments that are no longer pending, because they were
     // deleted or their review submitted or discarded, e.g. on github.com,
     // can't be saved anymore.
-    let pending: HashSet<String> = pr
-        .comments
-        .iter()
-        .filter(|c| c.pending)
-        .map(|c| edit_draft(&pr.summary.key, c.id))
-        .collect();
-    expect_context::<OpenBoxes>()
-        .close_unless(&edit_prefix(&pr.summary.key), |d| pending.contains(d));
-    let latest = pr.versions.len() as u32;
-    let selection = {
-        let pr = pr.clone();
-        Memo::new(move |_| {
-            let default = Selection {
-                base: 0,
-                head: latest,
-            };
-            match chosen.get() {
-                // Selections that no longer make sense fall back to the default.
-                Some(s)
-                    if s.head >= 1
-                        && s.head <= latest
-                        && s.base < s.head
-                        && !pr.versions[s.head as usize - 1].missing
-                        && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
-                {
-                    s
-                }
-                _ => default,
+    Effect::new(move |_| {
+        let pr = pr.get();
+        let pending: HashSet<String> = pr
+            .comments
+            .iter()
+            .filter(|c| c.pending)
+            .map(|c| edit_draft(&pr.summary.key, c.id))
+            .collect();
+        expect_context::<OpenBoxes>()
+            .close_unless(&edit_prefix(&pr.summary.key), |d| pending.contains(d));
+    });
+    // The version the right side stays on while the user picks none, so
+    // a later push doesn't move the diff they're reading.
+    let pinned = RwSignal::new(first.versions.len() as u32);
+    let selection = Memo::new(move |_| {
+        let pr = pr.get();
+        let latest = pr.versions.len() as u32;
+        let default = Selection {
+            base: 0,
+            head: pinned.get().clamp(1, latest.max(1)),
+        };
+        match chosen.get() {
+            // Selections that no longer make sense fall back to the default.
+            Some(s)
+                if s.head >= 1
+                    && s.head <= latest
+                    && s.base < s.head
+                    && !pr.versions[s.head as usize - 1].missing
+                    && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
+            {
+                s
             }
-        })
-    };
+            _ => default,
+        }
+    });
     // Only when both sides sit on different bases does a rebase bring in
     // upstream changes.
-    let upstream = {
-        let pr = pr.clone();
-        Memo::new(move |_| {
-            if pr.versions.is_empty() {
-                return None;
-            }
-            let sel = selection.get();
-            let head = &pr.versions[sel.head as usize - 1];
-            (sel.base != 0)
-                .then(|| {
-                    (
-                        pr.versions[sel.base as usize - 1].merge_base.clone(),
-                        head.merge_base.clone(),
-                    )
-                })
-                .and_then(|(a, b)| Some((a?, b?)))
-                .filter(|(a, b)| a != b)
-        })
-    };
-    let s = &pr.summary;
-    let review = pr.review.as_ref();
-    let reviewed = last_reviewed(&pr.versions, review);
-    let body_html = if pr.body.trim().is_empty() {
-        "<p class=\"muted\">No description provided.</p>".to_owned()
-    } else {
-        markdown::to_html(&pr.body, &s.key.repo)
-    };
-
-    let diff = {
-        let pr = pr.clone();
-        move || {
-            if pr.versions.is_empty() {
-                return view! { <p class="empty">"This PR has no versions yet."</p> }.into_any();
-            }
-            let sel = selection.get();
-            let head = &pr.versions[sel.head as usize - 1];
-            let left = if sel.base == 0 {
-                head.merge_base.clone()
-            } else {
-                Some(pr.versions[sel.base as usize - 1].sha.clone())
-            };
-            let Some(left) = left else {
-                return view! { <p class="empty error">"The merge-base of this version is unknown."</p> }.into_any();
-            };
-            let upstream = upstream.get();
-            let (inline, panel) = place(&pr.comments, &pr.versions, sel);
-            // GitHub anchors new comments to the PR's diff from the merge
-            // base to the head, and refuses lines outside it. Against an
-            // earlier version, a line can be changed in the diff shown but
-            // not in GitHub's, e.g. one the latest push changed back.
-            let commenting = (pr.review.is_some()
-                && pr.summary.state == "OPEN"
-                && sel.base == 0
-                && sel.head == latest)
-                .then(|| Commenting {
-                    key: pr.summary.key.clone(),
-                });
-            view! {
-                <CommentPanel threads=panel chosen=chosen selection=selection />
-                <DiffView
-                    repo=pr.summary.key.repo.clone()
-                    left=left
-                    right=head.sha.clone()
-                    upstream=upstream
-                    comments=Arc::new(inline)
-                    commenting=commenting
-                    side_by_side=side_by_side.into()
-                    inline_changes=inline_changes.into()
-                    rebase_older=rebase_older.into()
-                />
-            }
-            .into_any()
+    let upstream = Memo::new(move |_| {
+        let pr = pr.get();
+        if pr.versions.is_empty() {
+            return None;
         }
-    };
+        let sel = selection.get();
+        let head = &pr.versions[sel.head as usize - 1];
+        (sel.base != 0)
+            .then(|| {
+                (
+                    pr.versions[sel.base as usize - 1].merge_base.clone(),
+                    head.merge_base.clone(),
+                )
+            })
+            .and_then(|(a, b)| Some((a?, b?)))
+            .filter(|(a, b)| a != b)
+    });
+    // What the diff compares; a Memo so a sync that didn't move it
+    // doesn't reload it.
+    let diff_args = Memo::new(move |_| {
+        let pr = pr.get();
+        if pr.versions.is_empty() {
+            return None;
+        }
+        let sel = selection.get();
+        let head = &pr.versions[sel.head as usize - 1];
+        let left = if sel.base == 0 {
+            head.merge_base.clone()
+        } else {
+            Some(pr.versions[sel.base as usize - 1].sha.clone())
+        };
+        left.map(|left| (left, head.sha.clone(), upstream.get()))
+    });
+    // Where the threads go for the selected diff: inline per file, and
+    // the panel of ones that can't be shown.
+    let placed = Memo::new(move |_| {
+        let pr = pr.get();
+        if pr.versions.is_empty() {
+            return Default::default();
+        }
+        place(&pr.comments, &pr.versions, selection.get())
+    });
+    let inline = Memo::new(move |_| Arc::new(placed.get().0));
+    let panel = Memo::new(move |_| placed.get().1);
+    // GitHub anchors new comments to the PR's diff from the merge base
+    // to the head, and refuses lines outside it. Against an earlier
+    // version, a line can be changed in the diff shown but not in
+    // GitHub's, e.g. one the latest push changed back.
+    let commenting = Memo::new(move |_| {
+        let pr = pr.get();
+        (pr.review.is_some()
+            && pr.summary.state == "OPEN"
+            && selection.get().base == 0
+            && selection.get().head as usize == pr.versions.len())
+        .then(|| Commenting {
+            key: pr.summary.key.clone(),
+        })
+    });
+    let versions = Memo::new(move |_| pr.get().versions.clone());
+    let comments = Memo::new(move |_| pr.get().comments.clone());
+    let reviewed = Memo::new(move |_| {
+        let pr = pr.get();
+        last_reviewed(&pr.versions, pr.review.as_ref())
+    });
+    // A push doesn't move the diff; the notice offers the new version.
+    let new_version = Memo::new(move |_| {
+        let latest = pr.get().versions.len() as u32;
+        (latest > pinned.get()).then_some(latest)
+    });
+    let has_review = Memo::new(move |_| {
+        let pr = pr.get();
+        pr.review.is_some() && pr.summary.state == "OPEN"
+    });
+    let pending_count = Memo::new(move |_| pr.get().comments.iter().filter(|c| c.pending).count());
+    let own = Memo::new(move |_| {
+        let pr = pr.get();
+        pr.review
+            .as_ref()
+            .is_some_and(|i| i.viewer == pr.summary.author)
+    });
+    let no_versions = Memo::new(move |_| pr.with(|p| p.versions.is_empty()));
 
     // File headers stick just below the toolbar, so its height is kept in
-    // a CSS variable. Wrapping and the review panel change that height. A
-    // sync rebuilds PrBody and the old instance's cleanup can run after
-    // the new one has set the variable, so it lives on the document root
-    // and is never removed; the CSS only reads it inside `.pr`.
+    // a CSS variable. Wrapping and the review panel change that height. It
+    // lives on the document root and is never removed: the CSS only reads
+    // it inside `.pr`, and a detached toolbar's reports would be wrong.
     let toolbar = NodeRef::<leptos::html::Div>::new();
     let watching = StoredValue::new_local(None::<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>);
     Effect::new(move |_| {
@@ -689,8 +732,7 @@ fn PrBody(
                 .map(|e| e.unchecked_into::<web_sys::HtmlElement>())
         };
         let update = move || {
-            // A remounted PrBody's observer can still fire on its
-            // detached toolbar, which reports a height of 0.
+            // A toolbar whose page was left reports a height of 0.
             if !el.is_connected() {
                 return;
             }
@@ -719,35 +761,75 @@ fn PrBody(
 
     view! {
         <article class="pr">
-            <header class="pr-header">
-                <h1>{s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() /></h1>
-                <p class="muted">
-                    <span class=format!("state state-{}", state_label(&s.state, s.queued))>{state_label(&s.state, s.queued)}</span>
-                    {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
-                    {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
-                    " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
-                </p>
-                {pr.approximate.then(|| view! {
-                    <p class="banner warn">"GitHub has no push log for this PR, so its versions were reconstructed from force-push events and may not match every push."</p>
-                })}
-                {pr.drift.clone().map(|d| view! { <p class="banner warn">{d}</p> })}
-                {pr.sync_error.clone().map(|e| view! { <p class="banner error">{format!("The last sync failed: {e}")}</p> })}
-            </header>
-            {pr.stack.clone().filter(|st| st.prs.len() > 1).map(|st| view! {
-                <StackList stack=st repo=s.key.repo.clone() current=s.key.number />
-            })}
-            <section class="description markdown" inner_html=body_html></section>
-            {review.map(conversation)}
-            {review.filter(|_| s.state == "OPEN").map(|info| merge_box(info, merge_target(&pr)))}
+            {move || {
+                let pr = pr.get();
+                let s = &pr.summary;
+                view! {
+                    <header class="pr-header">
+                        <h1>{s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() /></h1>
+                        <p class="muted">
+                            <span class=format!("state state-{}", state_label(&s.state, s.queued))>{state_label(&s.state, s.queued)}</span>
+                            {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
+                            {format!(" {} wants to merge {} into {} in {}", s.author, pr.head_ref, pr.base_ref, s.key.repo)}
+                            " · " <a href=format!("#/agents/new/{}/{}", s.key.repo, s.key.number)>"Start an agent on this PR"</a>
+                        </p>
+                        {pr.approximate.then(|| view! {
+                            <p class="banner warn">"GitHub has no push log for this PR, so its versions were reconstructed from force-push events and may not match every push."</p>
+                        })}
+                        {pr.drift.clone().map(|d| view! { <p class="banner warn">{d}</p> })}
+                        {pr.sync_error.clone().map(|e| view! { <p class="banner error">{format!("The last sync failed: {e}")}</p> })}
+                    </header>
+                }
+                .into_any()
+            }}
+            {move || {
+                let pr = pr.get();
+                pr.stack
+                    .clone()
+                    .filter(|st| st.prs.len() > 1)
+                    .map(|st| {
+                        let s = &pr.summary;
+                        view! { <StackList stack=st repo=s.key.repo.clone() current=s.key.number /> }
+                            .into_any()
+                    })
+            }}
+            {move || {
+                let pr = pr.get();
+                let html = if pr.body.trim().is_empty() {
+                    "<p class=\"muted\">No description provided.</p>".to_owned()
+                } else {
+                    markdown::to_html(&pr.body, &pr.summary.key.repo)
+                };
+                view! { <section class="description markdown" inner_html=html></section> }.into_any()
+            }}
+            {move || pr.with(|p| p.review.clone()).map(|info| conversation(&info).into_any())}
+            {move || {
+                let pr = pr.get();
+                (pr.summary.state == "OPEN")
+                    .then(|| pr.review.clone())
+                    .flatten()
+                    .map(|info| merge_box(&info, merge_target(&pr, pinned.get())).into_any())
+            }}
             {merge_warning()}
             <div class="toolbar" node_ref=toolbar>
-                <VersionPicker versions=pr.versions.clone() comments=pr.comments.clone() reviewed=reviewed chosen=chosen selection=selection />
-                {pr.review.as_ref().filter(|_| s.state == "OPEN").map(|info| view! {
-                    <ReviewPanel
-                        pending=pr.comments.iter().filter(|c| c.pending).count()
-                        own=info.viewer == s.author
-                    />
-                })}
+                <VersionPicker versions=versions comments=comments reviewed=reviewed chosen=chosen selection=selection />
+                {move || {
+                    has_review.get().then(|| {
+                        view! { <ReviewPanel pending=pending_count own=own /> }
+                    })
+                }}
+                {move || {
+                    new_version.get().map(|n| view! {
+                        <p class="new-version-notice">
+                            {format!("Version {n} was pushed")}
+                            " "
+                            <button type="button" class="link" on:click=move |_| {
+                                pinned.set(n);
+                                chosen.set(None);
+                            }>"Show it"</button>
+                        </p>
+                    })
+                }}
                 <label class="toggle">
                     <input
                         type="checkbox"
@@ -793,7 +875,29 @@ fn PrBody(
                     " Rebase older version"
                 </label>
             </div>
-            {diff}
+            {move || {
+                if no_versions.get() {
+                    return view! { <p class="empty">"This PR has no versions yet."</p> }.into_any();
+                }
+                match diff_args.get() {
+                    None => view! { <p class="empty error">"The merge-base of this version is unknown."</p> }.into_any(),
+                    Some((left, right, upstream)) => view! {
+                        <CommentPanel threads=panel chosen=chosen selection=selection />
+                        <DiffView
+                            repo=repo.clone()
+                            left=left
+                            right=right
+                            upstream=upstream
+                            comments=inline
+                            commenting=commenting
+                            side_by_side=side_by_side.into()
+                            inline_changes=inline_changes.into()
+                            rebase_older=rebase_older.into()
+                        />
+                    }
+                    .into_any(),
+                }
+            }}
         </article>
     }
 }
@@ -807,7 +911,9 @@ fn state_label(state: &str, queued: bool) -> String {
     }
 }
 
-fn merge_target(pr: &PrDetail) -> MergeTarget {
+/// `head` is the version the merge expects at the tip: the pinned one,
+/// so GitHub refuses a merge for a push the page hasn't shown.
+fn merge_target(pr: &PrDetail, head: u32) -> MergeTarget {
     let n = pr.summary.key.number;
     let stack = pr
         .stack
@@ -823,7 +929,10 @@ fn merge_target(pr: &PrDetail) -> MergeTarget {
         title: pr.summary.title.clone(),
         body: pr.body.clone(),
         is_draft: pr.summary.is_draft,
-        head_oid: pr.versions.last().map(|v| v.sha.clone()),
+        head_oid: pr
+            .versions
+            .get(head.max(1) as usize - 1)
+            .map(|v| v.sha.clone()),
         base_ref: pr.base_ref.clone(),
         head_ref: pr.head_ref.clone(),
         open_parent: stack
@@ -1010,16 +1119,12 @@ fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u3
 
 #[component]
 fn VersionPicker(
-    versions: Vec<Version>,
-    comments: Vec<ReviewComment>,
-    reviewed: Option<u32>,
+    versions: Memo<Vec<Version>>,
+    comments: Memo<Vec<ReviewComment>>,
+    reviewed: Memo<Option<u32>>,
     chosen: RwSignal<Option<Selection>>,
     selection: Memo<Selection>,
 ) -> impl IntoView {
-    let latest = versions.len() as u32;
-    let counts = thread_counts(&comments, &versions);
-    let versions = Arc::new(versions);
-
     // Clicks outside the picker and Escape close it.
     let details = NodeRef::<leptos::html::Details>::new();
     let close = move || {
@@ -1046,30 +1151,26 @@ fn VersionPicker(
         on_click.remove();
         on_key.remove();
     });
-    let missing = {
-        let versions = versions.clone();
-        move |n: u32| n > 0 && versions[n as usize - 1].missing
-    };
-    let label = {
-        let versions = versions.clone();
-        move || {
-            let s = selection.get();
-            let name = |n: u32| {
-                if n == 0 {
-                    "Base".to_owned()
-                } else {
-                    format!("v{n} ({})", short(&versions[n as usize - 1].sha))
-                }
-            };
-            if latest == 0 {
-                "No versions".to_owned()
+    let missing = move |n: u32| n > 0 && versions.with_untracked(|v| v[n as usize - 1].missing);
+    let label = move || {
+        let s = selection.get();
+        let versions = versions.get();
+        let name = |n: u32| {
+            if n == 0 {
+                "Base".to_owned()
             } else {
-                format!("{} → {}", name(s.base), name(s.head))
+                format!("v{n} ({})", short(&versions[n as usize - 1].sha))
             }
+        };
+        if versions.is_empty() {
+            "No versions".to_owned()
+        } else {
+            format!("{} → {}", name(s.base), name(s.head))
         }
     };
     let set_base = move |n: u32| {
         let s = selection.get_untracked();
+        let latest = versions.with_untracked(|v| v.len() as u32);
         // Moving Base past Head pulls Head to the latest version.
         let head = if n >= s.head { latest } else { s.head };
         chosen.set(Some(Selection { base: n, head }));
@@ -1080,58 +1181,64 @@ fn VersionPicker(
         chosen.set(Some(Selection { base, head: n }));
     };
 
-    let rows = (0..=latest)
-        .map(|n| {
-            let v = (n > 0).then(|| versions[n as usize - 1].clone());
-            let base_disabled = n == latest || missing(n);
-            let head_disabled = n == 0 || missing(n);
-            let pusher = v.as_ref().and_then(|v| {
-                let guess = v.pushed_by_is_guess;
-                v.pushed_by
-                    .clone()
-                    .map(|person| view! { <PersonChip person=person guess=guess /> })
-            });
-            let threads = counts.get(&n).map(|&(resolved, total)| {
+    let rows = move || {
+        let versions = versions.get();
+        let latest = versions.len() as u32;
+        let counts = thread_counts(&comments.get(), &versions);
+        let reviewed = reviewed.get();
+        (0..=latest)
+            .map(|n| {
+                let v = (n > 0).then(|| versions[n as usize - 1].clone());
+                let base_disabled = n == latest || missing(n);
+                let head_disabled = n == 0 || missing(n);
+                let pusher = v.as_ref().and_then(|v| {
+                    let guess = v.pushed_by_is_guess;
+                    v.pushed_by
+                        .clone()
+                        .map(|person| view! { <PersonChip person=person guess=guess /> })
+                });
+                let threads = counts.get(&n).map(|&(resolved, total)| {
+                    view! {
+                        <span class:all-resolved=resolved == total
+                            title=format!("{resolved} of {total} threads resolved")>
+                            {format!("{resolved}/{total}")}
+                        </span>
+                    }
+                });
                 view! {
-                    <span class:all-resolved=resolved == total
-                        title=format!("{resolved} of {total} threads resolved")>
-                        {format!("{resolved}/{total}")}
-                    </span>
+                    <tr class:missing=v.as_ref().is_some_and(|v| v.missing)
+                        class:reviewed=reviewed == Some(n)>
+                        <td class="radio">
+                            <input type="radio" name="base" disabled=base_disabled
+                                prop:checked=move || selection.get().base == n
+                                on:change=move |_| set_base(n) />
+                        </td>
+                        <td class="radio">
+                            <input type="radio" name="head" disabled=head_disabled
+                                prop:checked=move || selection.get().head == n
+                                on:change=move |_| set_head(n) />
+                        </td>
+                        <td class="version">
+                            {match &v {
+                                None => view! { <span>"Base"</span> }.into_any(),
+                                Some(v) => view! {
+                                    <span class="vnum">{format!("{n}")}</span>
+                                    " "
+                                    <code title=v.sha.clone()>{short(&v.sha).to_owned()}</code>
+                                    <span class="muted vkind">{kind_label(v)}</span>
+                                    {v.pushed_at.clone().map(|t| view! { <span class="muted vtime">{t.replace('T', " ").trim_end_matches("+00:00").to_owned()}</span> })}
+                                    {(reviewed == Some(n)).then(|| view! { <span class="vreviewed" title="The latest version you reviewed">"last reviewed"</span> })}
+                                    {v.missing.then(|| view! { <span class="error">"missing"</span> })}
+                                }.into_any(),
+                            }}
+                        </td>
+                        <td class="pushed-by">{pusher}</td>
+                        <td class="threads">{threads}</td>
+                    </tr>
                 }
-            });
-            view! {
-                <tr class:missing=v.as_ref().is_some_and(|v| v.missing)
-                    class:reviewed=reviewed == Some(n)>
-                    <td class="radio">
-                        <input type="radio" name="base" disabled=base_disabled
-                            prop:checked=move || selection.get().base == n
-                            on:change=move |_| set_base(n) />
-                    </td>
-                    <td class="radio">
-                        <input type="radio" name="head" disabled=head_disabled
-                            prop:checked=move || selection.get().head == n
-                            on:change=move |_| set_head(n) />
-                    </td>
-                    <td class="version">
-                        {match &v {
-                            None => view! { <span>"Base"</span> }.into_any(),
-                            Some(v) => view! {
-                                <span class="vnum">{format!("{n}")}</span>
-                                " "
-                                <code title=v.sha.clone()>{short(&v.sha).to_owned()}</code>
-                                <span class="muted vkind">{kind_label(v)}</span>
-                                {v.pushed_at.clone().map(|t| view! { <span class="muted vtime">{t.replace('T', " ").trim_end_matches("+00:00").to_owned()}</span> })}
-                                {(reviewed == Some(n)).then(|| view! { <span class="vreviewed" title="The latest version you reviewed">"last reviewed"</span> })}
-                                {v.missing.then(|| view! { <span class="error">"missing"</span> })}
-                            }.into_any(),
-                        }}
-                    </td>
-                    <td class="pushed-by">{pusher}</td>
-                    <td class="threads">{threads}</td>
-                </tr>
-            }
-        })
-        .collect_view();
+            })
+            .collect_view()
+    };
 
     view! {
         <details class="picker" node_ref=details>
@@ -1268,7 +1375,7 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
             return;
         }
         let (key, node) = (target.key.clone(), node.clone());
-        // On success the page is rebuilt once the PR has synced.
+        // On success the comment's view re-renders once the PR has synced.
         boxes.send(
             &deleting,
             async move { api::delete_review_comment(&key, &node).await },
@@ -1369,53 +1476,61 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
     let resolved = root.resolved;
     let toggle = {
         let (key, thread) = (key.clone(), thread.clone());
-        move |_| {
+        Callback::new(move |_: leptos::ev::MouseEvent| {
             let (key, thread) = (key.clone(), thread.clone());
             busy.set(true);
             error.set(None);
             leptos::task::spawn_local(async move {
-                // On success the page is rebuilt once the PR has synced,
-                // and until then the button stays busy. This component
-                // may be gone by the time the answer comes.
+                // On success the thread's view re-renders once the PR has
+                // synced, and until then the button stays busy. This
+                // component may be gone by the time the answer comes.
                 if let Err(e) = api::set_thread_resolved(&key, &thread, !resolved).await {
                     error.try_set(Some(e));
                     busy.try_set(false);
                 }
             });
-        }
-    };
-    let reply = |review: bool| -> SendComment {
-        let (key, thread) = (key.clone(), thread.clone());
-        sender(move |body| {
-            let (key, thread) = (key.clone(), thread.clone());
-            async move { api::reply_to_thread(&key, &thread, body, review).await }
         })
     };
-    // While a review is pending, replies go into it unless asked otherwise.
-    let (label, send, alt) = if target.reviewing {
-        (
-            "Add to review",
-            reply(true),
-            ("Reply now".to_owned(), reply(false)),
-        )
-    } else {
-        (
-            "Reply",
-            reply(false),
-            ("Add to review".to_owned(), reply(true)),
-        )
+    let reply = {
+        let (key, thread) = (key.clone(), thread.clone());
+        move |review: bool| -> SendComment {
+            let (key, thread) = (key.clone(), thread.clone());
+            sender(move |body| {
+                let (key, thread) = (key.clone(), thread.clone());
+                async move { api::reply_to_thread(&key, &thread, body, review).await }
+            })
+        }
     };
     let can_resolve = root.can_resolve;
     view! {
         <div class="thread-actions">
-            <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…"
-                send_label=label send=send alt=alt>
-                {can_resolve.then(|| view! {
-                    <button type="button" disabled=move || busy.get() on:click=toggle.clone()>
-                        {if resolved { "Unresolve" } else { "Resolve" }}
-                    </button>
-                })}
-            </ComposerToggle>
+            {move || {
+                // While a review is pending, replies go into it unless
+                // asked otherwise.
+                let (label, send, alt) = if target.reviewing.get() {
+                    (
+                        "Add to review",
+                        reply(true),
+                        ("Reply now".to_owned(), reply(false)),
+                    )
+                } else {
+                    (
+                        "Reply",
+                        reply(false),
+                        ("Add to review".to_owned(), reply(true)),
+                    )
+                };
+                view! {
+                    <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…"
+                        send_label=label send=send alt=alt>
+                        {can_resolve.then(|| view! {
+                            <button type="button" disabled=move || busy.get() on:click=move |e| toggle.run(e)>
+                                {if resolved { "Unresolve" } else { "Resolve" }}
+                            </button>
+                        })}
+                    </ComposerToggle>
+                }
+            }}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
         </div>
     }
@@ -1424,50 +1539,53 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
 
 #[component]
 fn CommentPanel(
-    threads: Vec<Unplaced>,
+    threads: Memo<Vec<Unplaced>>,
     chosen: RwSignal<Option<Selection>>,
     selection: Memo<Selection>,
 ) -> impl IntoView {
-    if threads.is_empty() {
-        return ().into_any();
-    }
-    let count = threads.len();
-    let items = threads
-        .into_iter()
-        .map(|u| {
-            let c = &u.thread.root;
-            let line = c.original_line.map(|l| format!(":{l}")).unwrap_or_default();
-            let jump = u.version.map(|v| {
+    move || {
+        let threads = threads.get();
+        if threads.is_empty() {
+            return ().into_any();
+        }
+        let count = threads.len();
+        let items = threads
+            .into_iter()
+            .map(|u| {
+                let c = &u.thread.root;
+                let line = c.original_line.map(|l| format!(":{l}")).unwrap_or_default();
+                let jump = u.version.map(|v| {
+                    view! {
+                        <button
+                            class="link"
+                            on:click=move |_| {
+                                let s = selection.get_untracked();
+                                let base = if s.base < v { s.base } else { 0 };
+                                chosen.set(Some(Selection { base, head: v }));
+                            }
+                        >
+                            {format!("on v{v}")}
+                        </button>
+                    }
+                });
                 view! {
-                    <button
-                        class="link"
-                        on:click=move |_| {
-                            let s = selection.get_untracked();
-                            let base = if s.base < v { s.base } else { 0 };
-                            chosen.set(Some(Selection { base, head: v }));
-                        }
-                    >
-                        {format!("on v{v}")}
-                    </button>
+                    <li>
+                        <div class="panel-where"><code>{format!("{}{line}", c.path)}</code> " " {jump}
+                            {u.version.is_none().then(|| view! { <span class="muted">"on an unknown version"</span> })}
+                        </div>
+                        <ThreadView thread=u.thread.clone() />
+                    </li>
                 }
-            });
-            view! {
-                <li>
-                    <div class="panel-where"><code>{format!("{}{line}", c.path)}</code> " " {jump}
-                        {u.version.is_none().then(|| view! { <span class="muted">"on an unknown version"</span> })}
-                    </div>
-                    <ThreadView thread=u.thread.clone() />
-                </li>
-            }
-        })
-        .collect_view();
-    view! {
-        <details class="comment-panel">
-            <summary>{format!("{count} comment threads on other versions")}</summary>
-            <ul>{items}</ul>
-        </details>
+            })
+            .collect_view();
+        view! {
+            <details class="comment-panel">
+                <summary>{format!("{count} comment threads on other versions")}</summary>
+                <ul>{items}</ul>
+            </details>
+        }
+        .into_any()
     }
-    .into_any()
 }
 
 #[cfg(test)]

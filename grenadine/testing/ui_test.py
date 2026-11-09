@@ -2219,10 +2219,123 @@ class ReviewTest(ServerTestCase):
         self.assertEqual((pr.reviews[-1].state, pr.reviews[-1].body), (COMMENTED, ""))
         self.assertEqual(pr.comments[-1].body, "One thing.")
 
-    def resync(self, title: str) -> None:
-        """Comments on the PR from outside the page, which resyncs it, and
+    def make_pr(self, branch: str, title: str, files: dict[str, str]) -> PullRequest:
+        """Adds a PR on `branch` holding `files`, by the other account."""
+        repo = self.prs[scenarios.RESOLVE].repo
+        repo.checkout(branch, "main")
+        repo.commit(title, files, author=scenarios.OTHER)
+        repo.push(branch, actor=scenarios.OTHER)
+        return repo.open_pr(title, head=branch, author=scenarios.OTHER)
+
+    def test_main_keeps_its_scroll_through_a_sync(self) -> None:
+        pr = self.make_pr(
+            "review/scroll",
+            "Scroll through a sync",
+            {scenarios.REVIEW_PATH: "".join(f"Line {i}\n" for i in range(1, 300))},
+        )
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        file = self.file()
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        main = self.page.locator(".pr-page .main")
+        self.assertGreater(main.evaluate("el => el.scrollTop"), 0)
+        # The comment the sync adds grows the conversation above the
+        # viewport, so the scroll anchoring that keeps this row's place
+        # also moves scrollTop. Its place is what mustn't move.
+        row = file.locator("tr.line").nth(150)
+        y = row.bounding_box()["y"]
+        # A remount of the diff would lose the marker.
+        file.evaluate("el => el.setAttribute('data-marker', '1')")
+
+        self.resync_pr(pr)
+        self.assertAlmostEqual(row.bounding_box()["y"], y, delta=2)
+        expect(file).to_have_attribute("data-marker", "1")
+
+    def test_an_inline_thread_does_not_rebuild_the_diff(self) -> None:
+        pr = self.make_pr(
+            "review/inline",
+            "Take an inline comment",
+            {scenarios.REVIEW_PATH: "".join(f"Line {i}\n" for i in range(1, 300))},
+        )
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        file = self.file()
+        file.evaluate("el => el.scrollIntoView({block: 'center'})")
+        main = self.page.locator(".pr-page .main")
+        self.assertGreater(main.evaluate("el => el.scrollTop"), 0)
+        file.evaluate("el => el.setAttribute('data-marker', '1')")
+
+        pr.repo.comment(
+            pr,
+            author=scenarios.OTHER,
+            body="Out of band.",
+            path=scenarios.REVIEW_PATH,
+            line=6,
+        )
+        self.resync_pr(pr)
+        expect(file.locator(".thread", has_text="Out of band.")).to_be_visible()
+        # The thread's row reflows the file above the viewport, but the
+        # scroll mustn't reset the way a remount would.
+        self.assertGreater(main.evaluate("el => el.scrollTop"), 0)
+        expect(file).to_have_attribute("data-marker", "1")
+
+    def test_a_push_offers_the_new_version(self) -> None:
+        pr = self.make_pr(
+            "review/push-notice",
+            "Notice a push",
+            {"notice/a.txt": "a\n"},
+        )
+        v1 = pr.head_oid
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        picker = self.page.locator("details.picker")
+        expect(picker.locator("summary")).to_have_text(f"Base → v1 ({v1[:8]})")
+
+        pr.repo.checkout(pr.head)
+        v2 = pr.repo.commit("More", {"notice/b.txt": "b\n"})
+        pr.repo.push(pr.head)
+        self.resync_pr(pr)
+        notice = self.page.locator(".new-version-notice")
+        expect(notice).to_contain_text("Version 2 was pushed")
+        # The diff stays on v1 until asked.
+        expect(picker.locator("summary")).to_have_text(f"Base → v1 ({v1[:8]})")
+
+        notice.get_by_role("button", name="Show it").click()
+        expect(picker.locator("summary")).to_have_text(f"Base → v2 ({v2[:8]})")
+        expect(notice).to_have_count(0)
+
+    def test_a_push_offers_the_new_version_with_a_selection(self) -> None:
+        pr = self.make_pr(
+            "review/push-picked",
+            "Pick, then push",
+            {"pick/a.txt": "a\n"},
+        )
+        v1 = pr.head_oid
+        pr.repo.checkout(pr.head)
+        pr.repo.commit("Second", {"pick/b.txt": "b\n"})
+        v2 = pr.repo.push(pr.head)
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        picker = self.page.locator("details.picker")
+
+        # Picking v1 → v2 by hand doesn't keep a push from being offered.
+        picker.locator("summary").click()
+        rows = picker.locator("tbody tr")
+        rows.nth(2).locator("input[name=head]").check()
+        rows.nth(1).locator("input[name=base]").check()
+        self.page.keyboard.press("Escape")
+        expect(picker.locator("summary")).to_have_text(f"v1 ({v1[:8]}) → v2 ({v2[:8]})")
+
+        pr.repo.checkout(pr.head)
+        v3 = pr.repo.commit("Third", {"pick/c.txt": "c\n"})
+        pr.repo.push(pr.head)
+        self.resync_pr(pr)
+        notice = self.page.locator(".new-version-notice")
+        expect(notice).to_contain_text("Version 3 was pushed")
+
+        notice.get_by_role("button", name="Show it").click()
+        expect(picker.locator("summary")).to_have_text(f"Base → v3 ({v3[:8]})")
+        expect(notice).to_have_count(0)
+
+    def resync_pr(self, pr: PullRequest) -> None:
+        """Comments on `pr` from outside the page, which resyncs it, and
         waits for the page to show the comment."""
-        pr = self.prs[title]
         resp = self.page.request.post(
             f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
             headers={"Origin": self.url.rstrip("/")},
@@ -2233,6 +2346,11 @@ class ReviewTest(ServerTestCase):
             f"{len(pr.issue_comments)} comment"
             + ("" if len(pr.issue_comments) == 1 else "s")
         )
+
+    def resync(self, title: str) -> None:
+        """Comments on the PR from outside the page, which resyncs it, and
+        waits for the page to show the comment."""
+        self.resync_pr(self.prs[title])
 
     def test_squash_and_merge(self) -> None:
         pr = self.prs[scenarios.SQUASH]
@@ -2271,8 +2389,16 @@ class ReviewTest(ServerTestCase):
             "Head branch was modified"
         )
         self.assertEqual(pr.state, "OPEN")
-        # The refusal resyncs the PR, so the page shows the push, and
-        # merging that goes through.
+        # The refusal resyncs the PR, so the page offers the push. Until
+        # it's shown, the merge box still expects the old head.
+        notice = self.page.locator(".new-version-notice")
+        expect(notice).to_contain_text("Version 2 was pushed")
+        self.merge()
+        expect(self.merge_box().locator(".error")).to_contain_text(
+            "Head branch was modified"
+        )
+        self.assertEqual(pr.state, "OPEN")
+        notice.get_by_role("button", name="Show it").click()
         expect(self.page.locator("details.picker summary")).to_have_text(
             f"Base → v2 ({pr.head_oid[:8]})"
         )
