@@ -597,6 +597,13 @@ fn random_hex(n: usize) -> String {
         .collect()
 }
 
+/// An id for a permission request the backend gave none, `prefix` and 64
+/// random bits. Counters such as JSON-RPC ids start over when the backend
+/// reconnects, and a repeated id would take an earlier request's answer.
+pub fn approval_id(prefix: &str) -> String {
+    format!("{prefix}-{}", random_hex(8))
+}
+
 /// A random (version 4) UUID, the format Claude Code's session IDs need.
 pub fn uuid() -> String {
     let mut b = random_bytes::<16>();

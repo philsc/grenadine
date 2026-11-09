@@ -319,7 +319,7 @@ pub async fn handle(
             let tool_name = args["tool_name"].as_str().unwrap_or_default();
             let tool_use = match args["tool_use_id"].as_str() {
                 Some(t) => t.to_owned(),
-                None => format!("request-{rpc_id}"),
+                None => agent::approval_id("request"),
             };
             // Claude Code hanging up, e.g. because the turn was
             // interrupted, drops the wait and so the request.
@@ -368,7 +368,7 @@ pub async fn handle(
             let result = match name {
                 "show_image" => show_image(&state, &id, args).await,
                 "update_prs" => {
-                    update_prs(&state, &id, &format!("update_prs-{rpc_id}"), args).await
+                    update_prs(&state, &id, &agent::approval_id("update_prs"), args).await
                 }
                 "land_on_checkout" => land_on_checkout(&state, &id).await,
                 "session_pr" => session_pr(&state, &session).await,
@@ -1119,6 +1119,54 @@ mod tests {
             "The user didn't allow opening or updating pull requests onto #24."
         );
         assert_eq!(state.db.agent(ID).unwrap().unwrap().landed, None);
+    }
+
+    /// The ids of the requests in the transcript so far, waiting until
+    /// there are `n`.
+    async fn requested_ids(state: &Arc<State>, n: usize) -> Vec<String> {
+        for _ in 0..1500 {
+            let ids: Vec<_> = state
+                .db
+                .agent_events(ID)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    AgentEventKind::ApprovalRequested { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            if ids.len() >= n {
+                return ids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {n} approvals were requested");
+    }
+
+    /// JSON-RPC ids start over when Claude Code reconnects, so the same
+    /// id from a later connection still gets a request of its own, which
+    /// an earlier answer doesn't resolve.
+    #[tokio::test]
+    async fn update_prs_requests_get_fresh_ids() {
+        let state = state_with(|s| s.pr = Some(24));
+        for n in 1..=2 {
+            let call_task = tokio::spawn({
+                let state = state.clone();
+                // `tool` sends the same JSON-RPC id every time.
+                async move { tool(&state, "update_prs", json!({})).await }
+            });
+            let ids = requested_ids(&state, n).await;
+            let decision = Decision {
+                allow: false,
+                ..Decision::default()
+            };
+            assert!(agent::approve(&state, ID, &ids[n - 1], decision).unwrap());
+            let (text, failed) = call_task.await.unwrap();
+            assert!(failed, "{text}");
+        }
+        let ids = requested_ids(&state, 2).await;
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|i| i.starts_with("update_prs-")), "{ids:?}");
     }
 
     /// Mapping a commit to the session's source PR asks to replace that
