@@ -1,5 +1,5 @@
 {
-  "checksum": "18c0ad0f40cbbb1934b53680a63c07cfb48ff20d3faf457564673b6d87fa6afd",
+  "checksum": "97dab79f889428518f3090924acc74c0e381c9982182e817c06a179b3f5552fe",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16659,6 +16659,7 @@
             "InputEvent",
             "IntersectionObserver",
             "IntersectionObserverEntry",
+            "IntersectionObserverInit",
             "KeyboardEvent",
             "Location",
             "MediaQueryList",
