@@ -67,24 +67,35 @@ single_version_override(
     patches = ["//third_party/aspect_rules_js:0001-Keep-the-npm-extension-in-the-lockfile.patch"],
 )
 
-# rules_buf, via aspect_rules_lint, registers a buf toolchain for every
-# build. Resolving any toolchain then fetched its 72MB repo, which picks the
-# host's binary and so can't come from the remote repo contents cache. Nothing
-# here lints protobufs, so an empty repo stands in for it.
+# Some modules register toolchains whose repos every toolchain resolution
+# fetches, and whose rules depend on the host, so they can't come from the
+# remote repo contents cache. Nothing here uses them, so an empty repo stands
+# in for each:
+# - rules_buf (via aspect_rules_lint) downloads buf (72MB) for the host.
+# - rules_swift (via aspect_rules_js and rules_apple) runs the host's swiftc
+#   to configure itself, which took 30s on GitHub's runners.
 bazel_dep(name = "rules_buf", version = "0.5.2")
-
-buf = use_extension("@rules_buf//buf:extensions.bzl", "buf")
+bazel_dep(name = "rules_swift", version = "3.1.2")
 
 local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
 
 local_repository(
-    name = "no_buf_toolchains",
-    path = "third_party/no_buf_toolchains",
+    name = "no_toolchains",
+    path = "third_party/no_toolchains",
 )
+
+buf = use_extension("@rules_buf//buf:extensions.bzl", "buf")
 
 override_repo(
     buf,
-    rules_buf_toolchains = "no_buf_toolchains",
+    rules_buf_toolchains = "no_toolchains",
+)
+
+swift_deps = use_extension("@rules_swift//swift:extensions.bzl", "non_module_deps")
+
+override_repo(
+    swift_deps,
+    build_bazel_rules_swift_local_config = "no_toolchains",
 )
 
 # Opt out of the deprecated implicit __init__.py creation. Every package that
