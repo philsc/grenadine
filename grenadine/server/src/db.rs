@@ -1855,6 +1855,25 @@ impl Db {
         .collect()
     }
 
+    /// The permission requests and their resolutions in every session's
+    /// transcript, by session id and in order.
+    pub fn approval_events(&self) -> Result<Vec<(String, AgentEventKind)>> {
+        let conn = self.conn();
+        // Events are stored with their kind as the only key, so the prefix
+        // finds these without parsing the others.
+        let mut stmt = conn.prepare(
+            r#"SELECT agent_id, event FROM agent_events
+             WHERE event LIKE '{"approval\_%' ESCAPE '\'
+             ORDER BY agent_id, seq"#,
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (id, json) = row?;
+            Ok((id, serde_json::from_str(&json)?))
+        })
+        .collect()
+    }
+
     /// The cleanup items, newest first.
     pub fn cleanup_items(&self) -> Result<Vec<CleanupItem>> {
         let conn = self.conn();

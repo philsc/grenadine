@@ -2821,9 +2821,9 @@ fn Transcript(
             events
                 .iter()
                 .filter_map(|e| match &e.kind {
-                    AgentEventKind::ApprovalResolved { id, allow, .. } => {
-                        Some((id.clone(), *allow))
-                    }
+                    AgentEventKind::ApprovalResolved {
+                        id, allow, expired, ..
+                    } => Some((id.clone(), Answer::of(*allow, *expired))),
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>()
@@ -3062,10 +3062,10 @@ fn Transcript(
                                         " " <code title=title>{summary}</code>
                                         {move || {
                                             resolved.with(|r| r.get(&approval_id).copied()).map(|allow| {
-                                                let (class, label, mark) = if allow {
-                                                    ("allowed", "Allowed", "✓")
-                                                } else {
-                                                    ("denied", "Denied", "✗")
+                                                let (class, label, mark) = match allow {
+                                                    Answer::Allowed => ("allowed", "Allowed", "✓"),
+                                                    Answer::Denied => ("denied", "Denied", "✗"),
+                                                    Answer::Expired => ("expired", "Expired", "–"),
                                                 };
                                                 view! {
                                                     " " <span class=format!("approval-mark {class}") role="img" aria-label=label title=label>{mark}</span>
@@ -3305,6 +3305,25 @@ fn send_approval(
     });
 }
 
+/// How a permission request ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Allowed,
+    Denied,
+    /// Nobody answered before the agent stopped waiting.
+    Expired,
+}
+
+impl Answer {
+    fn of(allow: bool, expired: bool) -> Answer {
+        match (allow, expired) {
+            (_, true) => Answer::Expired,
+            (true, false) => Answer::Allowed,
+            (false, false) => Answer::Denied,
+        }
+    }
+}
+
 /// `ExitPlanMode`: Claude's plan, to approve or to send back with
 /// feedback.
 #[component]
@@ -3315,7 +3334,7 @@ fn PlanCard(
     plan: String,
     /// The session's backend, for the modes the turn can go on in.
     backend: AgentBackend,
-    resolved: Memo<HashMap<String, bool>>,
+    resolved: Memo<HashMap<String, Answer>>,
     /// Whether this is the plan the last turn ended on, still unanswered.
     open: Signal<bool>,
     waiting: Signal<bool>,
@@ -3331,7 +3350,7 @@ fn PlanCard(
     let then = RwSignal::new(PermissionMode::new(backend.plan_default_mode()));
     let state = {
         let tool = tool.clone();
-        Signal::derive(move || resolved.with(|r| r.get(&tool).copied()))
+        Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)))
     };
     let answer = move |allow: bool| {
         let message = Some(feedback.get_untracked()).filter(|f| !f.trim().is_empty());
@@ -3467,7 +3486,7 @@ fn QuestionCard(
     /// The session's repository, for links in a question's Markdown.
     repo: String,
     questions: Vec<Question>,
-    resolved: Memo<HashMap<String, bool>>,
+    resolved: Memo<HashMap<String, Answer>>,
     /// The answers the user gave, by tool use id.
     answers: Memo<HashMap<String, BTreeMap<String, Vec<String>>>>,
     waiting: Signal<bool>,
@@ -3511,7 +3530,8 @@ fn QuestionCard(
     };
     let skip = answer.clone();
     let name = StoredValue::new(tool.clone());
-    let state = Signal::derive(move || resolved.with(|r| r.get(&tool).copied()));
+    let state =
+        Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)));
     let pending = move || state.get().is_none() && waiting.get();
     view! {
         <div class="approval questions" class:pending=pending>
@@ -3642,7 +3662,7 @@ fn ApprovalCard(
     diff: Option<(String, Vec<Fragment>)>,
     /// The answers the backend offers beyond allow/deny.
     options: Vec<ApprovalOption>,
-    resolved: Memo<HashMap<String, bool>>,
+    resolved: Memo<HashMap<String, Answer>>,
     /// Whether the call's own row shows the answer, making a resolved
     /// card redundant.
     on_row: Signal<bool>,
@@ -3683,8 +3703,9 @@ fn ApprovalCard(
                 <div class="approval" class:pending=move || state.get().is_none() && waiting.get()>
                     <p>
                         {move || match state.get() {
-                            Some(true) => "Allowed ".to_owned(),
-                            Some(false) => "Denied ".to_owned(),
+                            Some(Answer::Allowed) => "Allowed ".to_owned(),
+                            Some(Answer::Denied) => "Denied ".to_owned(),
+                            Some(Answer::Expired) => "Expired: ".to_owned(),
                             None if waiting.get() => format!("{} wants to use ", backend.agent_name()),
                             None => "Unanswered: ".to_owned(),
                         }}

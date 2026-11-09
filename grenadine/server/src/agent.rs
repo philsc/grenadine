@@ -1435,6 +1435,7 @@ pub fn interrupt(state: &State, id: &str) {
                 allow: false,
                 message: None,
                 answers: None,
+                expired: false,
             },
         );
     }
@@ -1518,19 +1519,87 @@ pub fn queue_next(state: &State, id: &str, prompt: String, mode: Option<Permissi
     });
 }
 
-/// Forgets a permission request when its waiter stops waiting.
+/// Forgets a permission request when its waiter stops waiting. One
+/// nobody answered expires, so its card stops offering answers, unless
+/// it's a plan.
 struct PendingGuard<'a> {
     state: &'a State,
     id: &'a str,
     tool_use: &'a str,
+    tool_name: &'a str,
+}
+
+/// Whether an unanswered request of `tool_name` expires once nobody waits
+/// for it. A plan stays open: answering it starts a new turn.
+fn expires(tool_name: &str) -> bool {
+    tool_name != "ExitPlanMode"
 }
 
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
-        self.state
-            .agents
-            .with_live(self.id, |l| l.pending.remove(self.tool_use));
+        // `approve` and `interrupt` take the request out before they
+        // answer it, so finding it here means nobody did.
+        let (unanswered, still_pending) = self.state.agents.with_live(self.id, |l| {
+            let unanswered = l.pending.remove(self.tool_use).is_some();
+            (unanswered, !l.pending.is_empty())
+        });
+        if !unanswered || !expires(self.tool_name) {
+            return;
+        }
+        expire_approval(self.state, self.id, self.tool_use);
+        // The turn may have ended already; only a session still waiting
+        // on this request goes back to running.
+        let waiting = matches!(
+            self.state.db.agent(self.id),
+            Ok(Some(s)) if s.status == AgentStatus::AwaitingApproval
+        );
+        if waiting && !still_pending {
+            set_status(self.state, self.id, AgentStatus::Running);
+        }
     }
+}
+
+/// Tells the page that nobody can answer the request `tool_use` anymore.
+fn expire_approval(state: &State, id: &str, tool_use: &str) {
+    let expired = emit(
+        state,
+        id,
+        AgentEventKind::ApprovalResolved {
+            id: tool_use.to_owned(),
+            allow: false,
+            message: None,
+            answers: None,
+            expired: true,
+        },
+    );
+    if let Err(e) = expired {
+        tracing::warn!("agent {id}: {e:#}");
+    }
+}
+
+/// Expires the permission requests the transcripts still show as
+/// waiting, which nobody can answer after a restart. Plans stay open.
+pub fn expire_orphaned_approvals(state: &State) -> Result<()> {
+    let mut open: Vec<(String, String)> = Vec::new();
+    for (session, kind) in state.db.approval_events()? {
+        match kind {
+            AgentEventKind::ApprovalRequested { id, tool_name, .. } if expires(&tool_name) => {
+                open.push((session, id))
+            }
+            AgentEventKind::ApprovalResolved { id, .. } => {
+                // Ids could repeat before they were random, so a
+                // resolution closes the latest request with its id.
+                if let Some(i) = open.iter().rposition(|(s, o)| *s == session && *o == id) {
+                    open.remove(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (session, tool_use) in open {
+        expire_approval(state, &session, &tool_use);
+    }
+    Ok(())
 }
 
 /// Asks the user about the tool use `tool_use`, as `request_approval`
@@ -1560,6 +1629,7 @@ pub async fn await_approval(
         state,
         id,
         tool_use,
+        tool_name,
     };
     tokio::select! {
         d = rx => d.ok(),
@@ -1592,6 +1662,7 @@ fn deny_unattended(
             allow: false,
             message: Some(UNATTENDED_DENIAL.to_owned()),
             answers: None,
+            expired: false,
         },
     ] {
         if let Err(e) = emit(state, id, kind) {
@@ -1637,6 +1708,7 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
             allow,
             message,
             answers,
+            expired: false,
         },
     )?;
     if !still_pending {

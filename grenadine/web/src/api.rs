@@ -353,11 +353,19 @@ pub async fn interrupt_agent(id: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Answers a permission request; the server has a 404 for a request that
+/// stopped waiting, such as one cut off by a restart.
 pub async fn approve(id: &str, approval: &Approval) -> Result<()> {
-    let req = Request::post(&format!("/api/agents/{id}/approvals"))
+    let resp = Request::post(&format!("/api/agents/{id}/approvals"))
         .json(approval)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
         .map_err(|e| e.to_string())?;
-    check(req.send().await).await.map(|_| ())
+    if resp.status() == 404 {
+        return Err("This request isn't waiting anymore.".into());
+    }
+    check(Ok(resp)).await.map(|_| ())
 }
 
 pub async fn delete_agent(id: &str) -> Result<()> {

@@ -296,6 +296,10 @@ async fn main() -> Result<()> {
         system: system::Sampler::default(),
         shutdown: shutdown.clone(),
     });
+    // No request from before the restart is waiting anymore.
+    if let Err(e) = agent::expire_orphaned_approvals(&state) {
+        tracing::warn!("can't expire the permission requests left open: {e:#}");
+    }
     let sync_task = tokio::spawn(sync::run(
         state.clone(),
         Duration::from_secs(args.poll_interval.max(1)),

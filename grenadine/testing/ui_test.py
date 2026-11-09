@@ -345,7 +345,8 @@ def devin_scenario(tmp: Path) -> dict:
 # tip, and `update prs ENTRY...` calls the update_prs MCP tool, ENTRY
 # naming a commit as NAME, or NAME:N to update PR #N. The Open PR
 # wrap-up's naming prompt makes it call update_prs too, naming each new
-# pull request's branch dev/test/<subject>. It says how many
+# pull request's branch dev/test/<subject>. `hang up` has it ask to run
+# a Bash command and hang up before anyone answers. It says how many
 # images came with the prompt. `long transcript N` has it run N Bash
 # calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
@@ -398,13 +399,13 @@ def emit(message):
     print(json.dumps(message), flush=True)
 
 
-def rpc(method, params, id=1):
+def rpc(method, params, id=1, timeout=None):
     request = urllib.request.Request(
         url,
         data=json.dumps({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).encode(),
         headers={"content-type": "application/json"},
     )
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -453,6 +454,17 @@ if "write" in prompt:
         result(tool_use, "Wrote notes.txt", patch=patch)
     else:
         result(tool_use, decision["message"], is_error=True)
+# `hang up` has it ask to run a Bash command and hang up before anyone
+# answers.
+if prompt == "hang up":
+    tool_input = {"command": "true"}
+    tool_use = use("Bash", tool_input)
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    try:
+        rpc("tools/call", {"name": "approve", "arguments": {"tool_name": "Bash", "input": tool_input, "tool_use_id": tool_use}}, timeout=3)
+    except TimeoutError:
+        pass
+    result(tool_use, "Nobody answered.", is_error=True)
 if prompt.startswith("commit "):
     name = prompt.removeprefix("commit ")
     with open(name + ".txt", "w") as f:
@@ -4189,6 +4201,27 @@ class AgentTest(ServerTestCase):
         expect(tool.locator(".approval-mark")).to_have_attribute("aria-label", "Denied")
         expect(tool.locator(".tool-status")).to_have_attribute("aria-label", "Failed")
         expect(tool.locator("summary")).not_to_contain_text("failed")
+        self.delete_session()
+
+    def test_a_request_nobody_waits_for_expires(self) -> None:
+        # Once Claude Code hangs up on a request, the request can't be
+        # answered anymore, so its row says it expired and nothing offers
+        # to answer it.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("hang up")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        transcript = self.page.locator(".transcript")
+        approval = transcript.locator(".approval")
+        expect(approval).to_contain_text("Claude wants to use Bash")
+        tool = transcript.locator("details.tool")
+        expect(tool.locator(".approval-mark")).to_have_attribute(
+            "aria-label", "Expired"
+        )
+        expect(approval).to_have_count(0)
+        expect(transcript.locator(".turn-end")).to_have_count(1)
         self.delete_session()
 
     def open_pr(self, title: str) -> Any:
