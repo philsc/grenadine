@@ -13,6 +13,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -700,12 +701,21 @@ class ServerTestCase(unittest.TestCase):
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
         cls.devin_log = tmp / "devin_acp.log"
+        # The database goes on tmpfs where there is one. Each of its
+        # commits waits for an fsync, which on a remote executor whose disk
+        # is busy with other actions' inputs held the server's startup for
+        # 30s. The worktrees stay where the server would put them.
+        db_dir = tmp
+        if os.access("/dev/shm", os.W_OK):
+            db_dir = Path(tempfile.mkdtemp(dir="/dev/shm"))
+            cls.addClassCleanup(shutil.rmtree, db_dir, ignore_errors=True)
         cls.server_args = (
             [
                 os.environ["GRENADINE_SERVER"],
                 *repo_flags,
                 f"--port={port}",
-                f"--db={tmp / 'grenadine.db'}",
+                f"--db={db_dir / 'grenadine.db'}",
+                f"--worktrees={tmp / 'worktrees'}",
                 f"--github-api={api}",
                 f"--devin={devin}",
                 f"--poll-interval={cls.POLL_INTERVAL}",
