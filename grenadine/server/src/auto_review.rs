@@ -27,17 +27,6 @@ const MAX_RUNNING: usize = 3;
 /// How long the rows of finished reviews are kept.
 const KEEP: i64 = 30 * 24 * 60 * 60;
 
-/// How long after a review's session finished its review is looked for
-/// on GitHub, which can take a moment to show what was just posted.
-#[cfg(not(test))]
-const POSTED_CHECKS: [Duration; 3] = [
-    Duration::ZERO,
-    Duration::from_secs(5),
-    Duration::from_secs(20),
-];
-#[cfg(test)]
-const POSTED_CHECKS: [Duration; 1] = [Duration::ZERO];
-
 /// What a review's session is told beyond its prompt, whichever skill it
 /// runs.
 pub const NOTE: &str = "This is an unattended pull request review. Nobody reads or answers this \
@@ -528,7 +517,7 @@ async fn finish(
         }
         _ => return failed("The review's session failed."),
     }
-    for delay in POSTED_CHECKS {
+    for &delay in &state.posted_checks {
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = state.shutdown.cancelled() => return Ok(()),

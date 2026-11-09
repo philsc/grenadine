@@ -709,6 +709,9 @@ class ServerTestCase(unittest.TestCase):
                 f"--github-api={api}",
                 f"--devin={devin}",
                 f"--poll-interval={cls.POLL_INTERVAL}",
+                # The fake GitHub shows posted reviews at once, so a review
+                # that posts nothing needn't be looked for over 25s.
+                "--review-post-checks=0,1",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
             ],
@@ -6318,7 +6321,7 @@ class AutoReviewTest(ServerTestCase):
         pr = self.open_pr(self.QUIET_REPO, "Quiet change")
         self.page.get_by_role("link", name="Auto-reviews").click()
         entry = self.review_entry("Quiet change")
-        # The server looks for the review on GitHub for half a minute.
+        # The server looks for the review on GitHub a few times.
         expect(entry.locator(".agent-status")).to_have_text(
             "didn't post", timeout=60_000
         )

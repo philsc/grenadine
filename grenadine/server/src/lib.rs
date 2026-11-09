@@ -107,6 +107,11 @@ struct Args {
     #[arg(long, hide = true, default_value = github::API)]
     github_api: String,
 
+    /// Seconds between the looks on GitHub for a finished review's
+    /// review, which GitHub can take a moment to show. Tests shorten them.
+    #[arg(long, hide = true, value_delimiter = ',', default_value = "0,5,20")]
+    review_post_checks: Vec<u64>,
+
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
@@ -291,6 +296,11 @@ pub async fn run() -> Result<()> {
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         watched: std::sync::Mutex::new(BTreeMap::new()),
         off_inbox_interval: Duration::from_secs(args.off_inbox_interval),
+        posted_checks: args
+            .review_post_checks
+            .iter()
+            .map(|&s| Duration::from_secs(s))
+            .collect(),
         inbox_searches: std::sync::Mutex::new(sync::InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
