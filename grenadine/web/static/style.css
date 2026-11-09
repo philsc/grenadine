@@ -1717,8 +1717,13 @@ textarea {
 .transcript > .tool:not([open]) + .tool:not([open]) {
   margin-top: -6px;
 }
-/* The status dot takes the spinner's footprint, so a call finishing
-   doesn't move the row's text. */
+/* A row's spinner and its status dot both take 14px, so a call
+   finishing doesn't move the row's text. Boxes are border-box, so the
+   spinner's border is inside its width; the dot's margin is outside. */
+.tool summary .spinner {
+  width: 14px;
+  height: 14px;
+}
 .tool-status {
   display: inline-block;
   width: 10px;

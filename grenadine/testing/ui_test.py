@@ -4189,6 +4189,10 @@ class AgentTest(ServerTestCase):
         expect(tool.locator(".approval-mark")).to_have_attribute("aria-label", "Denied")
         expect(tool.locator(".tool-status")).to_have_attribute("aria-label", "Failed")
         expect(tool.locator("summary")).not_to_contain_text("failed")
+        # The dot takes the spinner's space, so the name doesn't move.
+        finished_name_box = tool.locator(".tool-name").bounding_box()
+        assert finished_name_box
+        self.assertAlmostEqual(finished_name_box["x"], name_box["x"], delta=0.5)
         self.delete_session()
 
     def open_pr(self, title: str) -> Any:
