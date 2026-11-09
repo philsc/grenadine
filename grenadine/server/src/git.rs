@@ -230,14 +230,30 @@ impl Repo {
 
     /// Pushes each of `refs`, a commit and a branch, over HTTPS to the
     /// GitHub repository's branch, replacing what's there. All or none of
-    /// them are pushed.
-    pub fn push_commits(&self, refs: &[(String, String)]) -> Result<()> {
+    /// them are pushed. A branch in `leases`, with the commit it's
+    /// expected at, is only replaced while it's still there.
+    pub fn push_commits(
+        &self,
+        refs: &[(String, String)],
+        leases: &[(String, String)],
+    ) -> Result<()> {
         let url = self.fetch_url();
-        let mut args = vec!["push".to_owned(), "--quiet".into(), "--atomic".into(), url];
+        let mut args = vec!["push".to_owned(), "--quiet".into(), "--atomic".into()];
         args.extend(
-            refs.iter()
-                .map(|(sha, branch)| format!("+{sha}:refs/heads/{branch}")),
+            leases
+                .iter()
+                .map(|(branch, sha)| format!("--force-with-lease=refs/heads/{branch}:{sha}")),
         );
+        args.push(url);
+        // A leased branch's refspec has no `+`, which would override the
+        // lease.
+        args.extend(refs.iter().map(|(sha, branch)| {
+            let force = match leases.iter().any(|(b, _)| b == branch) {
+                true => "",
+                false => "+",
+            };
+            format!("{force}{sha}:refs/heads/{branch}")
+        }));
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.git(&args)?;
         Ok(())

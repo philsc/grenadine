@@ -1,8 +1,9 @@
 //! Plans which of the session's commits go into which pull requests when
-//! `update_prs` lands them: one PR per commit, either an open one of the
-//! session's or a new one. Without a mapping the commits keep the open
-//! PRs in order; the `prs` argument maps each commit to a PR by SHA, so
-//! commits can be added, dropped and reordered anywhere.
+//! `update_prs` lands them: each PR takes a run of commits, up to its tip,
+//! and is either an open one of the session's or a new one. Without a
+//! mapping the commits keep the open PRs in order, one commit each; the
+//! `prs` argument names each PR's tip commit by SHA, so PRs can be added,
+//! dropped, reordered and given several commits anywhere.
 
 use anyhow::{Result, bail};
 use grenadine_core::api::LandedPr;
@@ -11,25 +12,29 @@ use serde::Deserialize;
 use crate::agent::stack_branch;
 use crate::github::GhStack;
 
-/// One entry of `update_prs`'s `prs` argument: the PR `commit` updates,
-/// or a new one when `pr` is omitted.
+/// One entry of `update_prs`'s `prs` argument: the tip commit of a PR,
+/// the one `pr` names or a new one when `pr` is omitted. The PR takes the
+/// commits after the previous entry's tip up to `commit`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct PrSpec {
     /// A full or abbreviated SHA of one of the session's commits.
     pub commit: String,
     #[serde(default)]
     pub pr: Option<u64>,
-    /// The branch a new pull request's commit is pushed to; only with
+    /// The branch a new pull request's commits are pushed to; only with
     /// `pr` omitted.
     #[serde(default)]
     pub branch: Option<String>,
 }
 
-/// One commit of the stack and the PR it goes into: an open one of the
-/// session's, or a new one (`pr: None`) on `branch`.
+/// One PR of the stack: its tip commit `sha`, how many `commits` it has,
+/// the `message` of its bottom commit, which titles a new PR, and the PR
+/// it is, an open one of the session's or a new one (`pr: None`) on
+/// `branch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Planned {
     pub sha: String,
+    pub commits: usize,
     pub message: String,
     pub branch: String,
     pub pr: Option<LandedPr>,
@@ -48,24 +53,9 @@ pub fn plan_prs(
     closed: &[u64],
     specs: Option<&[PrSpec]>,
 ) -> Result<(Vec<Planned>, Vec<LandedPr>)> {
-    let pr_of = |specs: Option<&[PrSpec]>, i: usize| -> Result<Option<LandedPr>> {
-        match specs {
-            None => Ok(open.get(i).cloned()),
-            Some(specs) => match specs[i].pr {
-                None => Ok(None),
-                Some(number) => match open.iter().find(|pr| pr.number == number) {
-                    Some(pr) if specs[..i].iter().all(|s| s.pr != Some(number)) => {
-                        Ok(Some(pr.clone()))
-                    }
-                    Some(_) => {
-                        bail!("#{number} is already the pull request of another commit")
-                    }
-                    None => bail!("#{number} isn't one of this session's open pull requests"),
-                },
-            },
-        }
-    };
-    let specs = match specs {
+    // Each PR as the index of its tip in `commits`, the open PR it is,
+    // and the branch the agent picked for a new one.
+    let tips: Vec<(usize, Option<LandedPr>, Option<String>)> = match specs {
         None => {
             // Without a mapping a closed PR's commit can't be told from
             // the ones after it.
@@ -78,20 +68,21 @@ pub fn plan_prs(
                 bail!(
                     "the session's pull requests {numbers} were closed, so its commits can't \
                      be mapped by position; call `update_prs` again with `prs` to choose \
-                     which commit goes into which pull request"
+                     which commits go into which pull request"
                 );
             }
             if commits.len() < open.len() {
                 bail!(
-                    "the session has {} commits but opened {} pull requests, one per commit; \
-                     keep one commit per pull request, and amend a pull request's commit to \
-                     change it rather than squashing commits together, or pass `prs` to drop \
-                     or reorder pull requests",
+                    "the session has {} commits but opened {} pull requests, so they can't be \
+                     mapped one commit per pull request; pass `prs` naming each pull \
+                     request's tip commit",
                     commits.len(),
                     open.len()
                 );
             }
-            None
+            (0..commits.len())
+                .map(|i| (i, open.get(i).cloned(), None))
+                .collect()
         }
         Some(specs) => {
             let expected = commits
@@ -99,49 +90,72 @@ pub fn plan_prs(
                 .map(|(sha, message)| {
                     format!(
                         "- {} {}",
-                        &sha[..sha.len().min(12)],
+                        short(sha),
                         message.lines().next().unwrap_or_default()
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if specs.len() != commits.len() {
+            if specs.is_empty() {
                 bail!(
-                    "`prs` must have one entry per commit, bottom first; the commits are:\n{expected}"
+                    "`prs` must name each pull request's tip commit, bottom first; the commits \
+                     are:\n{expected}"
                 );
             }
+            let mut tips = Vec::with_capacity(specs.len());
+            let mut next = 0;
             for (i, spec) in specs.iter().enumerate() {
                 let hex =
                     spec.commit.len() >= 7 && spec.commit.chars().all(|c| c.is_ascii_hexdigit());
-                if !hex || !commits[i].0.starts_with(&spec.commit) {
+                let found = (next..commits.len()).find(|&k| commits[k].0.starts_with(&spec.commit));
+                let Some(k) = found.filter(|_| hex) else {
                     bail!(
-                        "`{}` doesn't name commit {} of the stack, bottom first; the commits \
-                         are:\n{expected}",
+                        "`{}` doesn't name a commit above the previous entry's; `prs` names \
+                         each pull request's tip commit, bottom first, and the commits are:\n\
+                         {expected}",
                         spec.commit,
-                        i + 1
                     );
-                }
+                };
+                next = k + 1;
+                let pr = match spec.pr {
+                    None => None,
+                    Some(number) => match open.iter().find(|pr| pr.number == number) {
+                        Some(pr) if specs[..i].iter().all(|s| s.pr != Some(number)) => {
+                            Some(pr.clone())
+                        }
+                        Some(_) => bail!("#{number} can only have one tip commit in `prs`"),
+                        None => bail!("#{number} isn't one of this session's open pull requests"),
+                    },
+                };
                 if let (Some(number), Some(_)) = (spec.pr, &spec.branch) {
                     bail!(
                         "a pull request's branch can't change; drop `branch` from the entry \
                          for #{number}"
                     );
                 }
+                tips.push((k, pr, spec.branch.clone()));
             }
-            Some(specs)
+            if next != commits.len() {
+                bail!(
+                    "the last entry of `prs` must be the top commit, {}, or the commits above \
+                     it would go into no pull request; the commits are:\n{expected}",
+                    short(&commits[commits.len() - 1].0)
+                );
+            }
+            tips
         }
     };
     let mut dropped: Vec<bool> = vec![true; open.len()];
-    let mut planned = Vec::with_capacity(commits.len());
+    let mut planned = Vec::with_capacity(tips.len());
     let mut branches: Vec<String> = Vec::new();
-    for (i, (sha, message)) in commits.iter().enumerate() {
-        let pr = pr_of(specs, i)?;
+    let mut bottom = 0;
+    for (tip, pr, picked) in tips {
         let branch = match &pr {
             Some(pr) => {
                 dropped[open.iter().position(|o| o.number == pr.number).unwrap()] = false;
                 pr.branch.clone()
             }
-            None => match specs.and_then(|s| s[i].branch.clone()) {
+            None => match picked {
                 // A branch the agent picked: it must be new, like a
                 // generated one.
                 Some(branch) => {
@@ -168,11 +182,13 @@ pub fn plan_prs(
         };
         branches.push(branch.clone());
         planned.push(Planned {
-            sha: sha.clone(),
-            message: message.clone(),
+            sha: commits[tip].0.clone(),
+            commits: tip + 1 - bottom,
+            message: commits[bottom].1.clone(),
             branch,
             pr,
         });
+        bottom = tip + 1;
     }
     let dropped = open
         .iter()
@@ -181,6 +197,30 @@ pub fn plan_prs(
         .map(|(pr, _)| pr.clone())
         .collect();
     Ok((planned, dropped))
+}
+
+/// Checks a plan against `source`, the PR the session started from when
+/// the session took over its commits: it isn't the session's to close, so
+/// it stays in the plan, and its base is the session's trunk, so it stays
+/// at the bottom.
+pub fn check_source(planned: &[Planned], dropped: &[LandedPr], source: u64) -> Result<()> {
+    if dropped.iter().any(|pr| pr.number == source) {
+        bail!(
+            "#{source} is the pull request this session started from, so it can't be dropped; \
+             keep an entry for it in `prs`, at the bottom"
+        );
+    }
+    match planned.first().and_then(|p| p.pr.as_ref()) {
+        Some(pr) if pr.number == source => Ok(()),
+        _ => bail!(
+            "#{source} is the pull request this session started from, so its entry must be the \
+             bottom one of `prs`"
+        ),
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
 }
 
 /// What to do with the GitHub stack a session's PRs make after landing.
@@ -248,6 +288,9 @@ pub fn plan_stack(
                 // The source sits in the middle of a stack; only the
                 // session's own PRs can be stacked on its branch.
                 Some(_) => (None, ours.to_vec()),
+                // The session took over the source's commits, so it's
+                // among the session's PRs already.
+                None if ours.contains(&s) => (None, ours.to_vec()),
                 None => (None, [vec![s], ours.to_vec()].concat()),
             },
             None => (None, ours.to_vec()),
@@ -526,13 +569,20 @@ mod tests {
         )
         .unwrap_err();
         let text = format!("{e:#}");
-        assert!(text.contains("one entry per commit"), "{text}");
+        assert!(text.contains("must be the top commit"), "{text}");
         assert!(text.contains("Add c1"), "{text}");
+
+        // No entries at all.
+        let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&[])).unwrap_err();
+        assert!(format!("{e:#}").contains("tip commit"), "{e:#}");
 
         // Wrong order: the second commit's SHA in the first entry.
         let specs = [spec(&commits[1].0, Some(24)), spec(&commits[0].0, Some(25))];
         let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap_err();
-        assert!(format!("{e:#}").contains("doesn't name commit 1"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("doesn't name a commit above the previous entry's"),
+            "{e:#}"
+        );
 
         // Not a hex SHA at all.
         let specs = [spec("xyz", None), spec(&commits[1].0, None)];
@@ -547,7 +597,89 @@ mod tests {
 
         let specs = [spec(&commits[0].0, Some(24)), spec(&commits[1].0, Some(24))];
         let e = plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap_err();
-        assert!(format!("{e:#}").contains("#24"), "{e:#}");
+        assert!(
+            format!("{e:#}").contains("#24 can only have one tip commit"),
+            "{e:#}"
+        );
+    }
+
+    /// A PR takes the commits from above the tip below it up to its own
+    /// tip, and a new one is titled from its bottom commit.
+    #[test]
+    fn prs_span_commits_up_to_their_tips() {
+        let commits = commits(5);
+        let open = [pr(24, "b"), pr(25, "b-2")];
+        let specs = [
+            spec(&commits[2].0, Some(24)),
+            spec(&commits[3].0, None),
+            spec(&commits[4].0[..9], Some(25)),
+        ];
+        let (planned, dropped) =
+            plan_prs("b", &commits, &open, &taken(&open), &[], Some(&specs)).unwrap();
+        assert!(dropped.is_empty());
+        let got: Vec<_> = planned
+            .iter()
+            .map(|p| {
+                (
+                    p.sha.as_str(),
+                    p.commits,
+                    p.message.as_str(),
+                    p.branch.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (commits[2].0.as_str(), 3, commits[0].1.as_str(), "b"),
+                (commits[3].0.as_str(), 1, commits[3].1.as_str(), "b-3"),
+                (commits[4].0.as_str(), 1, commits[4].1.as_str(), "b-2"),
+            ]
+        );
+
+        // All of them in one new PR.
+        let (planned, dropped) = plan_prs(
+            "b",
+            &commits,
+            &open,
+            &taken(&open),
+            &[],
+            Some(&[spec_branch(&commits[4].0, "dev/me/all")]),
+        )
+        .unwrap();
+        assert_eq!(dropped, open.to_vec());
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].commits, 5);
+        assert_eq!(planned[0].message, commits[0].1);
+        assert_eq!(planned[0].branch, "dev/me/all");
+    }
+
+    /// The PR the session started from and took over is neither dropped
+    /// nor moved off the bottom.
+    #[test]
+    fn the_source_pr_stays_at_the_bottom() {
+        let commits = commits(3);
+        let open = [pr(5, "theirs"), pr(24, "b")];
+        let check = |specs: &[PrSpec]| {
+            let (planned, dropped) =
+                plan_prs("b", &commits, &open, &taken(&open), &[], Some(specs)).unwrap();
+            check_source(&planned, &dropped, 5)
+        };
+        check(&[spec(&commits[1].0, Some(5)), spec(&commits[2].0, Some(24))]).unwrap();
+
+        let e = check(&[spec(&commits[2].0, Some(24))]).unwrap_err();
+        assert!(
+            format!("{e:#}").contains(
+                "#5 is the pull request this session started from, so it can't be dropped"
+            ),
+            "{e:#}"
+        );
+
+        let e = check(&[spec(&commits[1].0, Some(24)), spec(&commits[2].0, Some(5))]).unwrap_err();
+        assert!(format!("{e:#}").contains("must be the bottom one"), "{e:#}");
+
+        let e = check(&[spec(&commits[0].0, None), spec(&commits[2].0, Some(5))]).unwrap_err();
+        assert!(format!("{e:#}").contains("must be the bottom one"), "{e:#}");
     }
 
     /// A new PR's `branch` names the branch its commit is pushed to;
@@ -671,6 +803,25 @@ mod tests {
         assert_eq!(
             plan_stack(&[7, 8], &[7, 8], None, None, None, &[]),
             StackOp::Create(vec![7, 8])
+        );
+    }
+
+    /// A source PR in no stack that the session took over is one of the
+    /// session's PRs already, so it isn't stacked twice.
+    #[test]
+    fn stack_has_a_taken_over_source_once() {
+        assert_eq!(
+            plan_stack(&[5, 7], &[5, 7], Some(5), None, None, &[]),
+            StackOp::Create(vec![5, 7])
+        );
+        assert_eq!(
+            plan_stack(&[5], &[5], Some(5), None, None, &[]),
+            StackOp::Keep
+        );
+        // Stacking on it still puts it at the bottom.
+        assert_eq!(
+            plan_stack(&[7], &[7], Some(5), None, None, &[]),
+            StackOp::Create(vec![5, 7])
         );
     }
 

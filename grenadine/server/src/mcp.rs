@@ -253,18 +253,22 @@ pub async fn handle(
                 },
             }, {
                 "name": "update_prs",
-                "description": "Pushes each of this session's commits to its PR's branch, \
-                    updates this session's open pull requests and opens a pull request for \
-                    each new commit, stacked on the one before it, titled and described \
-                    from the commit messages. To change a pull request, amend its commit \
-                    and call this again. `prs` maps each commit to the pull request it \
-                    updates, one entry per commit in commit order, bottom first; pull \
-                    requests left out are closed and their branches deleted. Without \
-                    `prs`, the commits map to the open pull requests by position, which \
-                    only works when commits were added on top. New pull requests should \
-                    be given a `branch` in `prs`, named following this repository's \
-                    branch naming conventions. The pull requests are kept as a GitHub \
-                    stack where the repository has them turned on.",
+                "description": "Pushes this session's commits to their PRs' branches, \
+                    updates this session's open pull requests and opens the new ones, each \
+                    stacked on the one before it, titled and described from the commit \
+                    messages. To change a pull request, amend its commits and call this \
+                    again. `prs` names each pull request's tip commit, bottom first; a pull \
+                    request takes the commits after the tip below it up to its own, so one \
+                    entry per commit gives each commit its own pull request, and the last \
+                    entry must be the top commit. Open pull requests left out are closed and \
+                    their branches deleted. Without `prs`, the commits map onto the open pull \
+                    requests one per commit when there are as many of each, and a lone \
+                    commit opens a pull request; otherwise the call asks for `prs`. New pull requests should be given a `branch` in \
+                    `prs`, named following this repository's branch naming conventions. The \
+                    pull requests are kept as a GitHub stack where the repository has them \
+                    turned on. A session that started from a pull request stacks its pull \
+                    requests on it; naming that pull request in the first entry of `prs` \
+                    replaces its commits instead, e.g. after rebasing it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -276,7 +280,8 @@ pub async fn handle(
                                     "commit": {
                                         "type": "string",
                                         "description": "A full or abbreviated SHA of the \
-                                            commit; `pr` omitted opens a new pull request.",
+                                            pull request's tip commit; `pr` omitted opens \
+                                            a new pull request.",
                                     },
                                     "pr": {"type": "integer"},
                                     "branch": {
@@ -449,18 +454,35 @@ async fn update_prs(
     // before it shows a second approval card.
     let landing = agent::begin_landing(state, id)?;
     let session = state.db.agent(id)?.context("The session is gone.")?;
+    let specs = match args.get("prs") {
+        None => None,
+        Some(prs) => Some(
+            serde_json::from_value::<Vec<crate::pr_plan::PrSpec>>(prs.clone())
+                .context("`prs` must be a list of {commit, pr, branch} objects")?,
+        ),
+    };
     if let Some(number) = session.pr {
         let key = PrKey {
             repo: session.repo.clone(),
             number,
         };
-        let base = state.db.pr(&key).ok().flatten().map(|pr| pr.head_ref);
-        let input = json!({
-            "pr": number,
-            "branch": session.branch,
-            "base": base,
-            "stack": format!("Joins #{number}'s GitHub stack when #{number} is its top or in no stack."),
-        });
+        let pr = state.db.pr(&key).ok().flatten();
+        // Replacing the PR's commits force-pushes its branch, which the
+        // user may not own, so the card says so.
+        let input = match agent::adopts_source(&session, specs.as_deref()) {
+            true => json!({
+                "pr": number,
+                "replaces": format!("#{number}'s commits"),
+                "branch": pr.as_ref().map(|pr| &pr.head_ref),
+                "base": pr.as_ref().map(|pr| &pr.base_ref),
+            }),
+            false => json!({
+                "pr": number,
+                "branch": session.branch,
+                "base": pr.as_ref().map(|pr| &pr.head_ref),
+                "stack": format!("Joins #{number}'s GitHub stack when #{number} is its top or in no stack."),
+            }),
+        };
         let allowed = matches!(
             agent::await_approval(state, id, tool_use, "update_prs", &input, Vec::new()).await,
             Some(Decision { allow: true, .. })
@@ -469,13 +491,6 @@ async fn update_prs(
             bail!("The user didn't allow opening or updating pull requests onto #{number}.");
         }
     }
-    let specs = match args.get("prs") {
-        None => None,
-        Some(prs) => Some(
-            serde_json::from_value::<Vec<crate::pr_plan::PrSpec>>(prs.clone())
-                .context("`prs` must be a list of {commit, pr, branch} objects")?,
-        ),
-    };
     let (landed, notes) =
         agent::land_now(state, id, WrapUpTarget::PullRequest, specs, &landing).await?;
     let mut out = landed
@@ -1104,6 +1119,53 @@ mod tests {
             "The user didn't allow opening or updating pull requests onto #24."
         );
         assert_eq!(state.db.agent(ID).unwrap().unwrap().landed, None);
+    }
+
+    /// Mapping a commit to the session's source PR asks to replace that
+    /// PR's commits rather than to stack on it.
+    #[tokio::test]
+    async fn update_prs_asks_before_replacing_a_prs_commits() {
+        let state = state_with(|s| s.pr = Some(24));
+        let call_task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                tool(
+                    &state,
+                    "update_prs",
+                    json!({"prs": [{"commit": "abcdef0", "pr": 24}]}),
+                )
+                .await
+            }
+        });
+        let mut requested = None;
+        for _ in 0..1500 {
+            requested = state
+                .db
+                .agent_events(ID)
+                .unwrap()
+                .iter()
+                .find_map(|e| match &e.kind {
+                    AgentEventKind::ApprovalRequested { id, input, .. } => {
+                        Some((id.clone(), input.clone()))
+                    }
+                    _ => None,
+                });
+            if requested.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (tool_use, input) = requested.expect("no approval was requested");
+        assert!(input.contains("\"replaces\":\"#24's commits\""), "{input}");
+        assert!(!input.contains("\"stack\""), "{input}");
+
+        let decision = Decision {
+            allow: false,
+            ..Decision::default()
+        };
+        assert!(agent::approve(&state, ID, &tool_use, decision).unwrap());
+        let (_, failed) = call_task.await.unwrap();
+        assert!(failed);
     }
 
     /// Without a PR to push onto, `update_prs` doesn't ask; it fails here

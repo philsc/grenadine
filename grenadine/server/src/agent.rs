@@ -29,7 +29,7 @@ use crate::claude;
 use crate::devin;
 use crate::git::{REF_PREFIX, Repo};
 use crate::github::StackLookup;
-use crate::pr_plan::{Planned, PrSpec, StackOp, plan_prs, plan_stack};
+use crate::pr_plan::{Planned, PrSpec, StackOp, check_source, plan_prs, plan_stack};
 use crate::reflow::reflow;
 use crate::sync::State;
 
@@ -39,6 +39,9 @@ const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
 /// commits are pushed. One ref per repository is enough because pushing
 /// holds the repository's git lock.
 const TARGET_REF: &str = "refs/grenadine/agent/target";
+/// Where the head branch of the PR a session started from is fetched
+/// before the session's commits replace it.
+const SOURCE_REF: &str = "refs/grenadine/agent/source";
 
 /// The most images one prompt may come with.
 pub const MAX_IMAGES: usize = 20;
@@ -2039,7 +2042,10 @@ async fn land(
         .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?
         .clone();
     // A session that started from a PR proposes its work to that PR's
-    // branch.
+    // branch, or, when its commits replace the PR's own, to the PR's
+    // target branch.
+    let mut adopt = None;
+    let mut source = None;
     let pr_branch = match (target, session.pr) {
         (WrapUpTarget::PullRequest, Some(number)) => {
             let key = PrKey {
@@ -2050,7 +2056,34 @@ async fn land(
                 .db
                 .pr(&key)?
                 .ok_or_else(|| anyhow!("{}#{number} isn't synced", session.repo))?;
-            Some(pr.head_ref)
+            match adopts_source(&session, prs.as_deref()) {
+                true => {
+                    // The first time, the PR's branch may only be replaced
+                    // where the last sync saw it.
+                    let first = !landed_prs(&session).iter().any(|p| p.number == number);
+                    let expect = match first {
+                        true => Some(synced_head(&pr).ok_or_else(|| {
+                            anyhow!("#{number} has no synced head commit yet; try again later")
+                        })?),
+                        false => None,
+                    };
+                    if first {
+                        source_stack_check(&session, &pr)?;
+                        source = Some(LandedPr {
+                            number,
+                            url: pr.summary.url.clone(),
+                            branch: pr.head_ref.clone(),
+                        });
+                    }
+                    adopt = Some(Adopt {
+                        number,
+                        head_ref: pr.head_ref.clone(),
+                        expect,
+                    });
+                    Some(pr.base_ref)
+                }
+                false => Some(pr.head_ref),
+            }
         }
         _ => None,
     };
@@ -2063,7 +2096,11 @@ async fn land(
     let mut taken = Vec::new();
     let mut statuses = BTreeMap::new();
     if target == WrapUpTarget::PullRequest {
-        let landed = landed_prs(&session);
+        let mut landed = landed_prs(&session);
+        // The source PR becomes the session's bottom PR.
+        if let Some(source) = source {
+            landed.insert(0, source);
+        }
         taken = landed.iter().map(|pr| pr.branch.clone()).collect();
         if !landed.is_empty() {
             let keys: Vec<PrKey> = landed
@@ -2110,6 +2147,7 @@ async fn land(
                 &repo,
                 &session,
                 pr_branch,
+                adopt.as_ref(),
                 &open,
                 &merged,
                 &heads,
@@ -2455,6 +2493,109 @@ pub(crate) fn landed_prs(session: &AgentSession) -> Vec<LandedPr> {
         .collect()
 }
 
+/// The pull request a session started from, when the session's commits
+/// replace that PR's own commits instead of stacking on them, e.g. after
+/// rebasing or amending it.
+#[derive(Clone, Debug)]
+pub(crate) struct Adopt {
+    pub number: u64,
+    /// The PR's head branch, which the session's bottom commit replaces.
+    pub head_ref: String,
+    /// The commit the head branch is expected at the first time the
+    /// session replaces it, as the last sync saw it; `None` once the
+    /// session pushed to it.
+    pub expect: Option<String>,
+}
+
+/// Whether `update_prs` with `specs` replaces the commits of the PR the
+/// session started from: once a commit is mapped to it, and from then
+/// on.
+pub(crate) fn adopts_source(session: &AgentSession, specs: Option<&[PrSpec]>) -> bool {
+    let Some(number) = session.pr else {
+        return false;
+    };
+    landed_prs(session).iter().any(|pr| pr.number == number)
+        || specs.is_some_and(|specs| specs.iter().any(|s| s.pr == Some(number)))
+}
+
+/// The PR's head as the last sync saw it.
+fn synced_head(pr: &PrDetail) -> Option<String> {
+    pr.versions
+        .iter()
+        .rev()
+        .find(|v| !v.missing)
+        .map(|v| v.sha.clone())
+}
+
+/// Refuses to replace the commits of the session's source PR while open
+/// PRs that aren't the session's are stacked on it: their branches would
+/// keep the old commits.
+fn source_stack_check(session: &AgentSession, pr: &PrDetail) -> Result<()> {
+    let ours: Vec<u64> = landed_prs(session).iter().map(|p| p.number).collect();
+    let number = pr.summary.key.number;
+    let above: Vec<String> = pr
+        .stack
+        .iter()
+        .flat_map(|stack| &stack.prs)
+        .filter(|p| p.parent == Some(number) && p.state == "OPEN" && !ours.contains(&p.number))
+        .map(|p| format!("#{}", p.number))
+        .collect();
+    if !above.is_empty() {
+        bail!(
+            "other pull requests are stacked on #{number} ({}) and would keep its old commits, \
+             so its commits can't be replaced; stack the new commits on #{number} instead",
+            above.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// How the agent maps `commits` (bottom first) to PRs in `update_prs`'s
+/// `prs`, with the mapping by position onto `open` as the suggestion, to
+/// follow "call the update_prs tool with".
+fn tips_prompt(commits: &[(String, String)], open: &[LandedPr]) -> String {
+    let json = serde_json::to_string(
+        &commits
+            .iter()
+            .enumerate()
+            .map(|(i, (sha, _))| match open.get(i) {
+                Some(pr) => serde_json::json!({"commit": sha, "pr": pr.number}),
+                None => serde_json::json!({"commit": sha}),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    let list = commits
+        .iter()
+        .map(|(sha, message)| {
+            format!(
+                "- {} {}",
+                short(sha),
+                message.lines().next().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prs = match open.is_empty() {
+        true => String::new(),
+        false => format!(
+            " This session's open pull requests are {}.",
+            open.iter()
+                .map(|pr| format!("#{}", pr.number))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!(
+        "`prs` set to `{json}`, giving each new pull request a `branch` that follows this \
+         repository's branch naming conventions. Each entry names a pull request's tip \
+         commit, bottom first: the pull request takes the commits after the tip below it up \
+         to its own. That suggestion gives each commit its own pull request; to put several \
+         commits into one pull request, leave out the entries of all but its top commit.{prs} \
+         The commits, bottom first, are:\n{list}"
+    )
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
@@ -2571,12 +2712,15 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
 /// first; `merged` the ones that merged, with their head commits in
 /// `heads`. `specs` maps commits to PRs as `update_prs` takes it. When
 /// `name_branches`, a plan with a new pull request isn't pushed: the
-/// agent picks the new pull requests' branches first.
+/// agent picks the new pull requests' branches first. With `adopt`, the
+/// session's commits replace the source PR's own, which `pr_branch`, its
+/// target, doesn't have either.
 #[allow(clippy::too_many_arguments)]
 fn push_stack(
     repo: &Repo,
     session: &AgentSession,
     pr_branch: Option<String>,
+    adopt: Option<&Adopt>,
     open: &[LandedPr],
     merged: &[LandedPr],
     heads: &BTreeMap<u64, String>,
@@ -2607,6 +2751,13 @@ fn push_stack(
     // tip. Their commits still in the worktree have to be rebased away
     // first.
     let mut lower = session.base_sha.clone();
+    // The source PR's commits are the session's own when it replaces
+    // them: they start where the PR forked off its target.
+    if adopt.is_some()
+        && let Some(fork) = repo.merge_base(&target, &session.base_sha)
+    {
+        lower = fork;
+    }
     let mut rebased = None;
     if !merged.is_empty() {
         let tip = &target;
@@ -2651,6 +2802,28 @@ fn push_stack(
         Lower::Target => {
             rebased = Some(target.clone());
             target.clone()
+        }
+        // The source PR's branch is where the session started, but its
+        // commits were rewritten: they replace the PR's own only when the
+        // agent says so.
+        // `Lower::Base` with the target at the base is handled above.
+        Lower::Unrelated if session.pr.is_some() && adopt.is_none() && target == lower => {
+            let number = session.pr.unwrap_or_default();
+            return Ok(Step::Ask {
+                reason: format!(
+                    "the commits don't build on #{number}'s commits, the tip {} of {trunk}",
+                    short(&target)
+                ),
+                prompt: format!(
+                    "Wrap up: if your commits are meant to replace #{number}'s own, e.g. because \
+                     you rebased or amended them, call `update_prs` with `prs` whose first entry \
+                     names the top one of #{number}'s rewritten commits with `\"pr\": {number}`, \
+                     followed by the tip commits of any new pull requests above it. Otherwise rebase your commits onto {target} with `git rebase \
+                     --onto {target} <the commit your work starts after>`, resolve the \
+                     conflicts, and check that the result still builds and passes the relevant \
+                     tests. Finish the rebase and leave nothing uncommitted."
+                ),
+            });
         }
         Lower::Base | Lower::Unrelated => {
             return Ok(Step::Ask {
@@ -2698,6 +2871,32 @@ fn push_stack(
             ),
         });
     }
+    // Without `prs` the commits only map one per PR onto the open PRs, or
+    // a lone commit onto a new one; any other shape takes the agent
+    // naming each PR's tip commit, since a PR may hold several commits.
+    if specs.is_none() {
+        let one_to_one = closed.is_empty() && commits.len() == open.len();
+        let lone_new = closed.is_empty() && open.is_empty() && commits.len() == 1;
+        if !one_to_one && (name_branches || !lone_new) {
+            let prompt = tips_prompt(&commits, open);
+            return Ok(match name_branches {
+                true => Step::NameBranches {
+                    prompt: format!(
+                        "Wrap up: call the grenadine MCP server's update_prs tool with {prompt}"
+                    ),
+                },
+                false => Step::Ask {
+                    reason: format!(
+                        "the {} commits don't map one per pull request onto the session's {} \
+                         open pull requests",
+                        commits.len(),
+                        open.len()
+                    ),
+                    prompt: format!("Wrap up: pass {prompt}"),
+                },
+            });
+        }
+    }
     let (planned, dropped) = plan_prs(
         &session.branch,
         &commits,
@@ -2706,37 +2905,10 @@ fn push_stack(
         closed,
         specs.as_deref(),
     )?;
-    let new: Vec<&Planned> = planned.iter().filter(|p| p.pr.is_none()).collect();
-    if name_branches && !new.is_empty() {
-        let json = serde_json::to_string(
-            &planned
-                .iter()
-                .map(|p| match &p.pr {
-                    Some(pr) => serde_json::json!({"commit": p.sha, "pr": pr.number}),
-                    None => serde_json::json!({"commit": p.sha}),
-                })
-                .collect::<Vec<_>>(),
-        )?;
-        let list = new
-            .iter()
-            .map(|p| {
-                format!(
-                    "- {} {}",
-                    short(&p.sha),
-                    p.message.lines().next().unwrap_or_default()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Ok(Step::NameBranches {
-            prompt: format!(
-                "Wrap up: call the grenadine MCP server's update_prs tool with `prs` set to \
-                 `{json}`, giving each new pull request a `branch` that follows this \
-                 repository's branch naming conventions. The commits that need new pull \
-                 requests are:\n{list}"
-            ),
-        });
+    if let Some(adopt) = adopt {
+        check_source(&planned, &dropped, adopt.number)?;
     }
+    let new: Vec<&Planned> = planned.iter().filter(|p| p.pr.is_none()).collect();
     let branches: Vec<String> = new.iter().map(|p| p.branch.clone()).collect();
     for branch in &branches {
         if !repo.valid_branch_name(branch) {
@@ -2769,7 +2941,31 @@ fn push_stack(
         .iter()
         .map(|p| (p.sha.clone(), p.branch.clone()))
         .collect();
-    repo.push_commits(&refs)?;
+    // The first time the source PR's branch is replaced, it has to be
+    // where the last sync saw it: otherwise someone pushed to it since,
+    // or it's a branch of a fork with the same name.
+    let mut leases = Vec::new();
+    if let Some(Adopt {
+        number,
+        head_ref,
+        expect: Some(expect),
+    }) = adopt
+    {
+        let tip = repo
+            .fetch_branch(head_ref, SOURCE_REF)
+            .with_context(|| format!("can't fetch #{number}'s branch {head_ref}"))?;
+        if tip != *expect {
+            bail!(
+                "#{number}'s branch {head_ref} is at {} in this repository, not at {} as \
+                 Grenadine last synced it; it may have been pushed to since, or come from a \
+                 fork. Check the pull request before trying again",
+                short(&tip),
+                short(expect)
+            );
+        }
+        leases.push((head_ref.clone(), tip));
+    }
+    repo.push_commits(&refs, &leases)?;
     Ok(Step::Pushed {
         trunk,
         planned,
@@ -2795,10 +2991,11 @@ fn landed_note(session: &AgentSession) -> Option<String> {
                 .join("\n");
             format!(
                 "The user had Grenadine, the app running this session, open these pull requests \
-                 from this session's commits, one per commit, each stacked on the one before \
-                 it:\n{prs}\nThese are this session's PRs. Don't open other PRs for this work or \
-                 push it to other branches. To update them or open PRs for new commits, call \
-                 the grenadine MCP server's update_prs tool; pass `prs` to drop or reorder PRs. \
+                 from this session's commits, each stacked on the one before it:\n{prs}\nThese \
+                 are this session's PRs. Don't open other PRs for this work or push it to other \
+                 branches. To update them or open PRs for new commits, call the grenadine MCP \
+                 server's update_prs tool; pass `prs`, naming each PR's tip commit, to drop, \
+                 reorder or merge PRs. \
                  Grenadine keeps the PRs in a GitHub stack."
             )
         }
@@ -2905,6 +3102,14 @@ fn pr_note(pr: &SessionPr) -> String {
     note += " This branch's upstream is the pull request's target branch, so \
              `git merge-base @{u} HEAD` gives the PR's base. The grenadine MCP server's \
              session_pr tool gives these details and the PR's stack.";
+    note += &format!(
+        " New commits go into pull requests stacked on #{n}. To change #{n}'s own commits \
+         instead, e.g. to rebase or amend them, rewrite them and call update_prs with `prs` \
+         whose first entry names the top rewritten commit with `\"pr\": {n}`; Grenadine then \
+         pushes them to `{}`.",
+        detail.head_ref,
+        n = pr.number
+    );
     let head = detail
         .versions
         .iter()
@@ -5205,11 +5410,19 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         // The agent's update_prs then pushes. The test state's GitHub is
         // unreachable, so only the push works.
         let worktree = Path::new(&session.worktree);
+        let specs = ["HEAD~2", "HEAD~", "HEAD"]
+            .iter()
+            .map(|rev| PrSpec {
+                commit: run(worktree, &["rev-parse", rev]),
+                pr: None,
+                branch: None,
+            })
+            .collect();
         land_now(
             &state,
             id,
             WrapUpTarget::PullRequest,
-            None,
+            Some(specs),
             &begin_landing(&state, id).unwrap(),
         )
         .await
@@ -5594,11 +5807,23 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         wait_for_turns(&state, id, 2).await;
 
         // The test state's GitHub is unreachable, so only the push works.
+        let specs = vec![
+            PrSpec {
+                commit: run(worktree, &["rev-parse", "HEAD~"]),
+                pr: Some(24),
+                branch: None,
+            },
+            PrSpec {
+                commit: run(worktree, &["rev-parse", "HEAD"]),
+                pr: None,
+                branch: None,
+            },
+        ];
         land_now(
             &state,
             id,
             WrapUpTarget::PullRequest,
-            None,
+            Some(specs),
             &begin_landing(&state, id).unwrap(),
         )
         .await
@@ -5609,6 +5834,74 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             run(worktree, &["rev-parse", "HEAD"])
         );
         assert_eq!(state.db.agent(id).unwrap().unwrap().landed, Some(pr));
+    }
+
+    /// A new PR whose `prs` entry names the top of two commits takes both:
+    /// only its tip is pushed, to its branch.
+    #[tokio::test]
+    async fn pushes_a_new_pr_spanning_two_commits() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+        for prompt in ["commit c more", "commit d last"] {
+            send(
+                &state,
+                id,
+                prompt.into(),
+                PermissionMode::from("auto"),
+                None,
+            );
+        }
+        wait_for_turns(&state, id, 3).await;
+
+        let specs = vec![
+            PrSpec {
+                commit: run(worktree, &["rev-parse", "HEAD~2"]),
+                pr: Some(24),
+                branch: None,
+            },
+            PrSpec {
+                commit: run(worktree, &["rev-parse", "HEAD"]),
+                pr: None,
+                branch: Some("dev/me/both".into()),
+            },
+        ];
+        // The test state's GitHub is unreachable, so only the push works.
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let tip = |branch: &str| {
+            run(
+                &fx.upstream,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+        };
+        assert_eq!(
+            tip(&session.branch),
+            run(worktree, &["rev-parse", "HEAD~2"])
+        );
+        assert_eq!(tip("dev/me/both"), run(worktree, &["rev-parse", "HEAD"]));
+        assert_eq!(tip(&format!("{}-2", session.branch)), "");
     }
 
     /// Commits that reached the default branch since the session started
@@ -5787,6 +6080,252 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             ""
         );
         assert_eq!(state.db.agent(id).unwrap().unwrap().base_sha, old);
+    }
+
+    /// Sets up a session started from PR 5, whose `n` commits are on
+    /// `pr-branch`, after which main moves on and the worktree rebases the
+    /// PR's commits onto it. Returns the state, the session, the PR's old
+    /// head and main's new tip. The upstream is left on main.
+    async fn rebased_source_pr(
+        fx: &crate::git::tests::Fixture,
+        dir: &Path,
+        n: usize,
+    ) -> (Arc<State>, AgentSession, String, String) {
+        use crate::git::tests::{commit, run};
+        let (state, _) = wrap_up_state(fx, dir);
+        run(&fx.upstream, &["checkout", "-qb", "pr-branch"]);
+        let mut old = String::new();
+        for i in 1..=n {
+            old = commit(&fx.upstream, &format!("p{i}"), "1\n");
+        }
+        store_pr(&state, fx, 5, "pr-branch", &old);
+        let session = start_from_pr(&state, "look around", 5).await;
+        assert_eq!(session.base_sha, old);
+
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+        let main = commit(&fx.upstream, "m", "m\n");
+        let worktree = Path::new(&session.worktree);
+        run(
+            worktree,
+            &[
+                "fetch",
+                "--quiet",
+                "https://github.com/owner/name.git",
+                "main",
+            ],
+        );
+        run(worktree, &["rebase", "--quiet", "FETCH_HEAD"]);
+        (state, session, old, main)
+    }
+
+    fn upstream_tip(fx: &crate::git::tests::Fixture, branch: &str) -> String {
+        crate::git::tests::run(
+            &fx.upstream,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+    }
+
+    /// A session started from a PR that rebased the PR's commit replaces
+    /// it on the PR's branch once the agent maps the commit to the PR, and
+    /// opens no PR of its own.
+    #[tokio::test]
+    async fn update_prs_replaces_the_source_prs_rebased_commit() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _, main) = rebased_source_pr(&fx, dir.path(), 1).await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let head = run(worktree, &["rev-parse", "HEAD"]);
+
+        let specs = vec![PrSpec {
+            commit: head.clone(),
+            pr: Some(5),
+            branch: None,
+        }];
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            landed,
+            Landed::PullRequest {
+                number: 5,
+                url: "u".into(),
+                branch: "pr-branch".into(),
+            }
+        );
+        assert_eq!(upstream_tip(&fx, "pr-branch"), head);
+        assert_eq!(run(&fx.upstream, &["rev-parse", "pr-branch~1"]), main);
+        assert_eq!(upstream_tip(&fx, &session.branch), "");
+
+        // Amending it again updates the same PR without `prs`.
+        run(worktree, &["commit", "--quiet", "--amend", "-m", "Amended"]);
+        let amended = run(worktree, &["rev-parse", "HEAD"]);
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.prs()[0].number, 5);
+        assert_eq!(upstream_tip(&fx, "pr-branch"), amended);
+        assert_eq!(upstream_tip(&fx, &session.branch), "");
+    }
+
+    /// A source PR with several commits takes all of them back when its
+    /// entry names the top one, instead of being split into several PRs.
+    #[tokio::test]
+    async fn update_prs_replaces_all_of_a_source_prs_commits() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _, main) = rebased_source_pr(&fx, dir.path(), 3).await;
+        let id = &session.id;
+        let head = run(Path::new(&session.worktree), &["rev-parse", "HEAD"]);
+
+        let specs = vec![PrSpec {
+            commit: head.clone(),
+            pr: Some(5),
+            branch: None,
+        }];
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.prs().len(), 1);
+        assert_eq!(landed.prs()[0].number, 5);
+        assert_eq!(upstream_tip(&fx, "pr-branch"), head);
+        assert_eq!(run(&fx.upstream, &["rev-parse", "pr-branch~3"]), main);
+        assert_eq!(upstream_tip(&fx, &session.branch), "");
+    }
+
+    /// Once the session took over its source PR, leaving the PR out of
+    /// `prs` would close someone else's PR and delete its branch, so it's
+    /// refused.
+    #[tokio::test]
+    async fn update_prs_never_drops_the_source_pr() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _, _) = rebased_source_pr(&fx, dir.path(), 1).await;
+        let id = &session.id;
+        let worktree = Path::new(&session.worktree);
+        let head = run(worktree, &["rev-parse", "HEAD"]);
+        let land = |specs: Vec<PrSpec>| {
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                let landing = begin_landing(&state, &id).unwrap();
+                land_now(
+                    &state,
+                    &id,
+                    WrapUpTarget::PullRequest,
+                    Some(specs),
+                    &landing,
+                )
+                .await
+            }
+        };
+        land(vec![PrSpec {
+            commit: head.clone(),
+            pr: Some(5),
+            branch: None,
+        }])
+        .await
+        .unwrap();
+
+        let top = commit(worktree, "q", "2\n");
+        let err = land(vec![PrSpec {
+            commit: top,
+            pr: None,
+            branch: Some("dev/me/all".into()),
+        }])
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("#5 is the pull request this session started from"),
+            "{text}"
+        );
+        assert_eq!(upstream_tip(&fx, "pr-branch"), head);
+        assert_eq!(upstream_tip(&fx, "dev/me/all"), "");
+    }
+
+    /// Without the commit mapped to the source PR, a rebased source PR's
+    /// commit isn't pushed, and the agent is told how to replace it.
+    #[tokio::test]
+    async fn update_prs_explains_how_to_replace_the_source_prs_commits() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, old, _) = rebased_source_pr(&fx, dir.path(), 1).await;
+        let id = &session.id;
+
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("`\"pr\": 5`"), "{text}");
+        assert!(!text.contains(&format!("--onto {old} {old}")), "{text}");
+        assert_eq!(upstream_tip(&fx, "pr-branch"), old);
+        assert_eq!(upstream_tip(&fx, &session.branch), "");
+    }
+
+    /// The source PR's branch isn't replaced when it moved since the last
+    /// sync: someone else may have pushed to it.
+    #[tokio::test]
+    async fn update_prs_keeps_a_source_pr_branch_that_moved_since_the_sync() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _, _) = rebased_source_pr(&fx, dir.path(), 1).await;
+        let id = &session.id;
+        let head = run(Path::new(&session.worktree), &["rev-parse", "HEAD"]);
+
+        run(&fx.upstream, &["checkout", "-q", "pr-branch"]);
+        let theirs = commit(&fx.upstream, "q", "2\n");
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+
+        let specs = vec![PrSpec {
+            commit: head,
+            pr: Some(5),
+            branch: None,
+        }];
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("last synced"), "{text}");
+        assert_eq!(upstream_tip(&fx, "pr-branch"), theirs);
     }
 
     /// A commit the target already has a patch-equivalent of is called
@@ -6018,9 +6557,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(prompts, 1);
     }
 
-    /// Fewer commits than open PRs means a commit was squashed away.
+    /// Without `prs`, fewer commits than open PRs don't say which PR
+    /// lost its commits, so the agent is asked for each PR's tip.
     #[tokio::test]
-    async fn update_prs_needs_a_commit_per_pr() {
+    async fn update_prs_asks_for_tips_without_a_commit_per_pr() {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
         let (state, _) = wrap_up_state(&fx, dir.path());
@@ -6043,12 +6583,54 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         .unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("1 commits but opened 2 pull requests"),
+            text.contains("The 1 commits don't map one per pull request onto the session's 2"),
             "{text}"
         );
-        assert!(text.contains("one commit per pull request"), "{text}");
-        assert!(text.contains("amend"), "{text}");
-        assert!(text.contains("drop or reorder"), "{text}");
+        assert!(text.contains("Pass `prs` set to"), "{text}");
+        assert!(text.contains("names a pull request's tip commit"), "{text}");
+        assert!(text.contains("#24, #25"), "{text}");
+        assert!(text.contains("Then call `update_prs` again."), "{text}");
+    }
+
+    /// Without `prs`, a commit added on top of an open PR doesn't say
+    /// whether it's a new PR or part of the open one.
+    #[tokio::test]
+    async fn update_prs_asks_for_tips_for_a_new_commit() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let id = &session.id;
+        let pr = Landed::PullRequest {
+            number: 24,
+            url: "https://github.com/owner/name/pull/24".into(),
+            branch: session.branch.clone(),
+        };
+        record_landed(&state, id, &pr).unwrap();
+        send(
+            &state,
+            id,
+            "commit c more".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_turns(&state, id, 2).await;
+
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            None,
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("The 2 commits don't map"), "{text}");
+        assert_eq!(
+            crate::git::tests::run(&fx.upstream, &["for-each-ref", "--format=%(refname)"]),
+            "refs/heads/main"
+        );
     }
 
     /// The tools wait when the user is wrapping the session up from the
