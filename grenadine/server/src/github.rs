@@ -10,8 +10,8 @@ use grenadine_core::api::{
     ApiResource, AutoMerge, Check, CiStatus, Enqueue, GitHubUsage, IssueComment, MergeInfo,
     MergeMethod, MergeQueueInfo, MergeState, MergeStatus, NewThread, Person, PrKey, QueueEntry,
     QueueState, RequestPriority, RequestedReviewer, Review, ReviewComment, ReviewDecision,
-    ReviewEvent, ReviewInfo, ReviewState, Side, StackMerge, StackMergePr, StackPr, SubmitReview,
-    ThreadCounts,
+    ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, Side, StackMerge, StackMergePr,
+    StackPr, SubmitReview, TeamRef, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -440,6 +440,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         nodes { commit { oid checkSuites(first: 10) { nodes { createdAt } } } }
       }
       reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
+      viewerCanUpdate
       isMergeQueueEnabled
       mergeQueue { configuration { mergeMethod } }
       mergeQueueEntry { position state jump }
@@ -483,7 +484,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             ... on User { login name avatarUrl }
             # Team's name isn't nullable while User's is; the same field
             # can't be both, so the team's is aliased.
-            ... on Team { teamName: name }
+            ... on Team { teamName: name slug }
             ... on Bot { login avatarUrl }
             ... on Mannequin { login }
           }
@@ -572,6 +573,7 @@ const REVIEW_FIELDS: &[&[&str]] = &[
     &["repository", "pullRequest", "autoMergeRequest"],
     &["repository", "pullRequest", "viewerCanEnableAutoMerge"],
     &["repository", "pullRequest", "viewerCanDisableAutoMerge"],
+    &["repository", "pullRequest", "viewerCanUpdate"],
     &["repository", "pullRequest", "reviews"],
     &["repository", "pullRequest", "pending"],
     &["repository", "pullRequest", "reviewRequests"],
@@ -751,7 +753,12 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             match str_at(r, "/__typename") {
                 "Team" => Some(str_at(r, "/teamName"))
                     .filter(|s| !s.is_empty())
-                    .map(|name| RequestedReviewer::Team(name.to_owned())),
+                    .map(|name| {
+                        RequestedReviewer::Team(TeamRef {
+                            name: name.to_owned(),
+                            slug: str_at(r, "/slug").to_owned(),
+                        })
+                    }),
                 _ => person_at(r).map(RequestedReviewer::Person),
             }
         })
@@ -780,6 +787,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
         decision: review_decision(str_at(pr, "/reviewDecision")),
         reviews,
         requested,
+        can_edit_reviewers: pr["viewerCanUpdate"].as_bool().unwrap_or(false),
         comments,
         ci: combined_ci(&checks),
         checks,
@@ -1516,6 +1524,148 @@ impl GitHub {
             }
         };
         Ok(())
+    }
+
+    /// Asks `users` and the teams `team_slugs` to review the PR.
+    pub async fn request_reviewers(
+        &self,
+        key: &PrKey,
+        users: &[String],
+        team_slugs: &[String],
+    ) -> Result<()> {
+        self.reviewers_request(
+            reqwest::Method::POST,
+            key,
+            users,
+            team_slugs,
+            "request_reviewers",
+            "didn't request the reviewers",
+        )
+        .await
+    }
+
+    /// Takes back the review requests to `users` and `team_slugs`.
+    pub async fn remove_review_requests(
+        &self,
+        key: &PrKey,
+        users: &[String],
+        team_slugs: &[String],
+    ) -> Result<()> {
+        self.reviewers_request(
+            reqwest::Method::DELETE,
+            key,
+            users,
+            team_slugs,
+            "remove_review_requests",
+            "didn't remove the review requests",
+        )
+        .await
+    }
+
+    /// The request that adds or removes the PR's review requests.
+    async fn reviewers_request(
+        &self,
+        method: reqwest::Method,
+        key: &PrKey,
+        users: &[String],
+        team_slugs: &[String],
+        kind: &'static str,
+        doing: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/pulls/{}/requested_reviewers",
+            self.api, key.repo, key.number
+        );
+        let req = json!({ "reviewers": users, "team_reviewers": team_slugs });
+        let resp = self
+            .stacks_send(kind, &key.repo, self.http.request(method, url).json(&req))
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            let reason = v["message"].as_str().unwrap_or("no reason given");
+            bail!("GitHub {doing} ({status}): {reason}");
+        }
+        Ok(())
+    }
+
+    /// The people and teams the reviewer picker can offer on the PR:
+    /// GitHub's suggested reviewers first, then the repository's
+    /// assignable users and the owning organization's teams matching
+    /// `query`, minus the PR's author. An organization that can't be
+    /// read — the token may lack `read:org`, or the owner may not be
+    /// one — only drops the teams.
+    pub async fn reviewer_candidates(
+        &self,
+        key: &PrKey,
+        query: &str,
+    ) -> Result<ReviewerCandidates> {
+        let (owner, name) = split_repo(&key.repo)?;
+        let (data, errors) = self
+            .graphql(
+                "reviewer_candidates",
+                std::slice::from_ref(&key.repo),
+                "query($owner: String!, $name: String!, $number: Int!, $q: String!) {
+                   repository(owner: $owner, name: $name) {
+                     pullRequest(number: $number) {
+                       author { login }
+                       suggestedReviewers { nodes { reviewer { login name avatarUrl } } }
+                     }
+                     assignableUsers(query: $q, first: 20) {
+                       nodes { login name avatarUrl }
+                     }
+                   }
+                   organization(login: $owner) {
+                     teams(query: $q, first: 20) { nodes { name slug } }
+                   }
+                 }",
+                json!({ "owner": owner, "name": name, "number": key.number, "q": query }),
+            )
+            .await?;
+        if let Some(e) = errors
+            .iter()
+            .find(|e| e.pointer("/path/0").and_then(Value::as_str) != Some("organization"))
+        {
+            bail!(
+                "can't read {}#{}'s reviewers: {}",
+                key.repo,
+                key.number,
+                e["message"].as_str().unwrap_or("unknown error")
+            );
+        }
+        let pr = &data["repository"]["pullRequest"];
+        let author = str_at(pr, "/author/login").to_owned();
+        let person = |v: &Value| person_at(v).filter(|p| p.login.as_deref() != Some(&*author));
+        let suggested: Vec<Person> = nodes(pr, "/suggestedReviewers/nodes")
+            .filter_map(|n| person(&n["reviewer"]))
+            .collect();
+        let suggested_logins: std::collections::BTreeSet<&str> = suggested
+            .iter()
+            .filter_map(|p| p.login.as_deref())
+            .collect();
+        let users = nodes(&data, "/repository/assignableUsers/nodes")
+            .filter_map(person)
+            .filter(|p| {
+                !p.login
+                    .as_deref()
+                    .is_some_and(|l| suggested_logins.contains(l))
+            })
+            .collect();
+        let teams = nodes(&data, "/organization/teams/nodes")
+            .filter_map(|t| {
+                let name = str_at(t, "/name");
+                let slug = str_at(t, "/slug");
+                (!name.is_empty() && !slug.is_empty()).then(|| TeamRef {
+                    name: name.to_owned(),
+                    slug: slug.to_owned(),
+                })
+            })
+            .collect();
+        Ok(ReviewerCandidates {
+            suggested,
+            users,
+            teams,
+        })
     }
 
     /// Starts merging the PR through GitHub's asynchronous merge API,
@@ -2923,6 +3073,7 @@ mod tests {
                     "mergeable": "UNKNOWN",
                     "mergeStateStatus": "BLOCKED",
                     "viewerCanMergeAsAdmin": true,
+                    "viewerCanUpdate": true,
                     "isMergeQueueEnabled": true,
                     "mergeQueue": { "configuration": { "mergeMethod": "SQUASH" } },
                     "mergeQueueEntry": { "position": 3, "state": "AWAITING_CHECKS",
@@ -2943,7 +3094,8 @@ mod tests {
                     "reviewRequests": { "nodes": [
                         { "requestedReviewer": { "__typename": "User", "login": "a",
                           "name": "A Person", "avatarUrl": "av" } },
-                        { "requestedReviewer": { "__typename": "Team", "teamName": "team" } },
+                        { "requestedReviewer": { "__typename": "Team", "teamName": "team",
+                          "slug": "team-slug" } },
                         { "requestedReviewer": { "__typename": "Bot", "login": "copilot" } },
                         { "requestedReviewer": {} },
                         { "requestedReviewer": null },
@@ -2963,6 +3115,7 @@ mod tests {
         let info = review_info(&data, &data["repository"]["pullRequest"]);
         assert_eq!(info.viewer, "me");
         assert_eq!(info.decision, Some(ReviewDecision::ReviewRequired));
+        assert!(info.can_edit_reviewers);
         let [review] = &info.reviews[..] else {
             panic!("{:?}", info.reviews)
         };
@@ -2977,7 +3130,10 @@ mod tests {
                     name: Some("A Person".into()),
                     avatar_url: Some("av".into()),
                 }),
-                RequestedReviewer::Team("team".into()),
+                RequestedReviewer::Team(TeamRef {
+                    name: "team".into(),
+                    slug: "team-slug".into(),
+                }),
                 RequestedReviewer::Person(Person {
                     login: Some("copilot".into()),
                     name: None,
@@ -3193,6 +3349,7 @@ mod tests {
                 decision: None,
                 reviews: vec![],
                 requested: vec![],
+                can_edit_reviewers: false,
                 comments: vec![],
                 checks: vec![],
                 ci: None,

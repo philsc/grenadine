@@ -16,8 +16,8 @@ use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag, storage};
 use crate::review::{
-    CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, conversation,
-    merge_box, merge_warning,
+    CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, ReviewerEdit,
+    conversation, merge_box, merge_warning,
 };
 use crate::{GithubLink, Updates, api, github_url, hash_for, highlight, markdown};
 
@@ -219,6 +219,12 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     // Kept here, outside what version changes rebuild.
     provide_context(Folded(RwSignal::new(HashMap::new())));
     provide_context(CheckFolds(RwSignal::new(HashMap::new())));
+    provide_context(ReviewerEdit {
+        picks: RwSignal::new(None),
+        search: RwSignal::new(String::new()),
+        optimistic: RwSignal::new(None),
+        error: RwSignal::new(None),
+    });
     provide_context(OpenBoxes::new());
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
@@ -377,6 +383,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         }
     };
     let panel_key = key.clone();
+    let review_key = key.clone();
     // The latest detail, for PrBody: while it stays mounted a refetch
     // that leaves the PR unready keeps the last one rather than a gap.
     let current = Memo::new(move |prev| {
@@ -423,6 +430,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         </main>
         {move || {
             let panel_key = panel_key.clone();
+            let review_key = review_key.clone();
             if !ready.get() {
                 ().into_any()
             } else if shown() {
@@ -433,9 +441,15 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                         on_resize_reset=on_resize_reset>
                         <div class="pr-sidebar-body">
                             <div class="sidebar-head">
-                                <h2>"Reviewers"</h2>
                                 {button(false)}
                             </div>
+                            <crate::review::SidebarReview
+                                pr=Signal::derive(move || match pr.get() {
+                                    Some(Ok(api::PrResponse::Ready(d))) => Some(*d),
+                                    _ => None,
+                                })
+                                key=review_key
+                            />
                             {move || match pr.get() {
                                 Some(Ok(api::PrResponse::Ready(detail))) => {
                                     crate::review::sidebar_body(&detail)
@@ -1735,6 +1749,7 @@ mod tests {
             decision: None,
             reviews,
             requested: vec![],
+            can_edit_reviewers: false,
             comments: vec![],
             checks: vec![],
             ci: None,

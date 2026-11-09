@@ -2102,6 +2102,7 @@ mod tests {
 
     use grenadine_core::api::{
         Check, MergeInfo, MergeMethod, MergeState, RequestedReviewer, Review, ReviewState, Side,
+        TeamRef,
     };
 
     use super::*;
@@ -2343,7 +2344,11 @@ mod tests {
                 url: "u".into(),
                 commit: None,
             }],
-            requested: vec![RequestedReviewer::Team("team".into())],
+            requested: vec![RequestedReviewer::Team(TeamRef {
+                name: "team".into(),
+                slug: "team-slug".into(),
+            })],
+            can_edit_reviewers: false,
             comments: vec![],
             checks: vec![Check {
                 name: "test".into(),

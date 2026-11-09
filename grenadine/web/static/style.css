@@ -2529,16 +2529,18 @@ body.resizing-sidebar * {
   align-items: center;
   padding: 4px;
   color: var(--fg-muted);
+  margin-left: auto;
 }
 .sidebar-toggle.floating {
   position: absolute;
   top: 8px;
   right: 24px;
   z-index: 30;
+  margin-left: 0;
 }
 .reviewers {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   gap: 6px 8px;
   align-items: center;
   margin-top: 8px;
@@ -2556,6 +2558,91 @@ body.resizing-sidebar * {
 }
 .reviewers .review-state {
   text-align: right;
+}
+.reviewer-rerequest {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.reviewer-rerequest:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+/* The gear anchors the reviewer picker's popover. */
+.reviewer-edit {
+  position: relative;
+}
+.reviewer-gear {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.reviewer-gear:hover {
+  color: var(--fg);
+  background: var(--bg-hover);
+}
+.reviewer-popover {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 40;
+  width: 240px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+.picker-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 8px 8px 0 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  outline: none;
+}
+.picker-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.picker-row:hover {
+  background: var(--bg-hover);
+}
+.picker-row.disabled {
+  cursor: default;
+  color: var(--fg-muted);
+}
+.picker-row .picker-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker-list .muted,
+.picker-list .error {
+  margin: 8px 6px;
 }
 /* About 12 rows; more checks scroll inside the list while the group
    headers stay put at its top. */

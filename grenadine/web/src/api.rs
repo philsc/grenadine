@@ -11,7 +11,8 @@ use grenadine_core::api::{
     Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GitHubUsage, InboxEdit,
     InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment,
     NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
-    SubmitReview, SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
+    ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus, SystemStats, TerminalInfo,
+    WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -537,6 +538,33 @@ pub async fn dequeue(key: &PrKey) -> Result<()> {
     )
     .await
     .map(|_| ())
+}
+
+/// Changes who's asked to review the PR: what the picker's ticks added
+/// and removed, or a re-request's add of one user.
+pub async fn change_reviewers(key: &PrKey, change: &ReviewerChange) -> Result<()> {
+    let req = Request::post(&format!("{}/reviewers", pr_url(key)))
+        .json(change)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// The reviewers the picker can offer: the suggested ones first, then
+/// the assignable users and the organization's teams matching `q`.
+pub async fn reviewer_candidates(key: &PrKey, q: &str) -> Result<ReviewerCandidates> {
+    check(
+        Request::get(&format!(
+            "{}/reviewers/candidates?q={}",
+            pr_url(key),
+            String::from(js_sys::encode_uri_component(q)),
+        ))
+        .send()
+        .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Makes the PR join its merge queue once its requirements are met.

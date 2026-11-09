@@ -1512,6 +1512,7 @@ mod tests {
             decision: None,
             reviews: vec![],
             requested: vec![],
+            can_edit_reviewers: false,
             comments: vec![],
             checks: vec![],
             ci: Some(CiStatus::Passing),

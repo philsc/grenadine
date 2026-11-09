@@ -10,9 +10,18 @@ scalar GitObjectID
 type Query {
   search(type: SearchType!, query: String!, first: Int, after: String): SearchResultItemConnection
   repository(owner: String!, name: String!): Repository
+  organization(login: String!): Organization
   user(login: String!): User
   viewer: User!
   rateLimit: RateLimit
+}
+
+type Organization {
+  teams(query: String, first: Int, after: String): TeamConnection!
+}
+
+type TeamConnection {
+  nodes: [Team]
 }
 
 type RateLimit {
@@ -311,6 +320,11 @@ type Repository {
   rebaseMergeAllowed: Boolean!
   viewerDefaultMergeMethod: PullRequestMergeMethod!
   deleteBranchOnMerge: Boolean!
+  assignableUsers(query: String, first: Int, after: String): UserConnection!
+}
+
+type UserConnection {
+  nodes: [User]
 }
 
 enum PullRequestMergeMethod {
@@ -393,6 +407,8 @@ type PullRequest {
   reviewDecision: PullRequestReviewDecision
   mergeStateStatus: MergeStateStatus!
   viewerCanMergeAsAdmin: Boolean!
+  viewerCanUpdate: Boolean!
+  suggestedReviewers(first: Int): SuggestedReviewerConnection
   reviews(
     first: Int
     after: String
@@ -439,6 +455,17 @@ union RequestedReviewer = User | Team | Bot | Mannequin
 
 type Team {
   name: String!
+  slug: String!
+}
+
+type SuggestedReviewerConnection {
+  nodes: [SuggestedReviewer]
+}
+
+type SuggestedReviewer {
+  isAuthor: Boolean!
+  isCommenter: Boolean!
+  reviewer: User!
 }
 
 type IssueCommentConnection {

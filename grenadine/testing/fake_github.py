@@ -51,8 +51,10 @@ APPROVED = "APPROVED"
 CHANGES_REQUESTED = "CHANGES_REQUESTED"
 COMMENTED = "COMMENTED"
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
-# The name of the team whose members `team_review_requests` holds.
+# The name of the team whose members `team_review_requests` holds, and
+# the slug the review-request API removes it by.
 TEAM = "Reviewers"
+TEAM_SLUG = "reviewers"
 DISMISSED = "DISMISSED"
 PENDING = "PENDING"
 
@@ -194,6 +196,8 @@ class PullRequest:
     thread_resolution: str | None = None
     # The viewer may merge it bypassing the branch's rules.
     can_merge_as_admin: bool = False
+    # The viewer may change the PR, including who's asked to review.
+    viewer_can_update: bool = True
     pending: PendingReview | None = None
     # How it was merged through the API: the method, the commit's title and
     # body.
@@ -296,6 +300,13 @@ class FakeRepo:
         # The merge-async requests PUT started, by their UUID.
         self.merge_asyncs: dict[str, dict[str, Any]] = {}
         self.undeletable_branches: set[str] = set()
+        # Users assignable on the repository, as assignableUsers returns
+        # them, and who GitHub suggests as reviewers on its PRs.
+        self.collaborators: set[str] = set()
+        self.suggested_reviewers: set[str] = set()
+        # The owning organization's teams: slug to member logins. A repo
+        # without any has no organization, like a user-owned one.
+        self.teams: dict[str, set[str]] = {}
         self.bare.parent.mkdir(parents=True, exist_ok=True)
         self.work.parent.mkdir(parents=True, exist_ok=True)
         gh.git("init", "--quiet", "--bare", "--initial-branch=main", str(self.bare))
@@ -539,6 +550,9 @@ class FakeGitHub:
         # When set, the next mutation fails with this message and changes
         # nothing.
         self.fail_next_mutation: str | None = None
+        # When set, the next requested_reviewers REST call fails with
+        # this message and changes nothing.
+        self.fail_next_reviewers: str | None = None
         # What the x-ratelimit-* headers report: `used` is
         # limit - remaining and `reset` only moves when
         # `set_rate_limit` moves it.
@@ -638,6 +652,9 @@ class FakeGitHub:
             def do_PUT(self) -> None:
                 gh._handle(self, "PUT")
 
+            def do_DELETE(self) -> None:
+                gh._handle(self, "DELETE")
+
             def log_message(self, format: str, *args: Any) -> None:
                 pass
 
@@ -702,6 +719,14 @@ class FakeGitHub:
             m := re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls", path)
         ):
             return self._create_pr(m[1], json.loads(body))
+        if method in ("POST", "DELETE") and (
+            m := re.fullmatch(
+                r"/repos/([^/]+/[^/]+)/pulls/(\d+)/requested_reviewers", path
+            )
+        ):
+            return self._reviewers(
+                m[1], int(m[2]), json.loads(body), add=method == "POST"
+            )
         if method == "POST" and (
             m := re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
         ):
@@ -727,6 +752,35 @@ class FakeGitHub:
         ):
             return self._merge_async_status(m[1], int(m[2]), m[3], api_version)
         return 404, {"message": "Not Found"}
+
+    def _reviewers(
+        self, slug: str, number: int, req: dict[str, Any], *, add: bool
+    ) -> tuple[int, Any]:
+        """The requested_reviewers REST endpoint: POST asks `reviewers`
+        and `team_reviewers` to review, DELETE takes the requests back."""
+        repo = self.repos.get(slug)
+        pr = repo.prs.get(number) if repo else None
+        if pr is None:
+            return 404, {"message": "Not Found"}
+        error, self.fail_next_reviewers = self.fail_next_reviewers, None
+        if error is not None:
+            return 422, {"message": error}
+        assert repo is not None
+        users = req.get("reviewers") or []
+        if unknown := [u for u in users if u not in self.users]:
+            return 422, {"message": f"Could not resolve users {unknown!r}"}
+        slugs = req.get("team_reviewers") or []
+        if unknown := [s for s in slugs if s not in repo.teams]:
+            return 422, {"message": f"Could not resolve teams {unknown!r}"}
+        members = {m for s in slugs for m in repo.teams[s]}
+        if add:
+            pr.review_requests.update(users)
+            pr.team_review_requests.update(members)
+        else:
+            pr.review_requests.difference_update(users)
+            pr.team_review_requests.difference_update(members)
+        pr.touch()
+        return 200, {}
 
     def _create_issue_comment(
         self, slug: str, number: int, req: dict[str, Any]
@@ -1138,6 +1192,34 @@ class FakeGitHub:
                 )
             return self._user_node(login)
 
+        def organization(info: Any, login: str) -> Any:
+            # An owner with a configured repo and teams is an
+            # organization; a user-owned repo has none, like GitHub.
+            repo = next(
+                (r for r in self.repos.values() if r.slug.split("/")[0] == login),
+                None,
+            )
+            if repo is None or not repo.teams:
+                raise LookupError(
+                    f"Could not resolve to an Organization with the login of '{login}'."
+                )
+
+            def teams(
+                info: Any,
+                query: str | None = None,
+                first: int | None = None,
+                **_: Any,
+            ) -> Any:
+                q = (query or "").lower()
+                found = [
+                    {"name": TEAM, "slug": slug}
+                    for slug in sorted(repo.teams)
+                    if not q or q in slug or q in TEAM.lower()
+                ]
+                return {"nodes": found[:first]}
+
+            return {"__typename": "Organization", "login": login, "teams": teams}
+
         def mutation(f: Callable[..., Any]) -> Callable[..., Any]:
             def run(info: Any, input: dict[str, Any]) -> Any:
                 error, self.fail_next_mutation = self.fail_next_mutation, None
@@ -1411,6 +1493,7 @@ class FakeGitHub:
         return {
             "search": search,
             "repository": repository,
+            "organization": organization,
             "rateLimit": rate_limit,
             "user": user,
             "viewer": lambda info: self._user_node(VIEWER),
@@ -1557,6 +1640,20 @@ class FakeGitHub:
                 else None
             )
 
+        def assignable_users(
+            info: Any,
+            query: str | None = None,
+            first: int | None = None,
+            **_: Any,
+        ) -> Any:
+            q = (query or "").lower()
+            found = [
+                self._user_node(login)
+                for login in sorted(repo.collaborators)
+                if not q or q in login.lower() or q in self.users.get(login, "").lower()
+            ]
+            return {"nodes": found[:first]}
+
         return {
             "__typename": "Repository",
             "nameWithOwner": repo.slug,
@@ -1569,6 +1666,7 @@ class FakeGitHub:
             "rebaseMergeAllowed": "REBASE" in repo.merge_methods,
             "viewerDefaultMergeMethod": repo.merge_methods[0],
             "deleteBranchOnMerge": repo.delete_branch_on_merge,
+            "assignableUsers": assignable_users,
         }
 
     def _commit_node(
@@ -1815,6 +1913,17 @@ class FakeGitHub:
             "reviewDecision": pr.review_decision(),
             "mergeStateStatus": pr.merge_state_status(),
             "viewerCanMergeAsAdmin": pr.can_merge_as_admin,
+            "viewerCanUpdate": pr.viewer_can_update,
+            "suggestedReviewers": lambda info, first=None, **_: {
+                "nodes": [
+                    {
+                        "isAuthor": login == pr.author,
+                        "isCommenter": False,
+                        "reviewer": self._user_node(login),
+                    }
+                    for login in sorted(repo.suggested_reviewers)
+                ][: first or 20]
+            },
             "reviews": reviews,
             "reviewRequests": lambda info, **_: {
                 "nodes": [
@@ -1822,7 +1931,15 @@ class FakeGitHub:
                     for login in sorted(pr.review_requests)
                 ]
                 + (
-                    [{"requestedReviewer": {"__typename": "Team", "name": TEAM}}]
+                    [
+                        {
+                            "requestedReviewer": {
+                                "__typename": "Team",
+                                "name": TEAM,
+                                "slug": TEAM_SLUG,
+                            }
+                        }
+                    ]
                     if pr.team_review_requests
                     else []
                 )

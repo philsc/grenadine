@@ -16,6 +16,7 @@ from grenadine.testing.fake_github import (
     APPROVED,
     REVIEW_REQUIRED,
     TEAM,
+    TEAM_SLUG,
     TOKEN,
     CheckRun,
     FakeGitHub,
@@ -61,6 +62,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         nodes { commit { oid checkSuites(first: 10) { nodes { createdAt } } } }
       }
       reviewDecision mergeable mergeStateStatus viewerCanMergeAsAdmin
+      viewerCanUpdate
       reviews(last: 100) {
         nodes { state body submittedAt url author { ...Who } }
       }
@@ -84,7 +86,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             ... on User { login name avatarUrl }
             # Team's name isn't nullable while User's is; the same field
             # can't be both, so the team's is aliased.
-            ... on Team { teamName: name }
+            ... on Team { teamName: name slug }
             ... on Bot { login avatarUrl }
             ... on Mannequin { login }
           }
@@ -337,7 +339,13 @@ class FakeGitHubTest(unittest.TestCase):
                         "avatarUrl": None,
                     }
                 },
-                {"requestedReviewer": {"__typename": "Team", "teamName": TEAM}},
+                {
+                    "requestedReviewer": {
+                        "__typename": "Team",
+                        "teamName": TEAM,
+                        "slug": TEAM_SLUG,
+                    }
+                },
             ],
         )
         [comment] = data["comments"]["nodes"]
@@ -1174,6 +1182,116 @@ class FakeGitHubTest(unittest.TestCase):
             (opened.title, opened.base, opened.head_oid), ("Agent work", "main", sha)
         )
         self.assertEqual(created["html_url"], opened.url)
+
+    def test_reviewer_requests(self) -> None:
+        base = self.gh.start()
+        self.addCleanup(self.gh.stop)
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.teams[TEAM_SLUG] = {"other"}
+        url = f"{base}/repos/test/test/pulls/{pr.number}/requested_reviewers"
+
+        def call(method: str, body: object) -> object:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode(),
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req) as resp:
+                return json.load(resp)
+
+        call("POST", {"reviewers": ["other", "me"], "team_reviewers": [TEAM_SLUG]})
+        self.assertEqual(pr.review_requests, {"other", "me"})
+        self.assertEqual(pr.team_review_requests, {"other"})
+        call("DELETE", {"reviewers": ["other"], "team_reviewers": [TEAM_SLUG]})
+        self.assertEqual(pr.review_requests, {"me"})
+        self.assertEqual(pr.team_review_requests, set())
+
+        def fail(method: str, body: object) -> int:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode(),
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req)
+            return e.exception.code
+
+        self.assertEqual(
+            fail("POST", {"reviewers": ["nobody"], "team_reviewers": []}), 422
+        )
+        self.assertEqual(fail("POST", {"reviewers": [], "team_reviewers": ["x"]}), 422)
+        self.gh.fail_next_reviewers = "nope"
+        self.assertEqual(fail("POST", {"reviewers": [], "team_reviewers": []}), 422)
+        self.assertEqual(pr.review_requests, {"me"})
+
+    def test_reviewer_candidate_fields(self) -> None:
+        pr = self.inboxes.prs["Wait for reviewers"]
+        self.repo.collaborators = {"me", "other", "third"}
+        self.repo.suggested_reviewers = {"other"}
+        self.repo.teams[TEAM_SLUG] = {"other"}
+        data = self.query(
+            """
+            query($owner: String!, $name: String!, $number: Int!, $q: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  author { login }
+                  viewerCanUpdate
+                  suggestedReviewers { nodes { reviewer { login } } }
+                }
+                assignableUsers(query: $q, first: 20) { nodes { login } }
+              }
+              organization(login: $owner) {
+                teams(query: $q, first: 20) { nodes { name slug } }
+              }
+            }
+            """,
+            owner="test",
+            name="test",
+            number=pr.number,
+            q="",
+        )["data"]
+        repo = data["repository"]
+        self.assertTrue(repo["pullRequest"]["viewerCanUpdate"])
+        self.assertEqual(
+            repo["pullRequest"]["suggestedReviewers"]["nodes"],
+            [{"reviewer": {"login": "other"}}],
+        )
+        self.assertEqual(
+            repo["assignableUsers"]["nodes"],
+            [{"login": "me"}, {"login": "other"}, {"login": "third"}],
+        )
+        self.assertEqual(
+            data["organization"]["teams"]["nodes"],
+            [{"name": TEAM, "slug": TEAM_SLUG}],
+        )
+        pr.viewer_can_update = False
+        self.assertFalse(
+            self.query(
+                """
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { viewerCanUpdate }
+                  }
+                }
+                """,
+                owner="test",
+                name="test",
+                number=pr.number,
+            )["data"]["repository"]["pullRequest"]["viewerCanUpdate"]
+        )
+        # An owner with no teams is no organization, like a user-owned repo.
+        self.repo.teams.clear()
+        out = self.query('query { organization(login: "test") { login } }')
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertIn("Organization", out["errors"][0]["message"])
 
     def test_rate_limit(self) -> None:
         out = self.query("query { rateLimit { cost limit remaining } }")
