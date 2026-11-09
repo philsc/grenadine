@@ -27,7 +27,7 @@ use crate::pr::{Anchor, Placed, Thread, ThreadView};
 const CONTEXT: usize = 3;
 
 /// That the lines of a PR's diff can be commented on, and which PR's.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Commenting {
     pub key: PrKey,
 }
@@ -306,11 +306,11 @@ pub fn DiffView(
     left: String,
     right: String,
     upstream: Option<(String, String)>,
-    comments: Arc<HashMap<String, Vec<Placed>>>,
+    #[prop(into)] comments: Signal<Arc<HashMap<String, Vec<Placed>>>>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
     rebase_older: Signal<bool>,
-    #[prop(optional_no_strip)] commenting: Option<Commenting>,
+    #[prop(into)] commenting: Signal<Option<Commenting>>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
     // What the last diff still had queued can wait for this one's files.
@@ -332,7 +332,6 @@ pub fn DiffView(
             .into_any()
         }
         Some(Ok((files, hidden))) => {
-            let comments = comments.clone();
             start_reveal();
             let files = Arc::new(files);
             // Files with no change of the PR's own — which depends on the
@@ -384,23 +383,37 @@ pub fn DiffView(
                     }}
                 </ul>
                 {files.iter().map(|f| {
-                    let mut placed = comments.get(f.change.path()).cloned().unwrap_or_default();
-                    // Threads made on the diff's left version are keyed by
-                    // the file's path as of that version: a renamed file's
-                    // old path.
-                    if let Some(old) = f.change.old_path.as_deref() && old != f.change.path() {
-                        placed.extend(
-                            comments
-                                .get(old)
-                                .into_iter()
-                                .flatten()
-                                .filter(|p| {
-                                    matches!(p.anchor, Anchor::Line(Side::Left, _) | Anchor::File)
-                                })
-                                .cloned(),
-                        );
-                    }
-                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=commenting.clone() /> }
+                    // The file's threads; a Memo so only a file whose
+                    // threads changed re-renders.
+                    let placed = {
+                        let f = f.clone();
+                        Memo::new(move |_| {
+                            let comments = comments.get();
+                            let mut placed =
+                                comments.get(f.change.path()).cloned().unwrap_or_default();
+                            // Threads made on the diff's left version are keyed by
+                            // the file's path as of that version: a renamed file's
+                            // old path.
+                            if let Some(old) = f.change.old_path.as_deref() && old != f.change.path()
+                            {
+                                placed.extend(
+                                    comments
+                                        .get(old)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter(|p| {
+                                            matches!(
+                                                p.anchor,
+                                                Anchor::Line(Side::Left, _) | Anchor::File
+                                            )
+                                        })
+                                        .cloned(),
+                                );
+                            }
+                            placed
+                        })
+                    };
+                    view! { <FileView file=f.clone() comments=placed side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=commenting /> }
                 }).collect_view()}
             }
             .into_any()
@@ -941,19 +954,25 @@ fn status_shown(file: &FileData, rebase_older: bool) -> &'static str {
 #[component]
 fn FileView(
     file: Arc<FileData>,
-    comments: Vec<Placed>,
+    #[prop(into)] comments: Signal<Vec<Placed>>,
     side_by_side: Signal<bool>,
     inline_changes: Signal<bool>,
     rebase_older: Signal<bool>,
-    #[prop(optional_no_strip)] commenting: Option<Commenting>,
+    #[prop(into)] commenting: Signal<Option<Commenting>>,
     #[prop(optional)] folds: Option<Folds>,
 ) -> impl IntoView {
     let c = file.change.clone();
-    let fc = commenting.map(|commenting| FileCommenting {
-        commenting,
-        path: c.path().to_owned(),
-        boxes: expect_context::<OpenBoxes>(),
-    });
+    // Pages that only show diffs, like an agent's worktree, have no
+    // comment boxes and no context for them either.
+    let boxes = use_context::<OpenBoxes>();
+    let path = c.path().to_owned();
+    let fc = move || {
+        Option::zip(commenting.get(), boxes).map(|(commenting, boxes)| FileCommenting {
+            commenting,
+            path: path.clone(),
+            boxes,
+        })
+    };
     let binary = [&file.old, &file.new]
         .iter()
         .any(|b| b.as_ref().is_some_and(|b| b.text.is_none()));
@@ -984,17 +1003,23 @@ fn FileView(
         (ChangeStatus::Renamed | ChangeStatus::Copied, Some(o), Some(n)) => format!("{o} → {n}"),
         _ => c.path().to_owned(),
     };
-    let comments = Arc::new(comments);
-    let file_comments: Vec<_> = comments
-        .iter()
-        .filter(|p| p.anchor == Anchor::File)
-        .cloned()
-        .collect();
+    let file_comments = move || {
+        let file_comments: Vec<_> = comments
+            .get()
+            .iter()
+            .filter(|p| p.anchor == Anchor::File)
+            .cloned()
+            .collect();
+        (!file_comments.is_empty()).then(|| {
+            view! {
+                <div class="file-comments">{file_comments.into_iter().map(|p| view! { <ThreadView thread=p.thread /> }).collect_view()}</div>
+            }
+        })
+    };
     // The lines revealed by the file's "expand" buttons, per gap.
     let expand = RwSignal::new(vec![diff::Expand::default(); initial.blocks + 1]);
     let body = {
         let file = file.clone();
-        let comments = comments.clone();
         let fc = fc.clone();
         // Laid out plain on first expansion, and again once both sides are
         // highlighted, the rebase mode flips, or the gaps' expansion
@@ -1054,7 +1079,9 @@ fn FileView(
             let map = mode
                 .then(|| file.rebase.as_ref().and_then(|i| i.ours_to_merged.clone()))
                 .flatten();
-            let (placed, dropped) = remap_left(&comments, map.as_deref());
+            let placed_src = comments.get();
+            let (placed, dropped) = remap_left(&placed_src, map.as_deref());
+            let fc = fc();
             if side_by_side.get() {
                 split_view(
                     &l,
@@ -1126,24 +1153,29 @@ fn FileView(
                     let f = file.clone();
                     move || format!("−{}", f.stats(rebase_older.get()).removed)
                 }}</span></span>
-                {fc.clone().map(|fc| {
-                    let draft = fc.commenting.draft(&fc.path, None);
-                    view! {
-                        <button type="button" class="link file-comment-button" on:click=move |ev| {
-                            // The header's own click folds the file.
-                            ev.stop_propagation();
-                            fc.boxes.set(&draft, true);
-                        }>"Comment on file"</button>
+                {{
+                    let fc = fc.clone();
+                    move || {
+                        fc().map(|fc| {
+                            let draft = fc.commenting.draft(&fc.path, None);
+                            view! {
+                                <button type="button" class="link file-comment-button" on:click=move |ev| {
+                                    // The header's own click folds the file.
+                                    ev.stop_propagation();
+                                    fc.boxes.set(&draft, true);
+                                }>"Comment on file"</button>
+                            }
+                        })
                     }
-                })}
+                }}
             </header>
-            {(!file_comments.is_empty()).then(|| view! {
-                <div class="file-comments">{file_comments.into_iter().map(|p| view! { <ThreadView thread=p.thread /> }).collect_view()}</div>
-            })}
-            {fc.map(|fc| {
-                let draft = fc.commenting.draft(&fc.path, None);
-                move || fc.boxes.is_open(&draft).then(|| view! { <div class="file-comments">{fc.composer(None)}</div> })
-            })}
+            {file_comments}
+            {move || {
+                fc().map(|fc| {
+                    let draft = fc.commenting.draft(&fc.path, None);
+                    move || fc.boxes.is_open(&draft).then(|| view! { <div class="file-comments">{fc.composer(None)}</div> })
+                })
+            }}
             {body}
         </section>
     }
@@ -1173,7 +1205,7 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
                     rebase: None,
                     stats: [OnceLock::new(), OnceLock::new()],
                 });
-                view! { <FileView file=file comments=vec![] side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older folds=folds.clone() /> }
+                view! { <FileView file=file comments=Signal::stored(vec![]) side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=Signal::stored(None) folds=folds.clone() /> }
             }
         </For>
     }
