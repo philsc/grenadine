@@ -1,0 +1,17 @@
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
+
+# Only the CLI: nothing here runs wasm-bindgen's tests in a browser.
+rust_wasm_bindgen_toolchain(
+    name = "toolchain_impl",
+    wasm_bindgen_cli = "@wasm_bindgen_cli//:wasm_bindgen",
+)
+
+toolchain(
+    name = "toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    toolchain = ":toolchain_impl",
+    toolchain_type = "@rules_rust_wasm_bindgen//:toolchain_type",
+)
