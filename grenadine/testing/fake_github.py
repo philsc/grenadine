@@ -128,6 +128,10 @@ class Comment:
     created_at: int
     in_reply_to: int | None = None
     side: str = "RIGHT"
+    # The first line of a multi-line comment's range, and its side when
+    # it differs from `side`.
+    start_line: int | None = None
+    start_side: str | None = None
     resolved: bool = False
     resolved_by: str | None = None
     # Whether the viewer may resolve the thread this comment starts, or
@@ -489,6 +493,8 @@ class FakeRepo:
         line: int,
         commit: str | None = None,
         reply_to: Comment | None = None,
+        start_line: int | None = None,
+        start_side: str | None = None,
     ) -> Comment:
         c = Comment(
             id=self.gh.next_comment_id(),
@@ -499,6 +505,8 @@ class FakeRepo:
             line=line,
             created_at=self.gh.tick(),
             in_reply_to=reply_to.id if reply_to else None,
+            start_line=start_line,
+            start_side=start_side,
         )
         pr.comments.append(c)
         pr.touch()
@@ -812,9 +820,10 @@ class FakeGitHub:
                 "commit_id": c.commit,
                 "original_commit_id": c.commit,
                 "original_line": None if c.on_file else c.line,
-                "original_start_line": None,
+                "original_start_line": None if c.on_file else c.start_line,
                 "line": None if c.on_file else c.line,
-                "start_line": None,
+                "start_line": None if c.on_file else c.start_line,
+                "start_side": c.start_side,
                 "side": c.side,
                 "subject_type": "file" if c.on_file else "line",
                 "created_at": iso(c.created_at),
@@ -1474,9 +1483,9 @@ class FakeGitHub:
                 "body": c.body,
                 "path": c.path,
                 "line": None if c.on_file else c.line,
-                "startLine": None,
+                "startLine": None if c.on_file else c.start_line,
                 "originalLine": None if c.on_file else c.line,
-                "originalStartLine": None,
+                "originalStartLine": None if c.on_file else c.start_line,
                 "subjectType": "FILE" if c.on_file else "LINE",
                 "createdAt": iso(c.created_at),
                 "url": f"{pr.url}#discussion_r{c.id}",

@@ -38,6 +38,9 @@ pub enum Anchor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placed {
     pub anchor: Anchor,
+    /// The first line of a multi-line thread's range, in the anchor's
+    /// coordinates; `None` for a single-line thread.
+    pub start: Option<(Side, u32)>,
     pub thread: Arc<Thread>,
 }
 
@@ -99,41 +102,67 @@ pub fn place(
     let is_latest = sel.head as usize == versions.len();
     for thread in threads(comments) {
         let c = &thread.root;
-        let anchor = if sel.base != 0 && c.original_commit == versions[sel.base as usize - 1].sha {
-            // Made on the version the diff's left side shows: its
-            // right-side lines are that version's own.
-            if c.on_file {
-                Some(Anchor::File)
-            } else {
-                match (c.original_line, c.side) {
-                    (Some(l), Side::Right) => Some(Anchor::Line(Side::Left, l)),
+        let (anchor, start) =
+            if sel.base != 0 && c.original_commit == versions[sel.base as usize - 1].sha {
+                // Made on the version the diff's left side shows: its
+                // right-side lines are that version's own. A range starting
+                // on the right lands there too; one starting on the left is
+                // in the merge-base's coordinates, which this view doesn't
+                // show.
+                let anchor = if c.on_file {
+                    Some(Anchor::File)
+                } else {
+                    match (c.original_line, c.side) {
+                        (Some(l), Side::Right) => Some(Anchor::Line(Side::Left, l)),
+                        _ => None,
+                    }
+                };
+                let start = match (c.original_start_line, c.start_side.unwrap_or(c.side)) {
+                    (Some(l), Side::Right) => Some((Side::Left, l)),
                     _ => None,
-                }
-            }
-        } else {
-            let line = if c.original_commit == head.sha {
-                c.original_line
-            } else if is_latest {
-                c.line
+                };
+                (anchor, start)
             } else {
-                None
+                let line = if c.original_commit == head.sha {
+                    c.original_line
+                } else if is_latest {
+                    c.line
+                } else {
+                    None
+                };
+                let anchor = if c.on_file && (c.original_commit == head.sha || is_latest) {
+                    Some(Anchor::File)
+                } else {
+                    match (line, c.side) {
+                        (Some(l), Side::Right) => Some(Anchor::Line(Side::Right, l)),
+                        (Some(l), Side::Left) if sel.base == 0 => Some(Anchor::Line(Side::Left, l)),
+                        _ => None,
+                    }
+                };
+                let start_line = if c.original_commit == head.sha {
+                    c.original_start_line
+                } else {
+                    c.start_line
+                };
+                let start = match (start_line, c.start_side.unwrap_or(c.side)) {
+                    (Some(l), Side::Right) => Some((Side::Right, l)),
+                    (Some(l), Side::Left) if sel.base == 0 => Some((Side::Left, l)),
+                    _ => None,
+                };
+                (anchor, start)
             };
-            if c.on_file && (c.original_commit == head.sha || is_latest) {
-                Some(Anchor::File)
-            } else {
-                match (line, c.side) {
-                    (Some(l), Side::Right) => Some(Anchor::Line(Side::Right, l)),
-                    (Some(l), Side::Left) if sel.base == 0 => Some(Anchor::Line(Side::Left, l)),
-                    _ => None,
-                }
-            }
-        };
+        // A range ending where it starts is a single line.
+        let start = start.filter(|&s| anchor != Some(Anchor::Line(s.0, s.1)));
         let thread = Arc::new(thread);
         match anchor {
             Some(anchor) => inline
                 .entry(thread.root.path.clone())
                 .or_default()
-                .push(Placed { anchor, thread }),
+                .push(Placed {
+                    anchor,
+                    start,
+                    thread,
+                }),
             None => panel.push(Unplaced {
                 version: versions
                     .iter()
@@ -164,6 +193,14 @@ fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u3
         }
     }
     counts
+}
+
+/// The label GitHub shows a multi-line thread, like "Lines +26 to +29";
+/// the left side's lines read "-10". A range across the sides reads
+/// "Lines -10 to +14".
+pub fn range_label(start: (Side, u32), end: (Side, u32)) -> String {
+    let line = |(side, l)| format!("{}{l}", if side == Side::Left { "-" } else { "+" });
+    format!("Lines {} to {}", line(start), line(end))
 }
 
 fn short(sha: &str) -> &str {
@@ -1404,7 +1441,10 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
 /// A thread under a header that folds and unfolds it. Resolved threads
 /// start out folded.
 #[component]
-pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
+pub fn ThreadView(
+    thread: Arc<Thread>,
+    #[prop(optional_no_strip)] lines: Option<String>,
+) -> impl IntoView {
     let Folded(folded) = expect_context::<Folded>();
     let root = &thread.root;
     let (id, resolved) = (root.id, root.resolved);
@@ -1452,6 +1492,7 @@ pub fn ThreadView(thread: Arc<Thread>) -> impl IntoView {
                 <span class="thread-toggle">{move || if collapsed() { "▸" } else { "▾" }}</span>
                 <strong>{root.author.clone()}</strong>
                 <span class="muted">{if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") }}</span>
+                {lines.map(|lines| view! { <span class="muted thread-lines">{lines}</span> })}
                 {move || collapsed().then(|| view! { <span class="muted thread-snippet">{snippet.clone()}</span> })}
                 {status}
             </button>
@@ -1554,6 +1595,12 @@ fn CommentPanel(
             .map(|u| {
                 let c = &u.thread.root;
                 let line = c.original_line.map(|l| format!(":{l}")).unwrap_or_default();
+                let lines = match (c.original_start_line, c.original_line) {
+                    (Some(s), Some(e)) if (c.start_side.unwrap_or(c.side), s) != (c.side, e) => {
+                        Some(range_label((c.start_side.unwrap_or(c.side), s), (c.side, e)))
+                    }
+                    _ => None,
+                };
                 let jump = u.version.map(|v| {
                     view! {
                         <button
@@ -1573,7 +1620,7 @@ fn CommentPanel(
                         <div class="panel-where"><code>{format!("{}{line}", c.path)}</code> " " {jump}
                             {u.version.is_none().then(|| view! { <span class="muted">"on an unknown version"</span> })}
                         </div>
-                        <ThreadView thread=u.thread.clone() />
+                        <ThreadView thread=u.thread.clone() lines=lines />
                     </li>
                 }
             })
@@ -1629,6 +1676,7 @@ mod tests {
             original_start_line: None,
             line,
             start_line: None,
+            start_side: None,
             side,
             on_file: false,
             created_at: String::new(),
@@ -1769,6 +1817,94 @@ mod tests {
         assert_eq!(panel.len(), 1);
         assert_eq!(panel[0].thread.root.id, 2);
         assert_eq!(panel[0].version, Some(1));
+    }
+
+    fn starts(inline: &HashMap<String, Vec<Placed>>) -> Vec<(u64, Option<(Side, u32)>)> {
+        let mut out: Vec<_> = inline
+            .values()
+            .flatten()
+            .map(|p| (p.thread.root.id, p.start))
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    #[test]
+    fn placement_sets_a_ranges_start() {
+        let versions = [version(1, "a"), version(2, "b")];
+        // Made on the head: the start is its original_start_line.
+        let mut on_head = comment(1, "b", Side::Right, 20, Some(20));
+        on_head.original_start_line = Some(16);
+        // Mapped forward from v1: the start is start_line.
+        let mut mapped = comment(2, "a", Side::Right, 10, Some(30));
+        mapped.start_line = Some(26);
+        // A range ending where it starts is a single line.
+        let mut single = comment(3, "b", Side::Right, 5, Some(5));
+        single.original_start_line = Some(5);
+        // A range crossing the sides starts on the left.
+        let mut cross = comment(4, "b", Side::Right, 22, Some(22));
+        cross.original_start_line = Some(9);
+        cross.start_side = Some(Side::Left);
+        let comments = [on_head, mapped, single, cross];
+
+        let (inline, _) = place(&comments, &versions, Selection { base: 0, head: 2 });
+        assert_eq!(
+            starts(&inline),
+            [
+                (1, Some((Side::Right, 16))),
+                (2, Some((Side::Right, 26))),
+                (3, None),
+                (4, Some((Side::Left, 9))),
+            ]
+        );
+    }
+
+    #[test]
+    fn placement_of_a_ranges_start_on_the_left_version() {
+        let versions = [version(1, "a"), version(2, "b")];
+        // A range made on v1 starts on the left with it.
+        let mut ranged = comment(1, "a", Side::Right, 10, None);
+        ranged.original_start_line = Some(8);
+        // A range starting on the left lands on the merge-base, which a
+        // diff between versions doesn't show.
+        let mut cross = comment(2, "a", Side::Right, 12, None);
+        cross.original_start_line = Some(9);
+        cross.start_side = Some(Side::Left);
+        // A left-side start on a head comment has the same problem.
+        let mut head_cross = comment(3, "b", Side::Right, 20, Some(20));
+        head_cross.original_start_line = Some(9);
+        head_cross.start_side = Some(Side::Left);
+        let comments = [ranged, cross, head_cross];
+
+        let (inline, _) = place(&comments, &versions, Selection { base: 1, head: 2 });
+        assert_eq!(
+            anchors(&inline),
+            [
+                (1, Anchor::Line(Side::Left, 10)),
+                (2, Anchor::Line(Side::Left, 12)),
+                (3, Anchor::Line(Side::Right, 20)),
+            ]
+        );
+        assert_eq!(
+            starts(&inline),
+            [(1, Some((Side::Left, 8))), (2, None), (3, None)]
+        );
+    }
+
+    #[test]
+    fn range_label_formats_githubs_label() {
+        assert_eq!(
+            range_label((Side::Right, 26), (Side::Right, 29)),
+            "Lines +26 to +29"
+        );
+        assert_eq!(
+            range_label((Side::Left, 10), (Side::Left, 14)),
+            "Lines -10 to -14"
+        );
+        assert_eq!(
+            range_label((Side::Left, 10), (Side::Right, 14)),
+            "Lines -10 to +14"
+        );
     }
 
     #[test]

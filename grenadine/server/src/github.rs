@@ -877,6 +877,7 @@ fn pending_review(pr: &Value, viewer: &str) -> (Option<String>, Vec<ReviewCommen
                 original_start_line: line(c, "/originalStartLine"),
                 line: line(c, "/line"),
                 start_line: line(c, "/startLine"),
+                start_side: None,
                 // Comments don't say which side they're on, their threads
                 // do; the sync fills it in from those.
                 side: Side::Right,
@@ -979,6 +980,7 @@ struct RestComment {
     original_start_line: Option<u32>,
     line: Option<u32>,
     start_line: Option<u32>,
+    start_side: Option<String>,
     side: Option<String>,
     subject_type: Option<String>,
     created_at: String,
@@ -2372,6 +2374,7 @@ impl GitHub {
                 original_start_line: c.original_start_line,
                 line: c.line,
                 start_line: c.start_line,
+                start_side: c.start_side.map(|s| Side::from_github(&s)),
                 side: Side::from_github(c.side.as_deref().unwrap_or_default()),
                 on_file: c.subject_type.as_deref() == Some("file"),
                 created_at: c.created_at,
