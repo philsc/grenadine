@@ -1151,6 +1151,7 @@ class InboxTest(ServerTestCase):
                 "Wait for reviewers",
                 scenarios.STACK_BASE,
                 scenarios.STACK_TOP,
+                "Get only a bot's comment",
                 "Get a comment-only review",
             ],
         )
@@ -1173,15 +1174,15 @@ class InboxTest(ServerTestCase):
         expect(self.page).to_have_title("(4) grenadine")
         # A counted inbox overlapping them counts its PRs once.
         self.add_inbox("Mine too", "state:open author:@me", counted=True)
-        expect(tab.locator(".count")).to_have_text("9")
-        expect(self.page).to_have_title("(9) grenadine")
+        expect(tab.locator(".count")).to_have_text("10")
+        expect(self.page).to_have_title("(10) grenadine")
 
     def test_count_in_total_survives_reorder(self) -> None:
         self.page.goto(self.url)
         inbox = self.add_inbox("Counted", "state:open author:@me", counted=True)
         inbox.locator(".inbox-header").hover()
         inbox.get_by_title("Move up").click()
-        expect(inbox.locator(".count")).to_have_text("8")
+        expect(inbox.locator(".count")).to_have_text("9")
 
         with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
             [saved] = [

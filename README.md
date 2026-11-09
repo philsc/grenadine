@@ -23,7 +23,7 @@ Each inbox has a name and a filter. A filter is a GitHub search query, optionall
 A filter is a list of terms. Terms separated by spaces are ANDed. `OR` combines terms, parentheses group them, and AND binds tighter than OR. A `-` in front of a qualifier negates it.
 
 ```text
-author:@me ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed)
+author:@me ((gr:review:active-human -review:approved) OR gr:changes-requested:unaddressed)
 ```
 
 `@me` stands for the user whose token the server uses.
@@ -59,6 +59,7 @@ Every other qualifier, such as `team-review-requested-user:`, `label:` or `updat
 | Qualifier                          | Matches a PR that                                                                                                    |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `gr:review:active`                 | has an [active review](#reviews).                                                                                    |
+| `gr:review:active-human`           | has an active [human review](#reviews).                                                                              |
 | `gr:changes-requested:unaddressed` | has a reviewer whose [standing verdict](#reviews) is CHANGES_REQUESTED and who hasn't been [re-requested](#reviews). |
 | `gr:approvals:>N`                  | has more than N reviewers whose [standing verdict](#reviews) is APPROVED.                                            |
 | `gr:approved-by:USER`              | has USER's [standing verdict](#reviews) APPROVED.                                                                    |
@@ -75,6 +76,7 @@ The grenadine qualifiers look only at the PR's reviews and pending review reques
 - **Standing verdict**: a reviewer's most recent review that is APPROVED or CHANGES_REQUESTED. A later one replaces an earlier one. A dismissed review counts as no verdict. Comment-only reviews don't change the verdict. Re-requesting a reviewer doesn't clear their verdict either, so an approval stands until it's dismissed or replaced.
 - **Re-requested**: the reviewer has submitted a review and is again in the PR's pending review requests. GitHub removes a user's review request when they submit a review, so being requested again means someone asked for another review.
 - **Active review**: a review in any state, by anyone other than the PR's author, that isn't dismissed and whose reviewer hasn't been re-requested. Reviews by bots count. The author's own reviews don't count because replying to a review thread creates one.
+- **Active human review**: an active review not written by a bot (a GitHub App account). This keeps automated comment-only reviews from moving a PR to Returned to you, while a bot's change request still does through `gr:changes-requested:unaddressed`.
 
 For example, Bob requests changes on your PR. The PR has an active review and an unaddressed change request. You push a fix and re-request Bob's review. Bob's review is no longer active and his change request is no longer unaddressed, so the PR no longer matches `gr:review:active`. Bob's standing verdict is still CHANGES_REQUESTED until he reviews again.
 
@@ -118,29 +120,29 @@ Each inbox has a "count in total" setting. The top bar's Inboxes tab and the bro
 
 A new database starts with these inboxes. The ones marked "total" count in the total. The ones marked "sync" sync in the background and are searched on every poll; an inbox without that mark is searched every 10 minutes by default (`--off-inbox-interval`), right away when it's created or edited, and when you press Refresh. Its header shows when its search last succeeded. Its PRs are listed from its search results and sync when you open them.
 
-| Inbox                    | Total | Sync | Filter                                                                                                                                                    |
-| ------------------------ | ----- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Needs your review        | yes   | yes  | `state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc`                                                |
-| Needs your teams' review |       |      | `state:open archived:false draft:false team-review-requested-user:@me -user-review-requested:@me sort:updated-desc`                                       |
-| Returned to you          | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc` |
-| Approved                 | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed sort:updated-desc`         |
-| Merging                  |       |      | `state:open archived:false draft:false author:@me is:queued sort:updated-desc`                                                                            |
-| Drafts                   |       |      | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                       |
-| Drafts from others       |       |      | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                            |
-| Waiting for reviewers    |       |      | `state:open archived:false draft:false author:@me -is:queued -gr:review:active -review:approved sort:updated-desc`                                        |
-| All my open PRs          |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                  |
-| Waiting for author       |       |      | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                               |
-| Merged by me             |       |      | `state:closed archived:false author:@me sort:updated-desc`                                                                                                |
-| Merged by others         |       |      | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                |
-| All open PRs             |       |      | `state:open archived:false -is:queued sort:updated-desc`                                                                                                  |
-| Unmerged PRs on mine     |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                    |
+| Inbox                    | Total | Sync | Filter                                                                                                                                                          |
+| ------------------------ | ----- | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Needs your review        | yes   | yes  | `state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc`                                                      |
+| Needs your teams' review |       |      | `state:open archived:false draft:false team-review-requested-user:@me -user-review-requested:@me sort:updated-desc`                                             |
+| Returned to you          | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued ((gr:review:active-human -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc` |
+| Approved                 | yes   | yes  | `state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed sort:updated-desc`               |
+| Merging                  |       |      | `state:open archived:false draft:false author:@me is:queued sort:updated-desc`                                                                                  |
+| Drafts                   |       |      | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                             |
+| Drafts from others       |       |      | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                                  |
+| Waiting for reviewers    |       |      | `state:open archived:false draft:false author:@me -is:queued -gr:review:active-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc`      |
+| All my open PRs          |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                        |
+| Waiting for author       |       |      | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                                     |
+| Merged by me             |       |      | `state:closed archived:false author:@me sort:updated-desc`                                                                                                      |
+| Merged by others         |       |      | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                      |
+| All open PRs             |       |      | `state:open archived:false -is:queued sort:updated-desc`                                                                                                        |
+| Unmerged PRs on mine     |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                          |
 
 Your open PRs that aren't drafts each appear in exactly one of Returned to you, Approved, Merging and Waiting for reviewers:
 
 - Merging has the queued ones. The other three exclude them.
 - Of the rest, Approved has the ones GitHub considers approved without an unaddressed change request.
-- Returned to you has the ones with an unaddressed change request, or with an active review but not approved.
-- Waiting for reviewers has the ones with neither an active review nor approval.
+- Returned to you has the ones with an unaddressed change request, or with an active human review but not approved.
+- Waiting for reviewers has the ones left: no unaddressed change request, no active human review, not approved.
 
 `bazel run //grenadine/server:validate_inboxes` checks this against live GitHub data.
 

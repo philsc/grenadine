@@ -418,6 +418,9 @@ const MIGRATIONS: &[Migration] = &[
         SELECT id, repo, pr_number, 'OPEN' FROM agents WHERE pr_number IS NOT NULL;
 "#,
     ),
+    // Installs the default filters that count only human reviews as
+    // active.
+    Migration::ResetInboxes,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -2581,9 +2584,13 @@ mod tests {
         // listing's query needs.
         migrate(&mut conn, 3).unwrap();
         conn.pragma_update(None, "user_version", 4).unwrap();
-        let reset = last_reset();
-        migrate(&mut conn, reset).unwrap();
-        conn.pragma_update(None, "user_version", reset + 1).unwrap();
+        let resets: Vec<usize> = (4..MIGRATIONS.len())
+            .filter(|i| matches!(MIGRATIONS[*i], Migration::ResetInboxes))
+            .collect();
+        for reset in resets {
+            migrate(&mut conn, reset).unwrap();
+            conn.pragma_update(None, "user_version", reset + 1).unwrap();
+        }
         migrate(&mut conn, MIGRATIONS.len()).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
@@ -2768,7 +2775,13 @@ mod tests {
     fn searched_at_migrates_an_old_database() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        let searched_at = MIGRATIONS
+            .iter()
+            .position(
+                |m| matches!(m, Migration::Sql(sql) if sql.contains("ADD COLUMN searched_at")),
+            )
+            .unwrap();
+        migrate(&mut conn, searched_at).unwrap();
         let db = Db::init(conn, None).unwrap();
         assert_eq!(db.inbox_searched_at(1).unwrap(), None);
     }
@@ -3449,7 +3462,11 @@ mod tests {
     fn backfills_start_prs() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
-        migrate(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        let backfill = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::Sql(sql) if sql.contains("pr_number IS NOT NULL")))
+            .unwrap();
+        migrate(&mut conn, backfill).unwrap();
         // One session started from a PR, one from the trunk, and one
         // whose start PR is recorded already.
         conn.execute(

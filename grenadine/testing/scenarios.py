@@ -21,6 +21,8 @@ from grenadine.testing.fake_github import (
 
 REPO = "test/test"
 OTHER = "other"
+# A GitHub App account; its reviews come from a Bot actor.
+BOT = "review-bot"
 
 # The default inboxes, as named in grenadine/server/src/inboxes.rs.
 NEEDS_REVIEW = "Needs your review"
@@ -135,16 +137,17 @@ def _verdict(pr: PullRequest, user: str) -> str | None:
     return None
 
 
-def _gr_term(pr: PullRequest, term: str, me: str) -> bool:
+def _gr_term(pr: PullRequest, term: str, me: str, bots: set[str]) -> bool:
     """One gr: qualifier on one PR, as README's table describes it."""
     name, _, arg = term[3:].partition(":")
     user = me if arg == "@me" else arg
     match name:
-        case "review" if arg == "active":
+        case "review" if arg in ("active", "active-human"):
             return any(
                 r.state not in (DISMISSED, PENDING)
                 and r.author != pr.author
                 and r.author not in pr.review_requests
+                and (arg == "active" or r.author not in bots)
                 for r in pr.reviews
             )
         case "changes-requested" if arg == "unaddressed":
@@ -197,10 +200,12 @@ def _is_local(term: str) -> bool:
     return False
 
 
-def matches(pr: PullRequest, filter: str, me: str = VIEWER) -> bool:
+def matches(
+    pr: PullRequest, filter: str, me: str = VIEWER, bots: set[str] = frozenset()
+) -> bool:
     """Whether `pr` matches `filter` under grenadine's local evaluation:
     `gr:` and the local GitHub qualifiers by README's rules, search-only
-    terms true."""
+    terms true. `bots` holds the logins that are GitHub Apps."""
 
     def ev(e: tuple) -> bool:
         match e[0]:
@@ -213,7 +218,7 @@ def matches(pr: PullRequest, filter: str, me: str = VIEWER) -> bool:
             case "term":
                 term = e[1]
                 if term.startswith("gr:"):
-                    return _gr_term(pr, term, me)
+                    return _gr_term(pr, term, me, bots)
                 if not _is_local(term):
                     return True
                 return _term(pr, term)
@@ -261,6 +266,7 @@ def _simple_pr(
 def inbox_cases(gh: FakeGitHub) -> Inboxes:
     """PRs covering the default inboxes, PRs that belong in none of the
     counted ones, and a two-PR stack."""
+    gh.bots.add(BOT)
     repo = gh.repo(REPO)
     repo.checkout("main")
     repo.commit("Seed the repo", {"README.md": "# test\n"})
@@ -304,6 +310,13 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         [RETURNED, ALL_MY_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, COMMENTED)
+
+    # A bot's comment-only review isn't an active human review.
+    pr = add(
+        _simple_pr(repo, "waiting-bot-commented", "Get only a bot's comment"),
+        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+    )
+    pr.submit_review(BOT, COMMENTED)
 
     pr = add(
         _simple_pr(repo, "returned-changes", "Get changes requested"),

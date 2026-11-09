@@ -314,12 +314,14 @@ mod tests {
         let mut a = hit("o/n", 1, "Zebra");
         a.facts.reviews.push(grenadine_core::filter::ReviewFact {
             author: "bob".into(),
+            bot: false,
             state: "COMMENTED".into(),
         });
         let b = hit("o/n", 2, "apple");
         let mut c2 = hit("o/n", 3, "Mango");
         c2.facts.reviews.push(grenadine_core::filter::ReviewFact {
             author: "bob".into(),
+            bot: false,
             state: "APPROVED".into(),
         });
         // b has no review, so it's out; a and c2 sort by title.

@@ -394,7 +394,7 @@ fn queue_info(pr: &Value) -> Option<MergeQueueInfo> {
 /// towards the request's node limit — so searches that never read them
 /// don't ask.
 const SEARCH_FACT_FIELDS: &str = "
-    reviews(first: 100) { nodes { author { login } state } }
+    reviews(first: 100) { nodes { author { __typename login } state } }
     reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } }";
 
 /// Maps a `StatusState` of a commit's check rollup.
@@ -706,6 +706,7 @@ fn hit_from_node(n: &Value) -> Hit {
             reviews: nodes(n, "/reviews/nodes")
                 .map(|r| ReviewFact {
                     author: str_at(r, "/author/login").to_owned(),
+                    bot: str_at(r, "/author/__typename") == "Bot",
                     state: str_at(r, "/state").to_owned(),
                 })
                 .collect(),
@@ -2756,7 +2757,7 @@ mod tests {
 
     #[test]
     fn search_hits() {
-        let node = json!({
+        let mut node = json!({
             "number": 7,
             "title": "Fix it",
             "author": { "login": "alice" },
@@ -2774,6 +2775,12 @@ mod tests {
             },
             "commits": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }] }
         });
+        node["reviews"] = json!({
+            "nodes": [
+                { "author": { "__typename": "Bot", "login": "x" }, "state": "COMMENTED" },
+                { "author": { "__typename": "User", "login": "y" }, "state": "APPROVED" },
+            ]
+        });
         let hit = hit_from_node(&node);
         assert_eq!(
             hit.key,
@@ -2781,6 +2788,14 @@ mod tests {
                 repo: "o/r".into(),
                 number: 7
             }
+        );
+        assert_eq!(
+            hit.facts
+                .reviews
+                .iter()
+                .map(|r| (r.author.as_str(), r.bot))
+                .collect::<Vec<_>>(),
+            [("x", true), ("y", false)]
         );
         assert_eq!(hit.author, "alice");
         assert_eq!(
@@ -2796,7 +2811,6 @@ mod tests {
         assert!(hit.facts.queued);
 
         // GitHub has no decision for a PR nobody needs to review.
-        let mut node = node;
         node["reviewDecision"] = Value::Null;
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = Value::Null;
         let hit = hit_from_node(&node);
