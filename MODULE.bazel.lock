@@ -949,7 +949,7 @@
     "@@rules_rust+//crate_universe:extensions.bzl%crate": {
       "general": {
         "bzlTransitiveDigest": "SkTBRG0aVHxON4KFMAQizvrr1jGmIpbio3NW0TuRueQ=",
-        "usagesDigest": "bsMOryQKIRl6tbSe7ZU7Fz/RZDz53XudTV8sxgrTrHc=",
+        "usagesDigest": "KyMmNF+fR1SG2zODqivEA6nIJP1c/zoakHM3H90Tk5A=",
         "recordedInputs": [
           "ENV:CARGO_BAZEL_DEBUG \\0",
           "ENV:CARGO_BAZEL_GENERATOR_SHA256 \\0",
@@ -974,7 +974,10 @@
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "FILE:@@//Cargo.lock fd1927fb7b3d6bb9f7fb24fbccd92c4b28de733921e402341e4e043114e81af0",
           "FILE:@@//Cargo.toml 94b3c499fa49a843ecee147076a6b9c277679cdb1857afb7dffd11c912e890c5",
-          "FILE:@@//cargo-bazel-lock.json 6b1c054b493a506564aa8ae7f02c256d9d835460b47d1c6b6412da6e55c7abdf"
+          "FILE:@@//grenadine/core/Cargo.toml 3e34b79a67e8e7e051c901443e9b8e0e81d86e0a672fc65c6a7d340ae6591880",
+          "FILE:@@//grenadine/server/Cargo.toml 9bab09973c26ef10948ddb2029d1078d2f88414c395602352351fc254f178e44",
+          "FILE:@@//grenadine/web/Cargo.toml 5d97b07629722fa4f67714f31af43e5391fc2e0cf4f1ffc1cab48b3b1b0835fd",
+          "FILE:@@//cargo-bazel-lock.json 55eec59ae040397461ca7d8c83cb9e3d0c122aebd485d282a1ff8591c2f55054"
         ],
         "generatedRepoSpecs": {
           "crates": {

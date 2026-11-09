@@ -182,7 +182,15 @@ crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
     lockfile = "//:cargo-bazel-lock.json",
-    manifests = ["//:Cargo.toml"],
+    # The members too: MODULE.bazel.lock keeps the extension's result (see
+    # third_party/rules_rust), and only the files listed here make Bazel
+    # evaluate it again, which checks that the pins are up to date.
+    manifests = [
+        "//:Cargo.toml",
+        "//grenadine/core:Cargo.toml",
+        "//grenadine/server:Cargo.toml",
+        "//grenadine/web:Cargo.toml",
+    ],
     supported_platform_triples = [
         "x86_64-unknown-linux-gnu",
         "wasm32-unknown-unknown",
