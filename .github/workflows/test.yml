@@ -47,4 +47,13 @@ jobs:
           if [[ -n "$BUILDBUDDY_API_KEY" ]]; then
             echo "Build results: https://app.buildbuddy.io/invocation/$id" >> "$GITHUB_STEP_SUMMARY"
           fi
-          bazel test --config=lint --invocation_id="$id" //...
+          bazel test --config=lint --invocation_id="$id" --profile="$RUNNER_TEMP/profile.json.gz" //...
+      # Where the run's time went, for `bazel analyze-profile` or
+      # chrome://tracing. BuildBuddy doesn't keep it when Bazel uploads only
+      # what it needs.
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-profile
+          path: ${{ runner.temp }}/profile.json.gz
+          if-no-files-found: ignore
