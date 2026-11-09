@@ -1,6 +1,7 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
+load("//tools/opt:opt.bzl", "opt_files")
 
 exports_files(["Cargo.toml"])
 
@@ -31,10 +32,18 @@ rust_wasm_bindgen(
     wasm_file = ":web_lib",
 )
 
+# The UI does its diffing and highlighting in WebAssembly; unoptimized it is
+# both huge (~30MB) and slow. Only it is optimized: the rest builds faster
+# without.
+opt_files(
+    name = "web_bindgen_opt",
+    srcs = [":web_bindgen"],
+)
+
 # Gives the two files the server embeds fixed labels.
 genrule(
     name = "web_files",
-    srcs = [":web_bindgen"],
+    srcs = [":web_bindgen_opt"],
     outs = [
         "grenadine_web.js",
         "grenadine_web_bg.wasm",

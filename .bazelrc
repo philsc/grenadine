@@ -21,9 +21,6 @@ build --incompatible_strict_action_env=true
 # Don't auto-generate __init__.py files.
 build --incompatible_default_to_explicit_init_py
 
-# The web UI does its diffing and highlighting in WebAssembly; unoptimized it
-# is both huge (~30MB) and slow.
-build --compilation_mode=opt
 
 # The llvm toolchain links with --unwindlib=none, which clang ignores when
 # rustc passes -nodefaultlibs. rustc would show clang's warning about that on
