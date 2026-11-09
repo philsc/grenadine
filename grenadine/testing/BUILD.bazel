@@ -57,9 +57,10 @@ py_test(
         "FAKE_DEVIN": "$(rootpath :fake_devin)",
         "GRENADINE_SERVER": "$(rootpath //grenadine/server)",
     },
-    # Each class's setup takes about a second, but its tests take over 75s
-    # in all, so they spread well across shards.
-    shard_count = 6,
+    # The shards run on remote executors at once, so the slowest one sets
+    # the test's time. With 32, that's about 35s; 48 didn't lower it and
+    # only added setup, since each shard sets up most of the test classes.
+    shard_count = 32,
     deps = [
         ":fake_github",
         "@grenadine_pypi//playwright",
