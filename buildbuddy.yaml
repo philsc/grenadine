@@ -1,0 +1,21 @@
+# BuildBuddy Workflows: the test job, run on BuildBuddy's runners next to
+# the GitHub Actions one, to compare the two. The runners are snapshotted
+# VMs that are reused between runs, so Bazel can start warm.
+# BuildBuddy adds the API key and the build event flags; --config=remote
+# adds remote execution and the cache.
+actions:
+  - name: "Test (BuildBuddy Workflows)"
+    container_image: "ubuntu-24.04"
+    # Analysis runs on the runner, and it's CPU-bound; the default is 3.
+    resource_requests:
+      cpu: 8
+      memory: "16GB"
+    triggers:
+      push:
+        branches:
+          - "main"
+      pull_request:
+        branches:
+          - "*"
+    steps:
+      - run: "bazel test --config=remote --config=lint //..."
