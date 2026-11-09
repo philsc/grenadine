@@ -151,7 +151,7 @@ query($q0: String!, $q1: String!) {
       reviewThreads(first: 100) { totalCount nodes { isResolved } }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       isInMergeQueue reviewDecision repository { nameWithOwner isArchived }
-      reviews(first: 100) { nodes { author { login } state } }
+      reviews(first: 100) { nodes { author { __typename login } state } }
       reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } } } }
   }
   s1: search(type: ISSUE_ADVANCED, query: $q1, first: 100) {
@@ -160,7 +160,7 @@ query($q0: String!, $q1: String!) {
       reviewThreads(first: 100) { totalCount nodes { isResolved } }
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       isInMergeQueue reviewDecision repository { nameWithOwner isArchived }
-      reviews(first: 100) { nodes { author { login } state } }
+      reviews(first: 100) { nodes { author { __typename login } state } }
       reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } } } } } }
   }
 }
@@ -200,7 +200,11 @@ class FakeGitHubTest(unittest.TestCase):
                 )
                 # Local inboxes then keep the hits their filter matches.
                 if "gr:" in filter:
-                    found = [pr for pr in found if scenarios.matches(pr, filter)]
+                    found = [
+                        pr
+                        for pr in found
+                        if scenarios.matches(pr, filter, bots=self.gh.bots)
+                    ]
                     if "gr:sort:title-asc" in filter:
                         found.sort(key=lambda pr: pr.title.lower())
                 got = [pr.title for pr in found]
@@ -1047,7 +1051,14 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(node["reviewDecision"], "APPROVED")
         self.assertEqual(
             node["reviews"],
-            {"nodes": [{"author": {"login": "other"}, "state": "APPROVED"}]},
+            {
+                "nodes": [
+                    {
+                        "author": {"__typename": "User", "login": "other"},
+                        "state": "APPROVED",
+                    }
+                ]
+            },
         )
 
         team = self.inboxes.prs["Ask my team for a review"]

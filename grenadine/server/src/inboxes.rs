@@ -30,7 +30,7 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
     },
     DefaultInbox {
         name: "Returned to you",
-        filter: "state:open archived:false draft:false author:@me -is:queued ((gr:review:active -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc",
+        filter: "state:open archived:false draft:false author:@me -is:queued ((gr:review:active-human -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc",
         count_in_total: true,
         sync_in_background: true,
     },
@@ -60,7 +60,7 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
     },
     DefaultInbox {
         name: "Waiting for reviewers",
-        filter: "state:open archived:false draft:false author:@me -is:queued -gr:review:active -review:approved sort:updated-desc",
+        filter: "state:open archived:false draft:false author:@me -is:queued -gr:review:active-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc",
         count_in_total: false,
         sync_in_background: false,
     },

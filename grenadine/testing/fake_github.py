@@ -549,6 +549,8 @@ class FakeGitHub:
         self.repos: dict[str, FakeRepo] = {}
         # Logins and display names.
         self.users: dict[str, str] = {VIEWER: "Me Myself", "other": "Other Person"}
+        # Logins that are GitHub Apps: their actor nodes are Bots.
+        self.bots: set[str] = set()
         self.clock = EPOCH
         self._number = 0
         self._comment_id = 1000
@@ -1617,6 +1619,13 @@ class FakeGitHub:
         )
 
     def _user_node(self, login: str) -> dict[str, Any]:
+        # The Bot type has no `name`; only User resolves it.
+        if login in self.bots:
+            return {
+                "__typename": "Bot",
+                "login": login,
+                "avatarUrl": None,
+            }
         return {
             "__typename": "User",
             "login": login,
