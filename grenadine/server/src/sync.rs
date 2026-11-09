@@ -35,6 +35,9 @@ use crate::stack;
 /// How many PRs sync at the same time.
 const CONCURRENCY: usize = 4;
 
+/// What `State::stored` returns: the stored PR and the last sync's error.
+type Stored = (Option<PrDetail>, Option<String>);
+
 /// How long to wait before each extra sync of a PR whose merge state or
 /// checks GitHub was still working out. Neither changes the PR's
 /// `updatedAt`, and the search doesn't report the merge state, so the
@@ -256,20 +259,16 @@ impl State {
         }
         let state = self.clone();
         tokio::spawn(async move {
-            // A page that gets PrChanged fetches the PR again, which starts
-            // another of these syncs when no inbox covers the PR. Only a
-            // change is worth telling it about, or the two would loop.
-            let before = state.stored(&key);
-            let result = sync_pr(&state, &key).await;
-            state.finish(&key, result);
-            if state.stored(&key) != before {
-                state.send(ServerEvent::PrChanged(key));
-            }
+            sync_and_notify(&state, &key, sync_pr(&state, &key), |s, k, r| {
+                s.finish(k, r)
+            })
+            .await;
         });
     }
 
-    /// What a page shows for `key`: the stored PR and the last sync's error.
-    fn stored(&self, key: &PrKey) -> (Option<PrDetail>, Option<String>) {
+    /// What a page shows for `key`: the stored PR and the last sync's
+    /// error.
+    fn stored(&self, key: &PrKey) -> Stored {
         (
             self.db.pr(key).ok().flatten(),
             self.db.pr_sync_error(key).ok().flatten(),
@@ -347,13 +346,14 @@ impl State {
                     continue;
                 }
                 // A spawned task doesn't inherit the task-local priority.
-                let result =
-                    ratelimit::with_priority(RequestPriority::Background, sync_pr(&state, &key))
-                        .await;
-                let again = matches!(result, Ok(true));
                 // While this runs, `synced` doesn't start more follow-ups.
-                state.finish(&key, result);
-                state.send(ServerEvent::PrChanged(key.clone()));
+                let again = ratelimit::with_priority(
+                    RequestPriority::Background,
+                    sync_and_notify(&state, &key, sync_pr(&state, &key), |s, k, r| {
+                        s.finish(k, r)
+                    }),
+                )
+                .await;
                 state.send(ServerEvent::InboxesChanged);
                 if !again {
                     break;
@@ -410,6 +410,31 @@ impl State {
             s.paused_until = self.github.paused_until(RequestPriority::Background);
         });
     }
+}
+
+/// Syncs `key`, records the outcome through `finish`, and sends
+/// PrChanged only when the stored PR changed. Returns whether GitHub was
+/// still settling.
+///
+/// A page that gets PrChanged fetches the PR again, which starts an
+/// on-demand sync when no inbox covers it, so a sync that changed
+/// nothing mustn't send one or the two would loop. The polls' recurring
+/// resyncs of settling PRs rely on the same rule to keep quiet pages
+/// from rebuilding.
+async fn sync_and_notify(
+    state: &Arc<State>,
+    key: &PrKey,
+    sync: impl std::future::Future<Output = Result<bool>>,
+    finish: impl FnOnce(&Arc<State>, &PrKey, Result<bool>),
+) -> bool {
+    let before = state.stored(key);
+    let result = sync.await;
+    let again = matches!(result, Ok(true));
+    finish(state, key, result);
+    if state.stored(key) != before {
+        state.send(ServerEvent::PrChanged(key.clone()));
+    }
+    again
 }
 
 pub async fn run(state: Arc<State>, interval: Duration) {
@@ -574,11 +599,11 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
                 .paused_until(RequestPriority::Background)
                 .is_none()
             {
-                let result =
-                    ratelimit::with_priority(RequestPriority::Background, sync_pr(state, &key))
-                        .await;
-                state.synced(&key, result);
-                state.send(ServerEvent::PrChanged(key.clone()));
+                ratelimit::with_priority(
+                    RequestPriority::Background,
+                    sync_and_notify(state, &key, sync_pr(state, &key), |s, k, r| s.synced(k, r)),
+                )
+                .await;
                 // A synced or failed PR shows up differently in the
                 // inboxes.
                 state.send(ServerEvent::InboxesChanged);
@@ -1274,6 +1299,37 @@ mod tests {
             "sent {again:?} for a sync that changed nothing"
         );
         assert!(!state.on_demand.lock().unwrap().contains(&key));
+    }
+
+    /// The polls resync settling PRs every interval while their checks
+    /// run; a sync that changed nothing mustn't send PrChanged, or the
+    /// pages would rebuild around every poll.
+    #[tokio::test]
+    async fn background_syncs_send_only_changes() {
+        let state = test_state();
+        let key = key();
+        let mut events = state.events.subscribe();
+        // The sync fails at once since o/n isn't configured, which the
+        // page hasn't seen yet.
+        sync_and_notify(&state, &key, sync_pr(&state, &key), |s, k, r| {
+            s.synced(k, r)
+        })
+        .await;
+        let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(first, Ok(ServerEvent::PrChanged(k)) if k == key));
+
+        // Failing the same way again changes nothing.
+        sync_and_notify(&state, &key, sync_pr(&state, &key), |s, k, r| {
+            s.synced(k, r)
+        })
+        .await;
+        let again = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+        assert!(
+            again.is_err(),
+            "sent {again:?} for a sync that changed nothing"
+        );
     }
 
     #[tokio::test]
