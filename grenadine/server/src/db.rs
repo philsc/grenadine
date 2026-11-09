@@ -1378,7 +1378,7 @@ impl Db {
                AND EXISTS
                    (SELECT 1 FROM agent_prs p
                     WHERE p.agent_id = agents.id AND p.repo = ? AND p.number = ?)
-             ORDER BY created_at ASC, id"
+             ORDER BY created_at ASC, rowid"
         ))?;
         let rows = stmt.query_map(
             params![key.repo, key.repo, key.number],
@@ -1405,7 +1405,7 @@ impl Db {
     pub fn agents_unchecked(&self) -> Result<Vec<(AgentSession, bool)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC, id"
+            "SELECT {AGENT_COLUMNS} FROM agents ORDER BY created_at DESC, rowid DESC"
         ))?;
         let rows = stmt.query_map([], agent_from_row_unchecked)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -3006,13 +3006,14 @@ mod tests {
         assert_eq!(db.agent("a").unwrap().unwrap().landed, Some(landed));
 
         db.interrupt_agents().unwrap();
+        // Newest first: d, c, b, a.
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();
         assert_eq!(
             statuses,
             [
                 AgentStatus::Interrupted,
-                AgentStatus::Interrupted,
                 AgentStatus::Failed,
+                AgentStatus::Interrupted,
                 AgentStatus::Interrupted,
             ]
         );
@@ -3066,6 +3067,39 @@ mod tests {
         assert!(!db.delete_agent("a").unwrap());
         assert_eq!(db.agent_events("a").unwrap(), []);
         assert_eq!(db.agent_image("i").unwrap(), None);
+    }
+
+    #[test]
+    fn sessions_created_in_the_same_second_keep_their_creation_order() {
+        // created_at is in whole seconds, so sessions started in quick
+        // succession tie; their ids are random and mustn't decide.
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        for id in ["b", "a", "c"] {
+            db.create_agent(&AgentSession {
+                pr: Some(7),
+                created_at: 1,
+                ..agent(id, AgentStatus::Idle)
+            })
+            .unwrap();
+        }
+        let ids: Vec<_> = db
+            .pr_agents(&key)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["b", "a", "c"]);
+        let ids: Vec<_> = db
+            .agents_unchecked()
+            .unwrap()
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect();
+        assert_eq!(ids, ["c", "a", "b"]);
     }
 
     /// A PR's agents are the interactive sessions in its repository that
