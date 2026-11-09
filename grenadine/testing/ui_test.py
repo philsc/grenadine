@@ -2117,6 +2117,131 @@ class BackgroundSyncTest(ServerTestCase):
         expect(inbox.locator(".pr-meta")).to_have_text(re.compile(r"· 1 versions$"))
 
 
+class EditPrTest(ServerTestCase):
+    """Edits a PR's title and description from its page."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.checkout("main")
+        repo.commit("Seed the repo", {"README.md": "# test\n"})
+        repo.push("main")
+        cls.prs = {}
+        for title, body, can_update in (
+            ("Rename me", "The old description.", True),
+            ("Rewrite my description", "The **old** body.", True),
+            ("Leave me be", "Hands off.", True),
+            ("Race my description", "What I saw.", True),
+            ("Empty my description", "To be cleared.", True),
+            ("Leave me alone", "Can't touch this.", False),
+        ):
+            branch = f"edit/{len(cls.prs)}"
+            repo.checkout(branch, "main")
+            repo.commit(title, {f"{branch}.md": "x\n"})
+            repo.push(branch)
+            pr = repo.open_pr(title, head=branch, body=body)
+            pr.viewer_can_update = can_update
+            cls.prs[title] = pr
+
+    def open(self, title: str) -> PullRequest:
+        pr = self.prs[title]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            re.compile(f"{re.escape(pr.title)} #{pr.number}")
+        )
+        return pr
+
+    def header(self) -> Locator:
+        return self.page.locator(".pr-header")
+
+    def description(self) -> Locator:
+        return self.page.locator("section.description")
+
+    def test_edit_the_title(self) -> None:
+        pr = self.open("Rename me")
+        header = self.header()
+        header.get_by_role("button", name="Edit").click()
+        box = header.get_by_role("textbox", name="Edit the title")
+        expect(box).to_be_focused()
+        expect(box).to_have_value(pr.title)
+        box.fill("Renamed")
+        box.press("Enter")
+        expect(header.locator("h1")).to_have_text(re.compile(f"Renamed #{pr.number}"))
+        self.assertEqual(pr.title, "Renamed")
+
+    def test_edit_the_description(self) -> None:
+        pr = self.open("Rewrite my description")
+        description = self.description()
+        description.get_by_role("button", name="Edit").click()
+        box = description.get_by_role("textbox", name="Save")
+        expect(box).to_be_focused()
+        expect(box).to_have_value(pr.body)
+        box.fill("A new body with **emphasis**.")
+
+        # The preview renders the markdown.
+        description.get_by_role("tab", name="Preview").click()
+        expect(description.locator(".composer-preview strong")).to_have_text("emphasis")
+        description.get_by_role("tab", name="Write").click()
+
+        description.get_by_role("button", name="Save").click()
+        expect(description.locator(".markdown strong")).to_have_text("emphasis")
+        self.assertEqual(pr.body, "A new body with **emphasis**.")
+
+    def test_cancelling_discards_the_edits(self) -> None:
+        pr = self.open("Leave me be")
+
+        header = self.header()
+        header.get_by_role("button", name="Edit").click()
+        header.get_by_role("textbox", name="Edit the title").fill("Changed my mind")
+        header.get_by_role("textbox", name="Edit the title").press("Escape")
+        expect(header.locator("h1")).to_have_text(f"{pr.title} #{pr.number}")
+
+        description = self.description()
+        description.get_by_role("button", name="Edit").click()
+        description.get_by_role("textbox", name="Save").fill("Changed my mind")
+        description.get_by_role("button", name="Cancel").click()
+        expect(description.locator(".markdown")).to_have_text(pr.body)
+
+        # The drafts are gone; a reload doesn't bring the boxes back.
+        self.page.reload()
+        expect(self.header().get_by_role("button", name="Edit")).to_be_visible()
+        expect(self.description().get_by_role("button", name="Edit")).to_be_visible()
+        self.assertEqual(pr.title, "Leave me be")
+        self.assertEqual(pr.body, "Hands off.")
+
+    def test_an_edit_that_raced_github_is_refused(self) -> None:
+        pr = self.open("Race my description")
+        description = self.description()
+        description.get_by_role("button", name="Edit").click()
+        box = description.get_by_role("textbox", name="Save")
+        box.fill("My version")
+        # The description changed on GitHub behind the page's back.
+        pr.body = "Someone else wrote this"
+        box.press("Control+Enter")
+        expect(description.locator(".comment-composer .error")).to_contain_text(
+            "The description changed on GitHub since you started editing"
+        )
+        expect(box).to_have_value("My version")
+        self.assertEqual(pr.body, "Someone else wrote this")
+
+    def test_a_pr_the_viewer_cannot_update_has_no_edits(self) -> None:
+        self.open("Leave me alone")
+        expect(self.header().get_by_role("button", name="Edit")).to_have_count(0)
+        expect(self.description().get_by_role("button", name="Edit")).to_have_count(0)
+
+    def test_clearing_the_description(self) -> None:
+        pr = self.open("Empty my description")
+        description = self.description()
+        description.get_by_role("button", name="Edit").click()
+        box = description.get_by_role("textbox", name="Save")
+        box.fill("")
+        description.get_by_role("button", name="Save").click()
+        expect(description.locator(".markdown")).to_have_text(
+            "No description provided."
+        )
+        self.assertEqual(pr.body, "")
+
+
 class ReviewTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:

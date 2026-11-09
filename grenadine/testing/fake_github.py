@@ -1422,10 +1422,18 @@ class FakeGitHub:
 
         def update_pr(info: Any, input: dict[str, Any]) -> Any:
             pr = self._pr_by_id(input["pullRequestId"])
-            if pr.state != OPEN:
+            # Only retargeting is refused once a PR is closed; its title
+            # and body stay editable, like on GitHub.
+            if pr.state != OPEN and input.get("baseRefName"):
                 raise ValueError("Pull request is closed")
             if self._in_open_stack(pr) and input.get("baseRefName"):
                 raise ValueError("Pull request is in a stack")
+            if (title := input.get("title")) is not None:
+                pr.title = title
+                pr.touch()
+            if (body := input.get("body")) is not None:
+                pr.body = body
+                pr.touch()
             base = input.get("baseRefName")
             if base is not None:
                 try:

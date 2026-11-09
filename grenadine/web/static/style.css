@@ -614,6 +614,24 @@ input[type="text"] {
   font-weight: 600;
   margin: 0 0 4px;
 }
+.pr-title-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.pr-title-row h1 {
+  flex: 1;
+}
+.edit-title {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: 0 0 4px;
+}
+.edit-title input {
+  font-size: 22px;
+  font-weight: 600;
+}
 .pr-number {
   font-weight: 400;
 }
@@ -727,6 +745,9 @@ input[type="text"] {
   border-radius: 6px;
   padding: 8px 16px;
   margin: 16px 0;
+}
+.description-edit {
+  float: right;
 }
 
 .markdown {

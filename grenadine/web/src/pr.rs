@@ -6,12 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grenadine_core::api::{
-    Person, PrDetail, PrKey, Review, ReviewComment, ReviewInfo, Side, Stack, Version, VersionKind,
+    EditPr, EditText, Person, PrDetail, PrKey, Review, ReviewComment, ReviewInfo, Side, Stack,
+    Version, VersionKind,
 };
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 
-use crate::composer::{Composer, ComposerToggle, OpenBoxes, SendComment, sender};
+use crate::composer::{
+    Composer, ComposerToggle, OpenBoxes, SendComment, comment_draft_key, draft_signal_from, sender,
+};
 use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag, storage};
@@ -641,6 +644,71 @@ fn PrBody(
         })
         .into(),
     });
+    // The boxes editing the PR's title and description. Their drafts are
+    // named like the comment boxes' so that a resync's re-render doesn't
+    // close them; the text each edit started from is kept under the
+    // draft's `.base` key (see `edit_base`).
+    let boxes = expect_context::<OpenBoxes>();
+    let title_draft = format!(
+        "edit-title.{}#{}",
+        first.summary.key.repo, first.summary.key.number
+    );
+    let body_draft = format!(
+        "edit-body.{}#{}",
+        first.summary.key.repo, first.summary.key.number
+    );
+    drop_edit_base(boxes, title_draft.clone());
+    drop_edit_base(boxes, body_draft.clone());
+    let title_text =
+        draft_signal_from(comment_draft_key(&title_draft), first.summary.title.clone());
+    let title_editing = {
+        let title_draft = title_draft.clone();
+        Signal::derive(move || boxes.is_open(&title_draft))
+    };
+    let title_sending = {
+        let title_draft = title_draft.clone();
+        Signal::derive(move || boxes.sending(&title_draft))
+    };
+    let title_error = {
+        let title_draft = title_draft.clone();
+        Signal::derive(move || boxes.error(&title_draft))
+    };
+    let title_input = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move |_| {
+        if let Some(i) = title_input.get() {
+            let _ = i.focus();
+        }
+    });
+    let save_title = {
+        let (key, title_draft) = (first.summary.key.clone(), title_draft.clone());
+        Callback::new(move |()| {
+            if title_text.with(|t| t.trim().is_empty()) || title_sending.get_untracked() {
+                return;
+            }
+            let edit = EditPr {
+                title: Some(EditText {
+                    old: edit_base(&title_draft, &pr.get_untracked().summary.title),
+                    new: title_text.get_untracked(),
+                }),
+                body: None,
+            };
+            let (key, title_draft) = (key.clone(), title_draft.clone());
+            boxes.send(
+                &title_draft.clone(),
+                async move { api::edit_pr(&key, &edit).await },
+                move || boxes.close(&title_draft),
+            );
+        })
+    };
+    let cancel_title = {
+        let title_draft = title_draft.clone();
+        Callback::new(move |()| {
+            title_text.set(String::new());
+            boxes.close(&title_draft);
+        })
+    };
+    // Whether the viewer may edit the PR's title and description.
+    let can_update = Memo::new(move |_| pr.get().review.as_ref().is_some_and(|r| r.can_update));
     // Edits of comments that are no longer pending, because they were
     // deleted or their review submitted or discarded, e.g. on github.com,
     // can't be saved anymore.
@@ -873,9 +941,69 @@ fn PrBody(
             {move || {
                 let pr = pr.get();
                 let s = &pr.summary;
+                let (title_draft, title_now, number, url) = (
+                    title_draft.clone(),
+                    s.title.clone(),
+                    s.key.number,
+                    s.url.clone(),
+                );
                 view! {
                     <header class="pr-header">
-                        <h1>{s.title.clone()} " " <span class="muted pr-number">{format!("#{}", s.key.number)}</span><GithubLink url=s.url.clone() /></h1>
+                        {move || {
+                            let title = title_text;
+                            if title_editing.get() {
+                                view! {
+                                    <form class="edit-title" on:submit=move |ev| {
+                                        ev.prevent_default();
+                                        save_title.run(());
+                                    }>
+                                        <input
+                                            type="text"
+                                            node_ref=title_input
+                                            aria-label="Edit the title"
+                                            prop:value=move || title.get()
+                                            on:input=move |ev| title.set(event_target_value(&ev))
+                                            on:keydown=move |ev| {
+                                                if ev.key() == "Escape" {
+                                                    ev.prevent_default();
+                                                    cancel_title.run(());
+                                                }
+                                            }
+                                        />
+                                        <button type="submit" class="primary"
+                                            disabled=move || title.with(|t| t.trim().is_empty()) || title_sending.get()>
+                                            {move || if title_sending.get() { "Saving…" } else { "Save" }}
+                                        </button>
+                                        <button type="button" disabled=move || title_sending.get()
+                                            on:click=move |_| cancel_title.run(())>"Cancel"</button>
+                                    </form>
+                                    {move || title_error.get().map(|e| view! { <p class="error">{e}</p> })}
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <div class="pr-title-row">
+                                        <h1>{title_now.clone()} " "
+                                            <span class="muted pr-number">{format!("#{number}")}</span>
+                                            <GithubLink url=url.clone() />
+                                        </h1>
+                                        {can_update.get().then(|| {
+                                            let (t, title_draft) =
+                                                (title_now.clone(), title_draft.clone());
+                                            view! {
+                                                <button type="button" class="link edit-pr"
+                                                    on:click=move |_| {
+                                                        set_edit_base(&title_draft, &t);
+                                                        title_text.set(t.clone());
+                                                        boxes.set(&title_draft, true);
+                                                    }>"Edit"</button>
+                                            }
+                                        })}
+                                    </div>
+                                }
+                                .into_any()
+                            }
+                        }}
                         <p class="muted">
                             <span class=format!("state state-{}", state_label(&s.state, s.queued))>{state_label(&s.state, s.queued)}</span>
                             {s.is_draft.then(|| view! { <span class="badge">"draft"</span> })}
@@ -904,12 +1032,61 @@ fn PrBody(
             }}
             {move || {
                 let pr = pr.get();
-                let html = if pr.body.trim().is_empty() {
-                    "<p class=\"muted\">No description provided.</p>".to_owned()
+                let (body_draft, repo) =
+                    (body_draft.clone(), pr.summary.key.repo.clone());
+                if boxes.is_open(&body_draft) {
+                    let (key, send_draft) = (pr.summary.key.clone(), body_draft.clone());
+                    let fallback = pr.body.clone();
+                    let initial = edit_base(&body_draft, &fallback);
+                    let send = sender(move |body| {
+                        let edit = EditPr {
+                            title: None,
+                            body: Some(EditText {
+                                old: edit_base(&send_draft, &fallback),
+                                new: body,
+                            }),
+                        };
+                        let key = key.clone();
+                        async move { api::edit_pr(&key, &edit).await }
+                    });
+                    view! {
+                        <section class="description">
+                            <Composer
+                                draft=body_draft.clone()
+                                repo=repo.clone()
+                                label="Save"
+                                placeholder="Describe the PR…"
+                                send=send
+                                initial=initial
+                                autofocus=true
+                                allow_empty=true
+                            />
+                        </section>
+                    }
+                    .into_any()
                 } else {
-                    markdown::to_html(&pr.body, &pr.summary.key.repo)
-                };
-                view! { <section class="description markdown" inner_html=html></section> }.into_any()
+                    let html = if pr.body.trim().is_empty() {
+                        "<p class=\"muted\">No description provided.</p>".to_owned()
+                    } else {
+                        markdown::to_html(&pr.body, &pr.summary.key.repo)
+                    };
+                    view! {
+                        <section class="description">
+                            {can_update.get().then(|| {
+                                let (b, body_draft) = (pr.body.clone(), body_draft.clone());
+                                view! {
+                                    <button type="button" class="link edit-pr description-edit"
+                                        on:click=move |_| {
+                                            set_edit_base(&body_draft, &b);
+                                            boxes.set(&body_draft, true);
+                                        }>"Edit"</button>
+                                }
+                            })}
+                            <div class="markdown" inner_html=html></div>
+                        </section>
+                    }
+                    .into_any()
+                }
             }}
             {move || pr.with(|p| p.review.clone()).map(|info| conversation(&info).into_any())}
             {move || {
@@ -1429,6 +1606,41 @@ fn edit_draft(key: &PrKey, id: u64) -> String {
     format!("{}{id}", edit_prefix(key))
 }
 
+/// The localStorage key of the text an edit named `draft` started from.
+/// It's kept next to the draft so that a box a reload restored still
+/// refuses to overwrite what changed on GitHub since the edit started.
+fn edit_base_key(draft: &str) -> String {
+    format!("{}.base", comment_draft_key(draft))
+}
+
+/// Marks the text the edit named `draft` started from.
+fn set_edit_base(draft: &str, text: &str) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(&edit_base_key(draft), text);
+    }
+}
+
+/// The text the edit named `draft` started from, or `current` when none
+/// was kept.
+fn edit_base(draft: &str, current: &str) -> String {
+    storage()
+        .and_then(|s| s.get_item(&edit_base_key(draft)).ok().flatten())
+        .unwrap_or_else(|| current.to_owned())
+}
+
+/// Drops the edit's base once its box is closed, so a later edit of the
+/// same field starts fresh.
+fn drop_edit_base(boxes: OpenBoxes, draft: String) {
+    Effect::new(move |_| {
+        if boxes.is_open(&draft) {
+            return;
+        }
+        if let Some(s) = storage() {
+            let _ = s.remove_item(&edit_base_key(&draft));
+        }
+    });
+}
+
 /// A review comment. A pending one has a badge, and Edit and Delete.
 #[component]
 pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
@@ -1813,6 +2025,7 @@ mod tests {
                 stack: None,
             },
             pending_review: None,
+            can_update: true,
         }
     }
 

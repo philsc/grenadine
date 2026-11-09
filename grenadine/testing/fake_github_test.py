@@ -833,6 +833,19 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertNotIn("errors", out)
         self.assertEqual(pr.base, "main")
 
+        # The title and body are set through the same mutation.
+        out = self.query(
+            "mutation($p: ID!, $t: String!, $b: String!) {"
+            " updatePullRequest(input: {"
+            " pullRequestId: $p, title: $t, body: $b}) { clientMutationId } }",
+            p=pr_id["id"],
+            t="Renamed",
+            b="New body",
+        )
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.title, "Renamed")
+        self.assertEqual(pr.body, "New body")
+
         out = self.query(
             "mutation($p: ID!) { closePullRequest(input: {pullRequestId: $p})"
             " { clientMutationId } }",
@@ -840,6 +853,17 @@ class FakeGitHubTest(unittest.TestCase):
         )
         self.assertNotIn("errors", out)
         self.assertEqual(pr.state, "CLOSED")
+
+        # A closed PR's title and body stay editable.
+        out = self.query(
+            "mutation($p: ID!, $t: String!) { updatePullRequest(input: {"
+            " pullRequestId: $p, title: $t}) { clientMutationId } }",
+            p=pr_id["id"],
+            t="Renamed again",
+        )
+        self.assertNotIn("errors", out)
+        self.assertEqual(pr.title, "Renamed again")
+
         # A closed PR can't be retargeted or closed again.
         for mutation in (
             (

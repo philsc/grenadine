@@ -1517,6 +1517,7 @@ mod tests {
             checks: vec![],
             ci: Some(CiStatus::Passing),
             pending_review: None,
+            can_update: true,
             merge: MergeInfo {
                 conflicting: Some(false),
                 state: MergeState::Clean,

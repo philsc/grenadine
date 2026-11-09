@@ -1290,6 +1290,7 @@ sleep 30
             checks: vec![],
             ci: None,
             pending_review: None,
+            can_update: true,
             merge: MergeInfo {
                 conflicting: None,
                 state: MergeState::Clean,
