@@ -5745,6 +5745,48 @@ class AgentTest(ServerTestCase):
             self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
         ).to_contain_text(f"in-{session}")
 
+    def test_pr_agents_panel_opens_at_the_bottom(self) -> None:
+        # A finished session's transcript, taller than the panel's pane,
+        # opens scrolled to the bottom rather than showing its start.
+        count = 40
+        self.start_pr_session(f"long transcript {count}")
+
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(panel.locator(".transcript .tool")).to_have_count(count)
+        main = panel.locator(".agent-page .main")
+
+        def distance() -> int:
+            top, height, total = main.evaluate(
+                "(e) => [e.scrollTop, e.clientHeight, e.scrollHeight]"
+            )
+            return total - top - height
+
+        deadline = time.monotonic() + 15
+        while distance() > 1:
+            self.assertLess(time.monotonic(), deadline, "transcript not at bottom")
+            time.sleep(0.1)
+
+        # Scrolled up from the bottom, collapsing and expanding the
+        # panel puts the pane back at the same distance from the bottom.
+        main.evaluate("e => { e.scrollTop = e.scrollHeight - e.clientHeight - 200; }")
+        self.page.wait_for_timeout(500)
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        deadline = time.monotonic() + 15
+        while True:
+            if abs(distance() - 200) <= 2:
+                break
+            self.assertLess(
+                time.monotonic(), deadline, "distance from the bottom not restored"
+            )
+            time.sleep(0.1)
+
     def test_wrap_up(self) -> None:
         # The server's clone has main checked out, which the work lands on.
         clone = self.clones[self.OTHER_REPO]

@@ -2908,13 +2908,19 @@ fn Transcript(
     // When the pane's height changes, as when the terminal panel opens
     // under it, it keeps its distance from the bottom rather than from
     // the top, so what was at the bottom stays in view.
+    //
+    // A hidden pane, like the PR page's collapsed Agents panel, has no
+    // layout to scroll. When it is shown again it goes to the bottom if
+    // following, else back to where the user left it.
     let end = NodeRef::<leptos::html::Div>::new();
     let follow = StoredValue::new(true);
     // Where the user last scrolled to, and the pane's height then. The
     // distance from the bottom is worked out when the height changes,
-    // since content may have come in below without a scroll since.
+    // since content may have come in below without a scroll since. The
+    // height is the last one while visible, since a hidden pane has none.
     let top = StoredValue::new(0);
     let height = StoredValue::new(0);
+    let visible = StoredValue::new(false);
     let on_scroll = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
         let Some(main) = e
             .current_target()
@@ -2922,6 +2928,11 @@ fn Transcript(
         else {
             return;
         };
+        // A hidden pane reports a scroll position of 0, which must not
+        // stop following or overwrite where the user scrolled to.
+        if !visible.get_value() {
+            return;
+        }
         // A pane that grew can clamp its scroll position before the
         // resize observer restores the distance from the bottom.
         if main.client_height() != height.get_value() {
@@ -2950,14 +2961,28 @@ fn Transcript(
             main.set_value(Some(el.clone()));
             top.set_value(el.scroll_top());
             height.set_value(el.client_height());
+            visible.set_value(el.client_height() > 0);
             let pane = el.clone();
             let on_resize = Closure::<dyn FnMut()>::new(move || {
-                let (h, old) = (pane.client_height(), height.get_value());
-                if h == old {
+                let h = pane.client_height();
+                if h == 0 {
+                    visible.set_value(false);
+                    return;
+                }
+                let old = height.get_value();
+                if h == old && visible.get_value() {
                     return;
                 }
                 height.set_value(h);
-                pane.set_scroll_top(top.get_value() - (h - old));
+                visible.set_value(true);
+                // Hiding a pane resets its scroll position, so the
+                // distance from the bottom is restored even when the
+                // height is unchanged.
+                if follow.get_value() {
+                    pane.set_scroll_top(pane.scroll_height());
+                } else {
+                    pane.set_scroll_top(top.get_value() - (h - old));
+                }
             });
             if let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
                 observer.observe(&el);
