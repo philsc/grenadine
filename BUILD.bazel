@@ -10,11 +10,13 @@ npm_link_all_packages(name = "node_modules")
 alias(
     name = "format",
     actual = "//tools/format",
+    tags = ["manual"],
 )
 
 alias(
     name = "format.check",
     actual = "//tools/format:format.check",
+    tags = ["manual"],
 )
 
 # Regenerate with: bazel run //:requirements

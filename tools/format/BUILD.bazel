@@ -17,6 +17,9 @@ format_multirun(
     # The pinned toolchain's rustfmt. It reads the edition from //:rustfmt.toml.
     rust = "@rules_rust//tools/upstream_wrapper:rustfmt",
     starlark = "@buildifier_prebuilt//:buildifier",
+    # Only `bazel run` uses the formatters. Leaving them out of //... keeps
+    # `bazel test //...` from fetching Node, prettier, and the other tools.
+    tags = ["manual"],
     toml = ":taplo",
     visibility = ["//:__pkg__"],
 )
@@ -26,9 +29,11 @@ prettier.prettier_binary(
     # Run in the workspace rather than in bazel-bin, so that prettier finds
     # .prettierignore and the files it's given.
     env = {"BAZEL_BINDIR": "."},
+    tags = ["manual"],
 )
 
 taplo.taplo_binary(
     name = "taplo",
     env = {"BAZEL_BINDIR": "."},
+    tags = ["manual"],
 )

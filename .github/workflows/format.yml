@@ -13,6 +13,10 @@ concurrency:
 jobs:
   format:
     runs-on: ubuntu-latest
+    env:
+      # Empty in runs for PRs from forks, which don't get the repository's
+      # secrets. Those runs build without BuildBuddy.
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       # Ubuntu 24.04 blocks unprivileged user namespaces, which the
@@ -21,8 +25,20 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}
-          repository-cache: true
+          # With BuildBuddy, its remote cache, Remote Asset API, and remote repo
+          # contents cache take the place of these, and restoring them would
+          # only cost time.
+          disk-cache: ${{ env.BUILDBUDDY_API_KEY == '' && github.workflow }}
+          repository-cache: ${{ env.BUILDBUDDY_API_KEY == '' }}
+      - if: env.BUILDBUDDY_API_KEY != ''
+        run: |
+          cat > .bazelrc.user <<EOF
+          startup --experimental_remote_repo_contents_cache
+          build --config=remote
+          build --remote_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build --remote_downloader_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build --bes_header=x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          EOF
       - run: bazel run //:format
       # Fail if the formatter changed anything, and show what it changed.
       - run: git diff --exit-code

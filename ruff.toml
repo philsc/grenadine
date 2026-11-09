@@ -4,3 +4,9 @@ target-version = "py313"
 # The lint aspect runs ruff on one target's files at a time, so ruff can't
 # find the rest of the package to tell that it's first-party.
 known-first-party = ["grenadine"]
+
+[lint]
+# Remote executors receive a py_binary's main file with the executable bit
+# set whatever its mode in git, so ruff's checks of shebangs against that bit
+# would fail there and pass locally.
+ignore = ["EXE001", "EXE002"]

@@ -3928,6 +3928,11 @@ class AgentTest(ServerTestCase):
             self.page.wait_for_function(
                 "([e, h]) => e.clientHeight !== h", arg=[main.element_handle(), height]
             )
+            # The pane restores its distance from the bottom in a resize
+            # observer, which runs after the height changed.
+            self.page.evaluate(
+                "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+            )
 
         # Scrolled to the bottom, opening the first terminal keeps the
         # bottom of the transcript in view.
@@ -5023,7 +5028,8 @@ class AgentTest(ServerTestCase):
             # Keys typed while a tab parses its replay never reach the
             # shell, so wait until it's done and the prompt shows.
             expect(tab).to_have_attribute("aria-busy", "false")
-            expect(screen).to_contain_text("$")
+            # Remote executors run the tests as root, whose prompt is #.
+            expect(screen).to_contain_text(re.compile(r"[$#]"))
 
         # Opening the panel starts a shell in the worktree. The output
         # differs from the command line it echoes.
@@ -5279,6 +5285,10 @@ class AgentTest(ServerTestCase):
         expect(toggle).to_have_attribute("aria-expanded", "false")
         toggle.click()
         expect(tabs).to_have_text(["Terminal 1"])
+        # Keys typed while the tab parses its replay never reach the shell,
+        # so wait until it's done and the prompt shows.
+        expect(tabs.nth(0)).to_have_attribute("aria-busy", "false")
+        expect(screen).to_contain_text(re.compile(r"[$#]"))
         self.page.keyboard.type('echo in-$(basename "$PWD")\n')
         expect(screen).to_contain_text(f"in-{session}")
 
