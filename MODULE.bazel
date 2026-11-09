@@ -22,12 +22,19 @@ bazel_dep(name = "rules_go", version = "0.60.0", repo_name = None)
 
 # rules_python ships the interpreter three times over in every py_binary's
 # runfiles: bin/python, bin/python3 and bin/python3.13 are all the same 110MB
-# statically-linked CPython. The patch keeps bin/python3, the one the toolchain
-# points at.
+# statically-linked CPython. The first patch keeps bin/python3, the one the
+# toolchain points at.
+#
+# The interpreter's repo also symlinks its __pycache__ directories to a cache
+# outside the repo, which keeps the repo out of the remote repo contents cache.
+# The second patch makes them empty files instead.
 single_version_override(
     module_name = "rules_python",
     patch_strip = 1,
-    patches = ["//third_party/rules_python:0001-Remove-superfluous-copies-of-the-runtime.patch"],
+    patches = [
+        "//third_party/rules_python:0001-Remove-superfluous-copies-of-the-runtime.patch",
+        "//third_party/rules_python:0002-Use-empty-pycache-files-instead-of-symlinks.patch",
+    ],
 )
 
 # These modules download tools pinned by checksum but don't say that the
