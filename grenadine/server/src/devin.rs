@@ -1445,7 +1445,7 @@ async fn elicitation(
     // a card of its own.
     let tool_call = extension(&request.meta, "toolCallId")
         .and_then(Value::as_str)
-        .map_or_else(|| format!("request-{rpc_id}"), str::to_owned);
+        .map_or_else(|| crate::agent::approval_id("request"), str::to_owned);
     let input = tools
         .lock()
         .unwrap()
