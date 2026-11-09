@@ -133,6 +133,9 @@ pub struct State {
     pub watched: std::sync::Mutex<BTreeMap<PrKey, usize>>,
     /// How long an inbox without background sync goes between searches.
     pub off_inbox_interval: Duration,
+    /// When, after a review's session finished, its review is looked for
+    /// on GitHub, each delay after the one before.
+    pub posted_checks: Vec<Duration>,
     /// The per-inbox search times and the requested searches.
     pub inbox_searches: std::sync::Mutex<InboxSearches>,
     /// PRs that `follow_up` will sync again.
@@ -1088,6 +1091,7 @@ pub fn test_state_with_agents(
         on_demand: std::sync::Mutex::new(BTreeSet::new()),
         watched: std::sync::Mutex::new(BTreeMap::new()),
         off_inbox_interval: Duration::from_secs(600),
+        posted_checks: vec![Duration::ZERO],
         inbox_searches: std::sync::Mutex::new(InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
