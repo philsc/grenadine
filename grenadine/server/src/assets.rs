@@ -1,65 +1,37 @@
-//! The web UI's files, embedded into the binary at build time.
+//! Serves the web UI's files, which the binary embeds at build time.
+
+use std::sync::OnceLock;
 
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 
-struct Asset {
-    path: &'static str,
-    content_type: &'static str,
-    bytes: &'static [u8],
+/// One of the web UI's files.
+pub struct Asset {
+    pub path: &'static str,
+    pub content_type: &'static str,
+    pub bytes: &'static [u8],
 }
 
-const ASSETS: &[Asset] = &[
-    Asset {
-        path: "/",
-        content_type: "text/html; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_INDEX_HTML")),
-    },
-    Asset {
-        path: "/style.css",
-        content_type: "text/css; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_STYLE_CSS")),
-    },
-    Asset {
-        path: "/favicon.svg",
-        content_type: "image/svg+xml",
-        bytes: include_bytes!(env!("GRENADINE_FAVICON_SVG")),
-    },
-    Asset {
-        path: "/grenadine_web.js",
-        content_type: "text/javascript; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_WEB_JS")),
-    },
-    Asset {
-        path: "/grenadine_web_bg.wasm",
-        content_type: "application/wasm",
-        bytes: include_bytes!(env!("GRENADINE_WEB_WASM")),
-    },
-    Asset {
-        path: "/xterm.js",
-        content_type: "text/javascript; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_XTERM_JS")),
-    },
-    Asset {
-        path: "/xterm.css",
-        content_type: "text/css; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_XTERM_CSS")),
-    },
-    Asset {
-        path: "/addon-fit.js",
-        content_type: "text/javascript; charset=utf-8",
-        bytes: include_bytes!(env!("GRENADINE_XTERM_FIT_JS")),
-    },
-];
+static ASSETS: OnceLock<&'static [Asset]> = OnceLock::new();
+
+/// Sets the files to serve. The first one is index.html.
+pub fn set(assets: &'static [Asset]) {
+    assert!(ASSETS.set(assets).is_ok(), "the assets are already set");
+}
 
 pub async fn serve(uri: Uri) -> Response {
     let path = uri.path();
-    let asset = ASSETS
+    let assets: &[Asset] = ASSETS.get().copied().unwrap_or_default();
+    let asset = assets
         .iter()
         .find(|a| a.path == path)
         // The page routes on the client, so every other non-API path gets
         // index.html.
-        .or_else(|| (!path.starts_with("/api/") && !path.contains('.')).then_some(&ASSETS[0]));
+        .or_else(|| {
+            (!path.starts_with("/api/") && !path.contains('.'))
+                .then(|| assets.first())
+                .flatten()
+        });
     match asset {
         Some(a) => (
             [

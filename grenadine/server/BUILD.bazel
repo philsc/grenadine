@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 exports_files([
     "Cargo.toml",
@@ -18,18 +18,35 @@ WEB_FILES = {
     "GRENADINE_XTERM_FIT_JS": "//grenadine/web:addon-fit.js",
 }
 
-rust_binary(
-    name = "server",
+# The server's logic. It doesn't need the web UI's files, so it compiles
+# while the UI's WebAssembly does.
+rust_library(
+    name = "server_lib",
     srcs = glob(
         ["src/**/*.rs"],
-        exclude = ["src/bin/**"],
+        exclude = [
+            "src/bin/**",
+            "src/main.rs",
+        ],
     ),
+    crate_name = "grenadine_server",
+    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+)
+
+# The server with the web UI's files embedded.
+rust_binary(
+    name = "server",
+    srcs = ["src/main.rs"],
     compile_data = WEB_FILES.values(),
     crate_name = "grenadine",
     # rules_rust makes these absolute, which include_bytes! needs.
     rustc_env = {k: "$(execpath %s)" % v for k, v in WEB_FILES.items()},
     visibility = ["//grenadine/testing:__pkg__"],
-    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+    deps = [
+        ":server_lib",
+        "@crates//:anyhow",
+        "@crates//:tokio",
+    ],
 )
 
 rust_binary(
@@ -48,7 +65,7 @@ rust_binary(
 rust_test(
     name = "server_test",
     size = "small",
-    crate = ":server",
+    crate = ":server_lib",
     data = ["//grenadine/testing:fake_devin"],
     env = {"FAKE_DEVIN": "$(rootpath //grenadine/testing:fake_devin)"},
     deps = all_crate_deps(normal_dev = True),
