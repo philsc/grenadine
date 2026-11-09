@@ -386,6 +386,10 @@ pub struct ReviewComment {
     /// comment is outdated.
     pub line: Option<u32>,
     pub start_line: Option<u32>,
+    /// The side of `start_line`/`original_start_line`; `None` means the
+    /// same as `side`.
+    #[serde(default)]
+    pub start_side: Option<Side>,
     pub side: Side,
     /// True for a comment on the whole file rather than on lines.
     pub on_file: bool,

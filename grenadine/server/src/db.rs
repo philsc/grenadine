@@ -2308,6 +2308,7 @@ mod tests {
             original_start_line: None,
             line: Some(1),
             start_line: None,
+            start_side: None,
             side: Side::Right,
             on_file: false,
             created_at: "c".into(),

@@ -3211,6 +3211,16 @@ class VersionsTest(ServerTestCase):
             line=20,
             commit=shas[-1],
         )
+        # A multi-line thread on the head labels and marks its range.
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="These two steps look off.",
+            path=scenarios.STEPS_PY,
+            line=21,
+            start_line=16,
+            commit=shas[-1],
+        )
         # Threads on v1 of a rebased PR: one on a line the merge keeps,
         # one on a line upstream replaced, and one on v2.
         rebase_edit = cls.cases.prs[scenarios.REBASE_AND_EDIT]
@@ -3307,7 +3317,7 @@ class VersionsTest(ServerTestCase):
     def test_threads_fold(self) -> None:
         self.open(scenarios.GROW)
         threads = self.file(scenarios.STEPS_PY).locator(".thread")
-        expect(threads).to_have_count(4)
+        expect(threads).to_have_count(5)
         open_thread, resolved = threads.nth(0), threads.nth(1)
 
         # Open threads start unfolded, resolved ones folded.
@@ -3425,6 +3435,27 @@ class VersionsTest(ServerTestCase):
             ".outside-comments .outside", has_text="Dropped by the merge."
         )
         expect(outside).to_contain_text("old line 50")
+
+    def test_a_multi_line_thread_shows_its_range(self) -> None:
+        self.open(scenarios.GROW)
+        file = self.file(scenarios.STEPS_PY)
+        thread = file.locator(
+            "tr.comment-row .thread", has_text="These two steps look off."
+        )
+        expect(thread.locator(".thread-lines")).to_have_text("Lines +16 to +21")
+        marked = file.locator("tr.commented-range")
+        expect(marked).to_have_count(6)
+        self.assertEqual(
+            [r.locator("td.ln").nth(1).inner_text() for r in marked.all()],
+            ["16", "17", "18", "19", "20", "21"],
+        )
+        # Single-line threads have no label.
+        expect(
+            file.locator(".thread", has_text="Doubling, eh?").locator(".thread-lines")
+        ).to_have_count(0)
+        # The unified view marks the same rows.
+        self.page.get_by_label("Side by side").uncheck()
+        expect(file.locator("tr.commented-range")).to_have_count(6)
 
     def test_expand_context_buttons(self) -> None:
         # v1 → v2 of shared.py changes two far-apart lines, so its diff

@@ -1085,6 +1085,11 @@ input[type="text"] {
 .diff td.ln.add {
   background: var(--add-ln);
 }
+
+/* The lines a multi-line comment covers. */
+.diff tr.commented-range td.ln {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .diff td.blank {
   background: var(--bg-subtle);
 }

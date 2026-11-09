@@ -22,7 +22,7 @@ use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, highlight_lines, mark, plain_lines};
 use crate::inboxes::load_flag;
-use crate::pr::{Anchor, Placed, Thread, ThreadView};
+use crate::pr::{Anchor, Placed, ThreadView, range_label};
 
 const CONTEXT: usize = 3;
 
@@ -1255,6 +1255,14 @@ fn remap_left(comments: &[Placed], map: Option<&[Option<usize>]>) -> (Vec<Placed
                 }
             }
         }
+        if let Some((Side::Left, l)) = p.start {
+            // A start the merge dropped leaves a single-line thread.
+            p.start = map
+                .get(l.saturating_sub(1) as usize)
+                .copied()
+                .flatten()
+                .map(|m| (Side::Left, m as u32 + 1));
+        }
         placed.push(p);
     }
     (placed, dropped)
@@ -1298,7 +1306,7 @@ impl<'a> LineComments<'a> {
 struct Row {
     class: String,
     cells: String,
-    threads: Vec<Arc<Thread>>,
+    threads: Vec<Placed>,
     /// The lines (1-based) whose comment boxes go under the row.
     lines: Vec<(Side, u32)>,
 }
@@ -1359,7 +1367,7 @@ impl Row {
         Row {
             class,
             cells,
-            threads: threads.into_iter().map(|p| p.thread.clone()).collect(),
+            threads: threads.into_iter().cloned().collect(),
             lines: at
                 .iter()
                 .filter_map(|&(side, line)| Some((side, line? as u32 + 1)))
@@ -1397,6 +1405,15 @@ fn groups(rows: &[Row], open: &HashSet<(Side, u32)>) -> Vec<Group> {
     groups
 }
 
+/// A thread's range label for its header, like "Lines +26 to +29";
+/// `None` for single-line and file-level threads.
+fn thread_lines(p: &Placed) -> Option<String> {
+    match (p.start, p.anchor) {
+        (Some(s), Anchor::Line(side, line)) => Some(range_label(s, (side, line))),
+        _ => None,
+    }
+}
+
 fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyView {
     match group {
         Group::Plain(start, end) => {
@@ -1412,7 +1429,7 @@ fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyVie
                 view! {
                     <tr class="comment-row">
                         <td colspan=4>
-                            {r.threads.iter().map(|t| view! { <ThreadView thread=t.clone() /> }).collect_view()}
+                            {r.threads.iter().map(|p| view! { <ThreadView thread=p.thread.clone() lines=thread_lines(p) /> }).collect_view()}
                         </td>
                     </tr>
                 }
@@ -1499,6 +1516,36 @@ fn diff_table(
     }
 }
 
+/// Marks the rows each unresolved multi-line thread spans with a
+/// `commented-range` class. A start the diff doesn't show marks only the
+/// end's row; a thread whose end isn't shown marks nothing.
+fn mark_ranges(rows: &mut [Row], comments: &[Placed]) {
+    for p in comments {
+        let (Some(start), Anchor::Line(end_side, end_line)) = (p.start, p.anchor) else {
+            continue;
+        };
+        if p.thread.root.resolved {
+            continue;
+        }
+        let Some(end) = rows
+            .iter()
+            .position(|r| r.lines.contains(&(end_side, end_line)))
+        else {
+            continue;
+        };
+        let first = rows
+            .iter()
+            .position(|r| r.lines.contains(&start))
+            .filter(|&i| i <= end)
+            .unwrap_or(end);
+        for r in &mut rows[first..=end] {
+            if !r.class.split(' ').any(|c| c == "skip") {
+                r.class.push_str(" commented-range");
+            }
+        }
+    }
+}
+
 /// The line number cell for 0-based `line` of `side`. Clicking a
 /// commentable one opens a comment box on the line.
 fn ln_cell(
@@ -1543,7 +1590,7 @@ fn outside_comments(rest: Vec<(Side, u32, &Placed)>) -> Option<AnyView> {
                 {rest.into_iter().map(|(side, line, p)| view! {
                     <div class="outside">
                         <code class="muted">{format!("{} line {line}", if side == Side::Left { "old" } else { "new" })}</code>
-                        <ThreadView thread=p.thread.clone() />
+                        <ThreadView thread=p.thread.clone() lines=thread_lines(p) />
                     </div>
                 }).collect_view()}
             </div>
@@ -1639,6 +1686,7 @@ fn unified_view(
     if let Some(skip) = &l.skipped_after {
         rows.extend(Row::skip(skip, gaps, 4, expandable));
     }
+    mark_ranges(&mut rows, comments);
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
         {diff_table("diff unified", rows, inline_changes, fc.cloned(), expand)}
@@ -1704,6 +1752,7 @@ fn split_view(
     if let Some(skip) = &l.skipped_after {
         rows.extend(Row::skip(skip, gaps, 4, expandable));
     }
+    mark_ranges(&mut rows, comments);
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
         {diff_table("diff split", rows, inline_changes, fc.cloned(), expand)}
@@ -1713,11 +1762,15 @@ fn split_view(
 
 #[cfg(test)]
 mod tests {
+    use crate::pr::Thread;
+
     use super::*;
 
-    fn row(lines: &[(Side, u32)], threads: usize) -> Row {
-        let thread = |id| {
-            Arc::new(Thread {
+    fn placed(id: u64, anchor: Anchor, start: Option<(Side, u32)>) -> Placed {
+        Placed {
+            anchor,
+            start,
+            thread: Arc::new(Thread {
                 root: grenadine_core::api::ReviewComment {
                     id,
                     in_reply_to: None,
@@ -1729,6 +1782,7 @@ mod tests {
                     original_start_line: None,
                     line: None,
                     start_line: None,
+                    start_side: None,
                     side: Side::Right,
                     on_file: false,
                     created_at: String::new(),
@@ -1741,12 +1795,17 @@ mod tests {
                     node_id: None,
                 },
                 replies: Vec::new(),
-            })
-        };
+            }),
+        }
+    }
+
+    fn row(lines: &[(Side, u32)], threads: usize) -> Row {
         Row {
             class: "line".into(),
             cells: String::new(),
-            threads: (0..threads as u64).map(thread).collect(),
+            threads: (0..threads as u64)
+                .map(|id| placed(id, Anchor::File, None))
+                .collect(),
             lines: lines.to_vec(),
         }
     }
@@ -1775,5 +1834,123 @@ mod tests {
                 Group::Plain(4, 5)
             ]
         );
+    }
+
+    #[test]
+    fn remap_left_remaps_and_drops_starts() {
+        // Merged lines 1 and 5 stand where lines 1 and 3 were; line 2 is
+        // gone.
+        let map: Vec<Option<usize>> = vec![Some(0), None, Some(4)];
+        let comments = [
+            placed(1, Anchor::Line(Side::Left, 3), Some((Side::Left, 1))),
+            // The start the merge dropped leaves a single-line thread.
+            placed(2, Anchor::Line(Side::Left, 3), Some((Side::Left, 2))),
+            // The end the merge dropped drops the thread.
+            placed(3, Anchor::Line(Side::Left, 2), Some((Side::Left, 1))),
+            // A right-side range isn't touched.
+            placed(4, Anchor::Line(Side::Right, 9), Some((Side::Right, 8))),
+        ];
+        let (placed_out, dropped) = remap_left(&comments, Some(&map));
+        assert_eq!(
+            placed_out
+                .iter()
+                .map(|p| (p.thread.root.id, p.anchor, p.start))
+                .collect::<Vec<_>>(),
+            [
+                (1, Anchor::Line(Side::Left, 5), Some((Side::Left, 1))),
+                (2, Anchor::Line(Side::Left, 5), None),
+                (4, Anchor::Line(Side::Right, 9), Some((Side::Right, 8))),
+            ]
+        );
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].thread.root.id, 3);
+    }
+
+    #[test]
+    fn remap_left_without_a_map_is_a_noop() {
+        let comments = [placed(
+            1,
+            Anchor::Line(Side::Left, 3),
+            Some((Side::Left, 1)),
+        )];
+        let (placed_out, dropped) = remap_left(&comments, None);
+        assert_eq!(placed_out, comments);
+        assert!(dropped.is_empty());
+    }
+
+    fn marked(rows: &[Row]) -> Vec<bool> {
+        rows.iter()
+            .map(|r| r.class.contains("commented-range"))
+            .collect()
+    }
+
+    fn skip_row() -> Row {
+        Row {
+            class: "skip".into(),
+            ..row(&[], 0)
+        }
+    }
+
+    #[test]
+    fn mark_ranges_marks_the_rows_a_thread_spans() {
+        let mut rows = vec![
+            row(&[(Side::Right, 25)], 0),
+            row(&[(Side::Right, 26)], 0),
+            row(&[(Side::Right, 27)], 0),
+            row(&[(Side::Right, 28)], 0),
+            row(&[(Side::Right, 29)], 0),
+            row(&[(Side::Right, 30)], 0),
+        ];
+        mark_ranges(
+            &mut rows,
+            &[placed(
+                1,
+                Anchor::Line(Side::Right, 29),
+                Some((Side::Right, 26)),
+            )],
+        );
+        assert_eq!(marked(&rows), [false, true, true, true, true, false]);
+    }
+
+    #[test]
+    fn mark_ranges_marks_a_cross_side_range() {
+        let mut rows = vec![
+            row(&[(Side::Left, 10), (Side::Right, 12)], 0),
+            row(&[(Side::Left, 11)], 0),
+            row(&[(Side::Right, 14)], 0),
+        ];
+        mark_ranges(
+            &mut rows,
+            &[placed(
+                1,
+                Anchor::Line(Side::Right, 14),
+                Some((Side::Left, 10)),
+            )],
+        );
+        assert_eq!(marked(&rows), [true, true, true]);
+    }
+
+    #[test]
+    fn mark_ranges_skips_resolved_and_unshown_starts() {
+        let mut resolved = placed(1, Anchor::Line(Side::Right, 4), Some((Side::Right, 1)));
+        Arc::get_mut(&mut resolved.thread).unwrap().root.resolved = true;
+        let mut rows = vec![
+            row(&[(Side::Right, 1)], 0),
+            skip_row(),
+            row(&[(Side::Right, 3)], 0),
+            row(&[(Side::Right, 4)], 0),
+            row(&[(Side::Right, 5)], 0),
+        ];
+        mark_ranges(
+            &mut rows,
+            &[
+                resolved,
+                // A range spanning a skip row doesn't mark it.
+                placed(2, Anchor::Line(Side::Right, 4), Some((Side::Right, 1))),
+                // A range whose start is hidden marks only its end.
+                placed(3, Anchor::Line(Side::Right, 5), Some((Side::Right, 2))),
+            ],
+        );
+        assert_eq!(marked(&rows), [true, false, true, true, true]);
     }
 }
