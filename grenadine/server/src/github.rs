@@ -819,6 +819,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             stack: stack_merge(pr),
         },
         pending_review: None,
+        can_update: pr["viewerCanUpdate"].as_bool().unwrap_or(false),
     }
 }
 
@@ -1897,6 +1898,32 @@ impl GitHub {
                }
              }",
             json!({ "pr": self.pr_id(key).await?, "base": base }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sets the PR's title or body. A `None` field is left out of the
+    /// mutation's input so it's left alone rather than cleared.
+    pub async fn update_pr_text(
+        &self,
+        key: &PrKey,
+        title: Option<&str>,
+        body: Option<&str>,
+    ) -> Result<()> {
+        let mut input = json!({ "pullRequestId": self.pr_id(key).await? });
+        if let Some(title) = title {
+            input["title"] = title.into();
+        }
+        if let Some(body) = body {
+            input["body"] = body.into();
+        }
+        self.mutate(
+            std::slice::from_ref(&key.repo),
+            "mutation($input: UpdatePullRequestInput!) {
+               updatePullRequest(input: $input) { clientMutationId }
+             }",
+            json!({ "input": input }),
         )
         .await?;
         Ok(())
@@ -3368,6 +3395,7 @@ mod tests {
                     stack: None,
                 },
                 pending_review: None,
+                can_update: true,
             }),
             review_error: None,
             pending: vec![],

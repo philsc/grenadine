@@ -543,6 +543,25 @@ pub struct SubmitReview {
     pub body: String,
 }
 
+/// One field's old and new text. The old text is what the edit started
+/// from, so the server can refuse to overwrite a change made on GitHub
+/// since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditText {
+    pub old: String,
+    pub new: String,
+}
+
+/// The body of a request that edits a PR's title or description. A field
+/// that's `None` is left alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditPr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<EditText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<EditText>,
+}
+
 /// The body of a 404 response to `GET /api/pr/{owner}/{name}/{number}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -876,6 +895,9 @@ pub struct ReviewInfo {
     /// Its comments are among the PR's comments, marked `pending`.
     #[serde(default)]
     pub pending_review: Option<String>,
+    /// Whether the viewer may edit the PR's title and description.
+    #[serde(default)]
+    pub can_update: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

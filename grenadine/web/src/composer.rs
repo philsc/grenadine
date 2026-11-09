@@ -322,8 +322,9 @@ pub fn MarkdownEditor(
 /// its state in `OpenBoxes`, and `repo` is where markdown references in
 /// the preview point. `alt` adds a second button that sends the comment
 /// another way. `initial` is the text to start with when there's no
-/// draft. Cancel, which is disabled while a send is in flight, and sending
-/// close the box in `OpenBoxes` and drop its draft.
+/// draft. `allow_empty` lets the box send an empty text, e.g. to clear a
+/// PR's description. Cancel, which is disabled while a send is in
+/// flight, and sending close the box in `OpenBoxes` and drop its draft.
 #[component]
 pub fn Composer(
     draft: String,
@@ -334,6 +335,7 @@ pub fn Composer(
     #[prop(optional_no_strip)] alt: Option<(String, SendComment)>,
     #[prop(optional, into)] initial: Option<String>,
     #[prop(optional)] autofocus: bool,
+    #[prop(optional)] allow_empty: bool,
 ) -> impl IntoView {
     let boxes = expect_context::<OpenBoxes>();
     let text = draft_signal_from(comment_draft_key(&draft), initial.unwrap_or_default());
@@ -349,9 +351,10 @@ pub fn Composer(
     let (send, alt_send) = (StoredValue::new(send), StoredValue::new(alt_send));
     let draft = StoredValue::new(draft);
     let empty = move || text.with(|t| t.trim().is_empty());
+    let blocked = move || !allow_empty && empty();
     // Sends with the main button's action, or with `alt`'s.
     let submit_with = move |use_alt: bool| {
-        if empty() || busy.get_untracked() {
+        if blocked() || busy.get_untracked() {
             return;
         }
         let body = text.get_untracked();
@@ -384,11 +387,11 @@ pub fn Composer(
             />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
-                <button type="submit" class="primary" disabled=move || empty() || busy.get()>
+                <button type="submit" class="primary" disabled=move || blocked() || busy.get()>
                     {move || if busy.get() { "Sending…".to_owned() } else { label.clone() }}
                 </button>
                 {alt_label.map(|l| view! {
-                    <button type="button" disabled=move || empty() || busy.get()
+                    <button type="button" disabled=move || blocked() || busy.get()
                         on:click=move |_| submit_with(true)>{l}</button>
                 })}
                 <button type="button" disabled=move || busy.get() on:click=move |_| {

@@ -15,9 +15,9 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoMerge, AutoReviewEntry,
-    BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GENERAL, InboxEdit, InboxWithPrs,
-    MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment,
-    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings,
+    BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL, InboxEdit,
+    InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession,
+    NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings,
     ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges, WrapUp,
     submit_blocker,
 };
@@ -74,7 +74,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/inboxes", get(inboxes).post(create_inbox))
         .route("/api/inboxes/{id}", put(update_inbox).delete(delete_inbox))
         .route("/api/inboxes/refresh", post(refresh_inboxes))
-        .route("/api/pr/{owner}/{name}/{number}", get(pr))
+        .route("/api/pr/{owner}/{name}/{number}", get(pr).patch(edit_pr))
         .route(
             "/api/pr/{owner}/{name}/{number}/comments",
             post(add_comment),
@@ -309,6 +309,57 @@ fn require_body(body: &str) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Edits the PR's title or description. Each field carries the text it
+/// was edited from, which the PR's current text on GitHub must still
+/// match: a title or description that changed on GitHub since the edit
+/// started is refused rather than overwritten.
+async fn edit_pr(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+    Json(e): Json<EditPr>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    if e.title.is_none() && e.body.is_none() {
+        return Err(refuse(StatusCode::BAD_REQUEST, "nothing to change".into()));
+    }
+    if e.title.as_ref().is_some_and(|t| t.new.trim().is_empty()) {
+        return Err(refuse(StatusCode::BAD_REQUEST, "the title is empty".into()));
+    }
+    // GitHub's PR text uses CRLF line endings, the editor's doesn't, so
+    // both sides are compared without returns.
+    let current = state.github.pr_node(&key, "title body").await?;
+    let norm = |s: &str| s.replace("\r\n", "\n");
+    for (sent, field, what) in [
+        (&e.title, "/title", "title"),
+        (&e.body, "/body", "description"),
+    ] {
+        let Some(edit) = sent else { continue };
+        let now = current
+            .pointer(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if norm(&edit.old) != norm(now) {
+            return Err(refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "The {what} changed on GitHub since you started editing. \
+                     Cancel and edit it again."
+                ),
+            ));
+        }
+    }
+    state
+        .github
+        .update_pr_text(
+            &key,
+            e.title.as_ref().map(|t| t.new.as_str()),
+            e.body.as_ref().map(|b| b.new.as_str()),
+        )
+        .await?;
+    state.resync(key);
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Refuses `thread` unless it's one of the PR's review threads, so that a
@@ -2416,5 +2467,162 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(state.db.pr_sync_error(&key).unwrap().is_some());
+    }
+
+    /// A GraphQL endpoint that answers the `pr_node` lookup with `node`
+    /// and every mutation with success, recording each request's query
+    /// and variables.
+    async fn stub_github(
+        node: serde_json::Value,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        let app = Router::new().route(
+            "/graphql",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let node = node.clone();
+                let requests = requests.clone();
+                async move {
+                    let query = request["query"].as_str().unwrap_or("").to_owned();
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((query.clone(), request["variables"].clone()));
+                    let data = if query.trim_start().starts_with("mutation") {
+                        serde_json::json!({ "updatePullRequest": { "clientMutationId": null } })
+                    } else {
+                        serde_json::json!({ "repository": { "pullRequest": node } })
+                    };
+                    Json(serde_json::json!({ "data": data }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, app).into_future());
+        (api, seen)
+    }
+
+    /// A test state with `owner/name` configured and a GitHub client
+    /// pointed at `api`.
+    fn edit_state(api: &str) -> Arc<State> {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let mut state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        Arc::get_mut(&mut state).unwrap().github =
+            crate::github::GitHub::new("token", api).unwrap();
+        state
+    }
+
+    /// An edit sends updatePullRequest with only the fields it changes.
+    #[tokio::test]
+    async fn edits_the_pr_text() {
+        use grenadine_core::api::EditText;
+        let (api, seen) = stub_github(serde_json::json!({
+            "id": "PR", "title": "Old title", "body": "Old body"
+        }))
+        .await;
+        let state = edit_state(&api);
+        let response = edit_pr(
+            AxState(state),
+            Path(("owner".into(), "name".into(), 7)),
+            Json(EditPr {
+                title: Some(EditText {
+                    old: "Old title".into(),
+                    new: "New title".into(),
+                }),
+                body: None,
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let seen = seen.lock().unwrap();
+        // The staleness lookup, the mutation's PR id lookup, then the
+        // mutation. Its input names the title only, so the body is left
+        // alone.
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].0.contains("title body"));
+        assert!(seen[2].0.starts_with("mutation"));
+        assert_eq!(seen[2].1["input"]["title"], "New title");
+        assert!(seen[2].1["input"].get("body").is_none());
+    }
+
+    /// A field that moved on GitHub since the edit started is refused
+    /// before any mutation goes out.
+    #[tokio::test]
+    async fn a_stale_pr_edit_is_refused() {
+        use grenadine_core::api::EditText;
+        let (api, seen) = stub_github(serde_json::json!({
+            "id": "PR", "title": "Old title", "body": "Someone else wrote this"
+        }))
+        .await;
+        let state = edit_state(&api);
+        let err = edit_pr(
+            AxState(state),
+            Path(("owner".into(), "name".into(), 7)),
+            Json(EditPr {
+                title: None,
+                body: Some(EditText {
+                    old: "Old body".into(),
+                    new: "New body".into(),
+                }),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        // Only the lookup ran; no mutation was sent.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A blank title is refused before GitHub is even asked.
+    #[tokio::test]
+    async fn a_blank_pr_title_is_refused() {
+        use grenadine_core::api::EditText;
+        let (api, seen) = stub_github(serde_json::json!({ "id": "PR" })).await;
+        let state = edit_state(&api);
+        let err = edit_pr(
+            AxState(state),
+            Path(("owner".into(), "name".into(), 7)),
+            Json(EditPr {
+                title: Some(EditText {
+                    old: "Old title".into(),
+                    new: "  ".into(),
+                }),
+                body: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// An edit that changes nothing is refused.
+    #[tokio::test]
+    async fn an_empty_pr_edit_is_refused() {
+        let (api, seen) = stub_github(serde_json::json!({ "id": "PR" })).await;
+        let state = edit_state(&api);
+        let err = edit_pr(
+            AxState(state),
+            Path(("owner".into(), "name".into(), 7)),
+            Json(EditPr {
+                title: None,
+                body: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

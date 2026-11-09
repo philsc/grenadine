@@ -70,6 +70,8 @@ type Mutation {
 
 input UpdatePullRequestInput {
   pullRequestId: ID!
+  title: String
+  body: String
   baseRefName: String
   clientMutationId: String
 }

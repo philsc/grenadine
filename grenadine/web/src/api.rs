@@ -8,11 +8,11 @@ use std::sync::Arc;
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewEntry,
-    Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, Enqueue, GitHubUsage, InboxEdit,
-    InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment,
-    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
-    ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus, SystemStats, TerminalInfo,
-    WorktreeChanges, WrapUp,
+    Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GitHubUsage,
+    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession,
+    NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage,
+    RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus, SystemStats,
+    TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -439,6 +439,15 @@ pub async fn set_thread_resolved(key: &PrKey, thread: &str, resolved: bool) -> R
 pub async fn add_review_thread(key: &PrKey, thread: &NewThread) -> Result<()> {
     let req = Request::post(&format!("{}/review/comments", pr_url(key)))
         .json(thread)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Edits the PR's title or description. A field left `None` keeps its
+/// text.
+pub async fn edit_pr(key: &PrKey, edit: &EditPr) -> Result<()> {
+    let req = Request::patch(&pr_url(key))
+        .json(edit)
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
 }
