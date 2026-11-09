@@ -2904,8 +2904,17 @@ fn Transcript(
     // it again. Whether to follow is decided by where the user scrolled
     // rather than by how far the bottom is, since replaying a long
     // transcript adds a lot of it at once.
+    //
+    // When the pane's height changes, as when the terminal panel opens
+    // under it, it keeps its distance from the bottom rather than from
+    // the top, so what was at the bottom stays in view.
     let end = NodeRef::<leptos::html::Div>::new();
     let follow = StoredValue::new(true);
+    // Where the user last scrolled to, and the pane's height then. The
+    // distance from the bottom is worked out when the height changes,
+    // since content may have come in below without a scroll since.
+    let top = StoredValue::new(0);
+    let height = StoredValue::new(0);
     let on_scroll = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
         let Some(main) = e
             .current_target()
@@ -2913,11 +2922,18 @@ fn Transcript(
         else {
             return;
         };
+        // A pane that grew can clamp its scroll position before the
+        // resize observer restores the distance from the bottom.
+        if main.client_height() != height.get_value() {
+            return;
+        }
+        top.set_value(main.scroll_top());
         let below = main.scroll_height() - main.scroll_top() - main.client_height();
         follow.set_value(below < 40);
     });
     let on_scroll = StoredValue::new_local(on_scroll);
     let main = StoredValue::new_local(None::<web_sys::Element>);
+    let resizes = StoredValue::new_local(None::<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>);
     Effect::new(move |_| {
         events.track();
         streaming.track();
@@ -2932,12 +2948,32 @@ fn Transcript(
                 let _ = el.add_event_listener_with_callback("scroll", f.as_ref().unchecked_ref());
             });
             main.set_value(Some(el.clone()));
+            top.set_value(el.scroll_top());
+            height.set_value(el.client_height());
+            let pane = el.clone();
+            let on_resize = Closure::<dyn FnMut()>::new(move || {
+                let (h, old) = (pane.client_height(), height.get_value());
+                if h == old {
+                    return;
+                }
+                height.set_value(h);
+                pane.set_scroll_top(top.get_value() - (h - old));
+            });
+            if let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+                observer.observe(&el);
+                resizes.set_value(Some((observer, on_resize)));
+            }
         }
         if follow.get_value() {
             el.set_scroll_top(el.scroll_height());
         }
     });
     on_cleanup(move || {
+        resizes.try_with_value(|r| {
+            if let Some((observer, _)) = r {
+                observer.disconnect();
+            }
+        });
         let Some(Some(m)) = main.try_get_value() else {
             return;
         };

@@ -3889,6 +3889,62 @@ class AgentTest(ServerTestCase):
         )
         self.delete_session()
 
+    def test_transcript_keeps_bottom_when_terminal_opens(self) -> None:
+        # The terminal panel takes its room from the transcript's pane,
+        # which keeps its distance from the bottom rather than the top.
+        self.page.set_viewport_size({"width": 1000, "height": 800})
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("long transcript 30")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(
+            1, timeout=60_000
+        )
+        main = self.page.locator(".agent-panes > .main")
+        toggle = self.page.get_by_role("button", name="Terminal", exact=True)
+
+        def below() -> int:
+            return main.evaluate("e => e.scrollHeight - e.scrollTop - e.clientHeight")
+
+        def scroll_to(distance: int) -> None:
+            main.evaluate(
+                "e => e.scrollTop = e.scrollHeight - e.clientHeight - " + str(distance)
+            )
+            # The page hears of the scroll on the next frame.
+            self.page.evaluate(
+                "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+            )
+            self.assertAlmostEqual(below(), distance, delta=1)
+
+        def toggle_to(expanded: str) -> None:
+            height = main.evaluate("e => e.clientHeight")
+            toggle.click()
+            expect(toggle).to_have_attribute("aria-expanded", expanded)
+            expect(self.page.locator(".terminal-body")).to_be_visible(
+                visible=expanded == "true"
+            )
+            self.page.wait_for_function(
+                "([e, h]) => e.clientHeight !== h", arg=[main.element_handle(), height]
+            )
+
+        # Scrolled to the bottom, opening the first terminal keeps the
+        # bottom of the transcript in view.
+        scroll_to(0)
+        toggle_to("true")
+        expect(self.page.get_by_role("tab")).to_have_text(["Terminal 1"])
+        self.assertAlmostEqual(below(), 0, delta=1)
+
+        # Scrolled up, the pane keeps its distance from the bottom as the
+        # panel collapses and opens again.
+        scroll_to(200)
+        toggle_to("false")
+        self.assertAlmostEqual(below(), 200, delta=1)
+        toggle_to("true")
+        self.assertAlmostEqual(below(), 200, delta=1)
+        self.delete_session()
+
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")
         question = transcript.locator(".approval")
