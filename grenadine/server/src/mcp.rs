@@ -876,6 +876,7 @@ mod tests {
                     allow: true,
                     message: None,
                     answers: None,
+                    expired: false,
                 },
                 AgentEventKind::ApprovalRequested {
                     id: "toolu_2".into(),
@@ -888,6 +889,7 @@ mod tests {
                     allow: false,
                     message: None,
                     answers: None,
+                    expired: false,
                 },
             ]
         );
@@ -1167,6 +1169,111 @@ mod tests {
         let ids = requested_ids(&state, 2).await;
         assert_ne!(ids[0], ids[1]);
         assert!(ids.iter().all(|i| i.starts_with("update_prs-")), "{ids:?}");
+    }
+
+    /// A request whose waiter hangs up expires, so the page stops offering
+    /// answers nobody can take, and the session is running again. A plan
+    /// stays open, since answering it starts a new turn.
+    #[tokio::test]
+    async fn a_dropped_request_expires_unless_its_a_plan() {
+        let state = state();
+        let secret = state.agents.secret(ID);
+        for (n, (tool_use, tool_name)) in [("toolu_1", "Write"), ("toolu_2", "ExitPlanMode")]
+            .into_iter()
+            .enumerate()
+        {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "approve",
+                    "arguments": {"tool_name": tool_name, "input": {}, "tool_use_id": tool_use},
+                },
+            });
+            let task = tokio::spawn({
+                let (state, secret) = (state.clone(), secret.clone());
+                async move { call(&state, &secret, request).await }
+            });
+            requested_ids(&state, n + 1).await;
+            assert_eq!(
+                state.db.agent(ID).unwrap().unwrap().status,
+                AgentStatus::AwaitingApproval
+            );
+            // Claude Code hangs up.
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(!agent::approve(&state, ID, tool_use, Decision::default()).unwrap());
+        }
+        let resolved: Vec<_> = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::ApprovalResolved { .. }))
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            resolved,
+            [AgentEventKind::ApprovalResolved {
+                id: "toolu_1".into(),
+                allow: false,
+                message: None,
+                answers: None,
+                expired: true,
+            }]
+        );
+        // The plan's request left the session waiting on it, as a turn
+        // that ends on a plan does.
+        assert_eq!(
+            state.db.agent(ID).unwrap().unwrap().status,
+            AgentStatus::AwaitingApproval
+        );
+    }
+
+    /// After a restart, the requests the transcript leaves unresolved
+    /// expire, except plans. A resolution closes the latest request with
+    /// its id, as ids could repeat before they were random.
+    #[tokio::test]
+    async fn a_restart_expires_the_requests_left_open() {
+        let state = state();
+        let requested = |id: &str, tool_name: &str| AgentEventKind::ApprovalRequested {
+            id: id.into(),
+            tool_name: tool_name.into(),
+            input: "{}".into(),
+            options: Vec::new(),
+        };
+        let resolved = |id: &str, expired: bool| AgentEventKind::ApprovalResolved {
+            id: id.into(),
+            allow: !expired,
+            message: None,
+            answers: None,
+            expired,
+        };
+        for kind in [
+            requested("answered", "Bash"),
+            resolved("answered", false),
+            requested("repeated", "update_prs"),
+            resolved("repeated", false),
+            AgentEventKind::Text("hi".into()),
+            requested("repeated", "update_prs"),
+            requested("plan", "ExitPlanMode"),
+        ] {
+            state.db.append_agent_event(ID, &kind, 0).unwrap();
+        }
+        agent::expire_orphaned_approvals(&state).unwrap();
+        let after: Vec<_> = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .skip(7)
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(after, [resolved("repeated", true)]);
+        // A second restart finds nothing left to expire.
+        agent::expire_orphaned_approvals(&state).unwrap();
+        assert_eq!(state.db.agent_events(ID).unwrap().len(), 8);
     }
 
     /// Mapping a commit to the session's source PR asks to replace that

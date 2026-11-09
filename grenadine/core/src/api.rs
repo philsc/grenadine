@@ -1839,6 +1839,10 @@ pub enum AgentEventKind {
         /// `Approval::answers`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answers: Option<BTreeMap<String, Vec<String>>>,
+        /// Nobody answered, and nobody can anymore: the agent stopped
+        /// waiting or the server restarted. `allow` is false then.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        expired: bool,
     },
     /// A turn ended; `error` is set when it failed. `cost` is in the
     /// session's `cost_unit`.
@@ -1971,6 +1975,7 @@ mod tests {
                 allow: true,
                 message: None,
                 answers: None,
+                expired: false,
             }
         );
         let answered = AgentEventKind::ApprovalResolved {
@@ -1981,6 +1986,7 @@ mod tests {
                 "Pick one?".to_owned(),
                 vec!["Yes".to_owned()],
             )])),
+            expired: false,
         };
         let back: AgentEventKind =
             serde_json::from_str(&serde_json::to_string(&answered).unwrap()).unwrap();
@@ -1990,10 +1996,23 @@ mod tests {
             allow: false,
             message: Some("no".into()),
             answers: None,
+            expired: false,
         };
         let back: AgentEventKind =
             serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
         assert_eq!(back, plain);
+        // Only an expiry writes the flag.
+        assert!(!serde_json::to_string(&plain).unwrap().contains("expired"));
+        let expired = AgentEventKind::ApprovalResolved {
+            id: "t".into(),
+            allow: false,
+            message: None,
+            answers: None,
+            expired: true,
+        };
+        let back: AgentEventKind =
+            serde_json::from_str(&serde_json::to_string(&expired).unwrap()).unwrap();
+        assert_eq!(back, expired);
     }
 
     /// `PermissionMode::plan`, the pickers' starting values and plan

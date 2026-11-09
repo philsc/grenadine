@@ -1742,6 +1742,9 @@ textarea {
 .approval-mark.denied {
   color: var(--del-fg);
 }
+.approval-mark.expired {
+  color: var(--fg-muted);
+}
 /* A long summary keeps to one line so the spinner and duration after it
    stay visible. */
 .approval p code,
