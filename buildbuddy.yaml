@@ -6,6 +6,10 @@
 actions:
   - name: "Test (BuildBuddy Workflows)"
     container_image: "ubuntu-24.04"
+    # Analysis runs on the runner, and it's CPU-bound; the default is 3.
+    resource_requests:
+      cpu: 8
+      memory: "16GB"
     triggers:
       push:
         branches:
