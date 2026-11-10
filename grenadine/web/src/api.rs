@@ -94,6 +94,41 @@ pub async fn auto_reviews() -> Result<Vec<AutoReviewEntry>> {
         .map_err(|e| e.to_string())
 }
 
+/// The PR's auto-reviews, newest first.
+pub async fn pr_auto_reviews(key: &PrKey) -> Result<Vec<AutoReviewEntry>> {
+    check(
+        Request::get(&format!("{}/auto-reviews", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Asks for a review of the PR, which starts once there's room.
+pub async fn ask_auto_review(key: &PrKey) -> Result<()> {
+    check(
+        Request::post(&format!("{}/auto-reviews", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Cancels a queued or running review.
+pub async fn cancel_auto_review(id: i64) -> Result<()> {
+    check(
+        Request::delete(&format!("/api/auto-reviews/{id}"))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// What `/api/pr` answered for a PR that isn't synced.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PrResponse {

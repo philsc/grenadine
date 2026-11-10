@@ -431,6 +431,49 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agents ADD COLUMN handed_off_from TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- A commit can be reviewed again when asked to from the PR's page,
+    -- so instead of one review per commit there's at most one queued or
+    -- running review per PR. manual marks the reviews asked for there.
+    CREATE TABLE auto_reviews_new (
+        id INTEGER PRIMARY KEY,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_oid TEXT NOT NULL,
+        title TEXT NOT NULL,
+        url TEXT NOT NULL,
+        -- NULL once the session is deleted, and while queued.
+        agent_id TEXT,
+        -- An api::AutoReviewState: queued, running, posted, unposted,
+        -- failed or cancelled.
+        state TEXT NOT NULL,
+        -- Unix seconds; while queued, when it was asked for.
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        cost REAL NOT NULL DEFAULT 0,
+        cost_unit TEXT NOT NULL DEFAULT 'usd',
+        error TEXT,
+        manual INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO auto_reviews_new (id, repo, number, head_oid, title, url, agent_id, state,
+                                  started_at, finished_at, cost, cost_unit, error)
+        SELECT id, repo, number, head_oid, title, url, agent_id, state,
+               started_at, finished_at, cost, cost_unit, error
+        FROM auto_reviews;
+    DROP TABLE auto_reviews;
+    ALTER TABLE auto_reviews_new RENAME TO auto_reviews;
+    -- The index below can't take two running reviews of a PR, which
+    -- nothing should have started.
+    UPDATE auto_reviews SET state = 'failed', finished_at = started_at,
+        error = 'Another review of the PR was running.'
+    WHERE state = 'running' AND id NOT IN
+        (SELECT MAX(id) FROM auto_reviews WHERE state = 'running' GROUP BY repo, number);
+    CREATE UNIQUE INDEX auto_reviews_active ON auto_reviews (repo, number)
+        WHERE state IN ('queued', 'running');
+    CREATE INDEX auto_reviews_pr ON auto_reviews (repo, number);
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1799,7 +1842,7 @@ impl Db {
     }
 
     /// Records a review of `key` at `head_oid` starting. Returns its id,
-    /// or `None` when that commit already had a review.
+    /// or `None` when the PR already has a review queued or running.
     pub fn start_auto_review(
         &self,
         key: &PrKey,
@@ -1808,14 +1851,99 @@ impl Db {
         url: &str,
         now: i64,
     ) -> Result<Option<i64>> {
+        self.insert_auto_review(key, head_oid, title, url, "running", false, now)
+    }
+
+    /// Queues a review of `key` asked for from its page, at `head_oid`
+    /// for now. Returns its id, or `None` when the PR already has a
+    /// review queued or running.
+    pub fn queue_auto_review(
+        &self,
+        key: &PrKey,
+        head_oid: &str,
+        title: &str,
+        url: &str,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        self.insert_auto_review(key, head_oid, title, url, "queued", true, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_auto_review(
+        &self,
+        key: &PrKey,
+        head_oid: &str,
+        title: &str,
+        url: &str,
+        state: &str,
+        manual: bool,
+        now: i64,
+    ) -> Result<Option<i64>> {
         let conn = self.conn();
+        // The conflict is with auto_reviews_active.
         let n = conn.execute(
-            "INSERT INTO auto_reviews (repo, number, head_oid, title, url, state, started_at)
-             VALUES (?, ?, ?, ?, ?, 'running', ?)
-             ON CONFLICT (repo, number, head_oid) DO NOTHING",
-            params![key.repo, key.number, head_oid, title, url, now],
+            "INSERT INTO auto_reviews (repo, number, head_oid, title, url, state, manual, started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
+            params![key.repo, key.number, head_oid, title, url, state, manual, now],
         )?;
         Ok((n > 0).then(|| conn.last_insert_rowid()))
+    }
+
+    /// The queued reviews, oldest first.
+    pub fn queued_auto_reviews(&self) -> Result<Vec<AutoReviewEntry>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AUTO_REVIEW_COLUMNS} WHERE r.state = 'queued' ORDER BY r.started_at, r.id"
+        ))?;
+        let rows = stmt.query_map([], auto_review_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Starts the queued review `id` at `head_oid`, the PR's head now.
+    /// Returns whether it was still queued.
+    pub fn begin_queued_auto_review(
+        &self,
+        id: i64,
+        head_oid: &str,
+        title: &str,
+        url: &str,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE auto_reviews SET state = 'running', head_oid = ?, title = ?, url = ?,
+                started_at = ?
+             WHERE id = ? AND state = 'queued'",
+            params![head_oid, title, url, now, id],
+        )? > 0)
+    }
+
+    /// Ends the queued review `id` as `state` before it started. Returns
+    /// whether it was still queued.
+    pub fn end_queued_auto_review(
+        &self,
+        id: i64,
+        state: AutoReviewState,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE auto_reviews SET state = ?, error = ?, finished_at = ?
+             WHERE id = ? AND state = 'queued'",
+            params![auto_review_state_str(state), error, now, id],
+        )? > 0)
+    }
+
+    /// The review `id`.
+    pub fn auto_review(&self, id: i64) -> Result<Option<AutoReviewEntry>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {AUTO_REVIEW_COLUMNS} WHERE r.id = ?"),
+                [id],
+                auto_review_from_row,
+            )
+            .optional()?)
     }
 
     pub fn set_auto_review_session(&self, id: i64, agent_id: &str) -> Result<()> {
@@ -2120,7 +2248,7 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
 
 const AUTO_REVIEW_COLUMNS: &str = "r.id, r.repo, r.number, r.title, r.url, r.head_oid, r.state, \
      r.agent_id, a.status, r.started_at, r.finished_at, COALESCE(a.cost, r.cost), \
-     COALESCE(a.cost_unit, r.cost_unit), r.error \
+     COALESCE(a.cost_unit, r.cost_unit), r.error, r.manual \
      FROM auto_reviews r LEFT JOIN agents a ON a.id = r.agent_id";
 
 fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> {
@@ -2141,11 +2269,13 @@ fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> 
         cost: r.get(11)?,
         cost_unit: CostUnit::parse(&r.get::<_, String>(12)?).unwrap_or_default(),
         error: r.get(13)?,
+        manual: r.get(14)?,
     })
 }
 
 fn auto_review_state_str(s: AutoReviewState) -> &'static str {
     match s {
+        AutoReviewState::Queued => "queued",
         AutoReviewState::Running => "running",
         AutoReviewState::Posted => "posted",
         AutoReviewState::Unposted => "unposted",
@@ -2156,6 +2286,7 @@ fn auto_review_state_str(s: AutoReviewState) -> &'static str {
 
 fn parse_auto_review_state(s: &str) -> AutoReviewState {
     match s {
+        "queued" => AutoReviewState::Queued,
         "running" => AutoReviewState::Running,
         "posted" => AutoReviewState::Posted,
         "unposted" => AutoReviewState::Unposted,
@@ -3076,6 +3207,52 @@ mod tests {
             Some("started")
         );
         assert_eq!(db.backend_session("fresh").unwrap(), None);
+    }
+
+    #[test]
+    fn migrates_auto_reviews_to_one_active_review_per_pr() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let active = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::Sql(sql) if sql.contains("auto_reviews_active")))
+            .unwrap();
+        migrate(&mut conn, active).unwrap();
+        // Two running reviews of #2, which the new index can't take.
+        for (id, head, state) in [(1, "a", "posted"), (2, "b", "running"), (3, "c", "running")] {
+            conn.execute(
+                "INSERT INTO auto_reviews (id, repo, number, head_oid, title, url, state,
+                                           started_at, cost)
+                 VALUES (?, 'o/n', 2, ?, 't', 'u', ?, 5, 0.5)",
+                params![id, head, state],
+            )
+            .unwrap();
+        }
+        let db = Db::init(conn, None).unwrap();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 2,
+        };
+        let all = db.auto_reviews_of(&key).unwrap();
+        let states: Vec<_> = all.iter().map(|r| (r.id, r.state, r.manual)).collect();
+        assert_eq!(
+            states,
+            [
+                (3, AutoReviewState::Running, false),
+                (2, AutoReviewState::Failed, false),
+                (1, AutoReviewState::Posted, false),
+            ]
+        );
+        assert!(all.iter().all(|r| r.cost == 0.5));
+        assert_eq!(db.queue_auto_review(&key, "a", "t", "u", 6).unwrap(), None);
+        db.finish_auto_review(3, AutoReviewState::Posted, None, 7)
+            .unwrap();
+        // The commit reviewed before can be reviewed again.
+        assert!(
+            db.queue_auto_review(&key, "a", "t", "u", 8)
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn agent(id: &str, status: AgentStatus) -> AgentSession {

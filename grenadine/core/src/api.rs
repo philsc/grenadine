@@ -82,6 +82,9 @@ pub enum AutoReview {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoReviewState {
+    /// Asked for from the PR's page, waiting for one of the running
+    /// reviews to end. It reviews the PR's head as of when it starts.
+    Queued,
     /// Its session is working on it.
     Running,
     /// Its session posted on the PR, and was deleted.
@@ -92,25 +95,31 @@ pub enum AutoReviewState {
     /// Its session couldn't start, failed or was interrupted; the
     /// session, if any, is kept.
     Failed,
-    /// Its session was deleted before it finished.
+    /// It was cancelled while queued, or its session was deleted before
+    /// it finished.
     Cancelled,
 }
 
-/// A review of one of the viewer's PRs that the server started.
+/// A review of one of the viewer's PRs that the server started, by
+/// itself or when asked to from the PR's page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutoReviewEntry {
     pub id: i64,
     pub key: PrKey,
     pub title: String,
     pub url: String,
-    /// The commit reviewed.
+    /// The commit reviewed; while queued, the PR's head when it was
+    /// asked for.
     pub head_oid: String,
     pub state: AutoReviewState,
+    /// Asked for from the PR's page rather than started by the poller.
+    #[serde(default)]
+    pub manual: bool,
     /// The session doing the review; `None` once it's deleted.
     pub session: Option<String>,
     /// The session's status while it exists.
     pub status: Option<AgentStatus>,
-    /// Unix seconds.
+    /// Unix seconds; while queued, when it was asked for.
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub cost: f64,

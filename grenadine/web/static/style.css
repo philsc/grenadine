@@ -2767,6 +2767,21 @@ body.resizing-sidebar * {
   border-radius: 0;
   padding: 0;
 }
+/* The latest auto-review of one of the viewer's PRs, under the merge
+   box. */
+.auto-review-box p {
+  margin: 4px 0;
+}
+.auto-review-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.auto-review-box .form-buttons {
+  align-items: center;
+  margin-top: 8px;
+}
 .merge-status {
   margin: 4px 0;
   font-weight: 600;

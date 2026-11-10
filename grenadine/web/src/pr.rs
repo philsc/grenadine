@@ -426,6 +426,30 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     };
     let panel_key = key.clone();
     let review_key = key.clone();
+    let auto_review_key = key.clone();
+    // The viewer's own open PR, which gets an Auto-review section.
+    let own_open = Memo::new(move |_| {
+        detail.with(|d| {
+            d.as_ref().is_some_and(|d| {
+                d.summary.state == "OPEN"
+                    && d.review
+                        .as_ref()
+                        .is_some_and(|r| r.viewer == d.summary.author)
+            })
+        })
+    });
+    // The PR's latest synced commit, the one a review would start from.
+    let head = Memo::new(move |_| {
+        detail.with(|d| {
+            d.as_ref().and_then(|d| {
+                d.versions
+                    .iter()
+                    .rev()
+                    .find(|v| !v.missing)
+                    .map(|v| v.sha.clone())
+            })
+        })
+    });
     // The latest detail, for PrBody: while it stays mounted a refetch
     // that leaves the PR unready keeps the last one rather than a gap.
     let current = Memo::new(move |prev| {
@@ -473,6 +497,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         {move || {
             let panel_key = panel_key.clone();
             let review_key = review_key.clone();
+            let auto_review_key = auto_review_key.clone();
             if !ready.get() {
                 ().into_any()
             } else if shown() {
@@ -503,6 +528,11 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                                     {merge_section(&d, pinned.get(), true)}
                                     {merge_warning()}
                                 }
+                            })}
+                            // Its own closure, so that a refetch of the PR
+                            // doesn't remount it.
+                            {move || own_open.get().then(|| view! {
+                                <crate::auto_reviews::PrSection key=auto_review_key.clone() head=head />
                             })}
                             <crate::review::SidebarReview
                                 pr=Signal::derive(move || match pr.get() {

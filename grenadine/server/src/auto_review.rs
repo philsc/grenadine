@@ -4,6 +4,11 @@
 //! that reviews it and posts the review on GitHub. Once the review is on
 //! the PR, the session is deleted; the `auto_reviews` table keeps a row
 //! for each review.
+//!
+//! A review can also be asked for from the PR's page, whatever the
+//! repository's settings say. It's queued, and starts as soon as fewer
+//! than `MAX_RUNNING` reviews run, before the poller starts any. A PR has
+//! at most one review queued or running at a time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +17,7 @@ use std::time::Duration;
 use anyhow::Result;
 use grenadine_core::api::{
     AgentBackend, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState, NewAgent,
-    PermissionMode, PrDetail, RepoSettings, ServerEvent, SessionKind,
+    PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
 };
 
 use crate::agent;
@@ -21,8 +26,12 @@ use crate::github::{self, Hit};
 use crate::sync::State;
 
 /// How many reviews run at once; due PRs beyond that wait for a later
-/// poll.
+/// poll, and queued reviews for one of the running ones to end.
 const MAX_RUNNING: usize = 3;
+
+/// Held while reviews start, so that the poller and the queue don't
+/// both start one when only one more may run.
+static STARTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How long the rows of finished reviews are kept.
 const KEEP: i64 = 30 * 24 * 60 * 60;
@@ -186,7 +195,9 @@ fn due(
     } else {
         !reviews.is_empty()
     };
-    let busy = reviews.iter().any(|r| r.state == AutoReviewState::Running);
+    let busy = reviews
+        .iter()
+        .any(|r| matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running));
     wanted && hit.state == "OPEN" && new && !reviewed && !busy && running < MAX_RUNNING
 }
 
@@ -201,9 +212,18 @@ fn synced_head(detail: &PrDetail) -> Option<&str> {
         .map(|v| v.sha.as_str())
 }
 
+/// How many reviews are running.
+fn running(db: &Db) -> Result<usize> {
+    Ok(db
+        .auto_reviews()?
+        .iter()
+        .filter(|r| r.state == AutoReviewState::Running)
+        .count())
+}
+
 /// Starts a review of each of `hits` that is due, once it has synced at
 /// its head. Failures are logged; the PR gets another try next poll
-/// unless its review was recorded as failed.
+/// unless its review was recorded as failed. The queued reviews go first.
 pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
     let now = agent::now();
     match state.db.prune_auto_reviews(now - KEEP) {
@@ -211,11 +231,12 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
         Ok(false) => {}
         Err(e) => tracing::warn!("can't prune the auto-reviews: {e:#}"),
     }
-    let mut running = match state.db.auto_reviews() {
-        Ok(all) => all
-            .iter()
-            .filter(|r| r.state == AutoReviewState::Running)
-            .count(),
+    let _starting = STARTING.lock().await;
+    if let Err(e) = start_queued_locked(state).await {
+        tracing::warn!("can't start the queued reviews: {e:#}");
+    }
+    let mut running = match running(&state.db) {
+        Ok(n) => n,
         Err(e) => {
             tracing::warn!("can't list the auto-reviews: {e:#}");
             return;
@@ -262,6 +283,159 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
     }
 }
 
+/// Why a review can't be asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The PR hasn't synced, or has no commits.
+    NotSynced,
+    NotOpen,
+    /// Someone else opened it.
+    NotYours,
+    /// It already has a review queued or running.
+    Busy,
+    /// The repository's review backend isn't offered; its label.
+    NotOffered(&'static str),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::NotSynced => write!(f, "the PR hasn't synced yet"),
+            Refused::NotOpen => write!(f, "the PR isn't open"),
+            Refused::NotYours => write!(f, "only your own PRs can be auto-reviewed"),
+            Refused::Busy => write!(f, "a review of this PR is already queued or running"),
+            Refused::NotOffered(backend) => write!(f, "{backend} isn't available"),
+        }
+    }
+}
+
+/// Queues a review of `key`, asked for from its page, and starts it if
+/// fewer than `MAX_RUNNING` reviews run. Returns the review's id.
+pub async fn ask(state: &Arc<State>, key: &PrKey) -> Result<std::result::Result<i64, Refused>> {
+    let Some(detail) = state.db.pr(key)? else {
+        return Ok(Err(Refused::NotSynced));
+    };
+    let Some(head) = synced_head(&detail) else {
+        return Ok(Err(Refused::NotSynced));
+    };
+    if detail.summary.state != "OPEN" {
+        return Ok(Err(Refused::NotOpen));
+    }
+    let Some(review) = &detail.review else {
+        return Ok(Err(Refused::NotSynced));
+    };
+    if review.viewer != detail.summary.author {
+        return Ok(Err(Refused::NotYours));
+    }
+    let backend = state.db.repo_settings(&key.repo)?.review_backend;
+    if !state.agents.offered(backend).await {
+        return Ok(Err(Refused::NotOffered(backend.label())));
+    }
+    let queued = state.db.queue_auto_review(
+        key,
+        head,
+        &detail.summary.title,
+        &detail.summary.url,
+        agent::now(),
+    )?;
+    let Some(id) = queued else {
+        return Ok(Err(Refused::Busy));
+    };
+    tracing::info!("{}#{}: a review was asked for", key.repo, key.number);
+    state.send(ServerEvent::AutoReviewsChanged);
+    start_queued(state).await;
+    Ok(Ok(id))
+}
+
+/// Cancels the review `id`: a queued one doesn't start, and a running
+/// one's session is deleted. Returns whether it was queued or running.
+pub async fn cancel(state: &Arc<State>, id: i64) -> Result<bool> {
+    let Some(review) = state.db.auto_review(id)? else {
+        return Ok(false);
+    };
+    match (review.state, review.session) {
+        (AutoReviewState::Queued, _) => {
+            let cancelled = state.db.end_queued_auto_review(
+                id,
+                AutoReviewState::Cancelled,
+                None,
+                agent::now(),
+            )?;
+            if cancelled {
+                state.send(ServerEvent::AutoReviewsChanged);
+                return Ok(true);
+            }
+            // It started meanwhile.
+            match state.db.auto_review(id)?.and_then(|r| r.session) {
+                Some(session) => agent::delete(state, &session).await,
+                None => Ok(false),
+            }
+        }
+        (AutoReviewState::Running, Some(session)) => agent::delete(state, &session).await,
+        _ => Ok(false),
+    }
+}
+
+/// Starts the queued reviews in the background, as far as fewer than
+/// `MAX_RUNNING` run.
+pub fn kick(state: &Arc<State>) {
+    let state = state.clone();
+    tokio::spawn(async move { start_queued(&state).await });
+}
+
+/// Starts the queued reviews, oldest first, while fewer than
+/// `MAX_RUNNING` run.
+pub async fn start_queued(state: &Arc<State>) {
+    let _starting = STARTING.lock().await;
+    if let Err(e) = start_queued_locked(state).await {
+        tracing::warn!("can't start the queued reviews: {e:#}");
+    }
+}
+
+async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
+    let mut running = running(&state.db)?;
+    for review in state.db.queued_auto_reviews()? {
+        if running >= MAX_RUNNING {
+            break;
+        }
+        let key = &review.key;
+        let Some(detail) = state.db.pr(key)? else {
+            continue;
+        };
+        if detail.summary.state != "OPEN" {
+            let why = "The PR was closed before its review started.";
+            let ended = state.db.end_queued_auto_review(
+                review.id,
+                AutoReviewState::Cancelled,
+                Some(why),
+                agent::now(),
+            )?;
+            if ended {
+                state.send(ServerEvent::AutoReviewsChanged);
+            }
+            continue;
+        }
+        let Some(head) = synced_head(&detail) else {
+            continue;
+        };
+        let settings = state.db.repo_settings(&key.repo)?;
+        if !state.agents.offered(settings.review_backend).await {
+            continue;
+        }
+        let begun = state.db.begin_queued_auto_review(
+            review.id,
+            head,
+            &detail.summary.title,
+            &detail.summary.url,
+            agent::now(),
+        )?;
+        if begun && launch(state, review.id, key, head, &settings, &detail).await {
+            running += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Starts the review of `hit`. Returns whether it's running.
 async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &PrDetail) -> bool {
     let key = &hit.key;
@@ -288,6 +462,19 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
             return false;
         }
     };
+    launch(state, id, key, &hit.head_oid, settings, detail).await
+}
+
+/// Starts the session of the review `id` of `key` at `head`, which is
+/// recorded as running. Returns whether it's running.
+async fn launch(
+    state: &Arc<State>,
+    id: i64,
+    key: &PrKey,
+    head: &str,
+    settings: &RepoSettings,
+    detail: &PrDetail,
+) -> bool {
     // A pick the backend doesn't offer fails the review rather than
     // keep it waiting: the settings were checked when they were saved,
     // so this means the backend's models changed since.
@@ -309,12 +496,7 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
         state.send(ServerEvent::AutoReviewsChanged);
         return false;
     }
-    tracing::info!(
-        "{}#{}: starting a review of {}",
-        key.repo,
-        key.number,
-        hit.head_oid
-    );
+    tracing::info!("{}#{}: starting a review of {head}", key.repo, key.number);
     let req = NewAgent {
         backend: settings.review_backend,
         repo: key.repo.clone(),
@@ -489,6 +671,8 @@ pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus) {
             tracing::warn!("agent {id}: can't finish the review: {e:#}");
         }
         state.send(ServerEvent::AutoReviewsChanged);
+        // Its slot is free for a queued review.
+        start_queued(&state).await;
     });
 }
 
@@ -588,6 +772,7 @@ mod tests {
             url: "u".into(),
             head_oid: head.into(),
             state,
+            manual: false,
             session: None,
             status: None,
             started_at: 0,
@@ -1234,54 +1419,98 @@ sleep 30
     }
 
     #[test]
-    fn reviews_are_recorded_once_per_head() {
+    fn a_pr_has_one_review_queued_or_running() {
         let db = Db::in_memory();
         let key = PrKey {
             repo: "o/n".into(),
             number: 2,
         };
+        let other = PrKey {
+            repo: "o/n".into(),
+            number: 3,
+        };
         let id = db
             .start_auto_review(&key, "a", "t", "u", 10)
             .unwrap()
             .unwrap();
-        assert_eq!(db.start_auto_review(&key, "a", "t", "u", 11).unwrap(), None);
+        // Not while one runs, whichever commit.
+        assert_eq!(db.start_auto_review(&key, "b", "t", "u", 11).unwrap(), None);
+        assert_eq!(db.queue_auto_review(&key, "b", "t", "u", 11).unwrap(), None);
         assert!(
-            db.start_auto_review(&key, "b", "t", "u", 12)
+            db.queue_auto_review(&other, "c", "t", "u", 11)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(db.auto_reviews_of(&key).unwrap().len(), 2);
-
-        // A server that stopped during a review failed it; ending it again
-        // changes nothing.
-        db.interrupt_auto_reviews(20).unwrap();
-        db.finish_auto_review(id, AutoReviewState::Posted, None, 30)
+        // Once it ended, the same commit can be reviewed again.
+        db.finish_auto_review(id, AutoReviewState::Posted, None, 12)
             .unwrap();
-        let all = db.auto_reviews().unwrap();
-        assert!(all.iter().all(|r| r.state == AutoReviewState::Failed));
-        assert!(all.iter().all(|r| r.finished_at == Some(20)));
+        let queued = db
+            .queue_auto_review(&key, "a", "t", "u", 13)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.start_auto_review(&key, "a", "t", "u", 14).unwrap(), None);
+        let all = db.auto_reviews_of(&key).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].manual && !all[1].manual);
+        assert_eq!(all[0].state, AutoReviewState::Queued);
 
-        // Old rows without a session go.
-        assert!(!db.prune_auto_reviews(20).unwrap());
-        assert!(db.prune_auto_reviews(21).unwrap());
-        assert!(db.auto_reviews().unwrap().is_empty());
+        // The queue is oldest first, and a queued review starts at the
+        // commit it's given.
+        let order: Vec<_> = db
+            .queued_auto_reviews()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key.number)
+            .collect();
+        assert_eq!(order, [3, 2]);
+        assert!(
+            db.begin_queued_auto_review(queued, "z", "T", "U", 15)
+                .unwrap()
+        );
+        assert!(
+            !db.begin_queued_auto_review(queued, "z", "T", "U", 15)
+                .unwrap()
+        );
+        let r = db.auto_review(queued).unwrap().unwrap();
+        assert_eq!(
+            (r.state, r.head_oid.as_str(), r.title.as_str(), r.started_at),
+            (AutoReviewState::Running, "z", "T", 15)
+        );
+
+        // A server that stopped during a review failed it, but leaves the
+        // queue; ending it again changes nothing.
+        db.interrupt_auto_reviews(20).unwrap();
+        db.finish_auto_review(queued, AutoReviewState::Posted, None, 30)
+            .unwrap();
+        let r = db.auto_review(queued).unwrap().unwrap();
+        assert_eq!(
+            (r.state, r.finished_at),
+            (AutoReviewState::Failed, Some(20))
+        );
+        let left = db.queued_auto_reviews().unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(
+            db.end_queued_auto_review(left[0].id, AutoReviewState::Cancelled, None, 21)
+                .unwrap()
+        );
+        assert!(
+            !db.end_queued_auto_review(left[0].id, AutoReviewState::Cancelled, None, 21)
+                .unwrap()
+        );
+
+        // Old rows without a session go; a queued one isn't old.
+        db.queue_auto_review(&other, "d", "t", "u", 0)
+            .unwrap()
+            .unwrap();
+        assert!(db.prune_auto_reviews(25).unwrap());
+        let kept = db.auto_reviews().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].state, AutoReviewState::Queued);
     }
 
-    fn person(login: &str) -> Person {
-        Person {
-            login: Some(login.into()),
-            name: None,
-            avatar_url: None,
-        }
-    }
-
-    #[test]
-    fn what_counts_as_posted() {
-        let since = github::unix("2026-01-01T00:00:00Z").unwrap();
-        let mut d = detail(1, None);
-        assert!(!posted_since(&d, since));
-        let mut info = ReviewInfo {
-            viewer: "me".into(),
+    fn review_info(viewer: &str) -> ReviewInfo {
+        ReviewInfo {
+            viewer: viewer.into(),
             decision: None,
             reviews: vec![],
             requested: vec![],
@@ -1302,7 +1531,255 @@ sleep 30
                 queue: None,
                 stack: None,
             },
+        }
+    }
+
+    /// Stores PR `number` of the fixture's repository as synced at
+    /// `head`, opened by `author`, `pr_state`, with the viewer "me".
+    fn store_pr(state: &State, slug: &str, number: u64, head: &str, author: &str, pr_state: &str) {
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: PrKey {
+                        repo: slug.into(),
+                        number,
+                    },
+                    title: format!("PR {number}"),
+                    body: String::new(),
+                    author: author.into(),
+                    state: pr_state.into(),
+                    is_draft: false,
+                    queued: false,
+                    url: format!("u{number}"),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "main".into(),
+                    head_ref: "b".into(),
+                    head_oid: head.into(),
+                    ci: None,
+                    review: Some(review_info("me")),
+                    review_error: None,
+                },
+                &[Version {
+                    number: 1,
+                    sha: head.into(),
+                    merge_base: None,
+                    kind: VersionKind::Initial,
+                    pushed_at: None,
+                    pushed_by: None,
+                    pushed_by_is_guess: false,
+                    missing: false,
+                }],
+                &[],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+    }
+
+    const STALL: &str = "#!/bin/sh
+sleep 30
+";
+
+    /// A review asked for from the PR's page starts right away when
+    /// there's room, and the PR gets no other until it ends.
+    #[tokio::test]
+    async fn asking_for_a_review() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let key = PrKey {
+            repo: slug.clone(),
+            number: 2,
         };
+        store_pr(&state, &slug, 2, &head, "me", "OPEN");
+        // Settings that don't review the repository's PRs by themselves
+        // don't keep one from being asked for.
+        state
+            .db
+            .set_repo_settings(&slug, &settings(AutoReview::Off, false))
+            .unwrap();
+
+        let id = ask(&state, &key).await.unwrap().unwrap();
+        let review = state.db.auto_review(id).unwrap().unwrap();
+        assert_eq!(review.state, AutoReviewState::Running);
+        assert!(review.manual);
+        assert_eq!(review.head_oid, head);
+        let session = review.session.clone().unwrap();
+        assert_eq!(
+            state.db.agent(&session).unwrap().unwrap().kind,
+            SessionKind::AutoReview
+        );
+        assert_eq!(ask(&state, &key).await.unwrap(), Err(Refused::Busy));
+
+        // Cancelling it deletes its session; then the same commit can be
+        // reviewed again.
+        assert!(cancel(&state, id).await.unwrap());
+        assert!(state.db.agent(&session).unwrap().is_none());
+        let review = state.db.auto_review(id).unwrap().unwrap();
+        assert_eq!(review.state, AutoReviewState::Cancelled);
+        assert!(!cancel(&state, id).await.unwrap());
+        let again = ask(&state, &key).await.unwrap().unwrap();
+        let session = state
+            .db
+            .auto_review(again)
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        agent::delete(&state, &session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn what_cant_be_reviewed() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let pr = |number| PrKey {
+            repo: slug.clone(),
+            number,
+        };
+        store_pr(&state, &slug, 2, &head, "other", "OPEN");
+        store_pr(&state, &slug, 3, &head, "me", "MERGED");
+        assert_eq!(ask(&state, &pr(2)).await.unwrap(), Err(Refused::NotYours));
+        assert_eq!(ask(&state, &pr(3)).await.unwrap(), Err(Refused::NotOpen));
+        assert_eq!(ask(&state, &pr(4)).await.unwrap(), Err(Refused::NotSynced));
+        assert!(state.db.auto_reviews().unwrap().is_empty());
+
+        // Nor while the review's backend isn't offered.
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::agent::devin_tests::state_with_devin(&fx, dir.path(), dir.path().join("devin"));
+        store_pr(&state, &slug, 2, &head, "me", "OPEN");
+        state
+            .db
+            .set_repo_settings(
+                &slug,
+                &RepoSettings {
+                    review_backend: AgentBackend::Devin,
+                    ..RepoSettings::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ask(&state, &pr(2)).await.unwrap(),
+            Err(Refused::NotOffered("Devin"))
+        );
+    }
+
+    /// Beyond `MAX_RUNNING`, a review that's asked for waits, and starts
+    /// at the PR's head as of then once one of the others ends.
+    #[tokio::test]
+    async fn queued_reviews_wait_for_room() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let pr = |number| PrKey {
+            repo: slug.clone(),
+            number,
+        };
+        let busy: Vec<i64> = (10..10 + MAX_RUNNING as u64)
+            .map(|n| {
+                state
+                    .db
+                    .start_auto_review(&pr(n), "x", "t", "u", 1)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        store_pr(&state, &slug, 2, &head, "me", "OPEN");
+        store_pr(&state, &slug, 3, &head, "me", "OPEN");
+        let id = ask(&state, &pr(2)).await.unwrap().unwrap();
+        assert_eq!(
+            state.db.auto_review(id).unwrap().unwrap().state,
+            AutoReviewState::Queued
+        );
+        // A queued review is the PR's one review too.
+        assert_eq!(ask(&state, &pr(2)).await.unwrap(), Err(Refused::Busy));
+        // One asked for at a commit that's no longer the head starts at
+        // the head; a closed PR's is cancelled.
+        let stale = state
+            .db
+            .queue_auto_review(&pr(3), "old", "t", "u", 2)
+            .unwrap()
+            .unwrap();
+        store_pr(&state, &slug, 4, &head, "me", "CLOSED");
+        let closed = state
+            .db
+            .queue_auto_review(&pr(4), "old", "t", "u", 3)
+            .unwrap()
+            .unwrap();
+
+        start_queued(&state).await;
+        assert_eq!(state.db.queued_auto_reviews().unwrap().len(), 3);
+
+        // Two slots free up: the oldest two queued go, the closed PR's
+        // review is dropped.
+        for &b in &busy[..2] {
+            state
+                .db
+                .finish_auto_review(b, AutoReviewState::Posted, None, 5)
+                .unwrap();
+        }
+        start_queued(&state).await;
+        assert!(state.db.queued_auto_reviews().unwrap().is_empty());
+        for started in [id, stale] {
+            let r = state.db.auto_review(started).unwrap().unwrap();
+            assert_eq!(r.state, AutoReviewState::Running, "{r:?}");
+            assert_eq!(r.head_oid, head);
+            agent::delete(&state, &r.session.unwrap()).await.unwrap();
+        }
+        let r = state.db.auto_review(closed).unwrap().unwrap();
+        assert_eq!(r.state, AutoReviewState::Cancelled);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("The PR was closed before its review started.")
+        );
+    }
+
+    /// A queued review can be cancelled before it starts.
+    #[tokio::test]
+    async fn cancelling_a_queued_review() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let key = PrKey {
+            repo: fx.clone.slug.clone(),
+            number: 2,
+        };
+        let id = state
+            .db
+            .queue_auto_review(&key, "a", "t", "u", 1)
+            .unwrap()
+            .unwrap();
+        assert!(cancel(&state, id).await.unwrap());
+        let r = state.db.auto_review(id).unwrap().unwrap();
+        assert_eq!(r.state, AutoReviewState::Cancelled);
+        assert!(r.finished_at.is_some());
+    }
+
+    fn person(login: &str) -> Person {
+        Person {
+            login: Some(login.into()),
+            name: None,
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn what_counts_as_posted() {
+        let since = github::unix("2026-01-01T00:00:00Z").unwrap();
+        let mut d = detail(1, None);
+        assert!(!posted_since(&d, since));
+        let mut info = review_info("me");
         // Someone else's review, or the viewer's from before, don't count.
         info.reviews.push(Review {
             author: person("other"),
