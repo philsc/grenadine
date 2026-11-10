@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use grenadine_core::api::{ServerEvent, SessionKind};
+use grenadine_core::api::{AgentStatus, ServerEvent, SessionKind};
 
 use crate::sync::State;
 
@@ -58,7 +58,9 @@ impl Unstaged {
 
 /// Recounts one session's worktree, returning whether its count changed.
 /// Unknown and non-interactive sessions keep their count, as do sessions
-/// whose count git fails on; a missing worktree or repository counts 0.
+/// whose count git fails on; a missing worktree or repository counts 0,
+/// as does a worktree still being created, where the half-written
+/// checkout isn't meaningful yet.
 pub async fn recount(state: &State, id: &str) -> bool {
     let session = match state.db.agent(id) {
         Ok(Some(s)) => s,
@@ -72,6 +74,7 @@ pub async fn recount(state: &State, id: &str) -> bool {
         return false;
     }
     let count = match state.repo(&session.repo) {
+        _ if session.status == AgentStatus::Creating => 0,
         Some(repo) if std::path::Path::new(&session.worktree).is_dir() => {
             let worktree = session.worktree.clone();
             match tokio::task::spawn_blocking(move || {
