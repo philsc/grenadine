@@ -12,6 +12,7 @@ WEB_FILES = {
     "GRENADINE_STYLE_CSS": "//grenadine/web:static/style.css",
     "GRENADINE_FAVICON_SVG": "//grenadine/web:static/favicon.svg",
     "GRENADINE_WEB_JS": "//grenadine/web:grenadine_web.js",
+    "GRENADINE_HIGHLIGHT_WORKER_JS": "//grenadine/web:static/highlight_worker.js",
     "GRENADINE_WEB_WASM": "//grenadine/web:grenadine_web_bg.wasm",
     "GRENADINE_XTERM_JS": "//grenadine/web:xterm.js",
     "GRENADINE_XTERM_CSS": "//grenadine/web:xterm.css",

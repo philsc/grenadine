@@ -21,7 +21,7 @@ use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
-use crate::highlight::{self, Highlighted, highlight_lines, mark, plain_lines};
+use crate::highlight::{self, Highlighted, mark, plain_lines};
 use crate::inboxes::load_flag;
 use crate::pr::{Anchor, Placed, ThreadView, range_label};
 
@@ -1088,9 +1088,9 @@ impl SideLines {
         });
     }
 
-    /// The lines' HTML: highlighted if ready, plain otherwise.
+    /// The lines' HTML: highlighted if ready, plain otherwise; tracked.
     fn html(&self) -> Vec<String> {
-        match self.lines.get_untracked() {
+        match self.lines.get() {
             Some(h) => (*h).clone(),
             None => plain_lines(text(&self.blob).unwrap_or_default()),
         }
@@ -1463,17 +1463,30 @@ pub fn EditDiff(path: String, fragments: Vec<Fragment>) -> impl IntoView {
     view! {
         <div class="edit-diff">
             {fragments.iter().map(|f| {
-                let l = Layout {
-                    old_start: f.old_start,
-                    new_start: f.new_start,
-                    ..layout(
-                        Arc::new(shape_texts(&f.old, &f.new)),
-                        &[],
-                        highlight_lines(&path, &f.old),
-                        highlight_lines(&path, &f.new),
-                    )
+                let f = f.clone();
+                let side = |text: &str| {
+                    Some(Arc::new(Blob {
+                        text: Some(text.to_owned()),
+                        size: text.len() as u64,
+                    }))
                 };
-                unified_view(&l, &[], &[], inline_changes, None, None)
+                let old_lines = SideLines::new(&path, &None, &side(&f.old), true);
+                let new_lines = SideLines::new(&path, &None, &side(&f.new), true);
+                // Laid out plain first and again once the highlighting is
+                // in, which `html` tracks.
+                move || {
+                    let l = Layout {
+                        old_start: f.old_start,
+                        new_start: f.new_start,
+                        ..layout(
+                            Arc::new(shape_texts(&f.old, &f.new)),
+                            &[],
+                            old_lines.html(),
+                            new_lines.html(),
+                        )
+                    };
+                    unified_view(&l, &[], &[], inline_changes, None, None)
+                }
             }).collect_view()}
         </div>
     }
