@@ -599,8 +599,10 @@ if mode == "plan":
     with open(name, "w") as f:
         f.write(decision["updatedPermissions"][0]["mode"])
 # A review of a PR posts a comment on it, as `gh` would, unless the PR
-# asks it not to.
+# asks it not to. A "Slow" PR's review takes long enough to watch it run.
 review = re.search(r"Review pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
+if review and "Slow" in review[1]:
+    time.sleep(60)
 if review and "Quiet" not in review[1]:
     request = urllib.request.Request(
         f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
@@ -7154,7 +7156,15 @@ class AutoReviewTest(ServerTestCase):
     QUIET_REPO = "test/quiet"
     OFF_REPO = "test/off"
     DEVIN_REPO = "test/devin"
-    REPOS: ClassVar[list[str]] = [scenarios.REPO, QUIET_REPO, OFF_REPO, DEVIN_REPO]
+    # Reviews are only asked for from the PRs' pages.
+    MANUAL_REPO = "test/manual"
+    REPOS: ClassVar[list[str]] = [
+        scenarios.REPO,
+        QUIET_REPO,
+        OFF_REPO,
+        DEVIN_REPO,
+        MANUAL_REPO,
+    ]
     POLL_INTERVAL: ClassVar[int] = 1
 
     @classmethod
@@ -7166,13 +7176,136 @@ class AutoReviewTest(ServerTestCase):
             repo.commit("Seed", {"README": "hello\n"})
             repo.push("main")
 
-    def open_pr(self, slug: str, title: str) -> Any:
+    def open_pr(self, slug: str, title: str, author: str = scenarios.VIEWER) -> Any:
         repo = self.gh.repo(slug)
         branch = re.sub(r"\W+", "-", title).lower()
         repo.checkout(branch, "main")
         repo.commit(title, {f"{branch}.txt": title})
         repo.push(branch)
-        return repo.open_pr(title, head=branch)
+        return repo.open_pr(title, head=branch, author=author)
+
+    def turn_off_reviews(self, slug: str) -> None:
+        dialog = self.settings(slug)
+        dialog.get_by_label("Review my pull requests").select_option(label="Never")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+
+    def sidebar(self) -> Locator:
+        return self.page.locator(".pr-sidebar")
+
+    def auto_review_box(self) -> Locator:
+        return self.sidebar().locator(".auto-review-box")
+
+    def api(self, method: str, path: str) -> Any:
+        # From the page, since the server takes writes only from its own.
+        return self.page.evaluate(
+            """async ([method, path]) => {
+              const r = await fetch(path, {method});
+              const json = (r.headers.get("content-type") || "").includes("json");
+              return {status: r.status, body: json ? await r.json() : await r.text()};
+            }""",
+            [method, path],
+        )
+
+    def test_a_review_asked_for_from_the_pr_page(self) -> None:
+        self.turn_off_reviews(self.MANUAL_REPO)
+        pr = self.open_pr(self.MANUAL_REPO, "Slow manual change")
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{pr.number}")
+        box = self.auto_review_box()
+        expect(box.locator("h2")).to_have_text("Auto-review")
+        # Right under the merge box.
+        expect(
+            self.sidebar().locator(".pr-sidebar-body > section").nth(1)
+        ).to_have_class(re.compile(r"\bauto-review-box\b"))
+        expect(box).to_contain_text("Not reviewed yet.")
+        box.get_by_role("button", name="Review now").click()
+
+        # While it runs there's no starting another, only watching or
+        # cancelling it.
+        expect(box.locator(".agent-status")).to_have_text("working…")
+        expect(box.get_by_role("button", name=re.compile("Review"))).to_have_count(0)
+        expect(box.get_by_role("link", name="Open session")).to_have_attribute(
+            "href", re.compile(r"^#/auto-reviews/[0-9a-f-]{36}$")
+        )
+        conflict = self.api(
+            "POST", f"/api/pr/{self.MANUAL_REPO}/{pr.number}/auto-reviews"
+        )
+        self.assertEqual(conflict["status"], 409)
+        # The Auto-reviews tab marks it as asked for.
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        entry = self.review_entry("Slow manual change")
+        expect(entry).to_contain_text("asked for")
+        self.page.go_back()
+
+        box.get_by_role("button", name="Cancel").click()
+        expect(box.locator(".agent-status")).to_have_text("cancelled")
+        self.assertEqual(pr.issue_comments, [])
+
+        # The same commit can be reviewed again.
+        other = self.open_pr(self.MANUAL_REPO, "Manual change")
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{other.number}")
+        box.get_by_role("button", name="Review now").click()
+        expect(box.locator(".agent-status")).to_have_text("posted", timeout=60_000)
+        self.assertEqual([c.body for c in other.issue_comments], ["Looks good."])
+        box.get_by_role("button", name="Review again").click()
+        deadline = time.monotonic() + 60
+        while len(other.issue_comments) < 2:
+            self.assertLess(time.monotonic(), deadline, "the second review didn't post")
+            time.sleep(0.2)
+        # Its page shows the second review once it's recorded as posted.
+        with urllib.request.urlopen(
+            f"{self.url}api/pr/{self.MANUAL_REPO}/{other.number}/auto-reviews"
+        ) as resp:
+            self.assertEqual(len(json.load(resp)), 2)
+        expect(box.get_by_role("button", name="Review again")).to_be_visible(
+            timeout=60_000
+        )
+        expect(box.locator(".agent-status")).to_have_text("posted")
+
+    def test_only_your_open_prs_have_the_section(self) -> None:
+        theirs = self.open_pr(self.OFF_REPO, "Their change", author=scenarios.OTHER)
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{self.OFF_REPO}/{theirs.number}")
+        expect(self.sidebar().get_by_role("heading", name="Reviewers")).to_be_visible()
+        expect(self.auto_review_box()).to_have_count(0)
+        refused = self.api(
+            "POST", f"/api/pr/{self.OFF_REPO}/{theirs.number}/auto-reviews"
+        )
+        self.assertEqual(refused["status"], 403)
+
+    def test_reviews_beyond_the_limit_are_queued(self) -> None:
+        self.turn_off_reviews(self.MANUAL_REPO)
+        # Reviews left running by earlier tests would take up room.
+        deadline = time.monotonic() + 60
+        while any(
+            r["state"] in {"queued", "running"}
+            for r in self.api("GET", "/api/auto-reviews")["body"]
+        ):
+            self.assertLess(time.monotonic(), deadline, "reviews are still running")
+            time.sleep(0.5)
+        prs = [self.open_pr(self.MANUAL_REPO, f"Slow queued {i}") for i in range(4)]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        box = self.auto_review_box()
+        for pr in prs:
+            self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{pr.number}")
+            box.get_by_role("button", name="Review now").click()
+            expect(box.get_by_role("button", name="Cancel")).to_be_visible()
+        # The fourth waits for one of the three running.
+        expect(box.locator(".agent-status")).to_have_text("queued")
+        expect(box).to_contain_text("Waits for one of the running reviews to end.")
+        expect(box.get_by_role("link", name="Open session")).to_have_count(0)
+
+        # Cancelling a running one starts it.
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{prs[0].number}")
+        box.get_by_role("button", name="Cancel").click()
+        expect(box.locator(".agent-status")).to_have_text("cancelled")
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{prs[3].number}")
+        expect(box.locator(".agent-status")).to_have_text("working…", timeout=10_000)
+        for pr in prs[1:]:
+            self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{pr.number}")
+            box.get_by_role("button", name="Cancel").click()
+            expect(box.locator(".agent-status")).to_have_text("cancelled")
 
     def review_entry(self, title: str) -> Locator:
         return self.page.locator(".agent-entry").filter(has_text=title)

@@ -1903,6 +1903,8 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     state.send(ServerEvent::AgentsChanged);
     if reviewing {
         state.send(ServerEvent::AutoReviewsChanged);
+        // If it was running, its slot is free for a queued review.
+        crate::auto_review::kick(state);
     }
     // A review only reads its worktree, so it leaves nothing behind.
     if known && !reviewing {

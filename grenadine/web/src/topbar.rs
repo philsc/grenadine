@@ -101,7 +101,8 @@ fn reviews_waiting(reviews: &[AutoReviewEntry]) -> usize {
             r.session.is_some()
                 && match r.state {
                     AutoReviewState::Unposted | AutoReviewState::Failed => true,
-                    AutoReviewState::Running
+                    AutoReviewState::Queued
+                    | AutoReviewState::Running
                     | AutoReviewState::Posted
                     | AutoReviewState::Cancelled => false,
                 }
@@ -362,6 +363,7 @@ mod tests {
             url: "u".into(),
             head_oid: "h".into(),
             state,
+            manual: false,
             session: Some("s".into()),
             status: None,
             started_at: 0,
@@ -378,6 +380,7 @@ mod tests {
             assert_eq!(reviews_waiting(&[review(state)]), 1, "{state:?}");
         }
         for state in [
+            AutoReviewState::Queued,
             AutoReviewState::Running,
             AutoReviewState::Posted,
             AutoReviewState::Cancelled,

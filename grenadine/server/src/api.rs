@@ -106,6 +106,10 @@ fn api_routes() -> Router<Arc<State>> {
         )
         .route("/api/pr/{owner}/{name}/{number}/agents", get(pr_agents))
         .route(
+            "/api/pr/{owner}/{name}/{number}/auto-reviews",
+            get(pr_auto_reviews).post(ask_auto_review),
+        )
+        .route(
             "/api/pr/{owner}/{name}/{number}/queue",
             post(enqueue).delete(dequeue),
         )
@@ -133,6 +137,10 @@ fn api_routes() -> Router<Arc<State>> {
             get(repo_settings).put(set_repo_settings),
         )
         .route("/api/auto-reviews", get(auto_reviews))
+        .route(
+            "/api/auto-reviews/{id}",
+            axum::routing::delete(cancel_auto_review),
+        )
         .route(
             "/api/agents",
             get(agents)
@@ -1039,6 +1047,50 @@ async fn set_repo_settings(
 
 async fn auto_reviews(AxState(state): St) -> ApiResult<Json<Vec<AutoReviewEntry>>> {
     Ok(Json(state.db.auto_reviews()?))
+}
+
+/// The PR's auto-reviews, newest first.
+async fn pr_auto_reviews(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Json<Vec<AutoReviewEntry>>> {
+    let key = PrKey {
+        repo: format!("{owner}/{name}"),
+        number,
+    };
+    Ok(Json(state.db.auto_reviews_of(&key)?))
+}
+
+/// Queues a review of the PR, which starts as soon as there's room.
+async fn ask_auto_review(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    match auto_review::ask(&state, &key).await? {
+        Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(why) => {
+            let status = match why {
+                auto_review::Refused::NotYours => StatusCode::FORBIDDEN,
+                _ => StatusCode::CONFLICT,
+            };
+            Err(refuse(status, why.to_string()))
+        }
+    }
+}
+
+/// Cancels a queued or running review.
+async fn cancel_auto_review(AxState(state): St, Path(id): Path<i64>) -> ApiResult<Response> {
+    if state.db.auto_review(id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    if !auto_review::cancel(&state, id).await? {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "the review isn't queued or running".into(),
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn agents(AxState(state): St) -> ApiResult<Json<Vec<AgentSession>>> {
