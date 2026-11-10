@@ -1279,7 +1279,7 @@ class FakeGitHubTest(unittest.TestCase):
                 pullRequest(number: $number) {
                   author { login }
                   viewerCanUpdate
-                  suggestedReviewers { nodes { reviewer { login } } }
+                  suggestedReviewers { reviewer { login } }
                 }
                 assignableUsers(query: $q, first: 20) { nodes { login } }
               }
@@ -1296,7 +1296,7 @@ class FakeGitHubTest(unittest.TestCase):
         repo = data["repository"]
         self.assertTrue(repo["pullRequest"]["viewerCanUpdate"])
         self.assertEqual(
-            repo["pullRequest"]["suggestedReviewers"]["nodes"],
+            repo["pullRequest"]["suggestedReviewers"],
             [{"reviewer": {"login": "other"}}],
         )
         self.assertEqual(
