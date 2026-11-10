@@ -3,7 +3,7 @@
 //! back, or a reload, until its session starts or it's discarded. The
 //! draft's images are kept in IndexedDB (see `image_drafts`).
 
-use grenadine_core::api::{AgentBackend, GENERAL, PermissionMode};
+use grenadine_core::api::{AgentBackend, GENERAL, NewAgent, PermissionMode};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,24 @@ pub fn hash(id: &str) -> String {
     format!("#/agents/draft/{id}")
 }
 
+/// What the ids of the drafts that hold an agent's handoff proposal
+/// start with.
+const HANDOFF: &str = "handoff";
+
+/// The id of the draft that holds the proposal of the handoff request
+/// `tool`. Draft ids are alphanumeric.
+pub fn handoff_id(tool: &str) -> String {
+    let tool: String = tool.chars().filter(char::is_ascii_alphanumeric).collect();
+    let tool = tool.strip_prefix(HANDOFF).unwrap_or(&tool);
+    format!("{HANDOFF}{tool}")
+}
+
+/// Whether the draft `id` holds a handoff proposal, which shows in its
+/// request's card rather than as a draft of its own.
+fn is_handoff(id: &str) -> bool {
+    id.starts_with(HANDOFF)
+}
+
 /// The drafts worth keeping when the page loads: the blank ones were left
 /// behind by forms that were never written in, except the one that's open.
 fn prune(list: Vec<Draft>, open: Option<&str>) -> Vec<Draft> {
@@ -61,7 +79,11 @@ fn prune(list: Vec<Draft>, open: Option<&str>) -> Vec<Draft> {
 pub fn listed(list: &[Draft], open: Option<&str>) -> Vec<(String, String)> {
     let mut shown: Vec<&Draft> = list
         .iter()
-        .filter(|d| !d.repo.is_empty() && (!d.is_blank() || Some(d.id.as_str()) == open))
+        .filter(|d| {
+            !d.repo.is_empty()
+                && !is_handoff(&d.id)
+                && (!d.is_blank() || Some(d.id.as_str()) == open)
+        })
         .collect();
     shown.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
     shown
@@ -74,7 +96,7 @@ pub fn listed(list: &[Draft], open: Option<&str>) -> Vec<(String, String)> {
 /// `list` has one.
 fn find(list: &[Draft], repo: &str, pr: &str) -> Option<String> {
     list.iter()
-        .filter(|d| d.repo == repo && d.pr == pr)
+        .filter(|d| d.repo == repo && d.pr == pr && !is_handoff(&d.id))
         .max_by(|a, b| a.created_at.total_cmp(&b.created_at))
         .map(|d| d.id.clone())
 }
@@ -167,6 +189,32 @@ impl Drafts {
         };
         self.list.update(|list| list.push(d.clone()));
         d
+    }
+
+    /// Makes the draft `id` hold `req`, an agent's proposal, unless there
+    /// is one already, e.g. with the user's edits from before a reload.
+    pub fn seed(self, id: &str, req: &NewAgent) {
+        if self.contains(id) {
+            return;
+        }
+        let d = Draft {
+            id: id.to_owned(),
+            repo: req.repo.clone(),
+            pr: req.pr.map(|n| n.to_string()).unwrap_or_default(),
+            prompt: req.prompt.clone(),
+            has_images: false,
+            backend: req.backend,
+            mode: req.permission_mode.clone(),
+            // The agent picked it, so it doesn't follow the repository's
+            // default.
+            mode_picked: true,
+            model: req
+                .model
+                .clone()
+                .unwrap_or_else(|| crate::agents::DEFAULT_MODEL.to_owned()),
+            created_at: js_sys::Date::now(),
+        };
+        self.list.update(|list| list.push(d));
     }
 
     /// Whether there is a draft `id`, untracked: callers that react to
@@ -306,6 +354,22 @@ mod tests {
         assert_eq!(find(&list, "o/n", "8"), Some("c".into()));
         assert_eq!(find(&list, "o/m", "7"), Some("d".into()));
         assert_eq!(find(&list, "o/n", "9"), None);
+    }
+
+    #[test]
+    fn handoff_ids_are_alphanumeric() {
+        assert_eq!(handoff_id("handoff-0123abcd"), "handoff0123abcd");
+        assert!(is_handoff(&handoff_id("handoff-0123abcd")));
+        assert!(!is_handoff("18f0a1b2c3d4e5f6"));
+    }
+
+    #[test]
+    fn leaves_handoff_proposals_out() {
+        let mut proposal = draft(&handoff_id("handoff-01"), "o/n", "one", 2.0);
+        proposal.pr = "7".into();
+        let list = vec![draft("a", "o/n", "two", 1.0), proposal];
+        assert_eq!(listed(&list, None), [("o/n".to_owned(), "a".to_owned())]);
+        assert_eq!(find(&list, "o/n", "7"), None);
     }
 
     #[test]

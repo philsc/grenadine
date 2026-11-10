@@ -135,6 +135,8 @@ pub struct Decision {
     pub option: Option<String>,
     /// The answers to `AskUserQuestion`, by question.
     pub answers: Option<BTreeMap<String, Vec<String>>>,
+    /// For `handoff`: the session to start, as the user edited it.
+    pub handoff: Option<NewAgent>,
 }
 
 /// An agent backend: what runs sessions' turns and background jobs.
@@ -1125,35 +1127,31 @@ pub fn set_status(state: &State, id: &str, status: AgentStatus) {
 /// Creates the session's worktree, or a plain directory for a general
 /// session, and starts working on its first prompt.
 pub async fn create(state: &Arc<State>, req: NewAgent) -> Result<AgentSession> {
-    create_session(state, req, SessionKind::Interactive, None).await
+    create_session(state, req, SessionKind::Interactive, None, None).await
 }
 
 /// Creates a session as `create` does, of `kind`, titled `title` or
-/// else after its first prompt. Only interactive sessions get a summary
+/// else after its first prompt, and handed off from the session
+/// `handed_off_from` if given. Only interactive sessions get a summary
 /// of their prompt.
 pub async fn create_session(
     state: &Arc<State>,
     req: NewAgent,
     kind: SessionKind,
     title: Option<String>,
+    handed_off_from: Option<&str>,
 ) -> Result<AgentSession> {
     if req.prompt.trim().is_empty() {
         bail!("the prompt is empty");
     }
     let id = uuid();
     let worktree = state.agents.worktrees.join(&req.repo).join(&id);
+    // Checked now so these still fail on the form; the fetch and worktree
+    // add happen when the first turn runs, under `Creating`.
+    check_start(state, &req.repo, req.pr)?;
     let (branch, status) = if req.repo == GENERAL {
-        if req.pr.is_some() {
-            bail!("a general session can't start from a PR");
-        }
         (String::new(), AgentStatus::Idle)
     } else {
-        // Checked now so these still fail on the form; the fetch and
-        // worktree add happen when the first turn runs, under `Creating`.
-        if !state.repos.contains_key(&req.repo) {
-            bail!("{} is not a configured repository", req.repo);
-        }
-        pr_head(state, &req.repo, req.pr)?;
         (session_branch(&id), AgentStatus::Creating)
     };
 
@@ -1179,6 +1177,7 @@ pub async fn create_session(
         unstaged: 0,
         kind,
         draft: req.draft.clone(),
+        handed_off_from: handed_off_from.map(str::to_owned),
     };
     // A second start with the same draft returns the first one's session.
     if let Some(d) = &req.draft
@@ -1218,6 +1217,22 @@ pub async fn create_session(
         req.model,
     );
     Ok(session)
+}
+
+/// Fails unless a session can start in `repo`, from `pr` if given: a
+/// configured repository, or `GENERAL` without a PR.
+pub fn check_start(state: &State, repo: &str, pr: Option<u64>) -> Result<()> {
+    if repo == GENERAL {
+        if pr.is_some() {
+            bail!("a general session can't start from a PR");
+        }
+        return Ok(());
+    }
+    if !state.repos.contains_key(repo) {
+        bail!("{repo} is not a configured repository");
+    }
+    pr_head(state, repo, pr)?;
+    Ok(())
 }
 
 /// Makes a session that starts from a PR with a linear chain of open PRs
@@ -2082,6 +2097,18 @@ impl Drop for Landing {
             l.landing = false;
         }
     }
+}
+
+/// The mode and model the session's running turn goes with; `None`
+/// between turns.
+pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<String>)> {
+    state.agents.with_live(id, |l| l.turn.clone())
+}
+
+/// Makes `turn_settings` say `turn`, as a running turn would.
+#[cfg(test)]
+pub fn set_turn_settings(state: &State, id: &str, turn: (PermissionMode, Option<String>)) {
+    state.agents.with_live(id, |l| l.turn = Some(turn));
 }
 
 /// Marks the session's work as landing and returns the guard clearing the
@@ -3770,6 +3797,16 @@ fn images_note() -> String {
         .into()
 }
 
+/// What agents are told about handing work off to a new session. An
+/// unattended review can't hand anything off.
+fn handoff_note(session: &AgentSession) -> Option<String> {
+    (session.kind != SessionKind::AutoReview).then(|| {
+        "To hand work off to a new agent session with a fresh context, e.g. a follow-up task \
+         the user asks to have done separately, call the grenadine MCP server's handoff tool."
+            .into()
+    })
+}
+
 /// What Claude is told about the session's terminal tabs, when it has any.
 fn terminals_note(state: &State, id: &str) -> Option<String> {
     let open = state.agents.terminals.list(id);
@@ -3844,6 +3881,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         landed_note(&session),
         terminals_note(state, id),
         Some(images_note()),
+        handoff_note(&session),
     ]
     .into_iter()
     .flatten()
@@ -4773,7 +4811,8 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
                  mcp__grenadine__wait_for_terminal mcp__grenadine__show_image \
                  mcp__grenadine__update_prs mcp__grenadine__land_on_checkout \
-                 mcp__grenadine__session_pr mcp__grenadine__manage_prs --mcp-config "
+                 mcp__grenadine__session_pr mcp__grenadine__manage_prs mcp__grenadine__handoff \
+                 --mcp-config "
             ),
             "{log}"
         );
@@ -7785,6 +7824,19 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     fn tells_agents_about_showing_images() {
         let note = images_note();
         assert!(note.contains("show_image"), "{note}");
+    }
+
+    /// Sessions are told about the handoff tool, except unattended
+    /// reviews, which can't use it.
+    #[test]
+    fn tells_agents_about_handing_off() {
+        let session = |kind| AgentSession {
+            kind,
+            ..session_row("abcdef01-2345", "o/n", Path::new("/w"))
+        };
+        let note = handoff_note(&session(SessionKind::Interactive)).unwrap();
+        assert!(note.contains("handoff"), "{note}");
+        assert_eq!(handoff_note(&session(SessionKind::AutoReview)), None);
     }
 
     /// A version of a stored PR, in the shape `store_sync` takes.
