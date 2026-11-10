@@ -421,6 +421,9 @@ const MIGRATIONS: &[Migration] = &[
     // Installs the default filters that count only human reviews as
     // active.
     Migration::ResetInboxes,
+    // Installs the default filters that don't count a reviewer's
+    // approval as returning the PR.
+    Migration::ResetInboxes,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in

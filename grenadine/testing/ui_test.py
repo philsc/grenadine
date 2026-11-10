@@ -1126,6 +1126,7 @@ class InboxTest(ServerTestCase):
         self.page.goto(self.url)
         expect(self.inbox(scenarios.RETURNED).locator(".pr-title")).to_have_text(
             [
+                re.compile("Get a comment over an approval$"),
                 re.compile("Get a comment-only review$"),
                 re.compile("Get changes requested$"),
             ]
@@ -1136,7 +1137,11 @@ class InboxTest(ServerTestCase):
         self.page.goto(self.url)
         self.expect_titles(
             self.inbox(scenarios.RETURNED),
-            ["Get a comment-only review", "Get changes requested"],
+            [
+                "Get a comment over an approval",
+                "Get a comment-only review",
+                "Get changes requested",
+            ],
         )
         # Re-requesting the reviewer's review takes his review out of
         # "active", so the PR goes back to Waiting for reviewers.
@@ -1153,38 +1158,46 @@ class InboxTest(ServerTestCase):
                 "Wait for reviewers",
                 scenarios.STACK_BASE,
                 scenarios.STACK_TOP,
+                "Get one of two approvals",
                 "Get only a bot's comment",
                 "Get a comment-only review",
             ],
         )
-        self.expect_titles(self.inbox(scenarios.RETURNED), ["Get changes requested"])
+        self.expect_titles(
+            self.inbox(scenarios.RETURNED),
+            ["Get a comment over an approval", "Get changes requested"],
+        )
         # Put it back how it was, in the fake and in the database, so
         # later tests see the scenario's state.
         pr.review_requests.discard(scenarios.OTHER)
         self.refresh()
         self.expect_titles(
             self.inbox(scenarios.RETURNED),
-            ["Get a comment-only review", "Get changes requested"],
+            [
+                "Get a comment over an approval",
+                "Get a comment-only review",
+                "Get changes requested",
+            ],
         )
 
     def test_total_badge_counts_distinct_prs(self) -> None:
         self.page.goto(self.url)
         tab = self.page.locator(".topbar-tabs a").filter(has_text="Inboxes")
-        # Needs your review (1), Returned (2) and Approved (1) count in
+        # Needs your review (1), Returned (3) and Approved (1) count in
         # the total.
-        expect(tab.locator(".count")).to_have_text("4")
-        expect(self.page).to_have_title("(4) grenadine")
+        expect(tab.locator(".count")).to_have_text("5")
+        expect(self.page).to_have_title("(5) grenadine")
         # A counted inbox overlapping them counts its PRs once.
         self.add_inbox("Mine too", "state:open author:@me", counted=True)
-        expect(tab.locator(".count")).to_have_text("10")
-        expect(self.page).to_have_title("(10) grenadine")
+        expect(tab.locator(".count")).to_have_text("12")
+        expect(self.page).to_have_title("(12) grenadine")
 
     def test_count_in_total_survives_reorder(self) -> None:
         self.page.goto(self.url)
         inbox = self.add_inbox("Counted", "state:open author:@me", counted=True)
         inbox.locator(".inbox-header").hover()
         inbox.get_by_title("Move up").click()
-        expect(inbox.locator(".count")).to_have_text("9")
+        expect(inbox.locator(".count")).to_have_text("11")
 
         with urllib.request.urlopen(f"{self.url}api/inboxes") as resp:
             [saved] = [
