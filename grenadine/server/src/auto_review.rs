@@ -327,7 +327,7 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
     };
     let title = format!("Review #{}: {}", key.number, detail.summary.title);
     let (running, recorded) =
-        match agent::create_session(state, req, SessionKind::AutoReview, Some(title)).await {
+        match agent::create_session(state, req, SessionKind::AutoReview, Some(title), None).await {
             Ok(session) => (true, state.db.set_auto_review_session(id, &session.id)),
             Err(e) => {
                 tracing::warn!("{}#{}: can't start a review: {e:#}", key.repo, key.number);
@@ -888,7 +888,7 @@ mod tests {
             draft: None,
         };
         let title = Some("Review #2: t".to_owned());
-        let session = agent::create_session(&state, req, SessionKind::AutoReview, title)
+        let session = agent::create_session(&state, req, SessionKind::AutoReview, title, None)
             .await
             .unwrap();
         assert_eq!(session.title, "Review #2: t");
@@ -1048,7 +1048,7 @@ sleep 30
             draft: None,
         };
         let title = Some("Review #2: t".to_owned());
-        let session = agent::create_session(&state, req, SessionKind::AutoReview, title)
+        let session = agent::create_session(&state, req, SessionKind::AutoReview, title, None)
             .await
             .unwrap();
         state

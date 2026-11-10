@@ -424,6 +424,13 @@ const MIGRATIONS: &[Migration] = &[
     // Installs the default filters that don't count a reviewer's
     // approval as returning the PR.
     Migration::ResetInboxes,
+    Migration::Sql(
+        r#"
+    -- The session whose agent handed this one off with its handoff tool;
+    -- NULL for the others. It may name a session that's gone.
+    ALTER TABLE agents ADD COLUMN handed_off_from TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1361,8 +1368,8 @@ impl Db {
             "INSERT INTO agents
                 (id, backend, repo, pr_number, title, branch, worktree, base_sha, status,
                  cost, cost_unit, context_tokens, context_window, model, created_at, kind,
-                 draft_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 draft_id, handed_off_from)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -1380,7 +1387,8 @@ impl Db {
                 a.model,
                 a.created_at,
                 a.kind.as_str(),
-                a.draft
+                a.draft,
+                a.handed_off_from
             ],
         )?;
         if let Some(number) = a.pr {
@@ -2067,7 +2075,7 @@ const AGENT_COLUMNS: &str = "id, backend, repo, pr_number, title, branch, worktr
      (SELECT COUNT(*) FROM agent_prs p \
       WHERE p.agent_id = agents.id AND p.state = 'OPEN' AND NOT p.conflicting \
       AND NOT p.queued AND p.ci = 'failing'), \
-     kind, draft_id";
+     kind, draft_id, handed_off_from";
 
 /// The session in `r`, and whether this build knows its backend and cost
 /// unit; unknown ones read as the defaults.
@@ -2105,6 +2113,7 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
         unstaged: 0,
         kind: SessionKind::parse(&r.get::<_, String>(22)?),
         draft: r.get(23)?,
+        handed_off_from: r.get(24)?,
     };
     Ok((session, known))
 }
@@ -3400,6 +3409,23 @@ mod tests {
         // A session that started on the trunk has none.
         assert!(db.agent_pr_list("b").unwrap().is_empty());
         assert_eq!(db.agent("b").unwrap().unwrap().prs, None);
+    }
+
+    /// A session remembers the session that handed it off.
+    #[test]
+    fn agents_keep_who_handed_them_off() {
+        let db = Db::in_memory();
+        db.create_agent(&agent("a", AgentStatus::Idle)).unwrap();
+        db.create_agent(&AgentSession {
+            handed_off_from: Some("a".into()),
+            ..agent("b", AgentStatus::Idle)
+        })
+        .unwrap();
+        assert_eq!(db.agent("a").unwrap().unwrap().handed_off_from, None);
+        assert_eq!(
+            db.agent("b").unwrap().unwrap().handed_off_from.as_deref(),
+            Some("a")
+        );
     }
 
     #[test]

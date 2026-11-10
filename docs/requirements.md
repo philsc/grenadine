@@ -8,6 +8,7 @@ reviews can refer to it.
 - [Version picker](#version-picker)
 - [Reviews and merge state](#reviews-and-merge-state)
 - [Agent stacks](#agent-stacks)
+- [Agent handoffs](#agent-handoffs)
 
 # Stacked PRs
 
@@ -787,3 +788,35 @@ over it would lose their commits.
 hasn't pushed to yet, and must keep the PR it started from at the bottom.
 _Why:_ dropping a PR closes it and deletes its branch, which isn't the
 session's to do with someone else's PR.
+
+# Agent handoffs
+
+An agent session can hand work off to a new session, with a fresh context,
+through the `handoff` MCP tool: the agent writes the new session's first
+prompt, and Grenadine starts it like a session started from the form.
+
+**AGENT-HANDOFF-PROPOSE-1.** The proposed session must default to the
+asking session's repository, backend and model, the trunk, and the mode of
+the turn that asked. The agent may name another configured repository, or
+none, a PR to start from, and a mode.
+_Why:_ a follow-up usually continues in the same place, the same way.
+
+**AGENT-HANDOFF-PROPOSE-2.** A proposal that can't start, such as one in a
+repository that isn't configured, must fail before the user is asked.
+
+**AGENT-HANDOFF-ASK-1.** Unless the asking turn bypasses permissions, the
+user must be asked first, in a new-session form in the transcript filled
+in with the proposal. The session must start as the form has it, with
+the user's changes. The user may decline instead, optionally saying why,
+which the agent is told.
+_Why:_ each session costs money and works on its own, so the user decides
+what starts.
+
+**AGENT-HANDOFF-ASK-2.** An unattended review must not hand off.
+
+**AGENT-HANDOFF-LINK-1.** The asking session's transcript must link to
+the new session, and the new session's page must link back to the session
+that handed it off.
+
+**AGENT-HANDOFF-LINK-2.** The tool must return once the new session has
+started, without waiting for its work.

@@ -1368,6 +1368,10 @@ pub struct AgentSession {
     /// The draft the session started from, if any.
     #[serde(default)]
     pub draft: Option<String>,
+    /// The session whose agent handed this one off with its `handoff`
+    /// tool, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_off_from: Option<String>,
 }
 
 /// Who started an agent session.
@@ -1427,6 +1431,7 @@ impl AgentSession {
             unstaged: 0,
             kind: SessionKind::Interactive,
             draft: None,
+            handed_off_from: None,
         }
     }
 }
@@ -1871,6 +1876,10 @@ pub struct Approval {
     /// the user's own text if any.
     #[serde(default)]
     pub answers: Option<BTreeMap<String, Vec<String>>>,
+    /// For `handoff`: the session to start, as the user edited the
+    /// agent's proposal; `None` starts the proposal as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<NewAgent>,
 }
 
 /// An answer a backend's permission request offers.
@@ -1950,6 +1959,14 @@ pub enum AgentEventKind {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
+    },
+    /// The agent handed work off to a new session with its `handoff`
+    /// tool.
+    HandedOff {
+        /// The new session's id.
+        id: String,
+        /// The new session's title.
+        title: String,
     },
     /// The agent wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {

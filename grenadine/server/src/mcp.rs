@@ -9,7 +9,8 @@
 //! see what a command it asked the user to run printed. `show_image` puts
 //! an image, such as a screenshot, into the transcript. `update_prs` and
 //! `land_on_checkout` land the session's work the way the page's wrap-up
-//! does, from inside the agent's own turn.
+//! does, from inside the agent's own turn. `handoff` starts a new
+//! session, with a fresh context, once the user agrees.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use grenadine_core::api::{
-    AgentBackend, AgentEventKind, AgentSession, Landed, PermissionMode, PrKey, WrapUpTarget,
+    AgentBackend, AgentEventKind, AgentSession, GENERAL, Landed, NewAgent, PermissionMode, PrKey,
+    SessionKind, WrapUpTarget,
 };
 use serde_json::{Value, json};
 
@@ -49,7 +51,7 @@ const IDLE: Duration = Duration::from_secs(3);
 
 /// The tools agents may use without asking: all of this server's but
 /// `approve`, which answers for a permission request.
-pub const ALLOWED_TOOLS: [&str; 8] = [
+pub const ALLOWED_TOOLS: [&str; 9] = [
     "mcp__grenadine__list_terminals",
     "mcp__grenadine__read_terminal",
     "mcp__grenadine__wait_for_terminal",
@@ -58,6 +60,7 @@ pub const ALLOWED_TOOLS: [&str; 8] = [
     "mcp__grenadine__land_on_checkout",
     "mcp__grenadine__session_pr",
     "mcp__grenadine__manage_prs",
+    "mcp__grenadine__handoff",
 ];
 
 fn reply(id: &Value, result: Value) -> Response {
@@ -343,6 +346,47 @@ pub async fn handle(
                     },
                     "required": ["prs"],
                 },
+            }, {
+                "name": "handoff",
+                "description": "Hands work off to a new agent session in Grenadine, with a \
+                    fresh context: the new session sees only `prompt`, nothing of this \
+                    session, so write it to stand on its own, with what the new session \
+                    needs to know. It starts with this session's agent and model, in its own \
+                    worktree on the trunk or on a pull request's head; it can't see this \
+                    session's commits until they're pushed, so to build on them, call \
+                    update_prs first and pass the pull request as `pr`. Unless this session \
+                    bypasses permissions, the user sees the proposed session and may change \
+                    it before it starts, or decline it. Returns once the new session has \
+                    started; it doesn't wait for its work.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The new session's first prompt.",
+                        },
+                        "repo": {
+                            "type": "string",
+                            "description": format!(
+                                "The repository to work in, `owner/name`, or `{GENERAL}` \
+                                    for a session in no repository. Defaults to this \
+                                    session's."
+                            ),
+                        },
+                        "pr": {
+                            "type": "integer",
+                            "description": "Start from this pull request's head in `repo` \
+                                instead of the trunk.",
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "enum": backend.modes().iter().map(|(m, _)| *m).collect::<Vec<_>>(),
+                            "description": "The permission mode the new session starts \
+                                in. Defaults to this turn's.",
+                        },
+                    },
+                    "required": ["prompt"],
+                },
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -406,6 +450,7 @@ pub async fn handle(
                 "manage_prs" => {
                     manage_prs(&state, &id, &agent::approval_id("manage_prs"), args).await
                 }
+                "handoff" => handoff(&state, &session, &agent::approval_id("handoff"), args).await,
                 _ => terminal_tool(&state, &id, name, args, backend).await,
             };
             let (text, failed) = match result {
@@ -577,6 +622,123 @@ async fn manage_prs(
         return agent::take_over(state, &session, again).await;
     }
     agent::take_over(state, &session, plan).await
+}
+
+/// The mode a Devin turn bypasses permissions in, where a handoff starts
+/// without asking.
+const BYPASS: &str = "bypass";
+
+/// Starts the new session `args` proposes, handed off from `session`,
+/// once the user agrees to it or to their edit of it.
+async fn handoff(
+    state: &Arc<State>,
+    session: &AgentSession,
+    tool_use: &str,
+    args: &Value,
+) -> anyhow::Result<String> {
+    if session.kind == SessionKind::AutoReview {
+        bail!("{}", agent::UNATTENDED_DENIAL);
+    }
+    let prompt = args["prompt"].as_str().unwrap_or_default();
+    if prompt.trim().is_empty() {
+        bail!("`prompt` is empty");
+    }
+    let repo = match &args["repo"] {
+        Value::Null => session.repo.clone(),
+        v => v.as_str().context("`repo` must be a string")?.to_owned(),
+    };
+    let pr = match &args["pr"] {
+        Value::Null => None,
+        v => Some(v.as_u64().context("`pr` must be a pull request number")?),
+    };
+    // Before the user is asked, so a proposal that can't start isn't
+    // shown.
+    agent::check_start(state, &repo, pr)?;
+    let backend = session.backend;
+    let (turn_mode, model) = agent::turn_settings(state, &session.id)
+        .unwrap_or_else(|| (PermissionMode::new(backend.default_mode()), None));
+    let permission_mode = match &args["permission_mode"] {
+        Value::Null => turn_mode.clone(),
+        v => {
+            let mode = v.as_str().unwrap_or_default();
+            if !backend.has_mode(mode) {
+                let modes: Vec<_> = backend.modes().iter().map(|(m, _)| *m).collect();
+                bail!("`permission_mode` must be one of {}", modes.join(", "));
+            }
+            PermissionMode::new(mode)
+        }
+    };
+    let mut req = NewAgent {
+        backend,
+        repo,
+        pr,
+        prompt: prompt.to_owned(),
+        permission_mode,
+        model,
+        images: Vec::new(),
+        draft: None,
+    };
+    let bypassed = backend == AgentBackend::Devin && turn_mode.as_str() == BYPASS;
+    if !bypassed {
+        let input = serde_json::to_value(&req)?;
+        match agent::await_approval(state, &session.id, tool_use, "handoff", &input, Vec::new())
+            .await
+        {
+            Some(Decision {
+                allow: true,
+                handoff,
+                ..
+            }) => {
+                if let Some(edited) = handoff {
+                    req = edited;
+                }
+            }
+            Some(Decision {
+                allow: false,
+                message,
+                ..
+            }) => {
+                let why = message.filter(|m| !m.trim().is_empty());
+                match why {
+                    Some(why) => bail!("The user declined the handoff: {why}"),
+                    None => bail!("The user declined the handoff."),
+                }
+            }
+            None => bail!("Nobody answered the handoff request."),
+        }
+    }
+    let mode = req.permission_mode.clone();
+    let child = agent::create_session(
+        state,
+        req,
+        SessionKind::Interactive,
+        None,
+        Some(&session.id),
+    )
+    .await?;
+    agent::emit(
+        state,
+        &session.id,
+        AgentEventKind::HandedOff {
+            id: child.id.clone(),
+            title: child.title.clone(),
+        },
+    )?;
+    let place = match child.pr {
+        Some(n) => format!("{}#{n}", child.repo),
+        None if child.repo == GENERAL => "no repository".to_owned(),
+        None => format!("{} trunk", child.repo),
+    };
+    Ok(format!(
+        "Started session {} \"{}\" from {place}, with {} in {} mode.",
+        child.id,
+        child.title,
+        child.backend.agent_name(),
+        child
+            .backend
+            .mode_label(mode.as_str())
+            .unwrap_or(mode.as_str()),
+    ))
 }
 
 /// Rebases the session's commits onto the user's checkout and
@@ -806,7 +968,8 @@ mod tests {
                 "update_prs",
                 "land_on_checkout",
                 "session_pr",
-                "manage_prs"
+                "manage_prs",
+                "handoff"
             ]
         );
         let (_, body) = call(
@@ -1037,6 +1200,220 @@ mod tests {
             let answer = ask_with(&state, tool_use, "ExitPlanMode", plan.clone(), silent).await;
             assert_eq!(answer["updatedInput"], plan);
         }
+    }
+
+    /// A state whose session `ID`, `f` applied, is in no repository, with
+    /// backends that aren't there: the sessions it hands off to start in
+    /// no repository and their turns fail without running anything.
+    fn handoff_state(dir: &std::path::Path, f: impl FnOnce(&mut AgentSession)) -> Arc<State> {
+        let state = crate::sync::test_state_with_agents(
+            BTreeMap::new(),
+            dir.join("claude"),
+            dir.join("devin"),
+            dir.join("worktrees"),
+        );
+        let mut session = AgentSession {
+            title: "parent".into(),
+            status: AgentStatus::Running,
+            ..AgentSession::fixture(ID, GENERAL)
+        };
+        f(&mut session);
+        state.db.create_agent(&session).unwrap();
+        state
+    }
+
+    /// The sessions other than `ID`.
+    fn handed_off(state: &State) -> Vec<AgentSession> {
+        let mut sessions = state.db.agents().unwrap();
+        sessions.retain(|s| s.id != ID);
+        sessions
+    }
+
+    /// The `HandedOff` events in `ID`'s transcript.
+    fn handed_off_events(state: &State) -> Vec<(String, String)> {
+        state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::HandedOff { id, title } => Some((id, title)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A handoff proposes a session with the turn's mode and model, and
+    /// starts what the user made of it, linked both ways.
+    #[tokio::test]
+    async fn handoff_starts_the_users_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = handoff_state(dir.path(), |_| {});
+        agent::set_turn_settings(
+            &state,
+            ID,
+            (PermissionMode::from("acceptEdits"), Some("opus".into())),
+        );
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move { tool(&state, "handoff", json!({"prompt": "Do the follow-up"})).await }
+        });
+        let ids = requested_ids(&state, 1).await;
+        let input = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                AgentEventKind::ApprovalRequested {
+                    tool_name, input, ..
+                } if tool_name == "handoff" => Some(input),
+                _ => None,
+            })
+            .unwrap();
+        let proposal: NewAgent = serde_json::from_str(&input).unwrap();
+        assert_eq!(
+            proposal,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: GENERAL.into(),
+                pr: None,
+                prompt: "Do the follow-up".into(),
+                permission_mode: PermissionMode::from("acceptEdits"),
+                model: Some("opus".into()),
+                images: Vec::new(),
+                draft: None,
+            }
+        );
+        let edited = NewAgent {
+            prompt: "Do it differently\nin detail".into(),
+            permission_mode: PermissionMode::plan(),
+            ..proposal
+        };
+        let decision = Decision {
+            allow: true,
+            handoff: Some(edited),
+            ..Decision::default()
+        };
+        assert!(agent::approve(&state, ID, &ids[0], decision).unwrap());
+        let (text, failed) = task.await.unwrap();
+        assert!(!failed, "{text}");
+        let children = handed_off(&state);
+        assert_eq!(children.len(), 1, "{children:?}");
+        let child = &children[0];
+        assert_eq!(child.title, "Do it differently");
+        assert_eq!(child.handed_off_from.as_deref(), Some(ID));
+        assert_eq!(
+            text,
+            format!(
+                "Started session {} \"Do it differently\" from no repository, with Claude in \
+                 Plan first mode.",
+                child.id
+            )
+        );
+        assert_eq!(
+            handed_off_events(&state),
+            [(child.id.clone(), "Do it differently".to_owned())]
+        );
+    }
+
+    /// A declined handoff starts nothing and tells the agent why.
+    #[tokio::test]
+    async fn handoff_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = handoff_state(dir.path(), |_| {});
+        for (message, told) in [
+            (
+                Some("Not now".to_owned()),
+                "The user declined the handoff: Not now",
+            ),
+            (None, "The user declined the handoff."),
+        ] {
+            let task = tokio::spawn({
+                let state = state.clone();
+                async move { tool(&state, "handoff", json!({"prompt": "x"})).await }
+            });
+            let n = if message.is_some() { 1 } else { 2 };
+            let ids = requested_ids(&state, n).await;
+            let decision = Decision {
+                allow: false,
+                message,
+                ..Decision::default()
+            };
+            assert!(agent::approve(&state, ID, &ids[n - 1], decision).unwrap());
+            assert_eq!(task.await.unwrap(), (told.to_owned(), true));
+        }
+        assert!(handed_off(&state).is_empty());
+        assert!(handed_off_events(&state).is_empty());
+    }
+
+    /// A Devin turn that bypasses permissions hands off without asking.
+    #[tokio::test]
+    async fn handoff_without_asking_when_bypassing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = handoff_state(dir.path(), |s| s.backend = AgentBackend::Devin);
+        agent::set_turn_settings(&state, ID, (PermissionMode::from(BYPASS), None));
+        let (text, failed) = tool(
+            &state,
+            "handoff",
+            json!({"prompt": "x", "permission_mode": "smart"}),
+        )
+        .await;
+        assert!(!failed, "{text}");
+        assert!(text.ends_with("with Devin in Smart mode."), "{text}");
+        let children = handed_off(&state);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].backend, AgentBackend::Devin);
+        assert!(requested_ids_now(&state).is_empty());
+    }
+
+    /// The approval requests in `ID`'s transcript so far.
+    fn requested_ids_now(state: &State) -> Vec<String> {
+        state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::ApprovalRequested { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A handoff that can't start fails before the user is asked, and an
+    /// unattended review can't hand off at all.
+    #[tokio::test]
+    async fn handoff_refuses_what_cant_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = handoff_state(dir.path(), |_| {});
+        for (args, error) in [
+            (json!({"prompt": " "}), "`prompt` is empty"),
+            (
+                json!({"prompt": "x", "repo": "o/elsewhere"}),
+                "o/elsewhere is not a configured repository",
+            ),
+            (
+                json!({"prompt": "x", "pr": 7}),
+                "a general session can't start from a PR",
+            ),
+            (
+                json!({"prompt": "x", "permission_mode": "bypass"}),
+                "`permission_mode` must be one of manual, acceptEdits, auto, plan",
+            ),
+        ] {
+            assert_eq!(
+                tool(&state, "handoff", args).await,
+                (error.to_owned(), true)
+            );
+        }
+        assert!(requested_ids_now(&state).is_empty());
+
+        let state = handoff_state(dir.path(), |s| s.kind = SessionKind::AutoReview);
+        let (text, failed) = tool(&state, "handoff", json!({"prompt": "x"})).await;
+        assert!(failed);
+        assert_eq!(text, agent::UNATTENDED_DENIAL);
+        assert!(handed_off(&state).is_empty());
     }
 
     /// Calls a terminal tool and returns its text and whether it failed.

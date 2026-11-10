@@ -1907,6 +1907,28 @@ textarea {
   border-color: var(--warn-border);
   background: var(--warn-bg);
 }
+/* An agent's handoff proposal: the new-session form, inside its card. */
+.handoff .agent-form {
+  border: none;
+  padding: 4px 0;
+  margin: 0;
+}
+.handoff h2 {
+  font-size: 14px;
+  margin: 0;
+}
+.handoff .agent-pr {
+  width: 10em;
+}
+.handoff .handoff-reason {
+  width: auto;
+  flex: 1;
+  margin-left: auto;
+  max-width: 24em;
+}
+.handed-off-from {
+  margin: 0 0 4px;
+}
 .approval > .tool-input,
 .approval > .tool-input-wrap,
 .approval .edit-diff {
@@ -2546,12 +2568,15 @@ body.resizing-sidebar * {
 .pr-agents-body .agent-form.locked > p {
   margin: 0;
 }
-/* The run hints collapse behind a summary in the locked form. */
-.agent-form.locked .session-hints {
+/* The run hints collapse behind a summary in the locked form and in a
+   handoff proposal. */
+.agent-form.locked .session-hints,
+.handoff .session-hints {
   font-size: 12px;
   color: var(--fg-muted);
 }
-.agent-form.locked .session-hints > summary {
+.agent-form.locked .session-hints > summary,
+.handoff .session-hints > summary {
   margin-bottom: 4px;
   cursor: pointer;
 }

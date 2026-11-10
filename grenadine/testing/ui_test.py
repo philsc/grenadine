@@ -353,6 +353,8 @@ def devin_scenario(tmp: Path) -> dict:
 # images came with the prompt. `long transcript N` has it run N Bash
 # calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
+# `hand off PROMPT` hands PROMPT off to a new session with the handoff MCP
+# tool.
 FAKE_CLAUDE = r"""
 import base64
 import json
@@ -536,6 +538,13 @@ if prompt.startswith("Wrap up: call the grenadine MCP server's update_prs"):
             subject = git("log", "-1", "--format=%s", spec["commit"])
             spec["branch"] = "dev/test/" + re.sub(r"[^a-z0-9]+", "-", subject.lower()).strip("-")
     update_prs({"prs": prs})
+# `hand off PROMPT` hands PROMPT off to a new session.
+if prompt.startswith("hand off "):
+    arguments = {"prompt": prompt.removeprefix("hand off ")}
+    tool_use = use("mcp__grenadine__handoff", arguments)
+    rpc("initialize", {"protocolVersion": "2025-11-25"}, id=0)
+    handed = rpc("tools/call", {"name": "handoff", "arguments": arguments}, id=tool_use)
+    result(tool_use, handed["result"]["content"][0]["text"], is_error=handed["result"].get("isError", False))
 # `screenshot` has it read a screenshot, whose result carries the image,
 # and then show it to the user.
 if prompt == "screenshot":
@@ -5137,6 +5146,73 @@ class AgentTest(ServerTestCase):
         approval.get_by_role("button", name="Allow").click()
         expect(transcript.locator(".turn-end")).to_have_count(1)
         expect(activity).to_have_count(0)
+
+    def test_handoff(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("hand off say hello")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        parent = self.page.url
+
+        # The agent's proposal fills a new-session form in its transcript:
+        # its prompt, and the repository and mode of the turn that asked.
+        transcript = self.page.locator(".transcript")
+        card = transcript.locator(".approval.pending")
+        expect(card).to_contain_text("Hand off to a new session")
+        expect(card.get_by_label("Prompt")).to_have_value("say hello")
+        expect(card.get_by_label("Repository")).to_have_value(scenarios.REPO)
+        expect(card.get_by_label("Permissions")).to_have_value("auto")
+        # The proposal's draft isn't one of the sidebar's.
+        expect(self.section(scenarios.REPO).locator(".agent-entry")).to_have_count(1)
+
+        # The session starts as the user edits it.
+        card.get_by_label("Prompt").fill("say goodbye")
+        card.get_by_label("Permissions").select_option(label="Ask for everything")
+        card.get_by_role("button", name="Start").click()
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        expect(transcript.locator(".approval")).to_contain_text("Handed off: say hello")
+        handed_off = transcript.locator(".handed-off")
+        expect(handed_off).to_have_text("Handed off to say goodbye")
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
+        expect(transcript.locator(".tool-result").last).to_contain_text(
+            "with Claude in Ask for everything mode."
+        )
+
+        # Each session links to the other.
+        handed_off.get_by_role("link").click()
+        expect(self.page).not_to_have_url(parent)
+        child = self.page.locator(".transcript")
+        expect(child.locator(".turn-prompt").first).to_have_text("say goodbye")
+        expect(child.locator(".turn-end.muted")).to_have_count(1)
+        # Its follow-ups go on in the mode the user started it in.
+        expect(self.page.locator(".composer .agent-mode")).to_have_value("manual")
+        origin = self.page.locator(".handed-off-from")
+        expect(origin).to_have_text("Handed off from hand off say hello")
+        origin.get_by_role("link").click()
+        expect(self.page).to_have_url(parent)
+        # Until this session's page replaces the new session's, the new
+        # session's follow-up box would take what's typed.
+        expect(self.page.locator(".agent-header h1")).to_have_text("hand off say hello")
+        expect(origin).to_have_count(0)
+
+        # A declined handoff tells the agent why.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("hand off say nothing")
+        follow_up.press("Enter")
+        card = transcript.locator(".approval.pending")
+        expect(card.get_by_label("Prompt")).to_have_value("say nothing")
+        card.get_by_label("Why not").fill("Not now")
+        card.get_by_role("button", name="Decline").click()
+        expect(transcript.locator(".turn-end.muted")).to_have_count(2)
+        expect(transcript.locator(".approval").last).to_contain_text(
+            "Declined handoff: say nothing"
+        )
+        expect(transcript.locator(".tool-result").last).to_have_text(
+            "The user declined the handoff: Not now"
+        )
+        expect(handed_off).to_have_count(1)
 
     def test_images(self) -> None:
         self.page.goto(self.url + "#/agents")

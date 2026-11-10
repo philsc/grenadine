@@ -147,7 +147,10 @@ fn api_routes() -> Router<Arc<State>> {
         )
         .route("/api/agents/{id}/images/{name}", get(agent_image))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
-        .route("/api/agents/{id}/approvals", post(approve))
+        .route(
+            "/api/agents/{id}/approvals",
+            post(approve).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
+        )
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
@@ -1078,35 +1081,44 @@ fn can_start_in(state: &State, repo: &str) -> bool {
 }
 
 async fn create_agent(AxState(state): St, Json(req): Json<NewAgent>) -> ApiResult<Response> {
+    if let Some(r) = check_new_agent(&state, &req).await {
+        return Ok(r);
+    }
+    Ok(Json(agent::create(&state, req).await?).into_response())
+}
+
+/// The response refusing to start `req`, if it can't be started: from
+/// the form, or from a handoff's approval card.
+async fn check_new_agent(state: &Arc<State>, req: &NewAgent) -> Option<Response> {
     if req.prompt.trim().is_empty() {
-        return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
+        return Some((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
     if let Some(d) = &req.draft
         && (d.is_empty() || d.len() > 64 || !d.bytes().all(|b| b.is_ascii_alphanumeric()))
     {
-        return Ok((StatusCode::BAD_REQUEST, "not a valid draft id").into_response());
+        return Some((StatusCode::BAD_REQUEST, "not a valid draft id").into_response());
     }
     if let Some(e) = agent::check_images(&req.images) {
-        return Ok((StatusCode::BAD_REQUEST, e).into_response());
+        return Some((StatusCode::BAD_REQUEST, e).into_response());
     }
     if let Some(r) = offers(
-        &state,
+        state,
         req.backend,
         req.model.as_deref(),
         &req.permission_mode,
     )
     .await
     {
-        return Ok(r);
+        return Some(r);
     }
-    if !can_start_in(&state, &req.repo) {
-        return Ok((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
+    if !can_start_in(state, &req.repo) {
+        return Some((StatusCode::BAD_REQUEST, "not a configured repository").into_response());
     }
     if !state.agents.offered(req.backend).await {
         let message = format!("{} isn't installed on the server", req.backend.label());
-        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+        return Some((StatusCode::BAD_REQUEST, message).into_response());
     }
-    Ok(Json(agent::create(&state, req).await?).into_response())
+    None
 }
 
 async fn cleanup(AxState(state): St) -> ApiResult<Json<CleanupState>> {
@@ -1408,12 +1420,20 @@ async fn approve(
             None => return Ok((StatusCode::BAD_REQUEST, UNKNOWN_OPTION).into_response()),
         },
     };
+    // An edited handoff is checked as the form's start would be, so a
+    // session it can't start doesn't use up the agent's request.
+    if let Some(req) = approval.handoff.as_ref().filter(|_| allow)
+        && let Some(r) = check_new_agent(&state, req).await
+    {
+        return Ok(r);
+    }
     let decision = Decision {
         allow,
         message: approval.message,
         mode: approval.mode,
         option: approval.option,
         answers: approval.answers,
+        handoff: approval.handoff,
     };
     Ok(if agent::approve(&state, &id, &approval.id, decision)? {
         StatusCode::NO_CONTENT.into_response()
@@ -2216,6 +2236,7 @@ mod tests {
             mode,
             option: None,
             answers: None,
+            handoff: None,
         };
         let response = approve(
             AxState(state.clone()),
@@ -2285,6 +2306,7 @@ mod tests {
             mode: None,
             option: Some(option.into()),
             answers: None,
+            handoff: None,
         };
         let response = approve(
             AxState(state.clone()),

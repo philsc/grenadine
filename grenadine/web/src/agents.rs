@@ -1185,12 +1185,26 @@ fn repo_default_mode(settings: Option<&RepoSettings>, backend: AgentBackend) -> 
         .unwrap_or_else(PermissionMode::plan)
 }
 
+/// The agent's `handoff` request a `NewSession` form answers: the
+/// session `agent` asked, and the request's tool use id `tool`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffRequest {
+    pub agent: String,
+    pub tool: String,
+}
+
 /// The form that starts a session, filled in from the draft with id
 /// `draft` and kept in it as it changes. With `pr`, the session is
 /// locked to that PR: its repository and "Start from PR" aren't offered,
-/// and the draft takes them whatever it held.
+/// and the draft takes them whatever it held. With `handoff`, the form
+/// is an agent's proposal, in its transcript: starting it allows the
+/// request with the session as the form has it, and it can be declined.
 #[component]
-pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl IntoView {
+pub fn NewSession(
+    draft: String,
+    #[prop(optional)] pr: Option<PrKey>,
+    #[prop(optional)] handoff: Option<HandoffRequest>,
+) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
     let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
@@ -1279,9 +1293,11 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
     let images = image_drafts::draft_images(image_drafts::new_session_key(&draft));
     let error = RwSignal::new(None::<String>);
     let textarea = NodeRef::<leptos::html::Textarea>::new();
-    // The prompt gets the focus, with the caret at the end of any draft text.
+    // The prompt gets the focus, with the caret at the end of any draft
+    // text; a proposal in a transcript leaves the focus alone.
+    let focus = handoff.is_none();
     Effect::new(move |_| {
-        if let Some(t) = textarea.get() {
+        if let Some(t) = textarea.get().filter(|_| focus) {
             let _ = t.focus();
             let end = t.value().encode_utf16().count() as u32;
             let _ = t.set_selection_range(end, end);
@@ -1325,6 +1341,7 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
     // fails, so the form says so instead.
     let none_installed = move || matches!(backends().get(), Some(Ok(list)) if list.is_empty());
 
+    let handoff = StoredValue::new(handoff);
     let start = move || {
         if busy() || none_installed() || prompt.with_untracked(|p| p.trim().is_empty()) {
             return;
@@ -1380,6 +1397,32 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
                 images,
                 draft: Some(id.clone()),
             };
+            // A proposal starts once its request is allowed with it. Its
+            // draft stays until the session shows up, when the sidebar
+            // moves the start mode onto it and removes the draft, as it
+            // does for a start whose answer the page missed.
+            if let Some(h) = handoff.get_value() {
+                if let Some(s) = storage() {
+                    let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
+                }
+                let approval = Approval {
+                    id: h.tool,
+                    allow: true,
+                    message: None,
+                    mode: None,
+                    option: None,
+                    answers: None,
+                    handoff: Some(req),
+                };
+                if let Err(e) = api::approve(&h.agent, &approval).await {
+                    if let Some(s) = storage() {
+                        let _ = s.remove_item(&start_mode_key(&id));
+                    }
+                    drafts.set_start_error(&id, Some(e));
+                }
+                drafts.set_starting(&id, false);
+                return;
+            }
             // The session shows before this answer arrives, and its page
             // would lose the mode it starts in without the start key.
             if let Some(s) = storage() {
@@ -1409,10 +1452,36 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
         });
     };
 
-    // Locked to a PR the run hints collapse behind a summary.
-    let locked = pr.is_some();
+    // Locked to a PR, or proposed by an agent, the run hints collapse
+    // behind a summary.
+    let proposed = handoff.with_value(Option::is_some);
+    let locked = pr.is_some() || proposed;
+    // Why the user declines a proposal, told to the agent.
+    let reason = RwSignal::new(String::new());
+    let declining = RwSignal::new(false);
+    let decline = move |_| {
+        let Some(h) = handoff.get_value() else { return };
+        let approval = Approval {
+            id: h.tool,
+            allow: false,
+            message: Some(reason.get_untracked()).filter(|r| !r.trim().is_empty()),
+            mode: None,
+            option: None,
+            answers: None,
+            handoff: None,
+        };
+        let id = id.get_value();
+        declining.set(true);
+        spawn_local(async move {
+            match api::approve(&h.agent, &approval).await {
+                Ok(()) => drafts.remove(&id),
+                Err(e) => drafts.set_start_error(&id, Some(e)),
+            }
+            declining.set(false);
+        });
+    };
     view! {
-        <div class="agents">
+        <div class=if proposed { "handoff" } else { "agents" }>
             <form
                 class="agent-form"
                 class:locked=pr.is_some()
@@ -1423,7 +1492,7 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
                 on:dragover=images::drag_over
                 on:drop=move |ev| images::drop(ev, images, error)
             >
-                <h2>"New session"</h2>
+                <h2>{if proposed { "Hand off to a new session" } else { "New session" }}</h2>
                 {pr.clone().map(|key| view! {
                     <p class="muted">{format!("Starts from #{} in {}", key.number, key.repo)}</p>
                 })}
@@ -1545,6 +1614,21 @@ pub fn NewSession(draft: String, #[prop(optional)] pr: Option<PrKey>) -> impl In
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
                     <AttachButton images=images error=error />
+                    {proposed.then(|| view! {
+                        <input
+                            type="text"
+                            class="handoff-reason"
+                            placeholder="Why not? (optional)"
+                            aria-label="Why not"
+                            prop:value=move || reason.get()
+                            on:input=move |ev| reason.set(event_target_value(&ev))
+                        />
+                        <button
+                            type="button"
+                            disabled=move || busy() || declining.get()
+                            on:click=decline
+                        >"Decline"</button>
+                    })}
                 </div>
             </form>
         </div>
@@ -2036,6 +2120,21 @@ pub fn AgentView(
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
+    // A session the page didn't start itself, e.g. one an agent's handoff
+    // started, takes the mode its draft started it in once the session
+    // says which draft that was. The sidebar may get there first.
+    let draft = Memo::new(move |_| current.with(|s| s.as_ref().and_then(|s| s.draft.clone())));
+    Effect::new({
+        let id = id.clone();
+        move |_| {
+            let Some(d) = draft.get() else { return };
+            let started = storage().and_then(|s| s.get_item(&start_mode_key(&d)).ok().flatten());
+            if let Some(m) = started {
+                adopt_start_mode(&d, &id);
+                mode.set(PermissionMode::new(m));
+            }
+        }
+    });
     let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
     // Whether the session is a general one, so the pane below only
     // remounts when that flips, not on every session update.
@@ -2352,6 +2451,32 @@ fn AssociatedPrs(id: String, repo: String) -> impl IntoView {
     }
 }
 
+/// Which session handed this one off, linked, if one did.
+#[component]
+fn HandedOffFrom(session: Option<String>) -> impl IntoView {
+    session.map(|parent| {
+        let title = {
+            let parent = parent.clone();
+            move || {
+                sessions()
+                    .get()
+                    .and_then(Result::ok)
+                    .and_then(|list| list.into_iter().find(|s| s.id == parent))
+                    .map(|s| s.title)
+            }
+        };
+        view! {
+            <p class="muted handed-off-from">
+                "Handed off from "
+                {move || match title() {
+                    Some(t) => view! { <a href=agent_hash(&parent)>{t}</a> }.into_any(),
+                    None => "a session that's gone".into_any(),
+                }}
+            </p>
+        }
+    })
+}
+
 #[component]
 fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
     view! {
@@ -2361,6 +2486,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                 if s.repo == GENERAL {
                     return view! {
                         <h1>{s.title.clone()}</h1>
+                        <HandedOffFrom session=s.handed_off_from.clone() />
                         <p class="muted">
                             <StatusBadge status=s.status />
                             " in no repository"
@@ -2385,6 +2511,7 @@ fn AgentHeader(session: Signal<AgentSession>) -> impl IntoView {
                 };
                 view! {
                     <h1>{s.title.clone()}</h1>
+                    <HandedOffFrom session=s.handed_off_from.clone() />
                     <p class="muted">
                         <StatusBadge status=s.status />
                         " from " {from}
@@ -3255,6 +3382,20 @@ fn Transcript(
                                 />
                             }.into_any()
                         }
+                        AgentEventKind::ApprovalRequested { id: tool, tool_name, input, .. } if tool_name == "handoff" => view! {
+                            <HandoffCard
+                                agent=id
+                                tool=tool.clone()
+                                input=input.clone()
+                                resolved=resolved
+                                waiting=waiting
+                            />
+                        }.into_any(),
+                        AgentEventKind::HandedOff { id: child, title } => view! {
+                            <p class="turn-end handed-off">
+                                "Handed off to " <a href=agent_hash(child)>{title.clone()}</a>
+                            </p>
+                        }.into_any(),
                         AgentEventKind::ApprovalRequested { id: tool, tool_name, input, options } => {
                             let value = serde_json::from_str(input).unwrap_or_default();
                             let summary = tool_summary(tool_name, &value, Some(&worktree));
@@ -3456,6 +3597,7 @@ fn PlanCard(
                 mode: allow.then_some(next),
                 option: None,
                 answers: None,
+                handoff: None,
             };
             send_approval(agent.clone(), approval, busy, error);
             return;
@@ -3609,6 +3751,7 @@ fn QuestionCard(
                 mode: None,
                 option: None,
                 answers: allow.then(collect_answers),
+                handoff: None,
             };
             send_approval(agent.clone(), approval, busy, error);
         }
@@ -3732,6 +3875,79 @@ fn QuestionCard(
     }
 }
 
+/// `handoff`: the session the agent proposes to start, in a `NewSession`
+/// form the user can change it in before starting it, or decline it.
+#[component]
+fn HandoffCard(
+    agent: String,
+    tool: String,
+    /// The proposal, a `NewAgent` as JSON.
+    input: String,
+    resolved: Memo<HashMap<String, Answer>>,
+    /// Whether the backend is running and so may wait for an answer;
+    /// requests from before a restart stay unanswered.
+    waiting: Signal<bool>,
+) -> impl IntoView {
+    let drafts = expect_context::<Drafts>();
+    let draft = drafts::handoff_id(&tool);
+    let proposal = serde_json::from_str::<NewAgent>(&input).ok();
+    let state = {
+        let tool = tool.clone();
+        Signal::derive(move || resolved.with(|r| r.get(&tool).copied()))
+    };
+    // Only whether the form shows, so that it isn't rebuilt, losing what
+    // the user typed, whenever something else changes.
+    let open = Memo::new(move |_| state.get().is_none() && waiting.get());
+    // A proposal that didn't start leaves nothing to keep. An allowed
+    // one's draft goes once the sidebar moved its start mode onto the
+    // new session.
+    {
+        let draft = draft.clone();
+        Effect::new(move |_| {
+            if matches!(state.get(), Some(Answer::Denied | Answer::Expired)) {
+                drafts.remove(&draft);
+                if let Some(s) = storage() {
+                    let _ = s.remove_item(&start_mode_key(&draft));
+                }
+            }
+        });
+    }
+    let summary = proposal
+        .as_ref()
+        .and_then(|p| p.prompt.trim().lines().next().map(str::to_owned))
+        .unwrap_or_default();
+    view! {
+        {move || {
+            if open.get() {
+                let Some(proposal) = &proposal else {
+                    return view! { <p class="error">"Can't read the proposed session."</p> }.into_any();
+                };
+                drafts.seed(&draft, proposal);
+                let request = HandoffRequest {
+                    agent: agent.clone(),
+                    tool: tool.clone(),
+                };
+                return view! {
+                    <div class="approval pending">
+                        <NewSession draft=draft.clone() handoff=request />
+                    </div>
+                }.into_any();
+            }
+            let label = match state.get() {
+                Some(Answer::Allowed) => "Handed off: ",
+                Some(Answer::Denied) => "Declined handoff: ",
+                Some(Answer::Expired) => "Expired handoff: ",
+                None => "Unanswered handoff: ",
+            };
+            view! {
+                <div class="approval">
+                    <p>{label} <code>{summary.clone()}</code></p>
+                </div>
+            }.into_any()
+        }}
+    }
+}
+
 #[component]
 fn ApprovalCard(
     agent: String,
@@ -3767,6 +3983,7 @@ fn ApprovalCard(
                 mode: None,
                 option,
                 answers: None,
+                handoff: None,
             };
             send_approval(agent.clone(), approval, busy, error);
         }
