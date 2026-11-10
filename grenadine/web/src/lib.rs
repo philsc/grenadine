@@ -163,9 +163,18 @@ fn open_draft(route: Route, drafts: drafts::Drafts) -> Route {
 
 /// Fetches the sync status; the server's lag fallback sends InboxesChanged,
 /// so this also covers a dropped SyncStatus event.
-fn refetch_sync(updates: Updates) {
+///
+/// `events` counts the SyncStatus events received. The answer is dropped
+/// when one arrived while the fetch was in flight: the answer may predate
+/// it, as a poll's InboxesChanged comes while it still searches and its
+/// end can overtake the fetch. Dropping it loses nothing, since every
+/// later change sends its own event, in order.
+fn refetch_sync(updates: Updates, events: StoredValue<u64>) {
+    let before = events.get_value();
     leptos::task::spawn_local(async move {
-        if let Ok(s) = api::sync_status().await {
+        if let Ok(s) = api::sync_status().await
+            && events.get_value() == before
+        {
             updates.sync.set(s);
         }
     });
@@ -175,17 +184,21 @@ fn refetch_sync(updates: Updates) {
 /// carries the watched PR, so that the server syncs the PR the page
 /// shows.
 fn listen(updates: Updates, url: Signal<String>) {
+    let sync_events = StoredValue::new(0u64);
     let on_message = move |data: String| match serde_json::from_str::<ServerEvent>(&data) {
         Ok(ServerEvent::InboxesChanged) => {
             updates.inboxes.update(|n| *n += 1);
             updates.agents.update(|n| *n += 1);
-            refetch_sync(updates);
+            refetch_sync(updates, sync_events);
         }
         Ok(ServerEvent::PrChanged(key)) => updates.pr.update(|(k, n)| {
             *k = Some(key);
             *n += 1;
         }),
-        Ok(ServerEvent::SyncStatus(s)) => updates.sync.set(s),
+        Ok(ServerEvent::SyncStatus(s)) => {
+            sync_events.update_value(|n| *n += 1);
+            updates.sync.set(s);
+        }
         Ok(ServerEvent::AgentsChanged) => updates.agents.update(|n| *n += 1),
         Ok(ServerEvent::CleanupChanged) => updates.cleanup.update(|n| *n += 1),
         Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
@@ -206,7 +219,7 @@ fn listen(updates: Updates, url: Signal<String>) {
         updates.terminals.update(|n| *n += 1);
         updates.repo_settings.update(|n| *n += 1);
         updates.auto_reviews.update(|n| *n += 1);
-        refetch_sync(updates);
+        refetch_sync(updates, sync_events);
     };
     events::subscribe(url, on_message, on_open);
 }
