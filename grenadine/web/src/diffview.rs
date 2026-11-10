@@ -7,6 +7,7 @@ use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -166,12 +167,15 @@ struct RebaseInfo {
 /// text; `None` when the merge dropped it.
 type OursToMerged = Arc<[Option<usize>]>;
 
-/// What `stats` works out: added and removed lines, change blocks, and
-/// whether every changed line is the rebase's.
+/// What `stats` works out: added and removed lines, change blocks, the
+/// side-by-side row count, and whether every changed line is the rebase's.
 struct Stats {
     added: usize,
     removed: usize,
     blocks: usize,
+    /// The rows the side-by-side view needs for the changed lines: each
+    /// block's taller side.
+    split_rows: usize,
     all_rebase: bool,
 }
 
@@ -333,6 +337,7 @@ pub fn DiffView(
         }
         Some(Ok((files, hidden))) => {
             start_reveal();
+            provide_context(Measurer::new());
             let files = Arc::new(files);
             // Files with no change of the PR's own — which depends on the
             // mode — join the files the rebase alone changed.
@@ -747,6 +752,202 @@ const ROWS_PER_TASK: usize = 500;
 /// The height of a diff row, in pixels, as the stylesheet sets it.
 const ROW_HEIGHT: usize = 20;
 
+/// The height of a file's header including its bottom border, in pixels,
+/// as the stylesheet sets it.
+const HEADER_HEIGHT: usize = 33;
+
+/// The diff rows a file shows: the changed lines plus the context around
+/// each block and its hidden-lines row. A collapsed file shows none.
+fn estimated_rows(stats: &Stats, expanded: bool, side_by_side: bool) -> usize {
+    if !expanded {
+        return 0;
+    }
+    let changed = if side_by_side {
+        stats.split_rows
+    } else {
+        stats.added + stats.removed
+    };
+    changed + stats.blocks * (2 * CONTEXT + 1)
+}
+
+/// The pixel height a file's section takes: the header plus its rows.
+fn estimated_height(stats: &Stats, expanded: bool, side_by_side: bool) -> usize {
+    HEADER_HEIGHT + estimated_rows(stats, expanded, side_by_side) * ROW_HEIGHT
+}
+
+/// Resolves on the next animation frame.
+async fn animation_frame() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = window().request_animation_frame(&resolve);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// A file waiting for its measuring turn.
+struct Queued {
+    rows: usize,
+    measuring: RwSignal<bool>,
+    /// Set while the file sits in the queue so its triggers don't enqueue
+    /// it twice; cleared once its turn comes.
+    enqueued: Rc<Cell<bool>>,
+}
+
+struct MeasurerInner {
+    /// Files waiting to be measured, in order.
+    queue: VecDeque<Queued>,
+    /// The width the last settled resize left.
+    width: Cell<f64>,
+    running: Cell<bool>,
+}
+
+thread_local! {
+    /// The measuring state of each live measurer, by id.
+    static MEASURERS: RefCell<HashMap<usize, MeasurerInner>> = RefCell::default();
+    static NEXT_MEASURER: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Lays files out in the background so the browser records their real
+/// heights: `content-visibility: auto` remembers a laid-out file's size,
+/// which keeps the scrollable height — and the scrollbar — steady.
+/// Without it, off-screen files count as their estimated size until
+/// scrolled into view.
+#[derive(Clone, Copy)]
+struct Measurer {
+    /// Which `MEASURERS` entry the queue lives in.
+    id: usize,
+    /// Bumps when the window's width changed, after the resize events
+    /// settle; the files track it as a trigger.
+    width_epoch: RwSignal<usize>,
+}
+
+impl Measurer {
+    /// A measurer for one diff. Its window resize listener bumps the
+    /// width epoch 200ms after the last event when the width changed, so
+    /// the files re-measure at the new width; cleanup stops the loop and
+    /// removes the listener.
+    fn new() -> Self {
+        let id = NEXT_MEASURER.replace(NEXT_MEASURER.get() + 1);
+        let width_epoch = RwSignal::new(0);
+        MEASURERS.with_borrow_mut(|m| {
+            m.insert(
+                id,
+                MeasurerInner {
+                    queue: VecDeque::new(),
+                    width: Cell::new(
+                        window()
+                            .inner_width()
+                            .ok()
+                            .and_then(|w| w.as_f64())
+                            .unwrap_or_default(),
+                    ),
+                    running: Cell::new(false),
+                },
+            );
+        });
+        let resizes = Arc::new(AtomicU32::new(0));
+        let on_resize = window_event_listener_untyped("resize", move |_| {
+            let n = resizes.fetch_add(1, Ordering::Relaxed) + 1;
+            let resizes = resizes.clone();
+            set_timeout(
+                move || {
+                    let alive = MEASURERS.with_borrow(|m| m.contains_key(&id));
+                    if !alive || resizes.load(Ordering::Relaxed) != n {
+                        return;
+                    }
+                    let width = window()
+                        .inner_width()
+                        .ok()
+                        .and_then(|w| w.as_f64())
+                        .unwrap_or_default();
+                    let changed = MEASURERS.with_borrow_mut(|m| {
+                        m.get_mut(&id).is_some_and(|i| {
+                            let changed = width != i.width.get();
+                            if changed {
+                                i.width.set(width);
+                            }
+                            changed
+                        })
+                    });
+                    if changed {
+                        width_epoch.try_update(|e| *e += 1);
+                    }
+                },
+                Duration::from_millis(200),
+            );
+        });
+        on_cleanup(move || {
+            MEASURERS.with_borrow_mut(|m| m.remove(&id));
+            on_resize.remove();
+        });
+        Measurer { id, width_epoch }
+    }
+
+    /// Queues `measuring` to be set for two frames so the browser lays
+    /// the file out and records its height, with files totalling up to
+    /// `ROWS_PER_TASK` rows measured per turn.
+    fn enqueue(&self, rows: usize, measuring: RwSignal<bool>, enqueued: Rc<Cell<bool>>) {
+        let id = self.id;
+        let spawn = MEASURERS.with_borrow_mut(|m| {
+            let Some(inner) = m.get_mut(&id) else {
+                return false;
+            };
+            inner.queue.push_back(Queued {
+                rows,
+                measuring,
+                enqueued,
+            });
+            !inner.running.replace(true)
+        });
+        if !spawn {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            loop {
+                if !MEASURERS.with_borrow(|m| m.contains_key(&id)) {
+                    break;
+                }
+                let mut chunk = Vec::new();
+                let mut budget = ROWS_PER_TASK;
+                MEASURERS.with_borrow_mut(|m| {
+                    let Some(inner) = m.get_mut(&id) else {
+                        return;
+                    };
+                    // A file bigger than a whole turn's budget still
+                    // measures, on its own.
+                    while inner
+                        .queue
+                        .front()
+                        .is_some_and(|q| q.rows <= budget || chunk.is_empty())
+                    {
+                        let q = inner.queue.pop_front().unwrap();
+                        budget = budget.saturating_sub(q.rows);
+                        chunk.push(q);
+                    }
+                });
+                if chunk.is_empty() {
+                    break;
+                }
+                for q in &chunk {
+                    q.measuring.try_set(true);
+                    q.enqueued.set(false);
+                }
+                // Two frames: the first lays the files out, the second is
+                // past the observer that records their sizes.
+                animation_frame().await;
+                animation_frame().await;
+                for q in &chunk {
+                    q.measuring.try_set(false);
+                }
+            }
+            MEASURERS.with_borrow_mut(|m| {
+                if let Some(i) = m.get_mut(&id) {
+                    i.running.set(false);
+                }
+            });
+        });
+    }
+}
+
 thread_local! {
     /// Files waiting to render: their row counts and their flags.
     static REVEAL: RefCell<VecDeque<(usize, RwSignal<bool>)>> = RefCell::default();
@@ -809,6 +1010,7 @@ fn stats(file: &FileData, rebase_older: bool) -> Stats {
             added: 0,
             removed: 0,
             blocks: 0,
+            split_rows: 0,
             all_rebase: false,
         };
     }
@@ -828,6 +1030,7 @@ fn stats(file: &FileData, rebase_older: bool) -> Stats {
         added,
         removed,
         blocks: blocks.len(),
+        split_rows: blocks.iter().map(|b| b.old.len().max(b.new.len())).sum(),
         all_rebase,
     }
 }
@@ -991,6 +1194,37 @@ fn FileView(
     };
     let shown = RwSignal::new(false);
     shown.set(reveal(rows, shown));
+    // The measurer lays the file out off-screen so its real height is
+    // recorded; the triggers enqueue it once per layout change.
+    let measuring = RwSignal::new(false);
+    if let Some(measurer) = use_context::<Measurer>() {
+        let file = file.clone();
+        let enqueued = Rc::new(Cell::new(false));
+        Effect::new(move |_| {
+            let mode = rebase_older.get();
+            let stats = file.stats(mode);
+            // Hidden files have no box to measure, and ones still waiting
+            // to render just a placeholder would measure that.
+            let needs = shown.get() && !stats.all_rebase;
+            expanded.track();
+            side_by_side.track();
+            inline_changes.track();
+            measurer.width_epoch.track();
+            comments.track();
+            if !needs || enqueued.replace(true) {
+                return;
+            }
+            measurer.enqueue(
+                estimated_rows(
+                    stats,
+                    expanded.get_untracked(),
+                    side_by_side.get_untracked(),
+                ),
+                measuring,
+                enqueued.clone(),
+            );
+        });
+    }
     let old_path = c.old_path.clone().unwrap_or_else(|| c.path().to_owned());
     let old_lines = SideLines::new(&old_path, &c.old_blob, &file.old, expanded.get_untracked());
     let new_lines = SideLines::new(c.path(), &c.new_blob, &file.new, expanded.get_untracked());
@@ -1033,8 +1267,11 @@ fn FileView(
                 return ().into_any();
             }
             if !shown.get() {
-                let style = format!("height: {}px", rows * ROW_HEIGHT);
-                return view! { <div class="diff-placeholder" style=style></div> }.into_any();
+                let height =
+                    estimated_rows(file.stats(rebase_older.get()), true, side_by_side.get())
+                        * ROW_HEIGHT;
+                return view! { <div class="diff-placeholder" style=format!("height: {height}px")></div> }
+                    .into_any();
             }
             if binary {
                 let size = |b: &Option<Arc<Blob>>| {
@@ -1106,9 +1343,15 @@ fn FileView(
         }
     };
     view! {
-        <section class="file" id=file_id(c.path()) prop:hidden={
+        <section class="file" id=file_id(c.path()) class:measuring=measuring prop:hidden={
             let f = file.clone();
             move || f.stats(rebase_older.get()).all_rebase
+        } style:contain-intrinsic-size={
+            let f = file.clone();
+            move || format!(
+                "auto {}px",
+                estimated_height(f.stats(rebase_older.get()), expanded.get(), side_by_side.get())
+            )
         }>
             <header class="file-header" on:click={
                 let path = c.path().to_owned();
@@ -1190,6 +1433,7 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
     let side_by_side = Signal::stored(false);
     let rebase_older = Signal::stored(false);
     let folds = Folds::new(&session);
+    provide_context(Measurer::new());
     let key = |f: &WorktreeFile| {
         let mut h = DefaultHasher::new();
         f.hash(&mut h);

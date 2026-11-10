@@ -412,9 +412,20 @@ BIG_DIFF = "Add more files than render at once"
 # Enough rows that the later files render after the first ones paint.
 BIG_FILES = [f"big/module_{i}.py" for i in range(6)]
 
+SCROLLBAR = "Add files small, large, and huge"
+
 
 def big_module(i: int) -> str:
     return "".join(f"def f{i}_{n}():\n    return {n}\n" for n in range(150))
+
+
+# Tiny files paint at once, the large ones take the reveal queue, and the
+# huge one has too many changed lines and starts collapsed.
+SCROLLBAR_FILES = {
+    "scroll/huge.py": "".join(f"def h_{n}():\n    return {n}\n" for n in range(1700)),
+    **{f"scroll/large_{i}.py": big_module(i) for i in range(4)},
+    **{f"scroll/tiny_{i}.py": f"def tiny_{i}():\n    return {i}\n" for i in range(4)},
+}
 
 
 STEPS_PY = "versions/steps.py"
@@ -631,6 +642,12 @@ def versions_cases(gh: FakeGitHub) -> Versions:
     repo.push("case/big-diff")
     prs[BIG_DIFF] = repo.open_pr(BIG_DIFF, head="case/big-diff")
     shas[BIG_DIFF] = v
+
+    repo.checkout("case/scrollbar", "main")
+    v = [repo.commit(SCROLLBAR, SCROLLBAR_FILES)]
+    repo.push("case/scrollbar")
+    prs[SCROLLBAR] = repo.open_pr(SCROLLBAR, head="case/scrollbar")
+    shas[SCROLLBAR] = v
 
     return Versions(prs, shas)
 
