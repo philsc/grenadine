@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use grenadine_core::api::{Blob, ChangeStatus, FileChange, NewThread, PrKey, Side, WorktreeFile};
+use grenadine_core::api::{
+    Blob, ChangeStatus, FileChange, NewThread, PrKey, ReviewComment, Side, WorktreeFile,
+};
 use grenadine_core::diff::{self, Hunk, Line};
 use grenadine_core::edit::Fragment;
 use grenadine_core::inline::{self, Aligned};
@@ -23,7 +25,7 @@ use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, mark, plain_lines};
 use crate::inboxes::load_flag;
-use crate::pr::{Anchor, Placed, ThreadView, range_label};
+use crate::pr::{Anchor, Placed, ThreadView, ThreadWhere, range_label};
 
 const CONTEXT: usize = 3;
 
@@ -315,12 +317,34 @@ pub fn DiffView(
     inline_changes: Signal<bool>,
     rebase_older: Signal<bool>,
     #[prop(into)] commenting: Signal<Option<Commenting>>,
+    /// Set to the paths of the files the diff shows once they load, so
+    /// the caller can anchor threads it can't place on a line to their
+    /// file; `None` while a new diff loads.
+    diff_paths: RwSignal<Option<Arc<HashSet<String>>>>,
 ) -> impl IntoView {
     let has_upstream = upstream.is_some();
     // What the last diff still had queued can wait for this one's files.
     highlight::demote();
     let files = LocalResource::new(move || {
+        diff_paths.set(None);
         load(repo.clone(), left.clone(), right.clone(), upstream.clone())
+    });
+    Effect::new(move |_| {
+        let mode = rebase_older.get();
+        if let Some(Ok((files, _))) = files.get() {
+            // Files hidden as rebase-only in this mode aren't shown, so
+            // threads can't fall back to them.
+            diff_paths.set(Some(Arc::new(
+                files
+                    .iter()
+                    .filter(|f| !f.stats(mode).all_rebase)
+                    .flat_map(|f| {
+                        let path = f.change.path().to_owned();
+                        std::iter::once(path).chain(f.change.old_path.clone())
+                    })
+                    .collect(),
+            )));
+        }
     });
     move || match files.get() {
         None => view! { <p class="empty">"Loading the diff…"</p> }.into_any(),
@@ -1246,7 +1270,18 @@ fn FileView(
             .collect();
         (!file_comments.is_empty()).then(|| {
             view! {
-                <div class="file-comments">{file_comments.into_iter().map(|p| view! { <ThreadView thread=p.thread /> }).collect_view()}</div>
+                <div class="file-comments">{file_comments.into_iter().map(|p| {
+                    let header = p.fallback.map(|f| {
+                        let label = fallback_label(&p.thread.root);
+                        view! {
+                            <div class="file-where">
+                                <ThreadWhere version=f.version>{label}</ThreadWhere>
+                                {f.outdated.then(|| view! { " " <span class="badge outdated-badge">"Outdated"</span> })}
+                            </div>
+                        }
+                    });
+                    view! { {header} <ThreadView thread=p.thread /> }
+                }).collect_view()}</div>
             }
         })
     };
@@ -1709,6 +1744,21 @@ fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyVie
     }
 }
 
+/// A fallback thread's whereabouts on the version it was made on, like
+/// "Lines -9 to +14" or "Line +5"; empty for a thread on the file
+/// itself.
+fn fallback_label(c: &ReviewComment) -> String {
+    match (c.original_start_line, c.original_line) {
+        (Some(s), Some(e)) if (c.start_side.unwrap_or(c.side), s) != (c.side, e) => {
+            range_label((c.start_side.unwrap_or(c.side), s), (c.side, e))
+        }
+        (_, Some(l)) => {
+            format!("Line {}{l}", if c.side == Side::Left { "-" } else { "+" })
+        }
+        _ => String::new(),
+    }
+}
+
 /// The lines an "expand" button reveals per click.
 const EXPAND_LINES: usize = 20;
 
@@ -2027,6 +2077,7 @@ mod tests {
         Placed {
             anchor,
             start,
+            fallback: None,
             thread: Arc::new(Thread {
                 root: grenadine_core::api::ReviewComment {
                     id,

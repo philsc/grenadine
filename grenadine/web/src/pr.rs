@@ -44,7 +44,20 @@ pub struct Placed {
     /// The first line of a multi-line thread's range, in the anchor's
     /// coordinates; `None` for a single-line thread.
     pub start: Option<(Side, u32)>,
+    /// Set when the anchor is the fallback: the thread can't sit on its
+    /// lines in the selected diff, so it shows on its file instead.
+    pub fallback: Option<Fallback>,
     pub thread: Arc<Thread>,
+}
+
+/// What a fallback thread's header needs: the version it was made on and
+/// whether GitHub calls it outdated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fallback {
+    pub version: Option<u32>,
+    /// GitHub has no line for the thread on the PR's head: a later push
+    /// changed the lines it was made on.
+    pub outdated: bool,
 }
 
 /// Threads that can't be shown in the current diff, with the version each
@@ -90,6 +103,8 @@ fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
 ///   side is the version it was made on;
 /// - inline, when Head is the commit the comment was made on;
 /// - inline at GitHub's mapped-forward line, when Head is the latest version;
+/// - on its file, when the diff's files include it (`diff_paths`; `None`
+///   while the diff hasn't loaded);
 /// - otherwise in the side panel.
 ///
 /// Left-side comments were made against the PR's base at the time, so they
@@ -98,6 +113,7 @@ pub fn place(
     comments: &[ReviewComment],
     versions: &[Version],
     sel: Selection,
+    diff_paths: Option<&HashSet<String>>,
 ) -> (HashMap<String, Vec<Placed>>, Vec<Unplaced>) {
     let mut inline: HashMap<String, Vec<Placed>> = HashMap::new();
     let mut panel = Vec::new();
@@ -157,6 +173,12 @@ pub fn place(
         // A range ending where it starts is a single line.
         let start = start.filter(|&s| anchor != Some(Anchor::Line(s.0, s.1)));
         let thread = Arc::new(thread);
+        let version = || {
+            versions
+                .iter()
+                .find(|v| v.sha == thread.root.original_commit)
+                .map(|v| v.number)
+        };
         match anchor {
             Some(anchor) => inline
                 .entry(thread.root.path.clone())
@@ -164,13 +186,23 @@ pub fn place(
                 .push(Placed {
                     anchor,
                     start,
+                    fallback: None,
+                    thread,
+                }),
+            None if diff_paths.is_some_and(|p| p.contains(&thread.root.path)) => inline
+                .entry(thread.root.path.clone())
+                .or_default()
+                .push(Placed {
+                    anchor: Anchor::File,
+                    start: None,
+                    fallback: Some(Fallback {
+                        version: version(),
+                        outdated: thread.root.line.is_none() && !thread.root.on_file,
+                    }),
                     thread,
                 }),
             None => panel.push(Unplaced {
-                version: versions
-                    .iter()
-                    .find(|v| v.sha == thread.root.original_commit)
-                    .map(|v| v.number),
+                version: version(),
                 thread,
             }),
         }
@@ -839,6 +871,10 @@ fn PrBody(
         };
         left.map(|left| (left, head.sha.clone(), upstream.get()))
     });
+    provide_context(VersionJump { chosen, selection });
+    // The paths of the files the loaded diff shows, set by DiffView;
+    // `None` until it has loaded them.
+    let diff_paths = RwSignal::new(None::<Arc<HashSet<String>>>);
     // Where the threads go for the selected diff: inline per file, and
     // the panel of ones that can't be shown.
     let placed = Memo::new(move |_| {
@@ -846,7 +882,12 @@ fn PrBody(
         if pr.versions.is_empty() {
             return Default::default();
         }
-        place(&pr.comments, &pr.versions, selection.get())
+        place(
+            &pr.comments,
+            &pr.versions,
+            selection.get(),
+            diff_paths.get().as_deref(),
+        )
     });
     let inline = Memo::new(move |_| Arc::new(placed.get().0));
     let panel = Memo::new(move |_| placed.get().1);
@@ -1235,7 +1276,7 @@ fn PrBody(
                 match diff_args.get() {
                     None => view! { <p class="empty error">"The merge-base of this version is unknown."</p> }.into_any(),
                     Some((left, right, upstream)) => view! {
-                        <CommentPanel threads=panel chosen=chosen selection=selection />
+                        <CommentPanel threads=panel />
                         <DiffView
                             repo=repo.clone()
                             left=left
@@ -1246,6 +1287,7 @@ fn PrBody(
                             side_by_side=side_by_side.into()
                             inline_changes=inline_changes.into()
                             rebase_older=rebase_older.into()
+                            diff_paths=diff_paths
                         />
                     }
                     .into_any(),
@@ -1938,12 +1980,46 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
     .into_any()
 }
 
-#[component]
-fn CommentPanel(
-    threads: Memo<Vec<Unplaced>>,
+/// The diff's selection, for the buttons that jump a thread to the
+/// version it was made on.
+#[derive(Clone, Copy)]
+struct VersionJump {
     chosen: RwSignal<Option<Selection>>,
     selection: Memo<Selection>,
-) -> impl IntoView {
+}
+
+/// What a thread shown away from its lines says about where it was made:
+/// `children` — its path, line or range — followed by an "on vN" button
+/// that diffs vN against the current base (or Base), or "on an unknown
+/// version" when no version has its commit. The side panel and the
+/// file-level fallback threads share it.
+#[component]
+pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl IntoView {
+    let jump = expect_context::<VersionJump>();
+    view! {
+        {children()}
+        " "
+        {match version {
+            Some(v) => view! {
+                <button
+                    class="link"
+                    on:click=move |_| {
+                        let s = jump.selection.get_untracked();
+                        let base = if s.base < v { s.base } else { 0 };
+                        jump.chosen.set(Some(Selection { base, head: v }));
+                    }
+                >
+                    {format!("on v{v}")}
+                </button>
+            }
+            .into_any(),
+            None => view! { <span class="muted">"on an unknown version"</span> }.into_any(),
+        }}
+    }
+}
+
+#[component]
+fn CommentPanel(threads: Memo<Vec<Unplaced>>) -> impl IntoView {
     move || {
         let threads = threads.get();
         if threads.is_empty() {
@@ -1957,28 +2033,20 @@ fn CommentPanel(
                 let line = c.original_line.map(|l| format!(":{l}")).unwrap_or_default();
                 let lines = match (c.original_start_line, c.original_line) {
                     (Some(s), Some(e)) if (c.start_side.unwrap_or(c.side), s) != (c.side, e) => {
-                        Some(range_label((c.start_side.unwrap_or(c.side), s), (c.side, e)))
+                        Some(range_label(
+                            (c.start_side.unwrap_or(c.side), s),
+                            (c.side, e),
+                        ))
                     }
                     _ => None,
                 };
-                let jump = u.version.map(|v| {
-                    view! {
-                        <button
-                            class="link"
-                            on:click=move |_| {
-                                let s = selection.get_untracked();
-                                let base = if s.base < v { s.base } else { 0 };
-                                chosen.set(Some(Selection { base, head: v }));
-                            }
-                        >
-                            {format!("on v{v}")}
-                        </button>
-                    }
-                });
+                let path = format!("{}{line}", c.path);
                 view! {
                     <li>
-                        <div class="panel-where"><code>{format!("{}{line}", c.path)}</code> " " {jump}
-                            {u.version.is_none().then(|| view! { <span class="muted">"on an unknown version"</span> })}
+                        <div class="panel-where">
+                            <ThreadWhere version=u.version>
+                                <code>{path}</code>
+                            </ThreadWhere>
                         </div>
                         <ThreadView thread=u.thread.clone() lines=lines />
                     </li>
@@ -2111,7 +2179,7 @@ mod tests {
         ];
 
         // Base → latest: mapped forward, except the outdated one.
-        let (inline, panel) = place(&comments, &versions, Selection { base: 0, head: 3 });
+        let (inline, panel) = place(&comments, &versions, Selection { base: 0, head: 3 }, None);
         assert_eq!(
             anchors(&inline),
             [
@@ -2124,7 +2192,7 @@ mod tests {
 
         // v1 → v2: the comment made on v1 anchors the left, the one made
         // on v2 the right.
-        let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 2 });
+        let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 2 }, None);
         assert_eq!(
             anchors(&inline),
             [
@@ -2135,7 +2203,7 @@ mod tests {
         assert_eq!(panel.len(), 1);
 
         // v2 → v3: v2's own thread anchors the left too.
-        let (inline, _) = place(&comments, &versions, Selection { base: 2, head: 3 });
+        let (inline, _) = place(&comments, &versions, Selection { base: 2, head: 3 }, None);
         assert_eq!(
             anchors(&inline),
             [
@@ -2162,7 +2230,7 @@ mod tests {
             file_comment,
         ];
 
-        let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 3 });
+        let (inline, panel) = place(&comments, &versions, Selection { base: 1, head: 3 }, None);
         assert_eq!(
             anchors(&inline),
             [
@@ -2209,7 +2277,7 @@ mod tests {
         cross.start_side = Some(Side::Left);
         let comments = [on_head, mapped, single, cross];
 
-        let (inline, _) = place(&comments, &versions, Selection { base: 0, head: 2 });
+        let (inline, _) = place(&comments, &versions, Selection { base: 0, head: 2 }, None);
         assert_eq!(
             starts(&inline),
             [
@@ -2238,7 +2306,7 @@ mod tests {
         head_cross.start_side = Some(Side::Left);
         let comments = [ranged, cross, head_cross];
 
-        let (inline, _) = place(&comments, &versions, Selection { base: 1, head: 2 });
+        let (inline, _) = place(&comments, &versions, Selection { base: 1, head: 2 }, None);
         assert_eq!(
             anchors(&inline),
             [
@@ -2251,6 +2319,136 @@ mod tests {
             starts(&inline),
             [(1, Some((Side::Left, 8))), (2, None), (3, None)]
         );
+    }
+
+    fn fallbacks(inline: &HashMap<String, Vec<Placed>>) -> Vec<(u64, Anchor, Option<Fallback>)> {
+        let mut out: Vec<_> = inline
+            .values()
+            .flatten()
+            .map(|p| (p.thread.root.id, p.anchor, p.fallback))
+            .collect();
+        out.sort_by_key(|(id, _, _)| *id);
+        out
+    }
+
+    #[test]
+    fn placement_falls_back_to_the_file() {
+        let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
+        // GitHub reports the thread outdated: it has no mapped line.
+        let comments = [comment(1, "a", Side::Right, 10, None)];
+        let paths = |p: &str| HashSet::from([p.to_owned()]);
+
+        // Its file in the diff: a file-level anchor marked outdated, its
+        // version for the header.
+        let (inline, panel) = place(
+            &comments,
+            &versions,
+            Selection { base: 0, head: 3 },
+            Some(&paths("f.rs")),
+        );
+        assert_eq!(
+            fallbacks(&inline),
+            [(
+                1,
+                Anchor::File,
+                Some(Fallback {
+                    version: Some(1),
+                    outdated: true
+                })
+            )]
+        );
+        assert_eq!(inline["f.rs"][0].start, None);
+        assert!(panel.is_empty());
+
+        // A file the diff doesn't show, or a diff not yet loaded: the
+        // side panel, as before.
+        let (inline, panel) = place(
+            &comments,
+            &versions,
+            Selection { base: 0, head: 3 },
+            Some(&paths("other.rs")),
+        );
+        assert!(inline.is_empty());
+        assert_eq!(panel.len(), 1);
+        let (inline, panel) = place(&comments, &versions, Selection { base: 0, head: 3 }, None);
+        assert!(inline.is_empty());
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].version, Some(1));
+    }
+
+    #[test]
+    fn placement_fallback_is_outdated_only_without_a_mapped_line() {
+        let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
+        let paths = HashSet::from(["f.rs".to_owned()]);
+        let comments = [
+            // Mapped forward, but Head isn't the latest.
+            comment(1, "a", Side::Right, 10, Some(12)),
+            // A merge-base comment made on v1, unplaceable between
+            // versions.
+            comment(2, "a", Side::Left, 7, Some(7)),
+        ];
+
+        // Base → v2, not the latest: neither anchors a line, and neither
+        // is outdated.
+        let (inline, panel) = place(
+            &comments,
+            &versions,
+            Selection { base: 0, head: 2 },
+            Some(&paths),
+        );
+        assert_eq!(
+            fallbacks(&inline),
+            [
+                (
+                    1,
+                    Anchor::File,
+                    Some(Fallback {
+                        version: Some(1),
+                        outdated: false
+                    })
+                ),
+                (
+                    2,
+                    Anchor::File,
+                    Some(Fallback {
+                        version: Some(1),
+                        outdated: false
+                    })
+                ),
+            ]
+        );
+        assert!(panel.is_empty());
+    }
+
+    #[test]
+    fn placement_fallback_keeps_the_old_path_of_a_rename() {
+        let versions = [version(1, "a"), version(2, "b")];
+        // Made on the old path of a file the diff renamed: the diff lists
+        // both paths, and the thread stays keyed by the old one so the
+        // file view picks it up.
+        let mut outdated = comment(1, "a", Side::Right, 10, None);
+        outdated.path = "old.rs".into();
+        let paths = HashSet::from(["new.rs".to_owned(), "old.rs".to_owned()]);
+
+        let (inline, panel) = place(
+            &[outdated],
+            &versions,
+            Selection { base: 0, head: 2 },
+            Some(&paths),
+        );
+        assert_eq!(
+            fallbacks(&inline),
+            [(
+                1,
+                Anchor::File,
+                Some(Fallback {
+                    version: Some(1),
+                    outdated: true
+                })
+            )]
+        );
+        assert!(inline.contains_key("old.rs"));
+        assert!(panel.is_empty());
     }
 
     #[test]

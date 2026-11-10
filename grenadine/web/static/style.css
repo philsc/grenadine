@@ -946,6 +946,13 @@ input[type="text"] {
 .panel-where {
   margin-bottom: 4px;
 }
+.file-where {
+  margin-bottom: 4px;
+}
+.outdated-badge {
+  color: var(--warn-fg);
+  border-color: var(--warn-border);
+}
 
 /* Diff */
 

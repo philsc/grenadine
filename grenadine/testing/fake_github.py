@@ -141,6 +141,8 @@ class Comment:
     can_resolve: bool = True
     # On the whole file rather than on `line`.
     on_file: bool = False
+    # Its line is gone from the head, as GitHub reports a `line` of null.
+    outdated: bool = False
 
 
 @dataclasses.dataclass
@@ -880,8 +882,8 @@ class FakeGitHub:
                 "original_commit_id": c.commit,
                 "original_line": None if c.on_file else c.line,
                 "original_start_line": None if c.on_file else c.start_line,
-                "line": None if c.on_file else c.line,
-                "start_line": None if c.on_file else c.start_line,
+                "line": None if c.on_file or c.outdated else c.line,
+                "start_line": None if c.on_file or c.outdated else c.start_line,
                 "start_side": c.start_side,
                 "side": c.side,
                 "subject_type": "file" if c.on_file else "line",
