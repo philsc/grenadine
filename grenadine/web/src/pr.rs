@@ -302,6 +302,18 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     provide_context(OpenBoxes::new());
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
+    // The page's clock, ticking so the relative times stay fresh.
+    let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
+    let clock = set_interval_with_handle(
+        move || now.set((js_sys::Date::now() / 1000.0) as i64),
+        Duration::from_secs(30),
+    );
+    on_cleanup(move || {
+        if let Ok(h) = clock {
+            h.clear();
+        }
+    });
+    provide_context(Now(now));
 
     // The sidebar is a resizable column on wide windows, which is
     // remembered, and an overlay the button opens on narrow ones, which
@@ -1630,7 +1642,7 @@ fn VersionPicker(
                                     " "
                                     <code title=v.sha.clone()>{short(&v.sha).to_owned()}</code>
                                     <span class="muted vkind">{kind_label(v)}</span>
-                                    {v.pushed_at.clone().map(|t| view! { <span class="muted vtime">{t.replace('T', " ").trim_end_matches("+00:00").to_owned()}</span> })}
+                                    {v.pushed_at.clone().map(|t| view! { <RelTime at=t class="muted vtime" /> })}
                                     {(reviewed == Some(n)).then(|| view! { <span class="vreviewed" title="The latest version you reviewed">"last reviewed"</span> })}
                                     {v.missing.then(|| view! { <span class="error">"missing"</span> })}
                                 }.into_any(),
@@ -1655,9 +1667,30 @@ fn VersionPicker(
     }
 }
 
-/// A comment's RFC 3339 time in UTC as shown, e.g. "2026-01-02 03:04:05".
-fn comment_time(ts: &str) -> String {
-    ts.replace('T', " ").trim_end_matches('Z').to_owned()
+/// The page's clock, provided by `PrView` so the relative times on it
+/// tick together.
+#[derive(Clone, Copy)]
+pub(crate) struct Now(pub RwSignal<i64>);
+
+/// `at`, an RFC 3339 timestamp, as a relative time like "5m ago" that
+/// ticks with the page's clock, and its local time for a title. `None`
+/// when `at` isn't a timestamp, like a pending comment's empty time.
+fn rel(at: &str) -> Option<(impl Fn() -> String + Clone + use<>, String)> {
+    let secs = crate::rfc3339_secs(at)?;
+    let clock = use_context::<Now>();
+    let text = move || {
+        let now = clock.map_or_else(|| (js_sys::Date::now() / 1000.0) as i64, |n| n.0.get());
+        crate::ago(now, secs)
+    };
+    Some((text, crate::local_datetime(secs)))
+}
+
+/// `at`, an RFC 3339 timestamp, shown as a relative time like "5m ago"
+/// with its local time as the title. Renders nothing when `at` isn't a
+/// timestamp.
+#[component]
+pub(crate) fn RelTime(at: String, #[prop(optional)] class: &'static str) -> impl IntoView {
+    rel(&at).map(|(text, title)| view! { <span class=class title=title>{text}</span> })
 }
 
 /// A comment: its author (the children), its time linked to the comment
@@ -1676,6 +1709,7 @@ pub(crate) fn CommentFrame(
     #[prop(optional)] editor: Option<(Signal<bool>, ViewFn)>,
 ) -> impl IntoView {
     let links = expect_context::<PrLinks>();
+    let time = rel(&at);
     let html = (!body.trim().is_empty()).then(|| markdown::to_html(&body, &links.repo));
     let body = move || match editor.as_ref().filter(|(on, _)| on.get()) {
         Some((_, view)) => Some(view.run()),
@@ -1691,7 +1725,9 @@ pub(crate) fn CommentFrame(
             <div class="comment-meta">
                 {children()}
                 " "
-                <a class="muted" href=url target="_blank" rel="noopener">{comment_time(&at)}</a>
+                {time.map(|(text, title)| view! {
+                    <a class="muted" href=url target="_blank" rel="noopener" title=title>{text}</a>
+                })}
                 {actions}
             </div>
             {body}

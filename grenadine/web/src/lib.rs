@@ -413,6 +413,127 @@ pub(crate) fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// Days since 1970-01-01 for `y`-`m`-`d` (Howard Hinnant's
+/// days-from-civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m + 9).rem_euclid(12);
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The inverse of `days_from_civil`: (year, month, day). Only the
+/// non-wasm `local_datetime` uses it; under wasm `js_sys::Date` does.
+#[cfg(not(target_arch = "wasm32"))]
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// An RFC 3339 timestamp like "2026-01-02T03:04:05Z" or
+/// "2026-01-02T03:04:05.123-08:00" as Unix seconds, or `None` when `ts`
+/// isn't one.
+pub(crate) fn rfc3339_secs(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = ts.get(0..4)?.parse().ok()?;
+    let month: i64 = ts.get(5..7)?.parse().ok()?;
+    let day: i64 = ts.get(8..10)?.parse().ok()?;
+    let hour: i64 = ts.get(11..13)?.parse().ok()?;
+    let min: i64 = ts.get(14..16)?.parse().ok()?;
+    let sec: i64 = ts.get(17..19)?.parse().ok()?;
+    let mut rest = &ts[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(frac.len());
+        if digits == 0 {
+            return None;
+        }
+        rest = &frac[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let b = rest.as_bytes();
+            if b.len() != 6 || b[3] != b':' {
+                return None;
+            }
+            let sign = match b[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let h: i64 = rest[1..3].parse().ok()?;
+            let m: i64 = rest[4..6].parse().ok()?;
+            sign * (h * 3600 + m * 60)
+        }
+    };
+    Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec - offset)
+}
+
+/// `secs` (Unix seconds) as local "YYYY-MM-DD HH:MM:SS UTC±HH:MM".
+pub(crate) fn local_datetime(secs: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+        // JavaScript's offset is minutes to add to local time to get
+        // UTC, the opposite of the "UTC±HH:MM" sign.
+        let offset = -d.get_timezone_offset() as i64;
+        let (sign, abs) = if offset < 0 {
+            ('-', -offset)
+        } else {
+            ('+', offset)
+        };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC{}{:02}:{:02}",
+            d.get_full_year(),
+            d.get_month() + 1,
+            d.get_date(),
+            d.get_hours(),
+            d.get_minutes(),
+            d.get_seconds(),
+            sign,
+            abs / 60,
+            abs % 60
+        )
+    }
+    // The tests don't run under wasm; UTC is close enough there.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let t = secs.rem_euclid(86400);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC+00:00",
+            y,
+            m,
+            d,
+            t / 3600,
+            t / 60 % 60,
+            t % 60
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +548,29 @@ mod tests {
         assert_eq!(ago(3660, 60), "1h ago");
         assert_eq!(ago(86400 + 60, 60), "1d ago");
         assert_eq!(ago(86400 * 5 + 60, 60), "5d ago");
+    }
+
+    #[test]
+    fn rfc3339_secs_parses() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06+00:00"), Some(secs));
+        assert_eq!(rfc3339_secs("2026-11-10T10:34:06-08:00"), Some(secs));
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06.987Z"), Some(secs));
+        assert_eq!(rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_secs("1969-12-31T16:00:00-08:00"), Some(0));
+        assert_eq!(rfc3339_secs(""), None);
+        assert_eq!(rfc3339_secs("garbage"), None);
+        assert_eq!(rfc3339_secs("2026-11-10 18:34:06Z"), None);
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06"), None);
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06."), None);
+    }
+
+    #[test]
+    fn local_datetime_utc() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(local_datetime(secs), "2026-11-10 18:34:06 UTC+00:00");
+        assert_eq!(local_datetime(0), "1970-01-01 00:00:00 UTC+00:00");
+        assert_eq!(local_datetime(-1), "1969-12-31 23:59:59 UTC+00:00");
     }
 
     fn key(repo: &str, number: u64) -> PrKey {
