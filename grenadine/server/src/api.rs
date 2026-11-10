@@ -14,12 +14,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, Approval, AutoMerge, AutoReviewEntry,
-    BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL, InboxEdit,
-    InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession,
-    NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings,
-    ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges, WrapUp,
-    submit_blocker,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, Approval, AutoMerge,
+    AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL,
+    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
+    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
+    RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges,
+    WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -1228,14 +1228,17 @@ async fn agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
     })
 }
 
-/// The unstaged changes in the session's worktree; none once the worktree
-/// is gone.
+/// The unstaged changes in the session's worktree; none while the
+/// worktree is being created or once it is gone.
 async fn agent_changes(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     let Some(session) = find_agent(&state, &id)? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let worktree = std::path::PathBuf::from(&session.worktree);
-    let Some(repo) = state.repo(&session.repo).filter(|_| worktree.is_dir()) else {
+    let Some(repo) = state
+        .repo(&session.repo)
+        .filter(|_| session.status != AgentStatus::Creating && worktree.is_dir())
+    else {
         return Ok(Json(WorktreeChanges::default()).into_response());
     };
     let files = tokio::task::spawn_blocking(move || repo.worktree_changes(&worktree)).await??;
@@ -1764,6 +1767,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_changes_wait_for_the_created_worktree() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("wt");
+        fx.clone.worktree_add(&worktree, "x", "HEAD").unwrap();
+        std::fs::write(worktree.join("a"), "2\n").unwrap();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let id = "00000000-0000-0000-0000-000000000000";
+        state
+            .db
+            .create_agent(&AgentSession {
+                title: "t".into(),
+                branch: "x".into(),
+                worktree: worktree.to_string_lossy().into_owned(),
+                base_sha: "s".into(),
+                status: AgentStatus::Creating,
+                ..AgentSession::fixture(id, &fx.clone.slug)
+            })
+            .unwrap();
+        let get = |id: &str| agent_changes(AxState(state.clone()), Path(id.to_owned()));
+        let unstaged = || async {
+            let Json(list) = agents(AxState(state.clone()))
+                .await
+                .map_err(|e| e.0)
+                .unwrap();
+            list[0].unstaged
+        };
+
+        // While the worktree is still being written the change in it
+        // isn't reported.
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        assert_eq!(body(response).await, r#"{"files":[]}"#);
+        assert!(!crate::unstaged::recount(&state, id).await);
+        assert_eq!(unstaged().await, 0);
+
+        state.db.set_agent_status(id, AgentStatus::Running).unwrap();
+        let response = get(id).await.map_err(|e| e.0).unwrap();
+        let changes: WorktreeChanges = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(changes.files.len(), 1);
+        assert!(crate::unstaged::recount(&state, id).await);
+        assert_eq!(unstaged().await, 1);
+    }
+
+    #[tokio::test]
     async fn agent_prs_come_from_the_polls() {
         let state = crate::sync::test_state();
         let id = "00000000-0000-0000-0000-000000000000";
@@ -2277,7 +2329,7 @@ mod tests {
                 branch: "x".into(),
                 worktree: "/w".into(),
                 base_sha: "s".into(),
-                status: grenadine_core::api::AgentStatus::AwaitingApproval,
+                status: AgentStatus::AwaitingApproval,
                 ..AgentSession::fixture(id, "o/n")
             })
             .unwrap();

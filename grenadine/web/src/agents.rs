@@ -2283,7 +2283,14 @@ pub fn AgentView(
                 // A general session's directory isn't a git worktree, and a
                 // compact view has no room for the changes.
                 {move || {
-                    (load.get() == Load::Ready && !general.get() && !compact).then(|| view! { <ChangesPane id=id.clone() repo=repo.get_untracked() events=events /> })
+                    (load.get() == Load::Ready && !general.get() && !compact).then(|| view! {
+                        <ChangesPane
+                            id=id.clone()
+                            repo=repo.get_untracked()
+                            events=events
+                            creating=Signal::derive(move || current.with(|s| s.as_ref().is_some_and(|s| s.status == AgentStatus::Creating)))
+                        />
+                    })
                 }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
@@ -2312,9 +2319,16 @@ fn wide_enough() -> bool {
 /// when the window has room for them. They are refetched as the session's
 /// events come in, since those are when the agent changes files.
 #[component]
-fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<Arc<AgentEvent>>>) -> impl IntoView {
+fn ChangesPane(
+    id: String,
+    repo: String,
+    events: RwSignal<Vec<Arc<AgentEvent>>>,
+    creating: Signal<bool>,
+) -> impl IntoView {
     let updates = expect_context::<Updates>();
-    let session = id.clone();
+    // A StoredValue so the reactive blocks below can copy it in; the id
+    // never changes for the pane's lifetime.
+    let session = StoredValue::new(id.clone());
     let wide = RwSignal::new(wide_enough());
     let on_resize = window_event_listener_untyped("resize", move |_| {
         let w = wide_enough();
@@ -2372,19 +2386,28 @@ fn ChangesPane(id: String, repo: String, events: RwSignal<Vec<Arc<AgentEvent>>>)
         wide.get().then(|| {
             view! {
                 <aside class="changes-pane">
-                    <AssociatedPrs id=session.clone() repo=repo.clone() />
+                    <AssociatedPrs id=session.get_value() repo=repo.clone() />
                     <h2>"Unstaged changes"</h2>
-                    {move || match loaded.get() {
-                        None => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                        Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
-                        Some(Ok(f)) if f.is_empty() => {
-                            view! { <p class="muted">"No unstaged changes."</p> }.into_any()
+                    {move || {
+                        if creating.get() {
+                            return view! { <p class="muted">"Creating worktree…"</p> }.into_any();
                         }
-                        Some(Ok(f)) => view! {
-                            <p class="muted">{format!("{} files changed", f.len())}</p>
-                        }.into_any(),
+                        match loaded.get() {
+                            None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                            Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                            Some(Ok(f)) if f.is_empty() => {
+                                view! { <p class="muted">"No unstaged changes."</p> }.into_any()
+                            }
+                            Some(Ok(f)) => view! {
+                                <p class="muted">{format!("{} files changed", f.len())}</p>
+                            }.into_any(),
+                        }
                     }}
-                    <WorktreeDiff files=files session=session.clone() />
+                    {move || {
+                        (!creating.get()).then(move || {
+                            view! { <WorktreeDiff files=files session=session.get_value() /> }
+                        })
+                    }}
                 </aside>
             }
         })
