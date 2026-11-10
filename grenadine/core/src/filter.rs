@@ -63,6 +63,9 @@ enum Gr {
     ReviewActive,
     /// An active review written by a person, not a bot.
     ReviewActiveHuman,
+    /// An active human review whose reviewer's standing verdict isn't
+    /// APPROVED.
+    ReviewUnapprovedHuman,
     ChangesUnaddressed,
     Approvals(u64),
     ApprovedBy(String),
@@ -178,6 +181,7 @@ fn classify(term: &str) -> Result<Kind, String> {
         },
         "review" if value == "active" => Kind::Gr(Gr::ReviewActive),
         "review" if value == "active-human" => Kind::Gr(Gr::ReviewActiveHuman),
+        "review" if value == "unapproved-human" => Kind::Gr(Gr::ReviewUnapprovedHuman),
         "changes-requested" if value == "unaddressed" => Kind::Gr(Gr::ChangesUnaddressed),
         "approvals" => match value.strip_prefix('>').and_then(|n| n.parse::<u64>().ok()) {
             Some(n) => Kind::Gr(Gr::Approvals(n)),
@@ -459,6 +463,10 @@ fn eval_gr(gr: &Gr, pr: &PrFacts, me: &str) -> bool {
     match gr {
         Gr::ReviewActive => pr.reviews.iter().any(|r| active_review(pr, r)),
         Gr::ReviewActiveHuman => pr.reviews.iter().any(|r| active_review(pr, r) && !r.bot),
+        Gr::ReviewUnapprovedHuman => pr
+            .reviews
+            .iter()
+            .any(|r| active_review(pr, r) && !r.bot && verdict(pr, &r.author) != Some("APPROVED")),
         Gr::ChangesUnaddressed => pr
             .reviews
             .iter()
@@ -640,6 +648,7 @@ mod tests {
         let w = |f: &str| parses(f).search_terms();
         assert_eq!(w("gr:review:active"), "");
         assert_eq!(w("gr:review:active-human"), "");
+        assert_eq!(w("gr:review:unapproved-human"), "");
         assert_eq!(w("is:open gr:review:active"), "is:open");
         assert_eq!(w("-gr:review:active is:open"), "is:open");
         assert_eq!(
@@ -674,7 +683,7 @@ mod tests {
                 "state:open archived:false draft:false -author:@me -is:queued user-review-requested:@me sort:updated-desc",
             ),
             (
-                "state:open archived:false draft:false author:@me -is:queued ((gr:review:active-human -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc",
+                "state:open archived:false draft:false author:@me -is:queued ((gr:review:unapproved-human -review:approved) OR gr:changes-requested:unaddressed) gr:sort:title-asc",
                 "state:open archived:false draft:false author:@me -is:queued",
             ),
             (
@@ -686,7 +695,7 @@ mod tests {
                 "state:open archived:false draft:true -author:@me user-review-requested:@me",
             ),
             (
-                "state:open archived:false draft:false author:@me -is:queued -gr:review:active-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc",
+                "state:open archived:false draft:false author:@me -is:queued -gr:review:unapproved-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc",
                 "state:open archived:false draft:false author:@me -is:queued -review:approved sort:updated-desc",
             ),
         ];
@@ -766,6 +775,38 @@ mod tests {
     }
 
     #[test]
+    fn unapproved_human_review() {
+        let f = parses("gr:review:unapproved-human");
+        let m = |pr: &PrFacts| f.matches(pr, "me");
+        let mut pr = facts();
+        // An approval is not an unapproved review, even when a later
+        // comment-only review by the same reviewer is active.
+        pr.reviews = vec![review("bob", "APPROVED")];
+        assert!(!m(&pr));
+        pr.reviews = vec![review("bob", "APPROVED"), review("bob", "COMMENTED")];
+        assert!(!m(&pr));
+        // A comment-only review carries no verdict, so it is unapproved.
+        pr.reviews = vec![review("bob", "COMMENTED")];
+        assert!(m(&pr));
+        // A bot's comment doesn't count.
+        pr.reviews = vec![bot_review("ci-bot", "COMMENTED")];
+        assert!(!m(&pr));
+        // A change request is unapproved.
+        pr.reviews = vec![review("bob", "CHANGES_REQUESTED")];
+        assert!(m(&pr));
+        // A re-requested reviewer's comment isn't active.
+        pr.user_review_requests = vec!["bob".into()];
+        assert!(!m(&pr));
+        pr.user_review_requests = vec![];
+        // The author's own comment isn't active either.
+        pr.reviews = vec![review("me", "COMMENTED")];
+        assert!(!m(&pr));
+        // One approver plus another reviewer's comment is unapproved.
+        pr.reviews = vec![review("bob", "APPROVED"), review("ann", "COMMENTED")];
+        assert!(m(&pr));
+    }
+
+    #[test]
     fn rerequested() {
         let mut pr = facts();
         pr.user_review_requests = vec!["bob".into()];
@@ -832,14 +873,14 @@ mod tests {
         // The Returned/Approved/Waiting/Merging filters over a table of
         // non-draft open authored PRs: exactly one holds each.
         let ret = parses(
-            "state:open archived:false draft:false author:@me -is:queued ((gr:review:active-human -review:approved) OR gr:changes-requested:unaddressed)",
+            "state:open archived:false draft:false author:@me -is:queued ((gr:review:unapproved-human -review:approved) OR gr:changes-requested:unaddressed)",
         );
         let app = parses(
             "state:open archived:false draft:false author:@me -is:queued review:approved gr:approvals:>0 -gr:changes-requested:unaddressed",
         );
         let mrg = parses("state:open archived:false draft:false author:@me is:queued");
         let wr = parses(
-            "state:open archived:false draft:false author:@me -is:queued -gr:review:active-human -gr:changes-requested:unaddressed -review:approved",
+            "state:open archived:false draft:false author:@me -is:queued -gr:review:unapproved-human -gr:changes-requested:unaddressed -review:approved",
         );
         let base = facts();
         let cases: Vec<(PrFacts, [bool; 4])> = vec![
@@ -917,6 +958,25 @@ mod tests {
                         review("ann", "CHANGES_REQUESTED"),
                     ],
                     review_decision: Some("CHANGES_REQUESTED".into()),
+                    ..base.clone()
+                },
+                [true, false, false, false],
+            ),
+            // Approved, but branch protection still wants reviews: the
+            // approval isn't a reason to return the PR, so Waiting.
+            (
+                PrFacts {
+                    reviews: vec![review("bob", "APPROVED")],
+                    review_decision: Some("REVIEW_REQUIRED".into()),
+                    ..base.clone()
+                },
+                [false, false, false, true],
+            ),
+            // The same, plus another reviewer's comment: Returned.
+            (
+                PrFacts {
+                    reviews: vec![review("bob", "APPROVED"), review("ann", "COMMENTED")],
+                    review_decision: Some("REVIEW_REQUIRED".into()),
                     ..base.clone()
                 },
                 [true, false, false, false],

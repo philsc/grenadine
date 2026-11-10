@@ -188,6 +188,8 @@ class PullRequest:
     team_review_requests: set[str] = dataclasses.field(default_factory=set)
     # Branch protection requires an approving review.
     review_required: bool = False
+    # How many approvals branch protection requires.
+    required_approvals: int = 1
     reviews: list[Review] = dataclasses.field(default_factory=list)
     comments: list[Comment] = dataclasses.field(default_factory=list)
     # The check runs on the head, including ones later runs superseded.
@@ -235,9 +237,10 @@ class PullRequest:
                 latest[r.author] = r.state
         if CHANGES_REQUESTED in latest.values():
             return CHANGES_REQUESTED
-        if APPROVED in latest.values():
-            return APPROVED
-        return REVIEW_REQUIRED if self.review_required else None
+        approvals = sum(v == APPROVED for v in latest.values())
+        if self.review_required:
+            return APPROVED if approvals >= self.required_approvals else REVIEW_REQUIRED
+        return APPROVED if approvals else None
 
     def checks(self) -> str | None:
         """The StatusState of the checks on the head; None when it has

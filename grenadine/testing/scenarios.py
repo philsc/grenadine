@@ -142,12 +142,13 @@ def _gr_term(pr: PullRequest, term: str, me: str, bots: set[str]) -> bool:
     name, _, arg = term[3:].partition(":")
     user = me if arg == "@me" else arg
     match name:
-        case "review" if arg in ("active", "active-human"):
+        case "review" if arg in ("active", "active-human", "unapproved-human"):
             return any(
                 r.state not in (DISMISSED, PENDING)
                 and r.author != pr.author
                 and r.author not in pr.review_requests
                 and (arg == "active" or r.author not in bots)
+                and (arg != "unapproved-human" or _verdict(pr, r.author) != APPROVED)
                 for r in pr.reviews
             )
         case "changes-requested" if arg == "unaddressed":
@@ -331,6 +332,27 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
         [APPROVED_INBOX, ALL_MY_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, APPROVED)
+
+    # An approval isn't a reason to return the PR when branch protection
+    # wants more approvals.
+    pr = add(
+        _simple_pr(repo, "waiting-more-approvals", "Get one of two approvals"),
+        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+    )
+    pr.review_required = True
+    pr.required_approvals = 2
+    pr.submit_review(OTHER, APPROVED)
+
+    # A comment by a reviewer who hasn't approved is an unapproved
+    # human review even when the PR has a partial approval.
+    pr = add(
+        _simple_pr(repo, "returned-approval-comment", "Get a comment over an approval"),
+        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+    )
+    pr.review_required = True
+    pr.required_approvals = 2
+    pr.submit_review(OTHER, APPROVED)
+    pr.submit_review("third", COMMENTED)
 
     add(
         _simple_pr(repo, "waiting-reviewers", "Wait for reviewers"),
