@@ -7,6 +7,7 @@ reviews can refer to it.
 - [Stacked PRs](#stacked-prs)
 - [Version picker](#version-picker)
 - [Reviews and merge state](#reviews-and-merge-state)
+- [Agent stacks](#agent-stacks)
 
 # Stacked PRs
 
@@ -728,3 +729,61 @@ decision instead.
 _Why:_ after the viewer reviews a PR from grenadine, its resync updates
 the decision right away, so the inbox agrees with the PR's page instead
 of lagging until the next search.
+
+# Agent stacks
+
+These requirements cover which pull requests an agent session manages,
+that is, which ones its `update_prs` pushes to, retargets and closes. A
+session manages the PRs it opened, the PR it started from once it replaces
+that PR's commits, and the PRs it took over.
+
+**AGENT-STACK-CHAIN-1.** A session must manage at most one linear stack:
+its managed PRs must be one contiguous chain of open PRs, each stacked on
+the one before it. `manage_prs` must refuse PRs that would leave a gap in
+the chain or put two of its PRs on the same parent.
+_Why:_ `update_prs` maps the session's commits onto its PRs bottom first,
+which only works for a single chain.
+
+**AGENT-STACK-CHAIN-2.** A session started from a PR with a linear chain
+of open PRs stacked on it must manage that PR and every PR of the chain,
+without asking. Its worktree must start at the top PR's head. The PRs
+below the one it started from must stay its base.
+_Why:_ changing a PR's commits leaves the PRs stacked on it with the old
+ones unless they're updated too.
+
+**AGENT-STACK-CHAIN-3.** Naming PRs below the session's in `manage_prs`
+must move the PR the session counts as started from down to the chain's
+bottom.
+
+**AGENT-STACK-FORK-1.** When the PRs stacked on the session's starting PR
+fork, i.e. some PR of the chain has two open children, the session must
+not manage any of them. Its start note must say why and tell the agent to
+call `manage_prs` with the chain it wants.
+_Why:_ there's no telling which branch of the fork the user means.
+
+**AGENT-STACK-XFER-1.** Taking over a PR another session manages must move
+it: it leaves the other session's managed PRs and joins the new
+session's, in one transaction. The other session must keep showing it
+among its PRs.
+_Why:_ two sessions pushing to the same branch would undo each other's
+work.
+
+**AGENT-STACK-XFER-2.** A session's `update_prs` must neither push to nor
+close a PR another session took over from it. When asked to, it must say
+which session manages the PR now.
+
+**AGENT-STACK-XFER-3.** `manage_prs` must ask the user before it takes PRs
+from another session, naming the PRs and the session. Taking PRs that no
+session manages, and taking a stack when a session starts, must not ask.
+_Why:_ taking PRs from a session stops that session's work on them.
+
+**AGENT-STACK-LEASE-1.** The first push of each PR a session took over
+must only go through while the PR's branch is still at the head
+Grenadine last synced. Each taken PR keeps its own head branch.
+_Why:_ someone may have pushed to the branch since, and force-pushing
+over it would lose their commits.
+
+**AGENT-STACK-LEASE-2.** A session must not drop a PR it took over and
+hasn't pushed to yet, and must keep the PR it started from at the bottom.
+_Why:_ dropping a PR closes it and deletes its branch, which isn't the
+session's to do with someone else's PR.
