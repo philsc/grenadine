@@ -9,6 +9,7 @@ server only for the classes it has tests from.
 """
 
 import base64
+import datetime
 import http.client
 import json
 import os
@@ -22,6 +23,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zoneinfo
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1310,6 +1312,43 @@ class InboxTest(ServerTestCase):
         merge = self.page.locator(".merge-box")
         expect(merge.locator(".checks")).to_have_count(0)
         expect(merge.locator(".merge-status")).to_have_text("Ready to merge.")
+
+    def test_timestamps_show_relative_with_local_title(self) -> None:
+        # A page in Pacific time shows relative times whose titles give
+        # the local time.
+        self.page.close()
+        self.page = self.browser.new_page(timezone_id="America/Los_Angeles")
+        self.addCleanup(self.page.close)
+        pr = self.cases.prs["Get changes requested"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        la = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+        def local(ts: int) -> str:
+            dt = datetime.datetime.fromtimestamp(ts, la)
+            off = dt.strftime("%z")
+            return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC{off[:3]}:{off[3:]}"
+
+        # The issue comment's time links to it on GitHub.
+        link = (
+            self.page.locator("details.conversation .comment")
+            .nth(1)
+            .locator(".comment-meta a")
+        )
+        expect(link).to_have_text(re.compile(r"just now|\d+[mhd] ago"))
+        expect(link).to_have_attribute("title", local(pr.issue_comments[0].created_at))
+
+        # A version's pushed time reads the same way.
+        with urllib.request.urlopen(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}"
+        ) as resp:
+            pushed_at = json.load(resp)["versions"][0]["pushed_at"]
+        pushed_ts = int(datetime.datetime.fromisoformat(pushed_at).timestamp())
+        picker = self.page.locator("details.picker")
+        picker.locator("summary").click()
+        vtime = picker.locator(".vtime").first
+        expect(vtime).to_have_text(re.compile(r"just now|\d+[mhd] ago"))
+        expect(vtime).to_have_attribute("title", local(pushed_ts))
 
     def test_pr_page_shows_checks(self) -> None:
         pr = self.cases.prs["Ask my team for a review"]
