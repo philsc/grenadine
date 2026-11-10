@@ -2144,7 +2144,7 @@ pub async fn land_now(
     }
 }
 
-fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
+fn record_landed(state: &Arc<State>, id: &str, landed: &Landed) -> Result<()> {
     state.db.set_agent_landed(id, landed)?;
     // Wrapping up again lands only what came after.
     match landed {
@@ -2157,6 +2157,10 @@ fn record_landed(state: &State, id: &str, landed: &Landed) -> Result<()> {
                         number: pr.number,
                     };
                     state.db.add_agent_pr(id, &key, "OPEN")?;
+                    // The PR is new or was just pushed to, and the poll
+                    // may take a while to reach it, or may leave it alone
+                    // since no inbox shows it; its page shows it now.
+                    state.resync(key);
                 }
                 // The next poll fills in the titles right away.
                 state.poke.notify_one();
@@ -2427,6 +2431,14 @@ async fn land(
         }
     }
     gh_stack_sync(state, &session, &stack_op, &dropped, &prs, &mut notes).await;
+    // The closed PRs' pages show them closed now; the kept ones are
+    // synced as they're recorded.
+    for pr in &dropped {
+        state.resync(PrKey {
+            repo: session.repo.clone(),
+            number: pr.number,
+        });
+    }
     // The merged PRs' commits are landed; the next wrap-up continues
     // from the trunk's tip.
     if let Some(tip) = rebased {
@@ -6370,6 +6382,37 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
             .count();
         assert_eq!(prompts, 2);
+    }
+
+    /// A landing's PRs sync right away, so their pages don't wait for a
+    /// poll. The test's GitHub is unreachable, so each sync ends in a
+    /// stored error.
+    #[tokio::test]
+    async fn landed_prs_sync_right_away() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let session = start(&state, "commit b agent").await;
+        let pr = |number| LandedPr {
+            number,
+            url: format!("https://github.com/owner/name/pull/{number}"),
+            branch: format!("b{number}"),
+            lease: None,
+        };
+        record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
+        for number in [24, 25] {
+            let key = PrKey {
+                repo: "owner/name".into(),
+                number,
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while state.db.pr_sync_error(&key).unwrap().is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("#{number} wasn't synced"));
+        }
     }
 
     /// `update_prs` pushes the session's commits to their PRs' branches,
