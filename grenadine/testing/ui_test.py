@@ -1841,6 +1841,32 @@ class InboxTest(ServerTestCase):
             ).first
         ).to_be_visible()
 
+    def test_a_slow_sync_status_fetch_does_not_undo_a_newer_event(self) -> None:
+        # The page refetches the sync status on InboxesChanged, which a
+        # poll sends while it's still checking GitHub. Held back, that
+        # answer lands after the event saying the poll ended.
+        self.page.add_init_script(
+            """
+            const fetch = window.fetch;
+            window.fetch = async (...args) => {
+              const response = await fetch(...args);
+              if ((args[0].url ?? String(args[0])).endsWith("/api/sync")) {
+                await new Promise((resolve) => setTimeout(resolve, 1500));
+              }
+              return response;
+            };
+            """
+        )
+        self.page.goto(self.url)
+        status = self.page.locator(".sync-status")
+        expect(status).to_have_text(re.compile(r"^Synced"))
+
+        self.repoll()
+        # Past the held-back answers, the status still says the poll
+        # ended.
+        self.page.wait_for_timeout(4000)
+        expect(status).to_have_text(re.compile(r"^Synced"), timeout=1000)
+
     def test_pauses_near_the_rate_limit(self) -> None:
         self.page.goto(self.url)
         inbox = self.inbox(scenarios.NEEDS_REVIEW)
