@@ -373,7 +373,11 @@ impl ModelList {
             Err(e) => {
                 let missing = is_missing(&e);
                 let error = format!("{e:#}");
-                tracing::warn!("listing {name}'s models: {error}");
+                if missing {
+                    tracing::debug!("listing {name}'s models: {error}");
+                } else {
+                    tracing::warn!("listing {name}'s models: {error}");
+                }
                 *listing = Some(Listing::Failed {
                     at: Instant::now(),
                     error: error.clone(),

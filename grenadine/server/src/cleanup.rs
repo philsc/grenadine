@@ -721,7 +721,7 @@ pub(crate) async fn prune(state: &Arc<State>) -> Result<usize> {
     let mut failed = None;
     for ((backend, clone), items) in by_group {
         if !state.agents.offered(backend).await {
-            tracing::warn!(
+            tracing::debug!(
                 "{} isn't offered, skipping its cleanup items",
                 backend.label()
             );
