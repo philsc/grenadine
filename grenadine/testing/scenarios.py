@@ -491,6 +491,10 @@ UPSTREAM_ADDED_EDITS = [
     "added line 10, edited",
     "added line 21, new",
 ]
+OUTDATED = "Rewrite a commented block"
+OUTDATED_PATH = "outdated/block.py"
+OUTDATED_LINES = [f"block line {i}" for i in range(1, 11)]
+
 CONFLICT = "Conflict with upstream"
 CONFLICT_PATH = "conflict/shared.py"
 PR_SETTING_10 = "SETTING_10 = 10 + 100  # changed by the PR"
@@ -669,6 +673,21 @@ def versions_cases(gh: FakeGitHub) -> Versions:
     repo.push("case/file-kinds")
     prs[FILE_KINDS] = repo.open_pr(FILE_KINDS, head="case/file-kinds")
     shas[FILE_KINDS] = v
+
+    # A thread on lines the next version rewrites goes outdated.
+    repo.checkout("case/outdated", "main")
+    v = [
+        repo.commit("Add the block", {OUTDATED_PATH: "\n".join(OUTDATED_LINES) + "\n"})
+    ]
+    repo.push("case/outdated")
+    pr = prs[OUTDATED] = repo.open_pr(OUTDATED, head="case/outdated")
+    changed = list(OUTDATED_LINES)
+    changed[3:7] = ["rewritten block"]
+    v.append(
+        repo.commit("Rewrite the block", {OUTDATED_PATH: "\n".join(changed) + "\n"})
+    )
+    repo.push(pr.head)
+    shas[OUTDATED] = v
 
     repo.checkout("case/big-diff", "main")
     v = [

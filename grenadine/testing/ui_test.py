@@ -3465,6 +3465,19 @@ class VersionsTest(ServerTestCase):
             line=7,
             commit=r_shas[1],
         )
+        # A multi-line thread on v1 whose lines v2 rewrote: outdated.
+        outdated = cls.cases.prs[scenarios.OUTDATED]
+        o_shas = cls.cases.shas[scenarios.OUTDATED]
+        c = repo.comment(
+            outdated,
+            author=scenarios.OTHER,
+            body="This block reads better now.",
+            path=scenarios.OUTDATED_PATH,
+            line=7,
+            start_line=4,
+            commit=o_shas[0],
+        )
+        c.outdated = True
 
     def open(self, title: str) -> None:
         pr = self.cases.prs[title]
@@ -3655,6 +3668,30 @@ class VersionsTest(ServerTestCase):
             ".outside-comments .outside", has_text="Dropped by the merge."
         )
         expect(outside).to_contain_text("old line 50")
+
+    def test_an_outdated_thread_shows_on_its_file(self) -> None:
+        self.open(scenarios.OUTDATED)
+        file = self.file(scenarios.OUTDATED_PATH)
+        # Base → v2: the thread's lines are gone, so it sits on the file
+        # with an Outdated badge and its original range.
+        comments = file.locator(".file-comments")
+        where = comments.locator(".file-where")
+        expect(where).to_contain_text("Lines +4 to +7 on v1")
+        expect(where.locator(".outdated-badge")).to_have_text("Outdated")
+        expect(comments.locator(".thread")).to_contain_text(
+            "This block reads better now."
+        )
+        # Nothing stays behind in the side panel.
+        expect(self.page.locator(".comment-panel")).to_have_count(0)
+
+        # "on v1" diffs Base → v1, where the thread is back on its lines.
+        where.get_by_role("button", name="on v1").click()
+        expect(self.page.locator(".picker summary")).to_have_text(
+            f"Base → v1 ({self.shas[0][:8]})"
+        )
+        expect(
+            self.row_above(file, "This block reads better now.").locator("td.ln").nth(1)
+        ).to_have_text("7")
 
     def test_a_multi_line_thread_shows_its_range(self) -> None:
         self.open(scenarios.GROW)
