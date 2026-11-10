@@ -2736,6 +2736,12 @@ body.resizing-sidebar * {
 .merge-box {
   padding: 8px 12px;
 }
+/* In the sidebar it's a section like the others, under a heading. */
+.merge-box.in-sidebar {
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
 .merge-status {
   margin: 4px 0;
   font-weight: 600;

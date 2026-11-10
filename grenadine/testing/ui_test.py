@@ -1384,6 +1384,50 @@ class InboxTest(ServerTestCase):
         self.page.locator(".sidebar-toggle").click()
         expect(self.sidebar()).to_have_count(1)
 
+    def test_merge_box_sits_atop_the_sidebar(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        main = self.page.locator(".pr-page .main")
+
+        # The sidebar's first section, under a heading, and not in the
+        # main column too.
+        first = self.sidebar().locator(".pr-sidebar-body > section").first
+        expect(first).to_have_class(re.compile(r"\bmerge-box\b"))
+        expect(first.locator("h2")).to_have_text("Merge")
+        expect(main.locator(".merge-box")).to_have_count(0)
+        delete = first.get_by_label("Delete the branch")
+        expect(delete).to_be_checked()
+        delete.uncheck()
+
+        # With the sidebar hidden it's back in the main column, as it was,
+        # and keeps what was picked.
+        self.page.locator(".sidebar-toggle").click()
+        expect(self.sidebar()).to_have_count(0)
+        box = main.locator(".merge-box")
+        expect(box).to_be_visible()
+        expect(box.locator("h2")).to_have_count(0)
+        expect(box.get_by_label("Delete the branch")).not_to_be_checked()
+
+        self.page.locator(".sidebar-toggle").click()
+        expect(main.locator(".merge-box")).to_have_count(0)
+        expect(
+            self.sidebar().locator(".merge-box").get_by_label("Delete the branch")
+        ).not_to_be_checked()
+
+    def test_merge_box_follows_the_overlay(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.set_viewport_size({"width": 1280, "height": 900})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        main = self.page.locator(".pr-page .main")
+
+        # The overlay starts closed, so merging needn't open it.
+        expect(self.sidebar()).to_have_count(0)
+        expect(main.locator(".merge-box")).to_be_visible()
+        self.page.locator(".sidebar-toggle").click()
+        expect(self.sidebar().locator(".merge-box")).to_be_visible()
+        expect(main.locator(".merge-box")).to_have_count(0)
+
     def test_pr_sidebar_overlays_on_narrow_windows(self) -> None:
         pr = self.cases.prs["Get approved"]
         self.page.set_viewport_size({"width": 1280, "height": 900})
