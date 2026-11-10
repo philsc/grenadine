@@ -49,7 +49,7 @@ const IDLE: Duration = Duration::from_secs(3);
 
 /// The tools agents may use without asking: all of this server's but
 /// `approve`, which answers for a permission request.
-pub const ALLOWED_TOOLS: [&str; 7] = [
+pub const ALLOWED_TOOLS: [&str; 8] = [
     "mcp__grenadine__list_terminals",
     "mcp__grenadine__read_terminal",
     "mcp__grenadine__wait_for_terminal",
@@ -57,6 +57,7 @@ pub const ALLOWED_TOOLS: [&str; 7] = [
     "mcp__grenadine__update_prs",
     "mcp__grenadine__land_on_checkout",
     "mcp__grenadine__session_pr",
+    "mcp__grenadine__manage_prs",
 ];
 
 fn reply(id: &Value, result: Value) -> Response {
@@ -268,7 +269,11 @@ pub async fn handle(
                     pull requests are kept as a GitHub stack where the repository has them \
                     turned on. A session that started from a pull request stacks its pull \
                     requests on it; naming that pull request in the first entry of `prs` \
-                    replaces its commits instead, e.g. after rebasing it.",
+                    replaces its commits instead, e.g. after rebasing it. The pull requests \
+                    this session manages include any it took over, with manage_prs or by \
+                    starting from a pull request with others stacked on it: each keeps its \
+                    own branch and needs its own entry in `prs`. Pull requests another \
+                    session took over from this one can't be updated or closed anymore.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -309,9 +314,35 @@ pub async fn handle(
                     number, title, URL, state, branches, the commit range of its own \
                     changes (from the merge base with its target branch, which for a \
                     stacked pull request is the parent's branch), this session's own \
-                    commits, and its stack.",
+                    commits, its stack, and the pull requests this session manages, \
+                    bottom first, with their branches.",
                 "inputSchema": {"type": "object", "properties": {}},
                 "annotations": {"readOnlyHint": true},
+            }, {
+                "name": "manage_prs",
+                "description": "Takes over pull requests this session didn't open, so \
+                    that update_prs updates them too, e.g. to change the commits of the pull \
+                    request this session started from while others are stacked on it. A \
+                    session manages one linear stack: the pull requests named, the one this \
+                    session started from and this session's open ones must make one \
+                    contiguous chain, each stacked on the one before it. Naming pull \
+                    requests below this session's moves the pull request it counts as \
+                    started from down to the chain's bottom. Pull requests another session \
+                    manages are taken from it once the user agrees. Their heads are fetched \
+                    as refs and HEAD is left alone: the result lists each pull request's \
+                    commits to bring onto HEAD before calling update_prs with one `prs` \
+                    entry per pull request.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prs": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "The numbers of the pull requests to take over.",
+                        },
+                    },
+                    "required": ["prs"],
+                },
             }]}),
         ),
         "tools/call" if params["name"] == "approve" => {
@@ -372,6 +403,9 @@ pub async fn handle(
                 }
                 "land_on_checkout" => land_on_checkout(&state, &id).await,
                 "session_pr" => session_pr(&state, &session).await,
+                "manage_prs" => {
+                    manage_prs(&state, &id, &agent::approval_id("manage_prs"), args).await
+                }
                 _ => terminal_tool(&state, &id, name, args, backend).await,
             };
             let (text, failed) = match result {
@@ -505,6 +539,46 @@ async fn update_prs(
     Ok(out)
 }
 
+/// Takes over the pull requests `args.prs` names, asking the user first
+/// when that takes them from other sessions.
+async fn manage_prs(
+    state: &Arc<State>,
+    id: &str,
+    tool_use: &str,
+    args: &Value,
+) -> anyhow::Result<String> {
+    let named: Vec<u64> = serde_json::from_value(args["prs"].clone())
+        .context("`prs` must be a list of pull request numbers")?;
+    // Taking PRs while the session lands would change what it lands.
+    let _landing = agent::begin_landing(state, id)?;
+    let session = state.db.agent(id)?.context("The session is gone.")?;
+    let plan = agent::plan_takeover(state, &session, &named)?;
+    if let Some(question) = plan.question() {
+        let input = json!({
+            "take": question,
+            "prs": plan.added,
+            "manages": plan.prs.iter().map(|p| p.number).collect::<Vec<_>>(),
+        });
+        let allowed = matches!(
+            agent::await_approval(state, id, tool_use, "manage_prs", &input, Vec::new()).await,
+            Some(Decision { allow: true, .. })
+        );
+        if !allowed {
+            bail!("The user didn't allow taking over the pull requests.");
+        }
+        // Another session may have landed while the user decided.
+        let session = state.db.agent(id)?.context("The session is gone.")?;
+        let again = agent::plan_takeover(state, &session, &named)?;
+        if again.from != plan.from {
+            bail!(
+                "Which sessions manage these pull requests changed meanwhile; call manage_prs again."
+            );
+        }
+        return agent::take_over(state, &session, again).await;
+    }
+    agent::take_over(state, &session, plan).await
+}
+
 /// Rebases the session's commits onto the user's checkout and
 /// fast-forwards it, as the page's Land on checkout wrap-up does.
 async fn land_on_checkout(state: &Arc<State>, id: &str) -> anyhow::Result<String> {
@@ -545,6 +619,15 @@ async fn session_pr(state: &Arc<State>, session: &AgentSession) -> anyhow::Resul
                 .find(|v| !v.missing)
                 .map(|v| v.sha.as_str())
         );
+        let managed = agent::landed_prs(session);
+        if !managed.is_empty() {
+            out["managed"] = json!(
+                managed
+                    .iter()
+                    .map(|p| json!({"number": p.number, "url": p.url, "branch": p.branch}))
+                    .collect::<Vec<_>>()
+            );
+        }
         if let Some(stack) = &detail.stack {
             out["stack"] = json!({
                 "base_ref": stack.base_ref,
@@ -628,7 +711,7 @@ async fn terminal_tool(
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{AgentSession, AgentStatus, SessionKind};
+    use grenadine_core::api::{AgentSession, AgentStatus, SessionKind, Stack};
 
     use super::*;
 
@@ -722,7 +805,8 @@ mod tests {
                 "show_image",
                 "update_prs",
                 "land_on_checkout",
-                "session_pr"
+                "session_pr",
+                "manage_prs"
             ]
         );
         let (_, body) = call(
@@ -1120,6 +1204,126 @@ mod tests {
             text,
             "The user didn't allow opening or updating pull requests onto #24."
         );
+        assert_eq!(state.db.agent(ID).unwrap().unwrap().landed, None);
+    }
+
+    /// Records PR `number` of `o/n` on `branch` at `head` in `stack`.
+    fn store(state: &Arc<State>, number: u64, branch: &str, head: &str, stack: &Stack) {
+        state
+            .db
+            .store_sync(
+                &crate::db::PrMeta {
+                    key: PrKey {
+                        repo: "o/n".into(),
+                        number,
+                    },
+                    title: "t".into(),
+                    body: String::new(),
+                    author: "me".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    queued: false,
+                    url: format!("https://github.com/o/n/pull/{number}"),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    base_ref: "main".into(),
+                    head_ref: branch.into(),
+                    head_oid: head.into(),
+                    ci: None,
+                    review: None,
+                    review_error: None,
+                },
+                &[grenadine_core::api::Version {
+                    number: 1,
+                    sha: head.into(),
+                    merge_base: None,
+                    kind: grenadine_core::api::VersionKind::Initial,
+                    pushed_at: None,
+                    pushed_by: None,
+                    pushed_by_is_guess: false,
+                    missing: false,
+                }],
+                &[],
+                Some(stack),
+                false,
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Taking PRs that another session manages shows a card naming them
+    /// and the session; refusing it leaves them with that session
+    /// (AGENT-STACK-XFER-3).
+    #[tokio::test]
+    async fn manage_prs_asks_before_taking_another_sessions_prs() {
+        let state = state_with(|s| s.pr = Some(40));
+        let pr = |number: u64, parent: Option<u64>| grenadine_core::api::StackPr {
+            number,
+            title: "t".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            url: String::new(),
+            updated_at: String::new(),
+            head_oid: format!("{number:040}"),
+            parent,
+            queued: false,
+        };
+        let stack = Stack {
+            base_ref: "main".into(),
+            prs: vec![pr(40, None), pr(41, Some(40)), pr(42, Some(41))],
+            more_ancestors: false,
+            more_descendants: false,
+        };
+        for (n, branch) in [(40, "a"), (41, "b"), (42, "c")] {
+            store(&state, n, branch, &format!("{n:040}"), &stack);
+        }
+        let other = "22222222-2222-4333-8444-555555555555";
+        state
+            .db
+            .create_agent(&AgentSession {
+                branch: "o".into(),
+                ..AgentSession::fixture(other, "o/n")
+            })
+            .unwrap();
+        let theirs = |number: u64, branch: &str| grenadine_core::api::LandedPr {
+            number,
+            url: "u".into(),
+            branch: branch.into(),
+            lease: None,
+        };
+        let landed = Landed::from_prs(vec![theirs(41, "b"), theirs(42, "c")]);
+        state.db.set_agent_landed(other, &landed).unwrap();
+
+        let call_task = tokio::spawn({
+            let state = state.clone();
+            async move { tool(&state, "manage_prs", json!({"prs": [41, 42]})).await }
+        });
+        let ids = requested_ids(&state, 1).await;
+        let input = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                AgentEventKind::ApprovalRequested {
+                    tool_name, input, ..
+                } if tool_name == "manage_prs" => Some(input),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            input.contains("Take #41, #42 from session 22222222?"),
+            "{input}"
+        );
+        let decision = Decision {
+            allow: false,
+            ..Decision::default()
+        };
+        assert!(agent::approve(&state, ID, &ids[0], decision).unwrap());
+        let (text, failed) = call_task.await.unwrap();
+        assert!(failed, "{text}");
+        assert_eq!(text, "The user didn't allow taking over the pull requests.");
+        assert_eq!(state.db.agent(other).unwrap().unwrap().landed, Some(landed));
         assert_eq!(state.db.agent(ID).unwrap().unwrap().landed, None);
     }
 

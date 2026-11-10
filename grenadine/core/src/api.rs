@@ -1800,6 +1800,11 @@ pub struct LandedPr {
     /// before the branch was recorded.
     #[serde(default)]
     pub branch: String,
+    /// For a PR the session took over and hasn't pushed to yet, the
+    /// commit its branch must still be at when the session first
+    /// replaces it: the head as the last sync saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 impl Landed {
@@ -1815,18 +1820,21 @@ impl Landed {
                 number: *number,
                 url: url.clone(),
                 branch: branch.clone(),
+                lease: None,
             }],
             Landed::Stack { prs } => prs.clone(),
         }
     }
 
-    /// `prs` as a `Landed`: a single PR stays a `PullRequest`.
+    /// `prs` as a `Landed`: a single PR stays a `PullRequest`, unless it
+    /// has a lease, which only a `Stack` keeps.
     pub fn from_prs(mut prs: Vec<LandedPr>) -> Landed {
-        if prs.len() == 1 {
+        if prs.len() == 1 && prs[0].lease.is_none() {
             let LandedPr {
                 number,
                 url,
                 branch,
+                ..
             } = prs.remove(0);
             Landed::PullRequest {
                 number,

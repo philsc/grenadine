@@ -6,7 +6,7 @@
 //! dropped, reordered and given several commits anywhere.
 
 use anyhow::{Result, bail};
-use grenadine_core::api::LandedPr;
+use grenadine_core::api::{LandedPr, Stack};
 use serde::Deserialize;
 
 use crate::agent::stack_branch;
@@ -202,8 +202,24 @@ pub fn plan_prs(
 /// Checks a plan against `source`, the PR the session started from when
 /// the session took over its commits: it isn't the session's to close, so
 /// it stays in the plan, and its base is the session's trunk, so it stays
-/// at the bottom.
-pub fn check_source(planned: &[Planned], dropped: &[LandedPr], source: u64) -> Result<()> {
+/// at the bottom. Neither may the plan drop a PR in `leased`, one the
+/// session took over and hasn't pushed to yet.
+pub fn check_source(
+    planned: &[Planned],
+    dropped: &[LandedPr],
+    source: Option<u64>,
+    leased: &[u64],
+) -> Result<()> {
+    if let Some(pr) = dropped.iter().find(|pr| leased.contains(&pr.number)) {
+        bail!(
+            "#{} is a pull request this session took over and hasn't pushed to yet, so it \
+             can't be dropped; keep an entry for it in `prs`",
+            pr.number
+        );
+    }
+    let Some(source) = source else {
+        return Ok(());
+    };
     if dropped.iter().any(|pr| pr.number == source) {
         bail!(
             "#{source} is the pull request this session started from, so it can't be dropped; \
@@ -217,6 +233,104 @@ pub fn check_source(planned: &[Planned], dropped: &[LandedPr], source: u64) -> R
              bottom one of `prs`"
         ),
     }
+}
+
+/// The open PRs stacked on a PR, as far as they go one on another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Above {
+    /// Each one on the one before it, bottom first; empty when nothing is
+    /// stacked on the PR.
+    Linear(Vec<u64>),
+    /// `at`, the PR itself or one of the chain above it, has several open
+    /// `children`, so the stack has no single top.
+    Fork { at: u64, children: Vec<u64> },
+}
+
+/// The open PRs of `stack` whose parent is `number`.
+fn open_children(stack: &Stack, number: u64) -> Vec<u64> {
+    stack
+        .prs
+        .iter()
+        .filter(|p| p.parent == Some(number) && p.state == "OPEN")
+        .map(|p| p.number)
+        .collect()
+}
+
+/// Walks up `stack` from `number` along its open PRs.
+pub fn chain_above(stack: &Stack, number: u64) -> Above {
+    let mut chain = Vec::new();
+    let mut at = number;
+    loop {
+        match open_children(stack, at).as_slice() {
+            [] => return Above::Linear(chain),
+            [one] => {
+                chain.push(*one);
+                at = *one;
+            }
+            many => {
+                return Above::Fork {
+                    at,
+                    children: many.to_vec(),
+                };
+            }
+        }
+    }
+}
+
+/// Orders `members`, PRs of `stack`, bottom first, when they're one
+/// linear run of open PRs, each the parent of the next; otherwise says
+/// why they aren't.
+pub fn chain(stack: &Stack, members: &[u64]) -> Result<Vec<u64>> {
+    let list = |numbers: &[u64]| {
+        numbers
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for n in members {
+        match stack.prs.iter().find(|p| p.number == *n) {
+            Some(p) if p.state == "OPEN" => {}
+            Some(_) => bail!("#{n} isn't open"),
+            None => bail!(
+                "#{n} isn't in the stack as Grenadine last synced it; try again after the next \
+                 sync"
+            ),
+        }
+    }
+    let parent = |n: u64| stack.prs.iter().find(|p| p.number == n)?.parent;
+    let bottoms: Vec<u64> = members
+        .iter()
+        .filter(|n| !parent(**n).is_some_and(|p| members.contains(&p)))
+        .copied()
+        .collect();
+    let [bottom] = bottoms[..] else {
+        bail!(
+            "{} don't make one contiguous chain of pull requests, each stacked on the one \
+             before it: {} each start a chain of their own",
+            list(members),
+            list(&bottoms)
+        );
+    };
+    let mut ordered = vec![bottom];
+    loop {
+        let top = *ordered.last().unwrap();
+        let kids: Vec<u64> = members
+            .iter()
+            .filter(|n| parent(**n) == Some(top))
+            .copied()
+            .collect();
+        match kids.as_slice() {
+            [] => break,
+            [one] => ordered.push(*one),
+            many => bail!(
+                "{} are all stacked on #{top}, so they don't make one linear chain; a session \
+                 manages a single chain of pull requests",
+                list(many)
+            ),
+        }
+    }
+    Ok(ordered)
 }
 
 fn short(sha: &str) -> &str {
@@ -344,6 +458,7 @@ mod tests {
             number,
             url: format!("https://github.com/o/n/pull/{number}"),
             branch: branch.into(),
+            lease: None,
         }
     }
 
@@ -663,7 +778,7 @@ mod tests {
         let check = |specs: &[PrSpec]| {
             let (planned, dropped) =
                 plan_prs("b", &commits, &open, &taken(&open), &[], Some(specs)).unwrap();
-            check_source(&planned, &dropped, 5)
+            check_source(&planned, &dropped, Some(5), &[])
         };
         check(&[spec(&commits[1].0, Some(5)), spec(&commits[2].0, Some(24))]).unwrap();
 
@@ -680,6 +795,106 @@ mod tests {
 
         let e = check(&[spec(&commits[0].0, None), spec(&commits[2].0, Some(5))]).unwrap_err();
         assert!(format!("{e:#}").contains("must be the bottom one"), "{e:#}");
+    }
+
+    /// A PR the session took over and hasn't pushed to yet can't be
+    /// dropped.
+    #[test]
+    fn a_leased_pr_stays() {
+        let commits = commits(2);
+        let open = [pr(5, "theirs"), pr(6, "theirs-2")];
+        let (planned, dropped) = plan_prs(
+            "b",
+            &commits,
+            &open,
+            &taken(&open),
+            &[],
+            Some(&[spec(&commits[1].0, Some(5))]),
+        )
+        .unwrap();
+        let e = check_source(&planned, &dropped, Some(5), &[6]).unwrap_err();
+        assert!(format!("{e:#}").contains("#6 is a pull request this session took over"));
+        check_source(&planned, &dropped, Some(5), &[]).unwrap();
+    }
+
+    /// A stack whose PRs have the given `(number, parent, state)`.
+    fn api_stack(prs: &[(u64, Option<u64>, &str)]) -> Stack {
+        Stack {
+            base_ref: "main".into(),
+            prs: prs
+                .iter()
+                .map(|(number, parent, state)| grenadine_core::api::StackPr {
+                    number: *number,
+                    title: String::new(),
+                    state: (*state).into(),
+                    is_draft: false,
+                    url: String::new(),
+                    updated_at: String::new(),
+                    head_oid: String::new(),
+                    parent: *parent,
+                    queued: false,
+                })
+                .collect(),
+            more_ancestors: false,
+            more_descendants: false,
+        }
+    }
+
+    /// The walk up from a PR follows its open children until the top,
+    /// skipping merged ones, and stops at a fork.
+    #[test]
+    fn walks_the_chain_above_a_pr() {
+        let linear = api_stack(&[
+            (39, None, "MERGED"),
+            (40, Some(39), "OPEN"),
+            (41, Some(40), "OPEN"),
+            (42, Some(41), "OPEN"),
+        ]);
+        assert_eq!(chain_above(&linear, 40), Above::Linear(vec![41, 42]));
+        assert_eq!(chain_above(&linear, 42), Above::Linear(vec![]));
+
+        let forked = api_stack(&[
+            (40, None, "OPEN"),
+            (41, Some(40), "OPEN"),
+            (42, Some(41), "OPEN"),
+            (43, Some(41), "OPEN"),
+            (44, Some(41), "CLOSED"),
+        ]);
+        assert_eq!(
+            chain_above(&forked, 40),
+            Above::Fork {
+                at: 41,
+                children: vec![42, 43]
+            }
+        );
+    }
+
+    /// Managed PRs must be one linear run of open PRs; they come back
+    /// bottom first.
+    #[test]
+    fn checks_a_chain() {
+        let s = api_stack(&[
+            (39, None, "OPEN"),
+            (40, Some(39), "OPEN"),
+            (41, Some(40), "OPEN"),
+            (42, Some(41), "OPEN"),
+            (43, Some(41), "OPEN"),
+            (50, None, "MERGED"),
+        ]);
+        assert_eq!(chain(&s, &[42, 40, 41]).unwrap(), [40, 41, 42]);
+        assert_eq!(chain(&s, &[40, 39]).unwrap(), [39, 40]);
+
+        let e = chain(&s, &[40, 42]).unwrap_err();
+        assert!(format!("{e:#}").contains("contiguous"), "{e:#}");
+        let e = chain(&s, &[40, 41, 42, 43]).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("#42, #43 are all stacked on #41"),
+            "{e:#}"
+        );
+        let e = chain(&s, &[50]).unwrap_err();
+        assert!(format!("{e:#}").contains("#50 isn't open"), "{e:#}");
+        let e = chain(&s, &[60]).unwrap_err();
+        assert!(format!("{e:#}").contains("isn't in the stack"), "{e:#}");
     }
 
     /// A new PR's `branch` names the branch its commit is pushed to;

@@ -29,7 +29,9 @@ use crate::claude;
 use crate::devin;
 use crate::git::{REF_PREFIX, Repo};
 use crate::github::StackLookup;
-use crate::pr_plan::{Planned, PrSpec, StackOp, check_source, plan_prs, plan_stack};
+use crate::pr_plan::{
+    Above, Planned, PrSpec, StackOp, chain, chain_above, check_source, plan_prs, plan_stack,
+};
 use crate::reflow::reflow;
 use crate::sync::State;
 
@@ -39,9 +41,12 @@ const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
 /// commits are pushed. One ref per repository is enough because pushing
 /// holds the repository's git lock.
 const TARGET_REF: &str = "refs/grenadine/agent/target";
-/// Where the head branch of the PR a session started from is fetched
-/// before the session's commits replace it.
-const SOURCE_REF: &str = "refs/grenadine/agent/source";
+/// Where the head branch of each PR a session took over is fetched, under
+/// the PR's number, before the session's commits first replace it.
+const LEASE_REF: &str = "refs/grenadine/agent/lease";
+/// Where `manage_prs` puts the heads of the PRs a session takes over,
+/// under each PR's number, for the agent to rebase or cherry-pick.
+pub(crate) const STACK_REF: &str = "refs/grenadine/agent/stack";
 
 /// The most images one prompt may come with.
 pub const MAX_IMAGES: usize = 20;
@@ -1193,6 +1198,9 @@ pub async fn create_session(
         Err(e) => return Err(e),
     }
     if session.pr.is_some() {
+        if let Err(e) = take_stack_on_start(state, &session) {
+            tracing::warn!("agent {id}: can't take over the PRs stacked on its PR: {e:#}");
+        }
         // The next poll fills in the title right away.
         state.poke.notify_one();
     }
@@ -1210,6 +1218,63 @@ pub async fn create_session(
         req.model,
     );
     Ok(session)
+}
+
+/// Makes a session that starts from a PR with a linear chain of open PRs
+/// stacked on it manage that PR and all of the chain, taking them from
+/// any session that managed them. A chain that forks takes nothing: the
+/// start note tells the agent to pick one with `manage_prs`. So does one
+/// whose PRs haven't synced yet, which a sync is started for.
+fn take_stack_on_start(state: &Arc<State>, session: &AgentSession) -> Result<()> {
+    let Some(number) = session.pr else {
+        return Ok(());
+    };
+    let key = |number| PrKey {
+        repo: session.repo.clone(),
+        number,
+    };
+    let Some(pr) = state.db.pr(&key(number))? else {
+        return Ok(());
+    };
+    let Some(stack) = &pr.stack else {
+        return Ok(());
+    };
+    let Above::Linear(above) = chain_above(stack, number) else {
+        return Ok(());
+    };
+    if above.is_empty() {
+        return Ok(());
+    }
+    let mut prs = vec![taken_pr(&pr)?];
+    for n in above {
+        match state.db.pr(&key(n))? {
+            Some(detail) => prs.push(taken_pr(&detail)?),
+            None => {
+                state.sync_once(key(n));
+                return Ok(());
+            }
+        }
+    }
+    state.db.take_prs(
+        &session.id,
+        &session.repo,
+        &Landed::from_prs(prs),
+        Some(number),
+    )?;
+    Ok(())
+}
+
+/// The commit a session's worktree begins from: the head of the top PR
+/// it manages when it took over PRs stacked on the PR it started from,
+/// else `pr_head` of that PR.
+fn start_head(state: &State, session: &AgentSession) -> Result<Option<String>> {
+    if session.pr.is_some()
+        && let [_, .., top] = &landed_prs(session)[..]
+        && let Some(head) = &top.lease
+    {
+        return Ok(Some(head.clone()));
+    }
+    pr_head(state, &session.repo, session.pr)
 }
 
 /// The commit a session starting on `pr` begins from: the head of its
@@ -1256,7 +1321,7 @@ async fn ensure_worktree(state: &Arc<State>, session: &AgentSession) -> Result<(
         .get(&session.repo)
         .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?
         .clone();
-    let base = pr_head(state, &session.repo, session.pr)?;
+    let base = start_head(state, session)?;
     let _guard = cloned.git_lock.lock().await;
     // A delete that won the race for the lock shouldn't leave the
     // worktree and branch behind.
@@ -1270,7 +1335,12 @@ async fn ensure_worktree(state: &Arc<State>, session: &AgentSession) -> Result<(
     let base = tokio::task::spawn_blocking(move || -> Result<String> {
         repo.worktree_remove(&worktree, &branch)?;
         let base = match base {
-            Some(sha) => sha,
+            Some(sha) => {
+                if !repo.fetch_commits(std::slice::from_ref(&sha)).is_empty() {
+                    bail!("can't fetch {sha}");
+                }
+                sha
+            }
             None => repo.fetch_default_branch(TRUNK_REF)?,
         };
         if let Some(parent) = worktree.parent() {
@@ -2123,7 +2193,10 @@ async fn land(
     // A session that started from a PR proposes its work to that PR's
     // branch, or, when its commits replace the PR's own, to the PR's
     // target branch.
-    let mut adopt = None;
+    if target == WrapUpTarget::PullRequest {
+        managed_elsewhere_check(state, &session, prs.as_deref())?;
+    }
+    let mut adopt = Adopt::default();
     let mut source = None;
     let pr_branch = match (target, session.pr) {
         (WrapUpTarget::PullRequest, Some(number)) => {
@@ -2137,28 +2210,19 @@ async fn land(
                 .ok_or_else(|| anyhow!("{}#{number} isn't synced", session.repo))?;
             match adopts_source(&session, prs.as_deref()) {
                 true => {
-                    // The first time, the PR's branch may only be replaced
-                    // where the last sync saw it.
-                    let first = !landed_prs(&session).iter().any(|p| p.number == number);
-                    let expect = match first {
-                        true => Some(synced_head(&pr).ok_or_else(|| {
-                            anyhow!("#{number} has no synced head commit yet; try again later")
-                        })?),
-                        false => None,
-                    };
-                    if first {
-                        source_stack_check(&session, &pr)?;
-                        source = Some(LandedPr {
-                            number,
-                            url: pr.summary.url.clone(),
-                            branch: pr.head_ref.clone(),
-                        });
+                    match landed_prs(&session).iter().find(|p| p.number == number) {
+                        // The first time, the PR's branch may only be
+                        // replaced where the last sync saw it.
+                        None => {
+                            source_stack_check(&session, &pr)?;
+                            source = Some(taken_pr(&pr)?);
+                        }
+                        // Taken over but not pushed to yet: others may have
+                        // stacked on it since.
+                        Some(p) if p.lease.is_some() => source_stack_check(&session, &pr)?,
+                        Some(_) => {}
                     }
-                    adopt = Some(Adopt {
-                        number,
-                        head_ref: pr.head_ref.clone(),
-                        expect,
-                    });
+                    adopt.source = Some(number);
                     Some(pr.base_ref)
                 }
                 false => Some(pr.head_ref),
@@ -2210,6 +2274,18 @@ async fn land(
                 }
             }
         }
+        // The first push to each PR the session took over is leased
+        // against where the last sync saw its branch.
+        adopt.leases = open
+            .iter()
+            .filter_map(|pr| {
+                Some(Lease {
+                    number: pr.number,
+                    head_ref: pr.branch.clone(),
+                    expect: pr.lease.clone()?,
+                })
+            })
+            .collect();
     }
     let heads: BTreeMap<u64, String> = statuses
         .iter()
@@ -2226,7 +2302,7 @@ async fn land(
                 &repo,
                 &session,
                 pr_branch,
-                adopt.as_ref(),
+                &adopt,
                 &open,
                 &merged,
                 &heads,
@@ -2263,7 +2339,11 @@ async fn land(
         .collect();
     for (p, base) in planned.iter().zip(&bases) {
         match &p.pr {
-            Some(pr) => prs.push(pr.clone()),
+            // Pushed, so its lease is used up.
+            Some(pr) => prs.push(LandedPr {
+                lease: None,
+                ..pr.clone()
+            }),
             None => {
                 let (title, body) = pr_text(&p.message);
                 match state
@@ -2277,6 +2357,7 @@ async fn land(
                             number,
                             url,
                             branch: p.branch.clone(),
+                            lease: None,
                         });
                     }
                     Err(e) => {
@@ -2572,23 +2653,109 @@ pub(crate) fn landed_prs(session: &AgentSession) -> Vec<LandedPr> {
         .collect()
 }
 
-/// The pull request a session started from, when the session's commits
-/// replace that PR's own commits instead of stacking on them, e.g. after
-/// rebasing or amending it.
-#[derive(Clone, Debug)]
+/// The PRs a session took over from others: the one it started from,
+/// when the session's commits replace that PR's own commits instead of
+/// stacking on them, e.g. after rebasing or amending it, and the ones
+/// stacked on it that the session manages.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Adopt {
+    /// The PR the session started from, when it replaces its commits.
+    pub source: Option<u64>,
+    /// The taken PRs the session hasn't pushed to yet.
+    pub leases: Vec<Lease>,
+}
+
+/// A PR the session took over and hasn't pushed to yet: its branch is
+/// only replaced while it's still at `expect`.
+#[derive(Clone, Debug)]
+pub(crate) struct Lease {
     pub number: u64,
-    /// The PR's head branch, which the session's bottom commit replaces.
+    /// The PR's head branch.
     pub head_ref: String,
-    /// The commit the head branch is expected at the first time the
-    /// session replaces it, as the last sync saw it; `None` once the
-    /// session pushed to it.
-    pub expect: Option<String>,
+    /// Where the last sync saw the branch.
+    pub expect: String,
+}
+
+/// `pr` as a PR the session takes over, leased against its head as the
+/// last sync saw it.
+fn taken_pr(pr: &PrDetail) -> Result<LandedPr> {
+    let number = pr.summary.key.number;
+    let head = synced_head(pr)
+        .ok_or_else(|| anyhow!("#{number} has no synced head commit yet; try again later"))?;
+    Ok(LandedPr {
+        number,
+        url: pr.summary.url.clone(),
+        branch: pr.head_ref.clone(),
+        lease: Some(head),
+    })
+}
+
+/// The session's ID as the user sees it.
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// Refuses to push to or close PRs that another session took over from
+/// this one: the session's source PR when it replaces its commits, any
+/// PR `specs` names, and, without `specs`, any of the session's PRs that
+/// moved, since their commits would otherwise go into new PRs.
+fn managed_elsewhere_check(
+    state: &State,
+    session: &AgentSession,
+    specs: Option<&[PrSpec]>,
+) -> Result<()> {
+    let ours: Vec<u64> = landed_prs(session).iter().map(|p| p.number).collect();
+    let mut numbers: Vec<u64> = specs.into_iter().flatten().filter_map(|s| s.pr).collect();
+    if adopts_source(session, specs) {
+        numbers.extend(session.pr);
+    }
+    if specs.is_none() {
+        numbers.extend(
+            state
+                .db
+                .agent_pr_list(&session.id)?
+                .into_iter()
+                .filter(|p| p.state == "OPEN" && Some(p.key.number) != session.pr)
+                .map(|p| p.key.number),
+        );
+    }
+    numbers.retain(|n| !ours.contains(n));
+    numbers.sort();
+    numbers.dedup();
+    let managers = state.db.pr_managers(&session.repo, &numbers, &session.id)?;
+    if managers.is_empty() {
+        return Ok(());
+    }
+    let mut by: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (number, id) in &managers {
+        by.entry(id).or_default().push(format!("#{number}"));
+    }
+    let list = by
+        .iter()
+        .map(|(id, prs)| format!("{} by session {}", prs.join(", "), short_id(id)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "another session took over pull requests this call would push to or close, and \
+         manages them now: {list}. This session can't update them anymore. Pass `prs` naming \
+         only the pull requests this session still manages{}",
+        match ours.is_empty() {
+            true => String::new(),
+            false => format!(
+                " ({})",
+                ours.iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    )
 }
 
 /// Whether `update_prs` with `specs` replaces the commits of the PR the
 /// session started from: once a commit is mapped to it, and from then
-/// on.
+/// on. A session that manages PRs stacked on its source manages the
+/// source too, so it replaces its commits from the start.
 pub(crate) fn adopts_source(session: &AgentSession, specs: Option<&[PrSpec]>) -> bool {
     let Some(number) = session.pr else {
         return false;
@@ -2607,8 +2774,8 @@ fn synced_head(pr: &PrDetail) -> Option<String> {
 }
 
 /// Refuses to replace the commits of the session's source PR while open
-/// PRs that aren't the session's are stacked on it: their branches would
-/// keep the old commits.
+/// PRs that the session doesn't manage are stacked on it: their branches
+/// would keep the old commits.
 fn source_stack_check(session: &AgentSession, pr: &PrDetail) -> Result<()> {
     let ours: Vec<u64> = landed_prs(session).iter().map(|p| p.number).collect();
     let number = pr.summary.key.number;
@@ -2622,7 +2789,9 @@ fn source_stack_check(session: &AgentSession, pr: &PrDetail) -> Result<()> {
     if !above.is_empty() {
         bail!(
             "other pull requests are stacked on #{number} ({}) and would keep its old commits, \
-             so its commits can't be replaced; stack the new commits on #{number} instead",
+             so its commits can't be replaced; stack the new commits on #{number} instead, or \
+             call manage_prs with the chain of pull requests above #{number} that this session \
+             should manage, and update them too",
             above.join(", "),
         );
     }
@@ -2791,15 +2960,17 @@ fn land_on_checkout(repo: &Repo, session: &AgentSession) -> Result<Step> {
 /// first; `merged` the ones that merged, with their head commits in
 /// `heads`. `specs` maps commits to PRs as `update_prs` takes it. When
 /// `name_branches`, a plan with a new pull request isn't pushed: the
-/// agent picks the new pull requests' branches first. With `adopt`, the
-/// session's commits replace the source PR's own, which `pr_branch`, its
-/// target, doesn't have either.
+/// agent picks the new pull requests' branches first. With `adopt`'s
+/// source, the session's commits replace the source PR's own, which
+/// `pr_branch`, its target, doesn't have either; the first push to each
+/// of its leased PRs only goes through while its branch is still where
+/// the last sync saw it.
 #[allow(clippy::too_many_arguments)]
 fn push_stack(
     repo: &Repo,
     session: &AgentSession,
     pr_branch: Option<String>,
-    adopt: Option<&Adopt>,
+    adopt: &Adopt,
     open: &[LandedPr],
     merged: &[LandedPr],
     heads: &BTreeMap<u64, String>,
@@ -2832,7 +3003,7 @@ fn push_stack(
     let mut lower = session.base_sha.clone();
     // The source PR's commits are the session's own when it replaces
     // them: they start where the PR forked off its target.
-    if adopt.is_some()
+    if adopt.source.is_some()
         && let Some(fork) = repo.merge_base(&target, &session.base_sha)
     {
         lower = fork;
@@ -2886,7 +3057,7 @@ fn push_stack(
         // commits were rewritten: they replace the PR's own only when the
         // agent says so.
         // `Lower::Base` with the target at the base is handled above.
-        Lower::Unrelated if session.pr.is_some() && adopt.is_none() && target == lower => {
+        Lower::Unrelated if session.pr.is_some() && adopt.source.is_none() && target == lower => {
             let number = session.pr.unwrap_or_default();
             return Ok(Step::Ask {
                 reason: format!(
@@ -2984,9 +3155,8 @@ fn push_stack(
         closed,
         specs.as_deref(),
     )?;
-    if let Some(adopt) = adopt {
-        check_source(&planned, &dropped, adopt.number)?;
-    }
+    let leased: Vec<u64> = adopt.leases.iter().map(|l| l.number).collect();
+    check_source(&planned, &dropped, adopt.source, &leased)?;
     let new: Vec<&Planned> = planned.iter().filter(|p| p.pr.is_none()).collect();
     let branches: Vec<String> = new.iter().map(|p| p.branch.clone()).collect();
     for branch in &branches {
@@ -3020,18 +3190,18 @@ fn push_stack(
         .iter()
         .map(|p| (p.sha.clone(), p.branch.clone()))
         .collect();
-    // The first time the source PR's branch is replaced, it has to be
-    // where the last sync saw it: otherwise someone pushed to it since,
-    // or it's a branch of a fork with the same name.
+    // The first time a taken PR's branch is replaced, it has to be where
+    // the last sync saw it: otherwise someone pushed to it since, or it's
+    // a branch of a fork with the same name.
     let mut leases = Vec::new();
-    if let Some(Adopt {
+    for Lease {
         number,
         head_ref,
-        expect: Some(expect),
-    }) = adopt
+        expect,
+    } in &adopt.leases
     {
         let tip = repo
-            .fetch_branch(head_ref, SOURCE_REF)
+            .fetch_branch(head_ref, &format!("{LEASE_REF}/{number}"))
             .with_context(|| format!("can't fetch #{number}'s branch {head_ref}"))?;
         if tip != *expect {
             bail!(
@@ -3062,6 +3232,9 @@ fn landed_note(session: &AgentSession) -> Option<String> {
             "The user had Grenadine, the app running this session, land this session's commits \
              on their checkout, up to {sha}. Later commits land when the user wraps up again."
         ),
+        // A stack the session took over and hasn't pushed to yet is the
+        // start note's.
+        _ if landed_prs(session).iter().all(|pr| pr.lease.is_some()) => return None,
         _ => {
             let prs = landed_prs(session)
                 .iter()
@@ -3155,10 +3328,311 @@ pub(crate) async fn session_pr(state: &Arc<State>, session: &AgentSession) -> Op
     })
 }
 
+/// What `manage_prs` would do: the session's PRs afterwards, bottom
+/// first, the PR it then counts as started from, and which of the PRs
+/// it adds other sessions manage now.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Takeover {
+    pub prs: Vec<LandedPr>,
+    pub source: Option<u64>,
+    /// The PRs the session didn't manage before, bottom first.
+    pub added: Vec<u64>,
+    /// The sessions that manage some of `added`, with those PRs.
+    pub from: BTreeMap<String, Vec<u64>>,
+}
+
+impl Takeover {
+    /// What the approval card asks when the takeover takes PRs from
+    /// other sessions; `None` when it takes none.
+    pub fn question(&self) -> Option<String> {
+        if self.from.is_empty() {
+            return None;
+        }
+        let parts = self
+            .from
+            .iter()
+            .map(|(id, prs)| {
+                format!(
+                    "{} from session {}",
+                    prs.iter()
+                        .map(|n| format!("#{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    short_id(id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        Some(format!("Take {parts}?"))
+    }
+}
+
+/// Plans `manage_prs` with `named`: those PRs, the PR the session started
+/// from and the session's open PRs have to make one contiguous linear
+/// chain of open PRs in their stack as Grenadine last synced it, which
+/// the session then manages. Naming PRs below the session's moves the
+/// PR it counts as started from down to the chain's bottom.
+pub(crate) fn plan_takeover(
+    state: &Arc<State>,
+    session: &AgentSession,
+    named: &[u64],
+) -> Result<Takeover> {
+    if session.repo == GENERAL {
+        bail!("a general session isn't in a repository, so it has no pull requests");
+    }
+    if session.kind == SessionKind::AutoReview {
+        bail!("an unattended review doesn't manage pull requests");
+    }
+    if named.is_empty() {
+        bail!("`prs` must name at least one pull request");
+    }
+    let key = |number| PrKey {
+        repo: session.repo.clone(),
+        number,
+    };
+    // The session's PRs the user closed are forgotten, as landing does.
+    let closed: Vec<u64> = state
+        .db
+        .agent_pr_list(&session.id)?
+        .into_iter()
+        .filter(|p| p.state == "CLOSED")
+        .map(|p| p.key.number)
+        .collect();
+    let own: Vec<LandedPr> = landed_prs(session)
+        .into_iter()
+        .filter(|p| !closed.contains(&p.number))
+        .collect();
+    // Every PR named or the session's, with its synced detail.
+    let mut details: BTreeMap<u64, PrDetail> = BTreeMap::new();
+    let wanted: Vec<u64> = session
+        .pr
+        .into_iter()
+        .chain(own.iter().map(|p| p.number))
+        .chain(named.iter().copied())
+        .collect();
+    let mut unsynced = Vec::new();
+    for &n in &wanted {
+        if details.contains_key(&n) {
+            continue;
+        }
+        match state.db.pr(&key(n))? {
+            Some(d) => {
+                details.insert(n, d);
+            }
+            None if own.iter().any(|p| p.number == n) => {}
+            None => unsynced.push(n),
+        }
+    }
+    if !unsynced.is_empty() {
+        for &n in &unsynced {
+            state.sync_once(key(n));
+        }
+        bail!(
+            "{} hasn't synced yet; Grenadine started syncing it, so try again in a minute",
+            unsynced
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // The stack they're in: that of the session's source if it's synced,
+    // else that of any of them that has all of them.
+    let stack = wanted
+        .iter()
+        .filter_map(|n| details.get(n)?.stack.as_ref())
+        .find(|s| wanted.iter().all(|n| s.prs.iter().any(|p| p.number == *n)))
+        .ok_or_else(|| {
+            anyhow!(
+                "{} aren't all in one stack as Grenadine last synced it",
+                wanted
+                    .iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let state_of = |n: u64| stack.prs.iter().find(|p| p.number == n).map(|p| &p.state);
+    // The session's merged PRs stay below the chain, frozen.
+    let (merged, current): (Vec<LandedPr>, Vec<LandedPr>) = own
+        .iter()
+        .cloned()
+        .partition(|p| state_of(p.number).is_some_and(|s| s == "MERGED"));
+    let mut members: Vec<u64> = session
+        .pr
+        .into_iter()
+        .chain(current.iter().map(|p| p.number))
+        .chain(named.iter().copied())
+        .collect();
+    members.sort();
+    members.dedup();
+    let ordered = chain(stack, &members)?;
+    let mut prs = merged;
+    let mut added = Vec::new();
+    for &n in &ordered {
+        match own.iter().find(|p| p.number == n) {
+            Some(p) => prs.push(p.clone()),
+            None => {
+                prs.push(taken_pr(&details[&n])?);
+                added.push(n);
+            }
+        }
+    }
+    if added.is_empty() {
+        bail!("this session manages all of these pull requests already");
+    }
+    let bottom = ordered[0];
+    let source = match session.pr.is_some() || !own.iter().any(|p| p.number == bottom) {
+        true => Some(bottom),
+        false => None,
+    };
+    let mut from: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for (n, id) in state.db.pr_managers(&session.repo, &added, &session.id)? {
+        from.entry(id).or_default().push(n);
+    }
+    Ok(Takeover {
+        prs,
+        source,
+        added,
+        from,
+    })
+}
+
+/// Carries out `plan_takeover`'s plan: fetches the added PRs' heads into
+/// `STACK_REF`, leaving the worktree's HEAD alone, and moves the PRs to
+/// the session from any that managed them. Returns what the agent is
+/// told: each PR's commits and how to bring them into HEAD.
+pub(crate) async fn take_over(
+    state: &Arc<State>,
+    session: &AgentSession,
+    plan: Takeover,
+) -> Result<String> {
+    let cloned = state
+        .repos
+        .get(&session.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?
+        .clone();
+    // Each managed PR's head, where it's known, and the commit its own
+    // commits start after.
+    let heads: Vec<Option<String>> = plan.prs.iter().map(|p| p.lease.clone()).collect();
+    let bottom_base = plan.prs.first().and_then(|p| {
+        let detail = state
+            .db
+            .pr(&PrKey {
+                repo: session.repo.clone(),
+                number: p.number,
+            })
+            .ok()
+            .flatten()?;
+        let head = p.lease.as_deref()?;
+        detail
+            .versions
+            .iter()
+            .find(|v| v.sha == head)?
+            .merge_base
+            .clone()
+    });
+    let in_head: Vec<bool> = {
+        let _guard = cloned.git_lock.lock().await;
+        let repo = cloned.repo.clone();
+        let worktree = PathBuf::from(&session.worktree);
+        let added: Vec<(u64, String)> = plan
+            .prs
+            .iter()
+            .filter(|p| plan.added.contains(&p.number))
+            .filter_map(|p| Some((p.number, p.lease.clone()?)))
+            .collect();
+        let heads = heads.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<bool>> {
+            let shas: Vec<String> = added.iter().map(|(_, h)| h.clone()).collect();
+            let missing = repo.fetch_commits(&shas);
+            if !missing.is_empty() {
+                bail!("can't fetch {}", missing.join(", "));
+            }
+            let refs: Vec<(String, String)> = added
+                .iter()
+                .map(|(n, h)| (format!("{STACK_REF}/{n}"), h.clone()))
+                .collect();
+            repo.update_refs(&refs, &[])?;
+            let head = repo.worktree_head(&worktree).ok();
+            Ok(heads
+                .iter()
+                .map(|h| match (h, &head) {
+                    (Some(h), Some(head)) => repo.is_ancestor(h, head),
+                    _ => false,
+                })
+                .collect())
+        })
+        .await??
+    };
+    state.db.take_prs(
+        &session.id,
+        &session.repo,
+        &Landed::from_prs(plan.prs.clone()),
+        plan.source,
+    )?;
+    state.poke.notify_one();
+    state.send(ServerEvent::AgentsChanged);
+
+    let mut below = bottom_base;
+    let mut lines = Vec::new();
+    for (i, p) in plan.prs.iter().enumerate() {
+        let commits = match (&below, &heads[i]) {
+            (Some(from), Some(head)) => format!("commits {from}..{head}"),
+            (None, Some(head)) => format!("head {head}"),
+            _ => "commits as this session last pushed them".into(),
+        };
+        let fetched = match plan.added.contains(&p.number) {
+            true => format!(", fetched as {STACK_REF}/{}", p.number),
+            false => String::new(),
+        };
+        let status = match in_head[i] {
+            true => "; already in HEAD",
+            false if heads[i].is_some() => "; not in HEAD yet",
+            false => "",
+        };
+        lines.push(format!(
+            "- #{} {} on branch `{}`: {commits}{fetched}{status}",
+            p.number, p.url, p.branch
+        ));
+        below = heads[i].clone();
+    }
+    let numbers = plan
+        .prs
+        .iter()
+        .map(|p| format!("#{}", p.number))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let taken = match plan.from.is_empty() {
+        true => String::new(),
+        false => format!(
+            " Took {}; those sessions don't push to them anymore.",
+            plan.question()
+                .unwrap_or_default()
+                .trim_start_matches("Take ")
+                .trim_end_matches('?')
+        ),
+    };
+    Ok(format!(
+        "This session now manages {numbers}, bottom first, each stacked on the one before \
+         it.{taken} HEAD wasn't changed. The pull requests:\n{}\nBring the commits that aren't \
+         in HEAD yet onto HEAD, in order and keeping each pull request's commits together, \
+         e.g. with `git cherry-pick <from>..<head>` for each, or by rebasing them. Then call \
+         update_prs with `prs` holding one entry per pull request, bottom first, each naming \
+         the pull request's top commit and its `\"pr\"`. Grenadine pushes each to its own \
+         branch; the first push to each taken pull request only goes through while its branch \
+         is still where Grenadine last synced it.",
+        lines.join("\n")
+    ))
+}
+
 /// What a session started from a pull request is told about it: which
 /// commits are the PR's versus the session's own, that `@{u}` is the
-/// PR's target branch, and that `session_pr` says more.
-fn pr_note(pr: &SessionPr) -> String {
+/// PR's target branch, and that `session_pr` says more. `managed` is the
+/// session's landed PRs: with PRs stacked on this one among them, the
+/// session manages that stack, and without, it hears about open PRs
+/// stacked on this one that it could take over.
+fn pr_note(pr: &SessionPr, managed: &[LandedPr]) -> String {
     let Some(detail) = pr.detail.as_ref() else {
         return format!(
             "This session started from pull request #{}. It hasn't synced yet; the grenadine \
@@ -3170,6 +3644,12 @@ fn pr_note(pr: &SessionPr) -> String {
         "This session started from pull request #{} \"{}\" ({}), which merges `{}` into `{}`.",
         pr.number, detail.summary.title, detail.summary.url, detail.head_ref, detail.base_ref
     );
+    let at = managed.iter().position(|p| p.number == pr.number);
+    if let Some(at) = at
+        && at + 1 < managed.len()
+    {
+        return note + &stack_note(pr, &managed[at..]);
+    }
     if let Some(merge_base) = &pr.merge_base {
         note += &format!(
             " When the user says \"this PR\", they mean its commits {merge_base}..{}, the same \
@@ -3201,7 +3681,84 @@ fn pr_note(pr: &SessionPr) -> String {
              doesn't include."
         );
     }
+    let list = |numbers: &[u64]| {
+        numbers
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match detail.stack.as_ref().map(|s| chain_above(s, pr.number)) {
+        Some(Above::Fork { at, children }) => {
+            note += &format!(
+                " Open pull requests are stacked on #{n}, but the stack forks: {} are all \
+                 stacked on #{at}. So this session doesn't manage any of them, and #{n}'s \
+                 commits can't be replaced while they're stacked on it. To change #{n}'s \
+                 commits and update the pull requests above it too, call the grenadine MCP \
+                 server's manage_prs tool with the one chain of them this session should \
+                 manage.",
+                list(&children),
+                n = pr.number
+            );
+        }
+        Some(Above::Linear(above)) if !above.is_empty() => {
+            note += &format!(
+                " The open pull requests {} are stacked on #{n}, and this session doesn't \
+                 manage them, so #{n}'s commits can't be replaced while they're stacked on \
+                 it. To change #{n}'s commits and update them too, call the grenadine MCP \
+                 server's manage_prs tool with them first.",
+                list(&above),
+                n = pr.number
+            );
+        }
+        _ => {}
+    }
     note
+}
+
+/// What a session that manages `stack`, its source PR (`pr`) and the
+/// PRs stacked on it, bottom first, is told about them: their branches
+/// and commits, and that each gets its own entry in `update_prs`.
+fn stack_note(pr: &SessionPr, stack: &[LandedPr]) -> String {
+    let mut below = pr.merge_base.clone();
+    let lines = stack
+        .iter()
+        .map(|p| {
+            let range = match (&below, &p.lease) {
+                (Some(from), Some(head)) => format!(", commits {from}..{head}"),
+                (None, Some(head)) => format!(", head {head}"),
+                _ => String::new(),
+            };
+            below = p.lease.clone();
+            format!("- #{} {} on branch `{}`{range}", p.number, p.url, p.branch)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let numbers = stack
+        .iter()
+        .map(|p| format!("#{}", p.number))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let started = match stack.last().and_then(|p| p.lease.as_deref()) {
+        Some(top) if top == pr.base_sha => format!(
+            "This worktree started at the top one's head, {top}; commits after it are this \
+             session's own work."
+        ),
+        _ => format!("This worktree started at {}.", pr.base_sha),
+    };
+    format!(
+        " Open pull requests are stacked on it, and this session manages it and them, bottom \
+         first, each on its own branch:\n{lines}\n{started} When the user says \"this \
+         PR\", they mean #{}'s commits. To change any of these pull requests, rewrite their \
+         commits in place, keeping each pull request's commits together and in order, and call \
+         the grenadine MCP server's update_prs tool with `prs` holding one entry per pull \
+         request, bottom first, each naming the pull request's top commit and its `\"pr\"` \
+         ({numbers}). Grenadine pushes each to its own branch; the first push to each only \
+         goes through while its branch is still where Grenadine last synced it. New commits \
+         go into new pull requests stacked on the top one. The grenadine MCP server's \
+         session_pr tool gives these details and the PRs' stack.",
+        pr.number
+    )
 }
 
 /// What agents are told about showing the user images: a Markdown image
@@ -3281,7 +3838,9 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     let notes: Vec<_> = [
         (session.kind == SessionKind::AutoReview).then(|| crate::auto_review::NOTE.to_owned()),
         prs_note(&session),
-        starting_pr.as_ref().map(pr_note),
+        starting_pr
+            .as_ref()
+            .map(|pr| pr_note(pr, &landed_prs(&session))),
         landed_note(&session),
         terminals_note(state, id),
         Some(images_note()),
@@ -4214,7 +4773,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 " --allowedTools mcp__grenadine__list_terminals mcp__grenadine__read_terminal \
                  mcp__grenadine__wait_for_terminal mcp__grenadine__show_image \
                  mcp__grenadine__update_prs mcp__grenadine__land_on_checkout \
-                 mcp__grenadine__session_pr --mcp-config "
+                 mcp__grenadine__session_pr mcp__grenadine__manage_prs --mcp-config "
             ),
             "{log}"
         );
@@ -5168,6 +5727,19 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         branch: &str,
         head: &str,
     ) {
+        store_pr_on(state, fx, number, branch, "main", head, None);
+    }
+
+    /// Records an open PR like `store_pr`, into `base` and in `stack`.
+    fn store_pr_on(
+        state: &Arc<State>,
+        fx: &crate::git::tests::Fixture,
+        number: u64,
+        branch: &str,
+        base: &str,
+        head: &str,
+        stack: Option<&Stack>,
+    ) {
         use grenadine_core::api::{Version, VersionKind};
         crate::git::tests::run(
             &fx.clone.path,
@@ -5195,7 +5767,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                     url: "u".into(),
                     created_at: "2026-01-01T00:00:00Z".into(),
                     updated_at: "2026-01-01T00:00:00Z".into(),
-                    base_ref: "main".into(),
+                    base_ref: base.into(),
                     head_ref: branch.into(),
                     head_oid: head.into(),
                     ci: None,
@@ -5213,7 +5785,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                     missing: false,
                 }],
                 &[],
-                None,
+                stack,
                 false,
                 None,
             )
@@ -6407,6 +6979,407 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(upstream_tip(&fx, "pr-branch"), theirs);
     }
 
+    /// A stack of open PRs `(number, parent, head)`, bottom first.
+    fn open_stack(prs: &[(u64, Option<u64>, &str)]) -> Stack {
+        Stack {
+            base_ref: "main".into(),
+            prs: prs
+                .iter()
+                .map(|(number, parent, head)| grenadine_core::api::StackPr {
+                    number: *number,
+                    title: "t".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                    url: "u".into(),
+                    updated_at: String::new(),
+                    head_oid: (*head).into(),
+                    parent: *parent,
+                    queued: false,
+                })
+                .collect(),
+            more_ancestors: false,
+            more_descendants: false,
+        }
+    }
+
+    /// Pushes a chain of PRs to the upstream: #40 on `pr-a` into main,
+    /// #41 on `pr-b` into `pr-a`, then `extra`'s PRs, each `(number,
+    /// branch, parent number, parent branch)`, and returns the heads by
+    /// PR. Nothing is stored; the upstream is left on main.
+    fn push_chain(
+        fx: &crate::git::tests::Fixture,
+        extra: &[(u64, &str, u64, &str)],
+    ) -> BTreeMap<u64, String> {
+        use crate::git::tests::{commit, run};
+        let mut heads = BTreeMap::new();
+        let prs = [(40, "pr-a", 0, "main"), (41, "pr-b", 40, "pr-a")];
+        for (number, branch, _, base) in prs.iter().chain(extra) {
+            run(&fx.upstream, &["checkout", "-q", base]);
+            run(&fx.upstream, &["checkout", "-qb", branch]);
+            heads.insert(
+                *number,
+                commit(&fx.upstream, &format!("f{number}"), &format!("{number}\n")),
+            );
+        }
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+        heads
+    }
+
+    /// Stores each of `prs`, `(number, branch, parent number, base)`, with
+    /// `stack`.
+    fn store_chain(
+        state: &Arc<State>,
+        fx: &crate::git::tests::Fixture,
+        heads: &BTreeMap<u64, String>,
+        prs: &[(u64, &str, u64, &str)],
+        stack: &Stack,
+    ) {
+        for (number, branch, _, base) in prs {
+            store_pr_on(
+                state,
+                fx,
+                *number,
+                branch,
+                base,
+                &heads[number],
+                Some(stack),
+            );
+        }
+    }
+
+    const CHAIN: [(u64, &str, u64, &str); 3] = [
+        (40, "pr-a", 0, "main"),
+        (41, "pr-b", 40, "pr-a"),
+        (42, "pr-c", 41, "pr-b"),
+    ];
+
+    /// The stack of `CHAIN` with `heads`.
+    fn chain_stack(heads: &BTreeMap<u64, String>) -> Stack {
+        open_stack(&[
+            (40, None, &heads[&40]),
+            (41, Some(40), &heads[&41]),
+            (42, Some(41), &heads[&42]),
+        ])
+    }
+
+    /// A session started from a PR with a linear chain of PRs stacked on
+    /// it manages all of them, its worktree at the top's head, and hears
+    /// about each one's commits (AGENT-STACK-CHAIN-2).
+    #[tokio::test]
+    async fn a_session_started_below_a_stack_manages_all_of_it() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let heads = push_chain(&fx, &[(42, "pr-c", 41, "pr-b")]);
+        store_chain(&state, &fx, &heads, &CHAIN, &chain_stack(&heads));
+
+        let session = start_from_pr(&state, "look around", 40).await;
+        let managed: Vec<_> = landed_prs(&session)
+            .into_iter()
+            .map(|p| (p.number, p.branch, p.lease))
+            .collect();
+        assert_eq!(
+            managed,
+            [
+                (40, "pr-a".to_owned(), Some(heads[&40].clone())),
+                (41, "pr-b".to_owned(), Some(heads[&41].clone())),
+                (42, "pr-c".to_owned(), Some(heads[&42].clone())),
+            ]
+        );
+        assert_eq!(session.pr, Some(40));
+        assert_eq!(session.base_sha, heads[&42]);
+        assert_eq!(
+            run(Path::new(&session.worktree), &["rev-parse", "HEAD"]),
+            heads[&42]
+        );
+
+        let ctx = session_pr(&state, &session).await.unwrap();
+        let note = pr_note(&ctx, &landed_prs(&session));
+        assert!(note.contains("this session manages it and them"), "{note}");
+        assert!(
+            note.contains(&format!(
+                "#41 u on branch `pr-b`, commits {}..{}",
+                heads[&40], heads[&41]
+            )),
+            "{note}"
+        );
+        assert!(note.contains("(#40, #41, #42)"), "{note}");
+        // Nothing was pushed yet, so there's nothing landed to note.
+        assert_eq!(landed_note(&session), None);
+    }
+
+    /// A stack that forks above the starting PR isn't taken over, and the
+    /// note says why and what to do (AGENT-STACK-FORK-1).
+    #[tokio::test]
+    async fn a_forked_stack_isnt_taken_over() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let prs = [
+            (40, "pr-a", 0, "main"),
+            (41, "pr-b", 40, "pr-a"),
+            (43, "pr-d", 40, "pr-a"),
+        ];
+        let heads = push_chain(&fx, &prs[2..]);
+        let stack = open_stack(&[
+            (40, None, &heads[&40]),
+            (41, Some(40), &heads[&41]),
+            (43, Some(40), &heads[&43]),
+        ]);
+        store_chain(&state, &fx, &heads, &prs, &stack);
+
+        let session = start_from_pr(&state, "look around", 40).await;
+        assert_eq!(session.landed, None);
+        assert_eq!(session.base_sha, heads[&40]);
+        let ctx = session_pr(&state, &session).await.unwrap();
+        let note = pr_note(&ctx, &landed_prs(&session));
+        assert!(note.contains("the stack forks: #41, #43"), "{note}");
+        assert!(note.contains("manage_prs"), "{note}");
+
+        // Nor can the session manage both sides of the fork.
+        let err = plan_takeover(&state, &session, &[41, 43]).unwrap_err();
+        assert!(format!("{err:#}").contains("linear chain"), "{err:#}");
+    }
+
+    /// Sets up a session started from #40 before #41 and #42 were stacked
+    /// on it, so that it manages nothing, and stores them afterwards.
+    /// Returns the state, the session and the heads.
+    async fn session_below_a_later_stack(
+        fx: &crate::git::tests::Fixture,
+        dir: &Path,
+    ) -> (Arc<State>, AgentSession, BTreeMap<u64, String>) {
+        let (state, _) = wrap_up_state(fx, dir);
+        let heads = push_chain(fx, &[(42, "pr-c", 41, "pr-b")]);
+        let alone = open_stack(&[(40, None, &heads[&40])]);
+        store_chain(&state, fx, &heads, &CHAIN[..1], &alone);
+        let session = start_from_pr(&state, "look around", 40).await;
+        assert_eq!(session.landed, None);
+        store_chain(&state, fx, &heads, &CHAIN, &chain_stack(&heads));
+        (state, session, heads)
+    }
+
+    /// `manage_prs` takes only a contiguous linear chain
+    /// (AGENT-STACK-CHAIN-1).
+    #[tokio::test]
+    async fn manage_prs_refuses_a_gap() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, _) = session_below_a_later_stack(&fx, dir.path()).await;
+        let err = plan_takeover(&state, &session, &[42]).unwrap_err();
+        assert!(format!("{err:#}").contains("contiguous"), "{err:#}");
+        // Naming only the PR it started from manages that alone.
+        assert_eq!(plan_takeover(&state, &session, &[40]).unwrap().added, [40]);
+        assert_eq!(state.db.agent(&session.id).unwrap().unwrap().landed, None);
+    }
+
+    /// Taking PRs another session manages asks first and moves them out
+    /// of that session's PRs; that session then neither pushes to nor
+    /// closes them (AGENT-STACK-XFER-1, AGENT-STACK-XFER-2).
+    #[tokio::test]
+    async fn manage_prs_moves_prs_from_another_session() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, session, heads) = session_below_a_later_stack(&fx, dir.path()).await;
+        let worktree = Path::new(&session.worktree);
+        // Another session opened #41 and #42 on #40.
+        let other = start(&state, "other work").await;
+        let theirs = |number: u64, branch: &str| LandedPr {
+            number,
+            url: "u".into(),
+            branch: branch.into(),
+            lease: None,
+        };
+        record_landed(
+            &state,
+            &other.id,
+            &Landed::from_prs(vec![theirs(41, "pr-b"), theirs(42, "pr-c")]),
+        )
+        .unwrap();
+
+        let plan = plan_takeover(&state, &session, &[41, 42]).unwrap();
+        assert_eq!(plan.added, [40, 41, 42]);
+        assert_eq!(plan.source, Some(40));
+        assert_eq!(
+            plan.question().unwrap(),
+            format!("Take #41, #42 from session {}?", short_id(&other.id))
+        );
+        let text = take_over(&state, &session, plan).await.unwrap();
+        assert!(text.contains("HEAD wasn't changed"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "#42 u on branch `pr-c`: commits {}..{}, fetched as {STACK_REF}/42; not in HEAD yet",
+                heads[&41], heads[&42]
+            )),
+            "{text}"
+        );
+        assert!(text.contains("#40 u on branch `pr-a`"), "{text}");
+        assert!(text.contains("already in HEAD"), "{text}");
+        assert_eq!(run(worktree, &["rev-parse", "HEAD"]), heads[&40]);
+        assert_eq!(
+            run(&fx.clone.path, &["rev-parse", &format!("{STACK_REF}/42")]),
+            heads[&42]
+        );
+
+        let mine = state.db.agent(&session.id).unwrap().unwrap();
+        let numbers: Vec<u64> = landed_prs(&mine).iter().map(|p| p.number).collect();
+        assert_eq!(numbers, [40, 41, 42]);
+        let left = state.db.agent(&other.id).unwrap().unwrap();
+        assert_eq!(left.landed, None);
+        // It still shows them.
+        let shown: Vec<u64> = state
+            .db
+            .agent_pr_list(&other.id)
+            .unwrap()
+            .iter()
+            .map(|p| p.key.number)
+            .collect();
+        assert_eq!(shown, [41, 42]);
+
+        // The other session's update_prs doesn't touch them.
+        let other_worktree = Path::new(&other.worktree);
+        let top = commit(other_worktree, "o", "o\n");
+        for specs in [
+            None,
+            Some(vec![PrSpec {
+                commit: top.clone(),
+                pr: Some(41),
+                branch: None,
+            }]),
+        ] {
+            let err = land_now(
+                &state,
+                &other.id,
+                WrapUpTarget::PullRequest,
+                specs,
+                &begin_landing(&state, &other.id).unwrap(),
+            )
+            .await
+            .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("by session {}", short_id(&session.id))),
+                "{text}"
+            );
+        }
+        assert_eq!(upstream_tip(&fx, "pr-b"), heads[&41]);
+        assert_eq!(upstream_tip(&fx, "pr-c"), heads[&42]);
+    }
+
+    /// Rewrites the worktree's history onto main as `a2` for #40's commit,
+    /// then #41's and #42's changes, and returns the new commits.
+    fn rewrite_chain(worktree: &Path) -> [String; 3] {
+        use crate::git::tests::{commit, run};
+        run(worktree, &["reset", "-q", "--hard", "HEAD~3"]);
+        [
+            commit(worktree, "f40", "40 amended\n"),
+            commit(worktree, "f41", "41\n"),
+            commit(worktree, "f42", "42\n"),
+        ]
+    }
+
+    /// After taking over a stack, update_prs replaces the source PR's
+    /// commits and updates the PRs above it on their own branches
+    /// (AGENT-STACK-LEASE-1).
+    #[tokio::test]
+    async fn update_prs_updates_a_taken_stack() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let heads = push_chain(&fx, &[(42, "pr-c", 41, "pr-b")]);
+        store_chain(&state, &fx, &heads, &CHAIN, &chain_stack(&heads));
+        let session = start_from_pr(&state, "fix it", 40).await;
+        let id = &session.id;
+        let main = run(&fx.upstream, &["rev-parse", "main"]);
+        let new = rewrite_chain(Path::new(&session.worktree));
+
+        let specs = [40, 41, 42]
+            .into_iter()
+            .zip(&new)
+            .map(|(pr, commit)| PrSpec {
+                commit: commit.clone(),
+                pr: Some(pr),
+                branch: None,
+            })
+            .collect();
+        let (landed, _) = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
+        let prs: Vec<_> = landed
+            .prs()
+            .into_iter()
+            .map(|p| (p.number, p.branch, p.lease))
+            .collect();
+        assert_eq!(
+            prs,
+            [
+                (40, "pr-a".to_owned(), None),
+                (41, "pr-b".to_owned(), None),
+                (42, "pr-c".to_owned(), None),
+            ]
+        );
+        assert_eq!(upstream_tip(&fx, "pr-a"), new[0]);
+        assert_eq!(upstream_tip(&fx, "pr-b"), new[1]);
+        assert_eq!(upstream_tip(&fx, "pr-c"), new[2]);
+        assert_eq!(run(&fx.upstream, &["rev-parse", "pr-a~1"]), main);
+        assert_eq!(upstream_tip(&fx, &session.branch), "");
+    }
+
+    /// The first push to a taken PR doesn't go through when its branch
+    /// moved since the sync, and then nothing is pushed.
+    #[tokio::test]
+    async fn update_prs_leases_each_taken_pr() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let heads = push_chain(&fx, &[(42, "pr-c", 41, "pr-b")]);
+        store_chain(&state, &fx, &heads, &CHAIN, &chain_stack(&heads));
+        let session = start_from_pr(&state, "fix it", 40).await;
+        let id = &session.id;
+        let new = rewrite_chain(Path::new(&session.worktree));
+
+        run(&fx.upstream, &["checkout", "-q", "pr-b"]);
+        let pushed = commit(&fx.upstream, "q", "theirs\n");
+        run(&fx.upstream, &["checkout", "-q", "main"]);
+
+        let specs = [40, 41, 42]
+            .into_iter()
+            .zip(&new)
+            .map(|(pr, commit)| PrSpec {
+                commit: commit.clone(),
+                pr: Some(pr),
+                branch: None,
+            })
+            .collect();
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("#41's branch pr-b"), "{text}");
+        assert!(text.contains("last synced"), "{text}");
+        assert_eq!(upstream_tip(&fx, "pr-a"), heads[&40]);
+        assert_eq!(upstream_tip(&fx, "pr-b"), pushed);
+        assert_eq!(upstream_tip(&fx, "pr-c"), heads[&42]);
+        // The leases stay for the next try.
+        let session = state.db.agent(id).unwrap().unwrap();
+        assert!(landed_prs(&session).iter().all(|p| p.lease.is_some()));
+    }
+
     /// A commit the target already has a patch-equivalent of is called
     /// out for the agent to rebase away instead of being pushed.
     #[tokio::test]
@@ -6648,6 +7621,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             number,
             url: format!("https://github.com/owner/name/pull/{number}"),
             branch: String::new(),
+            lease: None,
         };
         record_landed(&state, &session.id, &Landed::from_prs(vec![pr(24), pr(25)])).unwrap();
 
@@ -6886,7 +7860,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             let session = pr_session(7, &base, kind);
             let ctx = session_pr(&state, &session).await.unwrap();
             assert_eq!(ctx.merge_base.as_deref(), Some(parent_tip.as_str()));
-            let note = pr_note(&ctx);
+            let note = pr_note(&ctx, &[]);
             assert!(
                 note.contains(
                     "pull request #7 \"The PR\" (https://github.com/o/n/pull/7), \
@@ -6933,7 +7907,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         let session = pr_session(7, &head, SessionKind::Interactive);
         let ctx = session_pr(&state, &session).await.unwrap();
         assert_eq!(ctx.merge_base.as_deref(), Some(main.as_str()));
-        let note = pr_note(&ctx);
+        let note = pr_note(&ctx, &[]);
         assert!(
             note.contains(&format!("its commits {main}..{head}")),
             "{note}"
@@ -6958,7 +7932,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         );
 
         let session = pr_session(7, &base, SessionKind::Interactive);
-        let note = pr_note(&session_pr(&state, &session).await.unwrap());
+        let note = pr_note(&session_pr(&state, &session).await.unwrap(), &[]);
         assert!(
             note.contains(&format!(
                 "The pull request has since moved on to {moved}, which this \
@@ -6986,7 +7960,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
 
         let unsynced = pr_session(9, &"b".repeat(40), SessionKind::Interactive);
         let ctx = session_pr(&state, &unsynced).await.unwrap();
-        let note = pr_note(&ctx);
+        let note = pr_note(&ctx, &[]);
         assert!(note.contains("pull request #9"), "{note}");
         assert!(note.contains("hasn't synced yet"), "{note}");
         assert!(note.contains("session_pr"), "{note}");
@@ -7162,6 +8136,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             number,
             url: format!("https://github.com/o/n/pull/{number}"),
             branch: String::new(),
+            lease: None,
         };
         let session = |landed| AgentSession {
             branch: "grenadine/agent/abc".into(),

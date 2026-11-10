@@ -2024,6 +2024,7 @@ mod tests {
         assert!(allowed(&["mcp__grenadine__update_prs"]));
         assert!(allowed(&["mcp__grenadine__land_on_checkout"]));
         assert!(allowed(&["mcp__grenadine__session_pr"]));
+        assert!(allowed(&["mcp__grenadine__manage_prs"]));
     }
 
     /// A tool's output repeats across updates, so the result keeps the

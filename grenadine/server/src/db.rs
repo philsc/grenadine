@@ -569,6 +569,47 @@ pub struct SyncMark {
     pub queued: Option<bool>,
 }
 
+/// The landed PRs of every session of `repo` but `except` that has any.
+fn landed_in(conn: &Connection, repo: &str, except: &str) -> Result<Vec<(String, Landed)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, landed, branch FROM agents WHERE repo = ? AND id != ? AND landed IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![repo, except], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json, branch) = row?;
+        let Ok(landed) = serde_json::from_str::<Landed>(&json) else {
+            continue;
+        };
+        // A PR landed before branches were recorded has its position's
+        // branch, which taking the PRs below it would shift.
+        let landed = match landed {
+            Landed::Checkout { .. } => landed,
+            _ => Landed::from_prs(
+                landed
+                    .prs()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut pr)| {
+                        if pr.branch.is_empty() {
+                            pr.branch = crate::agent::stack_branch(&branch, i);
+                        }
+                        pr
+                    })
+                    .collect(),
+            ),
+        };
+        out.push((id, landed));
+    }
+    Ok(out)
+}
+
 fn kind_str(k: VersionKind) -> &'static str {
     match k {
         VersionKind::Initial => "initial",
@@ -1551,6 +1592,76 @@ impl Db {
             params![serde_json::to_string(landed)?, id],
         )?;
         Ok(())
+    }
+
+    /// Which other sessions of `repo` than `except` manage any of
+    /// `numbers`, i.e. have them among their landed PRs, by PR.
+    pub fn pr_managers(
+        &self,
+        repo: &str,
+        numbers: &[u64],
+        except: &str,
+    ) -> Result<BTreeMap<u64, String>> {
+        let conn = self.conn();
+        let mut out = BTreeMap::new();
+        for (id, landed) in landed_in(&conn, repo, except)? {
+            for pr in landed.prs() {
+                if numbers.contains(&pr.number) {
+                    out.insert(pr.number, id.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Hands the PRs of `landed` to session `to` in one transaction: they
+    /// become its landed PRs, `source` the PR it started from, and they
+    /// join its PRs. Every other session of `repo` that had any of them
+    /// among its landed PRs loses them there, but keeps them among its
+    /// PRs. Returns the sessions they were taken from, with the PRs each
+    /// lost.
+    pub fn take_prs(
+        &self,
+        to: &str,
+        repo: &str,
+        landed: &Landed,
+        source: Option<u64>,
+    ) -> Result<BTreeMap<String, Vec<u64>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let taken: Vec<u64> = landed.prs().iter().map(|pr| pr.number).collect();
+        let mut from = BTreeMap::new();
+        for (id, theirs) in landed_in(&tx, repo, to)? {
+            let (lost, kept): (Vec<_>, Vec<_>) = theirs
+                .prs()
+                .into_iter()
+                .partition(|pr| taken.contains(&pr.number));
+            if lost.is_empty() {
+                continue;
+            }
+            let kept = match kept.is_empty() {
+                true => None,
+                false => Some(serde_json::to_string(&Landed::from_prs(kept))?),
+            };
+            tx.execute(
+                "UPDATE agents SET landed = ? WHERE id = ?",
+                params![kept, id],
+            )?;
+            from.insert(id, lost.iter().map(|pr| pr.number).collect());
+        }
+        tx.execute(
+            "UPDATE agents SET landed = ?, pr_number = ? WHERE id = ?",
+            params![serde_json::to_string(landed)?, source, to],
+        )?;
+        for number in &taken {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
+                 VALUES (?, ?, ?, 'OPEN')",
+                params![to, repo, number],
+            )?;
+        }
+        tx.commit()?;
+        Ok(from)
     }
 
     /// Records that the session opened the PR `key`, which is in `state`,
@@ -2653,6 +2764,59 @@ mod tests {
         assert!(db.cached_users(&logins, 101).unwrap().is_empty());
     }
 
+    /// Taking PRs moves them out of other sessions' landed PRs in one go,
+    /// filling in positional branches first, while those sessions keep
+    /// them among their PRs.
+    #[test]
+    fn take_prs_moves_landed_prs() {
+        let db = Db::in_memory();
+        for id in ["a", "b", "c"] {
+            db.create_agent(&AgentSession {
+                branch: format!("br-{id}"),
+                ..AgentSession::fixture(id, "o/n")
+            })
+            .unwrap();
+        }
+        let pr = |number, branch: &str| grenadine_core::api::LandedPr {
+            number,
+            url: "u".into(),
+            branch: branch.into(),
+            lease: None,
+        };
+        db.set_agent_landed(
+            "a",
+            &Landed::from_prs(vec![pr(4, ""), pr(5, ""), pr(6, "")]),
+        )
+        .unwrap();
+        for n in [4, 5, 6] {
+            db.add_agent_pr(
+                "a",
+                &PrKey {
+                    repo: "o/n".into(),
+                    number: n,
+                },
+                "OPEN",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.pr_managers("o/n", &[4, 5, 9], "b").unwrap(),
+            BTreeMap::from([(4, "a".to_owned()), (5, "a".to_owned())])
+        );
+        let taken = Landed::from_prs(vec![pr(4, "br-a"), pr(5, "br-a-2")]);
+        let from = db.take_prs("b", "o/n", &taken, Some(4)).unwrap();
+        assert_eq!(from, BTreeMap::from([("a".to_owned(), vec![4, 5])]));
+        let b = db.agent("b").unwrap().unwrap();
+        assert_eq!((b.landed, b.pr), (Some(taken), Some(4)));
+        assert_eq!(
+            db.agent("a").unwrap().unwrap().landed,
+            Some(Landed::from_prs(vec![pr(6, "br-a-3")]))
+        );
+        assert_eq!(db.agent_pr_list("a").unwrap().len(), 3);
+        assert_eq!(db.agent_pr_list("b").unwrap().len(), 2);
+        assert_eq!(db.agent("c").unwrap().unwrap().landed, None);
+    }
+
     /// Rows landed before pull requests recorded their branches still
     /// load, with the branch empty for the caller to fall back on.
     #[test]
@@ -3018,6 +3182,7 @@ mod tests {
             number,
             url: format!("https://github.com/o/n/pull/{number}"),
             branch: format!("feat-{number}"),
+            lease: None,
         };
         let landed = Landed::Stack {
             prs: vec![pr(3), pr(4)],
