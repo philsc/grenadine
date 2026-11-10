@@ -2909,6 +2909,12 @@ fn Transcript(
     // under it, it keeps its distance from the bottom rather than from
     // the top, so what was at the bottom stays in view.
     //
+    // Content can also grow without a new event, as when the activity bar
+    // shows in the sticky footer over the transcript's bottom once a
+    // follow-up starts a turn, or an image loads. While following, any
+    // change in the size of the transcript or the footer goes to the
+    // bottom too.
+    //
     // A hidden pane, like the PR page's collapsed Agents panel, has no
     // layout to scroll. When it is shown again it goes to the bottom if
     // following, else back to where the user left it.
@@ -2945,6 +2951,7 @@ fn Transcript(
     let on_scroll = StoredValue::new_local(on_scroll);
     let main = StoredValue::new_local(None::<web_sys::Element>);
     let resizes = StoredValue::new_local(None::<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>);
+    let grows = StoredValue::new_local(None::<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>);
     Effect::new(move |_| {
         events.track();
         streaming.track();
@@ -2988,17 +2995,34 @@ fn Transcript(
                 observer.observe(&el);
                 resizes.set_value(Some((observer, on_resize)));
             }
+            let pane = el.clone();
+            let on_grow = Closure::<dyn FnMut()>::new(move || {
+                if follow.get_value() && visible.get_value() {
+                    pane.set_scroll_top(pane.scroll_height());
+                }
+            });
+            if let Ok(observer) = web_sys::ResizeObserver::new(on_grow.as_ref().unchecked_ref()) {
+                if let Some(transcript) = end.parent_element() {
+                    observer.observe(&transcript);
+                }
+                if let Ok(Some(footer)) = el.query_selector(".agent-footer") {
+                    observer.observe(&footer);
+                }
+                grows.set_value(Some((observer, on_grow)));
+            }
         }
         if follow.get_value() {
             el.set_scroll_top(el.scroll_height());
         }
     });
     on_cleanup(move || {
-        resizes.try_with_value(|r| {
-            if let Some((observer, _)) = r {
-                observer.disconnect();
-            }
-        });
+        for observers in [resizes, grows] {
+            observers.try_with_value(|r| {
+                if let Some((observer, _)) = r {
+                    observer.disconnect();
+                }
+            });
+        }
         let Some(Some(m)) = main.try_get_value() else {
             return;
         };

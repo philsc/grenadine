@@ -4566,6 +4566,45 @@ class AgentTest(ServerTestCase):
         self.assertAlmostEqual(below(), 200, delta=1)
         self.delete_session()
 
+    def test_transcript_shows_all_of_a_sent_follow_up(self) -> None:
+        # Scrolled to the bottom, a long follow-up the user sends shows
+        # whole at the bottom of the transcript.
+        self.page.set_viewport_size({"width": 1000, "height": 800})
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("long transcript 30")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1, timeout=60_000)
+        main = self.page.locator(".agent-panes > .main")
+
+        def frames() -> None:
+            self.page.evaluate(
+                "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+            )
+
+        main.evaluate("e => e.scrollTop = e.scrollHeight")
+        frames()
+        follow_up = self.page.get_by_label("Follow-up")
+        # The fake agent holds the turn running, so the activity bar shows
+        # in the footer over the transcript's bottom.
+        follow_up.fill("sleep 5")
+        follow_up.press("Enter")
+        prompt = transcript.locator(".turn-prompt").nth(1)
+        expect(prompt).to_have_text("sleep 5")
+        expect(self.page.locator(".agent-footer .activity")).to_be_visible()
+        frames()
+        prompt_box = prompt.bounding_box()
+        footer_box = self.page.locator(".agent-footer").bounding_box()
+        assert prompt_box and footer_box
+        self.assertLessEqual(
+            prompt_box["y"] + prompt_box["height"], footer_box["y"] + 1
+        )
+        expect(transcript.locator(".turn-end")).to_have_count(2, timeout=30_000)
+        self.delete_session()
+
     def test_devin_question(self) -> None:
         transcript = self.start_devin_session("Code", "ask me a question")
         question = transcript.locator(".approval")
