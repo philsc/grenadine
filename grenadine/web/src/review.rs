@@ -1427,7 +1427,8 @@ fn merge_name(key: &PrKey) -> String {
 }
 
 /// What went wrong after merging, as a banner. Outside the merge box,
-/// which goes away once the page shows the PR merged.
+/// which goes away once the page shows the PR merged, but where it was:
+/// atop the sidebar, or in the main column while the sidebar's hidden.
 pub fn merge_warning() -> impl IntoView {
     let MergeChoice { warning, .. } = expect_context::<MergeChoice>();
     move || {
@@ -1962,8 +1963,9 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
 }
 
 /// Whether the PR can be merged and merging it. Only for open PRs; the
-/// checks are in the sidebar.
-pub fn merge_box(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<> {
+/// checks are in the sidebar. `sidebar` gives it the sidebar's look: a
+/// "Merge" heading like its other sections' instead of a border.
+pub fn merge_box(info: &ReviewInfo, target: MergeTarget, sidebar: bool) -> impl IntoView + use<> {
     let (class, text) = merge_status(info, target.unresolved_threads);
     let controls = if info.merge.queue.is_some() {
         queue_controls(info, target.clone()).into_any()
@@ -1971,7 +1973,8 @@ pub fn merge_box(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use<
         merge_controls(info, target, false).into_any()
     };
     view! {
-        <section class="merge-box">
+        <section class="merge-box" class:in-sidebar=sidebar>
+            {sidebar.then(|| view! { <h2>"Merge"</h2> })}
             <p class=format!("merge-status {class}")>{text}</p>
             {controls}
         </section>

@@ -252,6 +252,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     };
     // `None` until the user picks versions: Base against the latest.
     let chosen = RwSignal::new(None::<Selection>);
+    // Set by `PrBody` when it mounts.
+    let pinned = RwSignal::new(0);
     let side_by_side = RwSignal::new(load_flag("side-by-side", true));
     let inline_changes = RwSignal::new(load_flag("inline-changes", true));
     let rebase_older = RwSignal::new(load_flag("rebase-older-version", false));
@@ -463,7 +465,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         {move || {
             ready.get().then(|| {
                 view! {
-                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older />
+                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older pinned=pinned sidebar=Signal::derive(shown) />
                 }
             })
         }}
@@ -483,6 +485,25 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                             <div class="sidebar-head">
                                 {button(false)}
                             </div>
+                            // Up top, so merging after a review needs no
+                            // scrolling back up. Merging is the only thing
+                            // here that needs `ReviewTarget`; provided
+                            // page-wide it would reach the agents panel's
+                            // diffs.
+                            {move || detail.get().map(|d| {
+                                provide_context(ReviewTarget {
+                                    key: d.summary.key.clone(),
+                                    reviewing: Signal::derive(move || {
+                                        detail.with(|d| d.as_ref().is_some_and(|d| {
+                                            d.review.as_ref().is_some_and(|r| r.pending_review.is_some())
+                                        }))
+                                    }),
+                                });
+                                view! {
+                                    {merge_section(&d, pinned.get(), true)}
+                                    {merge_warning()}
+                                }
+                            })}
                             <crate::review::SidebarReview
                                 pr=Signal::derive(move || match pr.get() {
                                     Some(Ok(api::PrResponse::Ready(d))) => Some(*d),
@@ -630,6 +651,12 @@ fn PrBody(
     side_by_side: RwSignal<bool>,
     inline_changes: RwSignal<bool>,
     rebase_older: RwSignal<bool>,
+    /// The version the right side stays on while the user picks none.
+    /// `PrView` holds it so the sidebar's merge box can merge it too.
+    pinned: RwSignal<u32>,
+    /// The sidebar shows, and with it the merge box; the main column
+    /// shows the merge box only while it's hidden.
+    sidebar: Signal<bool>,
 ) -> impl IntoView {
     let first = pr.get_untracked();
     let repo = first.summary.key.repo.clone();
@@ -725,7 +752,7 @@ fn PrBody(
     });
     // The version the right side stays on while the user picks none, so
     // a later push doesn't move the diff they're reading.
-    let pinned = RwSignal::new(first.versions.len() as u32);
+    pinned.set(first.versions.len() as u32);
     let selection = Memo::new(move |_| {
         let pr = pr.get();
         let latest = pr.versions.len() as u32;
@@ -1089,14 +1116,10 @@ fn PrBody(
                 }
             }}
             {move || pr.with(|p| p.review.clone()).map(|info| conversation(&info).into_any())}
-            {move || {
-                let pr = pr.get();
-                (pr.summary.state == "OPEN")
-                    .then(|| pr.review.clone())
-                    .flatten()
-                    .map(|info| merge_box(&info, merge_target(&pr, pinned.get())).into_any())
-            }}
-            {merge_warning()}
+            {move || (!sidebar.get()).then(|| view! {
+                {move || merge_section(&pr.get(), pinned.get(), false)}
+                {merge_warning()}
+            })}
             <div class="toolbar-marker" aria-hidden="true" node_ref=marker></div>
             <div class="toolbar" node_ref=toolbar>
                 {move || {
@@ -1209,6 +1232,15 @@ fn state_label(state: &str, queued: bool) -> String {
         true => "queued".to_owned(),
         false => state.to_lowercase(),
     }
+}
+
+/// The merge box of an open PR with review data, in the sidebar or the
+/// main column.
+fn merge_section(pr: &PrDetail, pinned: u32, sidebar: bool) -> Option<AnyView> {
+    (pr.summary.state == "OPEN")
+        .then_some(pr.review.as_ref())
+        .flatten()
+        .map(|info| merge_box(info, merge_target(pr, pinned), sidebar).into_any())
 }
 
 /// `head` is the version the merge expects at the tip: the pinned one,
