@@ -1750,7 +1750,7 @@ fn strip_cd<'a>(command: &'a str, worktree: &str) -> &'a str {
             None => return command,
         }
     } else {
-        match rest.find(char::is_whitespace) {
+        match rest.find(|c: char| c.is_whitespace() || c == ';' || c == '&') {
             Some(i) => rest.split_at(i),
             None => (rest, ""),
         }
@@ -4242,6 +4242,10 @@ mod tests {
             "cd '/w/t'; x",
             "cd /w/t/ && x",
             "  cd /w/t   &&   x",
+            "cd /w/t; x",
+            "cd /w/t;x",
+            "cd /w/t&& x",
+            "cd /w/t/; x",
         ] {
             assert_eq!(strip_cd(command, "/w/t"), "x", "{command}");
         }
@@ -4252,6 +4256,8 @@ mod tests {
             "cd /w/t && ",
             "x && cd /w/t",
             "cd /w/tt && x",
+            "cd /w/t& x",
+            "cd /w/t;",
         ] {
             assert_eq!(strip_cd(command, "/w/t"), command, "{command}");
         }
