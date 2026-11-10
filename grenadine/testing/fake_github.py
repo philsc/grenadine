@@ -1940,16 +1940,14 @@ class FakeGitHub:
             "mergeStateStatus": pr.merge_state_status(),
             "viewerCanMergeAsAdmin": pr.can_merge_as_admin,
             "viewerCanUpdate": pr.viewer_can_update,
-            "suggestedReviewers": lambda info, first=None, **_: {
-                "nodes": [
-                    {
-                        "isAuthor": login == pr.author,
-                        "isCommenter": False,
-                        "reviewer": self._user_node(login),
-                    }
-                    for login in sorted(repo.suggested_reviewers)
-                ][: first or 20]
-            },
+            "suggestedReviewers": lambda info, **_: [
+                {
+                    "isAuthor": login == pr.author,
+                    "isCommenter": False,
+                    "reviewer": self._user_node(login),
+                }
+                for login in sorted(repo.suggested_reviewers)
+            ][:20],
             "reviews": reviews,
             "reviewRequests": lambda info, **_: {
                 "nodes": [

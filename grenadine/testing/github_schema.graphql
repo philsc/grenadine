@@ -410,7 +410,7 @@ type PullRequest {
   mergeStateStatus: MergeStateStatus!
   viewerCanMergeAsAdmin: Boolean!
   viewerCanUpdate: Boolean!
-  suggestedReviewers(first: Int): SuggestedReviewerConnection
+  suggestedReviewers: [SuggestedReviewer]
   reviews(
     first: Int
     after: String
@@ -458,10 +458,6 @@ union RequestedReviewer = User | Team | Bot | Mannequin
 type Team {
   name: String!
   slug: String!
-}
-
-type SuggestedReviewerConnection {
-  nodes: [SuggestedReviewer]
 }
 
 type SuggestedReviewer {

@@ -232,6 +232,18 @@ use_repo(pnpm, "pnpm")
 #   https://unpkg.com/playwright-core@<version>/browsers.json
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# GitHub's published GraphQL schema from the github/docs repo, pinned to a
+# commit so that github_schema_test can check the fake's hand-written schema
+# in testing/github_schema.graphql against it.
+http_file(
+    name = "github_graphql_schema",
+    downloaded_file_path = "schema.graphql",
+    sha256 = "0d71ca68a4e951599b2ea541a81cc259a843608fc22b8eb1713a1d03551b149e",
+    url = "https://raw.githubusercontent.com/github/docs/c6f68e2527c324d52226d7de8bc49cf8e5c0e954/src/graphql/data/fpt/schema.docs.graphql",
+)
+
 http_archive(
     name = "chrome_headless_shell",
     build_file_content = """

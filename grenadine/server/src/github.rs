@@ -1613,7 +1613,7 @@ impl GitHub {
                    repository(owner: $owner, name: $name) {
                      pullRequest(number: $number) {
                        author { login }
-                       suggestedReviewers { nodes { reviewer { login name avatarUrl } } }
+                       suggestedReviewers { reviewer { login name avatarUrl } }
                      }
                      assignableUsers(query: $q, first: 20) {
                        nodes { login name avatarUrl }
@@ -1640,7 +1640,7 @@ impl GitHub {
         let pr = &data["repository"]["pullRequest"];
         let author = str_at(pr, "/author/login").to_owned();
         let person = |v: &Value| person_at(v).filter(|p| p.login.as_deref() != Some(&*author));
-        let suggested: Vec<Person> = nodes(pr, "/suggestedReviewers/nodes")
+        let suggested: Vec<Person> = nodes(pr, "/suggestedReviewers")
             .filter_map(|n| person(&n["reviewer"]))
             .collect();
         let suggested_logins: std::collections::BTreeSet<&str> = suggested

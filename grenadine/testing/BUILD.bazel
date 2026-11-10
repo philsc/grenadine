@@ -29,6 +29,22 @@ py_test(
     deps = [":fake_github"],
 )
 
+# Checks the fake's hand-written GraphQL schema against the real GitHub
+# schema, so a query the fake accepts isn't rejected by GitHub.
+py_test(
+    name = "github_schema_test",
+    size = "small",
+    srcs = ["github_schema_test.py"],
+    data = [
+        "github_schema.graphql",
+        "@github_graphql_schema//file",
+    ],
+    env = {
+        "GITHUB_GRAPHQL_SCHEMA": "$(rootpath @github_graphql_schema//file)",
+    },
+    deps = ["@grenadine_pypi//graphql_core"],
+)
+
 # Stands in for `devin acp` in the server's and the UI's tests, playing a
 # scenario file.
 py_binary(
