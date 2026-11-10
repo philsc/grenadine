@@ -3836,6 +3836,64 @@ class VersionsTest(ServerTestCase):
                 expect(file.locator("tr.line td.code.add")).to_have_count(300)
                 expect(file.locator("td.code .sy-storage").first).to_have_text("def")
 
+    def settle(self) -> int:
+        """Waits for the measuring pass and a steady scroll height, and
+        returns `.main`'s scrollHeight."""
+        main = self.page.locator(".pr-page .main")
+        height = main.evaluate("el => el.scrollHeight")
+        for _ in range(20):
+            self.page.wait_for_timeout(500)
+            expect(self.page.locator(".file.measuring")).to_have_count(0)
+            new = main.evaluate("el => el.scrollHeight")
+            if new == height:
+                return height
+            height = new
+        self.fail("the scroll height never settled")
+
+    def scroll_through(self, height: int) -> None:
+        """Scrolls `.main` a viewport at a time to the bottom, asserting
+        the scrollHeight never changes."""
+        main = self.page.locator(".pr-page .main")
+        step = main.evaluate("el => el.clientHeight")
+        top = main.evaluate("el => el.scrollTop")
+        steps = []
+        while True:
+            main.evaluate("(el, y) => el.scrollTop = y", top)
+            steps.append((top, main.evaluate("el => el.scrollHeight")))
+            if top + step >= steps[-1][1]:
+                break
+            top += step
+        seen = {h for _, h in steps}
+        self.assertEqual(seen, {height}, f"scrollHeight changed: {steps}")
+        expect(self.page.locator("section.file").last).to_be_in_viewport()
+
+    def test_scrolling_to_the_bottom_keeps_a_steady_scrollbar(self) -> None:
+        self.open(scenarios.SCROLLBAR)
+        expect(self.page.locator(".diff-summary")).to_have_text(
+            f"{len(scenarios.SCROLLBAR_FILES)} files changed"
+        )
+        expect(self.page.locator(".diff-placeholder")).to_have_count(0)
+        main = self.page.locator(".pr-page .main")
+        # The pinned toolbar shows a title row, growing `.main` once, so
+        # pin it before the height is recorded.
+        main.evaluate("el => el.scrollTop = el.clientHeight")
+        expect(self.page.locator(".toolbar-title")).to_have_count(1)
+        height = self.settle()
+        self.scroll_through(height)
+
+        # Halfway down for the screenshot. Under Bazel /tmp is the
+        # sandbox's, so write to the undeclared outputs dir there.
+        main.evaluate("(el, y) => el.scrollTop = y", height // 2)
+        out = Path(os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR", "/tmp"))
+        self.page.screenshot(path=str(out / "scrollbar-fix.png"))
+
+        # The unified layout gets its own measuring pass; scrolling
+        # through it is just as steady.
+        self.page.get_by_label("Side by side").uncheck()
+        expect(self.page.locator("table.diff.unified").first).to_be_visible()
+        height = self.settle()
+        self.scroll_through(height)
+
     def toolbar_bottom(self) -> float:
         box = self.page.locator(".toolbar").bounding_box()
         return box["y"] + box["height"]

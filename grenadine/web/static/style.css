@@ -997,9 +997,14 @@ input[type="text"] {
   /* Clip, not hidden: hidden would make each file a scroll container and
      break the header's sticky positioning. */
   overflow: clip;
-  /* Big diffs: the browser skips laying out files that are off screen. */
+  /* Big diffs: the browser skips laying out files that are off screen.
+     Each file's inline contain-intrinsic-size estimates its height. */
   content-visibility: auto;
-  contain-intrinsic-size: auto 400px;
+}
+/* The measuring pass forces off-screen files to lay out so the browser
+   records their real heights. */
+.file.measuring {
+  content-visibility: visible;
 }
 .file-header {
   display: flex;
