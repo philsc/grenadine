@@ -2,6 +2,7 @@
 //! starts one, and a session's page with its live transcript, permission
 //! requests and a box for follow-up prompts.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1810,44 +1811,63 @@ fn follow(
     );
 }
 
-/// `command` without a leading `cd` into `worktree`, which changes nothing
-/// because commands already run there.
-fn strip_cd<'a>(command: &'a str, worktree: &str) -> &'a str {
+/// `command` with a leading `cd` into `worktree` or a directory inside it
+/// shortened. A `cd` into `worktree` itself is dropped, because commands
+/// already run there; a `cd` into a directory inside it names that directory
+/// relative to `worktree`, keeping its quotes and the `&&` or `;` after it.
+/// Agents often prefix every command with an absolute `cd`, which would
+/// otherwise fill a one-line summary.
+fn shorten_cd<'a>(command: &'a str, worktree: &str) -> Cow<'a, str> {
+    let unchanged = Cow::Borrowed(command);
     if worktree.is_empty() {
-        return command;
+        return unchanged;
     }
     let Some(rest) = command.trim_start().strip_prefix("cd") else {
-        return command;
+        return unchanged;
     };
     if !rest.starts_with(char::is_whitespace) {
-        return command;
+        return unchanged;
     }
     let rest = rest.trim_start();
-    let (dir, rest) = if let Some(r) = rest.strip_prefix('"') {
+    let (quote, dir, rest) = if let Some(r) = rest.strip_prefix('"') {
         match r.split_once('"') {
-            Some(parts) => parts,
-            None => return command,
+            Some((dir, rest)) => ("\"", dir, rest),
+            None => return unchanged,
         }
     } else if let Some(r) = rest.strip_prefix('\'') {
         match r.split_once('\'') {
-            Some(parts) => parts,
-            None => return command,
+            Some((dir, rest)) => ("'", dir, rest),
+            None => return unchanged,
         }
     } else {
-        match rest.find(|c: char| c.is_whitespace() || c == ';' || c == '&') {
+        let (dir, rest) = match rest.find(|c: char| c.is_whitespace() || c == ';' || c == '&') {
             Some(i) => rest.split_at(i),
             None => (rest, ""),
-        }
+        };
+        ("", dir, rest)
     };
-    if dir != worktree && dir.strip_suffix('/') != Some(worktree) {
-        return command;
+    let relative = relative_to(dir, worktree);
+    if relative == dir {
+        return unchanged;
     }
+    let relative = relative.trim_end_matches('/');
     let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix("&&").or_else(|| rest.strip_prefix(';')) else {
-        return command;
+    if rest.is_empty() && relative != "." {
+        return Cow::Owned(format!("cd {quote}{relative}{quote}"));
+    }
+    let (separator, rest) = match rest.strip_prefix("&&") {
+        Some(rest) => (" &&", rest),
+        None => match rest.strip_prefix(';') {
+            Some(rest) => (";", rest),
+            None => return unchanged,
+        },
     };
     let rest = rest.trim_start();
-    if rest.is_empty() { command } else { rest }
+    match (rest.is_empty(), relative) {
+        (true, _) => unchanged,
+        (false, ".") => Cow::Borrowed(rest),
+        (false, _) => Cow::Owned(format!("cd {quote}{relative}{quote}{separator} {rest}")),
+    }
 }
 
 /// `path` relative to `worktree` when it is inside it, or the path unchanged.
@@ -1886,7 +1906,7 @@ fn summary_title(input: &serde_json::Value, summary: &str) -> Option<String> {
 }
 
 /// A one-line summary of a tool call's input, e.g. the command or the path.
-/// `worktree` hides a redundant leading `cd` into it in a `Bash` command and
+/// `worktree` shortens a leading `cd` into it in a `Bash` command and
 /// shortens a file tool's or a search tool's path inside it.
 fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -> String {
     let field = match name {
@@ -1940,9 +1960,9 @@ fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -
     match input.get(field).and_then(|v| v.as_str()) {
         Some(s) => {
             let s = match worktree {
-                Some(worktree) if name == "Bash" => strip_cd(s, worktree),
-                Some(worktree) if field == "file_path" => relative_to(s, worktree),
-                _ => s,
+                Some(worktree) if name == "Bash" => shorten_cd(s, worktree),
+                Some(worktree) if field == "file_path" => Cow::Borrowed(relative_to(s, worktree)),
+                _ => Cow::Borrowed(s),
             };
             s.lines().next().unwrap_or_default().to_owned()
         }
@@ -4524,10 +4544,29 @@ mod tests {
             "cd /w/t&& x",
             "cd /w/t/; x",
         ] {
-            assert_eq!(strip_cd(command, "/w/t"), "x", "{command}");
+            assert_eq!(shorten_cd(command, "/w/t"), "x", "{command}");
+        }
+        for (command, shortened) in [
+            ("cd /w/t/sub && x", "cd sub && x"),
+            ("cd /w/t/a/b && x", "cd a/b && x"),
+            ("cd /w/t/sub/ && x", "cd sub && x"),
+            ("  cd /w/t/sub   &&   x", "cd sub && x"),
+            ("cd /w/t/sub&& x", "cd sub && x"),
+            ("cd /w/t/sub; x", "cd sub; x"),
+            ("cd /w/t/sub;x", "cd sub; x"),
+            (r#"cd "/w/t/a b" && x"#, r#"cd "a b" && x"#),
+            ("cd '/w/t/a b'; x", "cd 'a b'; x"),
+            ("cd /w/t/sub", "cd sub"),
+            ("cd /w/t/sub/", "cd sub"),
+        ] {
+            assert_eq!(shorten_cd(command, "/w/t"), shortened, "{command}");
+            assert_eq!(shorten_cd(command, "/w/t/"), shortened, "{command}");
         }
         for command in [
-            "cd /w/t/sub && x",
+            "cd sub && x",
+            "cd /w/t/sub && ",
+            "cd /w/t/sub& x",
+            "cd /w/t-other/x && y",
             "cd /other && x",
             "cd /w/t",
             "cd /w/t && ",
@@ -4536,9 +4575,10 @@ mod tests {
             "cd /w/t& x",
             "cd /w/t;",
         ] {
-            assert_eq!(strip_cd(command, "/w/t"), command, "{command}");
+            assert_eq!(shorten_cd(command, "/w/t"), command, "{command}");
         }
-        assert_eq!(strip_cd("cd /w/t && x", ""), "cd /w/t && x");
+        assert_eq!(shorten_cd("cd /w/t && x", ""), "cd /w/t && x");
+        assert_eq!(shorten_cd("cd /w/t/sub && x", ""), "cd /w/t/sub && x");
     }
 
     #[test]
@@ -4559,6 +4599,8 @@ mod tests {
         let input = serde_json::json!({"command": "cd /w/t && ls\nmore"});
         assert_eq!(tool_summary("Bash", &input, Some("/w/t")), "ls");
         assert_eq!(tool_summary("Bash", &input, None), "cd /w/t && ls");
+        let input = serde_json::json!({"command": "cd /w/t/sub && ls\nmore"});
+        assert_eq!(tool_summary("Bash", &input, Some("/w/t")), "cd sub && ls");
         let input = serde_json::json!({"file_path": "/w/a.rs"});
         assert_eq!(tool_summary("Edit", &input, None), "/w/a.rs");
         assert_eq!(tool_summary("mcp__x__y", &input, None), "");
