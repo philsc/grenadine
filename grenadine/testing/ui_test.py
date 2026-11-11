@@ -5959,6 +5959,124 @@ class AgentTest(ServerTestCase):
         self.page.set_viewport_size({"width": 1800, "height": 900})
         expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
 
+    def changes_pane(self) -> Locator:
+        return self.page.locator(".changes-pane")
+
+    def session_page(self, width: int) -> None:
+        """Starts a session at a window width, without a saved pane
+        width or collapse."""
+        self.page.set_viewport_size({"width": width, "height": 900})
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        self.page.evaluate(
+            "() => {"
+            "localStorage.removeItem('grenadine.changes-pane-width');"
+            "localStorage.removeItem('changes-pane-collapsed');"
+            "}"
+        )
+        self.page.reload()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+    def drag_changes_pane(self, dx: float) -> None:
+        """Drags the changes pane's divider `dx` pixels to the right."""
+        divider = self.page.locator(".changes-pane .sidebar-divider")
+        expect(divider).to_be_visible()
+        box = divider.bounding_box()
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        self.page.mouse.move(x, y)
+        self.page.mouse.down()
+        self.page.mouse.move(max(0.0, x + dx), y)
+        self.page.mouse.up()
+
+    def assert_changes_pane_width(self, expected: float, delta: float = 5) -> None:
+        """Waits for the changes pane's width to reach `expected` pixels."""
+        expect(self.changes_pane()).to_have_css("width", f"{expected}px")
+        self.assertAlmostEqual(
+            self.changes_pane().bounding_box()["width"], expected, delta=delta
+        )
+
+    def test_changes_pane_overlays_on_narrow_windows(self) -> None:
+        self.session_page(1200)
+
+        toggle = self.page.locator(".sidebar-toggle")
+        pane = self.changes_pane()
+        expect(pane).to_have_count(0)
+        toggle.click()
+        expect(pane).to_have_count(1)
+        expect(pane).to_have_class(re.compile(r"\boverlay\b"))
+        expect(pane.locator("section.file .path")).to_have_text(["notes.txt"])
+        # The overlay floats over the transcript; the terminal panel
+        # under it stays visible.
+        expect(self.page.locator(".terminal-bar")).to_be_visible()
+
+        # Escape closes the overlay.
+        self.page.keyboard.press("Escape")
+        expect(pane).to_have_count(0)
+
+        # So does a click outside it, on the transcript.
+        toggle.click()
+        expect(pane).to_have_count(1)
+        self.page.locator(".transcript").click(position={"x": 20, "y": 20})
+        expect(pane).to_have_count(0)
+
+        # And so does the toggle itself.
+        toggle.click()
+        expect(pane).to_have_count(1)
+        toggle.click()
+        expect(pane).to_have_count(0)
+
+    def test_changes_pane_collapses_and_stays_collapsed(self) -> None:
+        self.session_page(1800)
+
+        toggle = self.page.locator(".sidebar-toggle")
+        pane = self.changes_pane()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        toggle.click()
+        expect(pane).to_have_count(0)
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        self.page.reload()
+        expect(pane).to_have_count(0)
+        self.page.locator(".sidebar-toggle").click()
+        expect(pane).to_have_count(1)
+
+    def test_changes_pane_drags_and_remembers(self) -> None:
+        self.session_page(1800)
+        # The panes' row is the 1800px window minus the session list's
+        # 300; the pane defaults to what's left of the transcript's 960.
+        self.assert_changes_pane_width(540)
+
+        self.drag_changes_pane(-100)
+        self.assert_changes_pane_width(640)
+
+        # The width survives a reload.
+        self.page.reload()
+        expect(self.changes_pane()).to_be_visible()
+        self.assert_changes_pane_width(640)
+
+        # A double-click on the divider restores the default split.
+        self.page.locator(".changes-pane .sidebar-divider").dblclick()
+        self.assert_changes_pane_width(540)
+        self.page.reload()
+        self.assert_changes_pane_width(540)
+
+    def test_changes_pane_drags_wider_on_stacked_windows(self) -> None:
+        # Below 800px the session list stacks above the transcript, so
+        # the panes' row is the full window width; the overlay still
+        # leaves it a sliver at its widest.
+        self.session_page(700)
+
+        self.page.locator(".sidebar-toggle").click()
+        self.assert_changes_pane_width(480)
+
+        # The overlay may grow to 652px (the page minus a 48px sliver).
+        self.drag_changes_pane(-150)
+        self.assert_changes_pane_width(630)
+
     def test_terminals(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
