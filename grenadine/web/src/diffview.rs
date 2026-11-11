@@ -25,6 +25,7 @@ use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, mark, plain_lines};
 use crate::inboxes::load_flag;
+use crate::memlog;
 use crate::pr::{Anchor, Placed, ThreadView, ThreadWhere, range_label};
 
 const CONTEXT: usize = 3;
@@ -327,7 +328,14 @@ pub fn DiffView(
     highlight::demote();
     let files = LocalResource::new(move || {
         diff_paths.set(None);
-        load(repo.clone(), left.clone(), right.clone(), upstream.clone())
+        let load = load(repo.clone(), left.clone(), right.clone(), upstream.clone());
+        async move {
+            let loaded = load.await;
+            if let Ok((files, _)) = &loaded {
+                memlog::diff(files.len(), files.iter().map(|f| changed_lines(f)).sum());
+            }
+            loaded
+        }
     });
     Effect::new(move |_| {
         let mode = rebase_older.get();
@@ -448,6 +456,24 @@ pub fn DiffView(
             .into_any()
         }
     }
+}
+
+/// The file's added and removed lines, for the page memory log.
+fn changed_lines(file: &FileData) -> usize {
+    let s = file.stats(false);
+    s.added + s.removed
+}
+
+/// The change an agent's worktree shows, as the `FileData` the diff view
+/// renders.
+fn worktree_file_data(f: WorktreeFile) -> Arc<FileData> {
+    Arc::new(FileData {
+        change: f.change,
+        old: f.old.map(Arc::new),
+        new: f.new.map(Arc::new),
+        rebase: None,
+        stats: [OnceLock::new(), OnceLock::new()],
+    })
 }
 
 /// How many of `files` have no change of the PR's own in `rebase_older`
@@ -616,6 +642,11 @@ fn cached_shape(file: &FileData, old_id: &str, new_id: &str, rebase_older: bool)
         c.push_back((key, s.clone()));
     });
     s
+}
+
+/// How many file shapes are cached.
+pub fn shape_cache_entries() -> usize {
+    SHAPE_CACHE.with_borrow(VecDeque::len)
 }
 
 /// The old text `rebase_older` picks: the rebased text when it exists,
@@ -1469,21 +1500,38 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
     let rebase_older = Signal::stored(false);
     let folds = Folds::new(&session);
     provide_context(Measurer::new());
-    let key = |f: &WorktreeFile| {
-        let mut h = DefaultHasher::new();
-        f.hash(&mut h);
-        h.finish()
-    };
+    // Each file's FileData — and so its laid-out stats — lives as long as
+    // the file's contents stay the same, shared between the rows and the
+    // page memory log.
+    let cache = StoredValue::new_local(HashMap::<u64, Arc<FileData>>::new());
+    let keyed = RwSignal::new(Vec::<(u64, Arc<FileData>)>::new());
+    let keys = StoredValue::new_local(Vec::<u64>::new());
+    Effect::new(move |_| {
+        let files = files.get();
+        let mut next = Vec::with_capacity(files.len());
+        let mut keep = HashMap::new();
+        for f in files {
+            let mut h = DefaultHasher::new();
+            f.hash(&mut h);
+            let k = h.finish();
+            let file = cache
+                .with_value(|m| m.get(&k).cloned())
+                .unwrap_or_else(|| worktree_file_data(f));
+            keep.insert(k, file.clone());
+            next.push((k, file));
+        }
+        cache.set_value(keep);
+        let new_keys: Vec<u64> = next.iter().map(|(k, _)| *k).collect();
+        if !next.is_empty() && new_keys != keys.get_value() {
+            memlog::diff(next.len(), next.iter().map(|(_, f)| changed_lines(f)).sum());
+        }
+        keys.set_value(new_keys);
+        keyed.set(next);
+    });
     view! {
-        <For each=move || files.get() key=key let:f>
+        <For each=move || keyed.get() key=|entry| entry.0 let:entry>
             {
-                let file = Arc::new(FileData {
-                    change: f.change,
-                    old: f.old.map(Arc::new),
-                    new: f.new.map(Arc::new),
-                    rebase: None,
-                    stats: [OnceLock::new(), OnceLock::new()],
-                });
+                let file = entry.1;
                 view! { <FileView file=file comments=Signal::stored(vec![]) side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older commenting=Signal::stored(None) folds=folds.clone() /> }
             }
         </For>
@@ -2072,6 +2120,18 @@ mod tests {
     use crate::pr::Thread;
 
     use super::*;
+
+    #[test]
+    fn the_shape_cache_reports_its_entries() {
+        let before = shape_cache_entries();
+        SHAPE_CACHE.with_borrow_mut(|c| {
+            c.push_back((
+                ("o".into(), "n".into()),
+                Arc::new(shape_texts("a\n", "b\n")),
+            ))
+        });
+        assert_eq!(shape_cache_entries(), before + 1);
+    }
 
     fn placed(id: u64, anchor: Anchor, start: Option<(Side, u32)>) -> Placed {
         Placed {
