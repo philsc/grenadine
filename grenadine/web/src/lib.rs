@@ -20,6 +20,7 @@ mod pr;
 mod pr_agents;
 mod review;
 mod settings;
+mod sidebar;
 mod tabs;
 mod terminal;
 mod theme;
@@ -347,7 +348,7 @@ fn App() -> impl IntoView {
                 <inboxes::Inboxes last=last />
             </main>
             {move || selected.get().map(|key| view! {
-                <div class="pr-page"><pr::PrView key=key /></div>
+                <pr::PrView key=key />
             })}
             {move || on_agents.get().then(|| view! {
                 <div class="agents-page">

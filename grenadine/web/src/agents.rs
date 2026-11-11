@@ -26,6 +26,7 @@ use crate::image_drafts;
 use crate::images::{self, AttachButton, Attachments};
 use crate::inboxes::{load_flag, save_flag, storage};
 use crate::settings::{Settings, SettingsButton};
+use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
 fn agent_hash(id: &str) -> String {
@@ -2178,6 +2179,11 @@ pub fn AgentView(
     let repo = Memo::new(move |_| {
         current.with(|s| s.as_ref().map(|s| s.repo.clone()).unwrap_or_default())
     });
+    // `.agent-panes` is the row the changes pane's sidebar sits in; it
+    // measures it. A compact view has no room for the pane.
+    let panes = NodeRef::<leptos::html::Div>::new();
+    let changes_sidebar = (!compact).then(|| Sidebar::new(&CHANGES_SIDEBAR, panes));
+    let pane_id = StoredValue::new_local(id.clone());
 
     // The latest prompt starts the current turn: the activity bar times
     // it and the transcript's timers cover only calls after it. The
@@ -2240,7 +2246,7 @@ pub fn AgentView(
     let terminal_id = id.clone();
     view! {
         <div class="agent-page" class:compact=compact>
-            <div class="agent-panes">
+            <div class="agent-panes" node_ref=panes>
                 <main class="main">
                     <div class="agent">
                         {move || match load.get() {
@@ -2303,14 +2309,31 @@ pub fn AgentView(
                 // A general session's directory isn't a git worktree, and a
                 // compact view has no room for the changes.
                 {move || {
-                    (load.get() == Load::Ready && !general.get() && !compact).then(|| view! {
-                        <ChangesPane
-                            id=id.clone()
-                            repo=repo.get_untracked()
-                            events=events
-                            creating=Signal::derive(move || current.with(|s| s.as_ref().is_some_and(|s| s.status == AgentStatus::Creating)))
-                        />
-                    })
+                    let Some(sidebar) = changes_sidebar else {
+                        return ().into_any();
+                    };
+                    if load.get() != Load::Ready || general.get() {
+                        ().into_any()
+                    } else if sidebar.shown() {
+                        view! {
+                            <SidePanel sidebar=sidebar class="changes-pane">
+                                <div class="changes-body">
+                                    <div class="sidebar-head">
+                                        {sidebar.button(false)}
+                                    </div>
+                                    <ChangesPane
+                                        id=pane_id.get_value()
+                                        repo=repo.get_untracked()
+                                        events=events
+                                        creating=Signal::derive(move || current.with(|s| s.as_ref().is_some_and(|s| s.status == AgentStatus::Creating)))
+                                    />
+                                </div>
+                            </SidePanel>
+                        }
+                        .into_any()
+                    } else {
+                        sidebar.button(true).into_any()
+                    }
                 }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
@@ -2320,24 +2343,13 @@ pub fn AgentView(
     }
 }
 
-/// The window width from which the worktree's changes fit next to the
-/// transcript; `.changes-pane` in style.css uses the same.
-const CHANGES_PANE_QUERY: &str = "(min-width: 1500px)";
-
 /// How often at most the pane refetches while events stream in.
 const CHANGES_THROTTLE: Duration = Duration::from_millis(500);
 
-fn wide_enough() -> bool {
-    window()
-        .match_media(CHANGES_PANE_QUERY)
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.matches())
-}
-
-/// The unstaged changes in the session's worktree, next to the transcript
-/// when the window has room for them. They are refetched as the session's
-/// events come in, since those are when the agent changes files.
+/// The unstaged changes in the session's worktree, in the sidebar next
+/// to the transcript. They are refetched as the session's events come
+/// in, since those are when the agent changes files. The pane unmounts
+/// while the sidebar is hidden, so nothing fetches then.
 #[component]
 fn ChangesPane(
     id: String,
@@ -2349,14 +2361,6 @@ fn ChangesPane(
     // A StoredValue so the reactive blocks below can copy it in; the id
     // never changes for the pane's lifetime.
     let session = StoredValue::new(id.clone());
-    let wide = RwSignal::new(wide_enough());
-    let on_resize = window_event_listener_untyped("resize", move |_| {
-        let w = wide_enough();
-        if wide.get_untracked() != w {
-            wide.set(w);
-        }
-    });
-    on_cleanup(move || on_resize.remove());
 
     let tick = RwSignal::new(0u32);
     let pending = StoredValue::new(false);
@@ -2376,20 +2380,14 @@ fn ChangesPane(
     });
     let changes = LocalResource::new(move || {
         tick.track();
-        let (id, wide) = (id.clone(), wide.get());
-        async move {
-            match wide {
-                true => api::agent_changes(&id).await.map(|c| Some(c.files)),
-                false => Ok(None),
-            }
-        }
+        let id = id.clone();
+        async move { api::agent_changes(&id).await.map(|c| c.files) }
     });
     // Keeps the last changes while refetching so that the files don't
     // flicker.
     let loaded = Memo::new(
         move |prev: Option<&Option<Result<Vec<WorktreeFile>, String>>>| match changes.get() {
-            Some(Ok(None)) => None,
-            Some(r) => Some(r.map(Option::unwrap_or_default)),
+            Some(r) => Some(r),
             None => prev.cloned().flatten(),
         },
     );
@@ -2402,35 +2400,29 @@ fn ChangesPane(
         })
     });
 
-    move || {
-        wide.get().then(|| {
-            view! {
-                <aside class="changes-pane">
-                    <AssociatedPrs id=session.get_value() repo=repo.clone() />
-                    <h2>"Unstaged changes"</h2>
-                    {move || {
-                        if creating.get() {
-                            return view! { <p class="muted">"Creating worktree…"</p> }.into_any();
-                        }
-                        match loaded.get() {
-                            None => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                            Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
-                            Some(Ok(f)) if f.is_empty() => {
-                                view! { <p class="muted">"No unstaged changes."</p> }.into_any()
-                            }
-                            Some(Ok(f)) => view! {
-                                <p class="muted">{format!("{} files changed", f.len())}</p>
-                            }.into_any(),
-                        }
-                    }}
-                    {move || {
-                        (!creating.get()).then(move || {
-                            view! { <WorktreeDiff files=files session=session.get_value() /> }
-                        })
-                    }}
-                </aside>
+    view! {
+        <AssociatedPrs id=session.get_value() repo=repo.clone() />
+        <h2>"Unstaged changes"</h2>
+        {move || {
+            if creating.get() {
+                return view! { <p class="muted">"Creating worktree…"</p> }.into_any();
             }
-        })
+            match loaded.get() {
+                None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                Some(Ok(f)) if f.is_empty() => {
+                    view! { <p class="muted">"No unstaged changes."</p> }.into_any()
+                }
+                Some(Ok(f)) => view! {
+                    <p class="muted">{format!("{} files changed", f.len())}</p>
+                }.into_any(),
+            }
+        }}
+        {move || {
+            (!creating.get()).then(move || {
+                view! { <WorktreeDiff files=files session=session.get_value() /> }
+            })
+        }}
     }
 }
 

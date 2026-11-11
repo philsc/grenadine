@@ -2098,10 +2098,13 @@ textarea {
   min-width: 0;
   min-height: 0;
 }
+/* The changes sidebar's overlay and the floating toggle position
+   themselves inside it, so the terminal panel under it stays visible. */
 .agent-panes {
   flex: 1;
   display: flex;
   min-height: 0;
+  position: relative;
 }
 
 .terminal-panel {
@@ -2203,64 +2206,51 @@ textarea {
   display: none;
 }
 
-/* The worktree's changes only get room the transcript can spare; the
-   width is CHANGES_PANE_QUERY in agents.rs. */
-.changes-pane {
-  display: none;
+/* The worktree's changes fill the sidebar next to the transcript. Like
+   the PR sidebar's, the body scrolls on its own so the divider keeps its
+   place. */
+.changes-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 48px;
 }
-@media (min-width: 1500px) {
-  /* The transcript keeps its full width (that of .agent) when it
-     can, and the pane gets the rest. */
-  .agents-page > .main,
-  .agent-panes > .main {
-    flex: 0 1 960px;
-    min-width: 720px;
-  }
-  .changes-pane {
-    display: block;
-    flex: 1 1 480px;
-    min-width: 480px;
-    overflow-y: auto;
-    border-left: 1px solid var(--border);
-    padding: 12px 16px 48px;
-  }
-  .changes-pane h2 {
-    font-size: 16px;
-    margin: 4px 0 8px;
-  }
-  .associated-prs {
-    margin-bottom: 16px;
-  }
-  .associated-prs ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .associated-prs .pr-state {
-    display: inline-flex;
-    align-items: center;
-    margin-right: 4px;
-    color: var(--fg-muted);
-  }
-  .associated-prs .pr-state.merged {
-    color: #8250df;
-  }
-  .associated-prs .pr-state.queued {
-    color: #9a6700;
-  }
-  .associated-prs .pr-state.passing {
-    color: var(--add-fg);
-  }
-  .associated-prs .pr-state.running {
-    color: var(--warn-fg);
-  }
-  .associated-prs .pr-state.failing,
-  .associated-prs .pr-state.conflict {
-    color: var(--del-fg);
-  }
+.changes-pane h2 {
+  font-size: 16px;
+  margin: 4px 0 8px;
+}
+.associated-prs {
+  margin-bottom: 16px;
+}
+.associated-prs ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.associated-prs .pr-state {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  color: var(--fg-muted);
+}
+.associated-prs .pr-state.merged {
+  color: #8250df;
+}
+.associated-prs .pr-state.queued {
+  color: #9a6700;
+}
+.associated-prs .pr-state.passing {
+  color: var(--add-fg);
+}
+.associated-prs .pr-state.running {
+  color: var(--warn-fg);
+}
+.associated-prs .pr-state.failing,
+.associated-prs .pr-state.conflict {
+  color: var(--del-fg);
 }
 
 @media (max-width: 800px) {
@@ -2314,19 +2304,21 @@ textarea {
 }
 
 /* The sidebar is a full-height column whose body scrolls on its own.
-   Column or overlay is decided in pr.rs from the window width; the
+   Column or overlay is decided in sidebar.rs from the window width; the
    divider at its left edge resizes it. `width` is the fallback before
    the inline style lands. The aside itself doesn't scroll, so the
    divider keeps its place and the left of its hit area isn't clipped. */
-.pr-sidebar {
+.side-panel {
   flex: none;
   position: relative;
   display: flex;
   flex-direction: column;
   width: 320px;
   border-left: 1px solid var(--border);
-  font-size: 13px;
   background: var(--bg);
+}
+.pr-sidebar {
+  font-size: 13px;
 }
 .pr-sidebar-body {
   flex: 1;
@@ -2358,7 +2350,7 @@ body.resizing-sidebar * {
 }
 /* Too narrow for a column: the sidebar floats over the content's right
    edge instead. */
-.pr-sidebar.overlay {
+.side-panel.overlay {
   position: absolute;
   top: 0;
   right: 0;

@@ -955,37 +955,6 @@ pub fn sidebar_body(pr: &PrDetail) -> AnyView {
     }
 }
 
-/// The PR page's right sidebar. `overlay` floats it over the content on
-/// windows too narrow for a column. The body's children are what the PR
-/// shows; anything pinned under it is the caller's, so that it survives
-/// the body's rebuilds when the PR's detail changes.
-#[component]
-pub fn PrSidebar(
-    #[prop(into)] overlay: Signal<bool>,
-    #[prop(into)] width: Signal<f64>,
-    on_resize_start: Callback<web_sys::MouseEvent>,
-    on_resize_reset: Callback<web_sys::MouseEvent>,
-    children: Children,
-) -> impl IntoView {
-    view! {
-        <aside
-            class="pr-sidebar"
-            class:overlay=move || overlay.get()
-            style:width=move || format!("{}px", width.get())
-        >
-            <div
-                class="sidebar-divider"
-                role="separator"
-                aria-orientation="vertical"
-                title="Drag to resize"
-                on:mousedown=move |e| on_resize_start.run(e)
-                on:dblclick=move |e| on_resize_reset.run(e)
-            ></div>
-            {children()}
-        </aside>
-    }
-}
-
 /// One entry of the conversation.
 enum Entry<'a> {
     Comment(&'a IssueComment),
