@@ -474,6 +474,9 @@ const MIGRATIONS: &[Migration] = &[
     CREATE INDEX auto_reviews_pr ON auto_reviews (repo, number);
 "#,
     ),
+    // Installs the default inboxes named in the second person, with
+    // the closed ones split into merged and unmerged.
+    Migration::ResetInboxes,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in

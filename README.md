@@ -132,12 +132,12 @@ A new database starts with these inboxes. The ones marked "total" count in the t
 | Drafts                   |       |      | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                                 |
 | Drafts from others       |       |      | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                                      |
 | Waiting for reviewers    |       |      | `state:open archived:false draft:false author:@me -is:queued -gr:review:unapproved-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc`      |
-| All my open PRs          |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                            |
+| All your open PRs        |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                            |
 | Waiting for author       |       |      | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                                         |
-| Merged by me             |       |      | `state:closed archived:false author:@me sort:updated-desc`                                                                                                          |
-| Merged by others         |       |      | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                          |
+| Your merged PRs          |       |      | `state:closed archived:false author:@me is:merged sort:updated-desc`                                                                                                |
+| Merged PRs from others   |       |      | `state:closed archived:false -author:@me is:merged (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                |
 | All open PRs             |       |      | `state:open archived:false -is:queued sort:updated-desc`                                                                                                            |
-| Unmerged PRs on mine     |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                              |
+| Your unmerged PRs        |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                              |
 
 Your open PRs that aren't drafts each appear in exactly one of Returned to you, Approved, Merging and Waiting for reviewers:
 

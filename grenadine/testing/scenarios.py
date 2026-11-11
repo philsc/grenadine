@@ -33,12 +33,12 @@ MERGING = "Merging"
 DRAFTS = "Drafts"
 DRAFTS_FROM_OTHERS = "Drafts from others"
 WAITING_FOR_REVIEWERS = "Waiting for reviewers"
-ALL_MY_OPEN = "All my open PRs"
+ALL_YOUR_OPEN = "All your open PRs"
 WAITING_FOR_AUTHOR = "Waiting for author"
-MERGED_BY_ME = "Merged by me"
-MERGED_BY_OTHERS = "Merged by others"
+YOUR_MERGED = "Your merged PRs"
+MERGED_FROM_OTHERS = "Merged PRs from others"
 ALL_OPEN = "All open PRs"
-UNMERGED_ON_MINE = "Unmerged PRs on mine"
+YOUR_UNMERGED = "Your unmerged PRs"
 
 STACK_BASE = "Lay the stack's foundation"
 STACK_TOP = "Build on the foundation"
@@ -308,20 +308,20 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # A comment-only review is an active review.
     pr = add(
         _simple_pr(repo, "returned-commented", "Get a comment-only review"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, COMMENTED)
 
     # A bot's comment-only review isn't an active human review.
     pr = add(
         _simple_pr(repo, "waiting-bot-commented", "Get only a bot's comment"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(BOT, COMMENTED)
 
     pr = add(
         _simple_pr(repo, "returned-changes", "Get changes requested"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, CHANGES_REQUESTED, body="Please split this up.")
     repo.issue_comment(pr, author=VIEWER, body="Will do, thanks!")
@@ -329,7 +329,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     pr = add(
         _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION),
-        [APPROVED_INBOX, ALL_MY_OPEN, ALL_OPEN],
+        [APPROVED_INBOX, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, APPROVED)
 
@@ -337,7 +337,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # wants more approvals.
     pr = add(
         _simple_pr(repo, "waiting-more-approvals", "Get one of two approvals"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.review_required = True
     pr.required_approvals = 2
@@ -347,7 +347,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # human review even when the PR has a partial approval.
     pr = add(
         _simple_pr(repo, "returned-approval-comment", "Get a comment over an approval"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.review_required = True
     pr.required_approvals = 2
@@ -356,16 +356,16 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     add(
         _simple_pr(repo, "waiting-reviewers", "Wait for reviewers"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     add(
         _simple_pr(repo, "draft", "Stay a draft", draft=True),
-        [DRAFTS, ALL_MY_OPEN, ALL_OPEN],
+        [DRAFTS, ALL_YOUR_OPEN, ALL_OPEN],
     )
 
     pr = add(
         _simple_pr(repo, "merging", "Sit in the merge queue"),
-        [MERGING, ALL_MY_OPEN],
+        [MERGING, ALL_YOUR_OPEN],
     )
     pr.submit_review(OTHER, APPROVED)
     pr.queued = True
@@ -398,22 +398,22 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     pr = add(_simple_pr(repo, "closed", "Get closed", author=OTHER), [])
     repo.close(pr)
-    # state:closed covers unmerged PRs too, so "Merged by me" has it.
-    pr = add(
-        _simple_pr(repo, "closed-mine", "Retract my PR"),
-        [MERGED_BY_ME, UNMERGED_ON_MINE],
-    )
+    pr = add(_simple_pr(repo, "closed-mine", "Retract my PR"), [YOUR_UNMERGED])
     repo.close(pr)
-    pr = add(_simple_pr(repo, "merged", "Get merged"), [MERGED_BY_ME])
+    pr = add(_simple_pr(repo, "merged", "Get merged"), [YOUR_MERGED])
     pr.submit_review(OTHER, APPROVED)
     pr.check_runs = [CheckRun("test")]
     repo.merge(pr)
     pr = add(
         _simple_pr(repo, "merged-others", "Land the other's PR", author=OTHER),
-        [MERGED_BY_OTHERS],
+        [MERGED_FROM_OTHERS],
     )
     pr.submit_review(VIEWER, APPROVED)
     repo.merge(pr)
+    # Merged PRs from others has only the merged ones.
+    pr = add(_simple_pr(repo, "closed-others", "Drop the other's PR", author=OTHER), [])
+    pr.submit_review(VIEWER, CHANGES_REQUESTED)
+    repo.close(pr)
     pr = add(
         _simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER),
         [ALL_OPEN],
@@ -426,14 +426,14 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     repo.push("dev/stack-base")
     add(
         repo.open_pr(STACK_BASE, head="dev/stack-base"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     repo.checkout("dev/stack-top")
     repo.commit(STACK_TOP, {"stack/top.txt": "top\n"})
     repo.push("dev/stack-top")
     add(
         repo.open_pr(STACK_TOP, head="dev/stack-top", base="dev/stack-base"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
 
     return Inboxes(prs, expected)

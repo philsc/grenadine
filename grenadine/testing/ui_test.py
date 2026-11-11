@@ -2038,7 +2038,7 @@ class InboxPagingTest(ServerTestCase):
 
     def test_show_more_grows_the_list(self) -> None:
         self.page.goto(self.url)
-        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        inbox = self.inbox(scenarios.ALL_YOUR_OPEN)
         rows = inbox.locator(".pr-list li")
         more = inbox.get_by_role("button", name=re.compile(r"^Show \d+ more$"))
         expect(inbox.locator(".count")).to_have_text("37")
@@ -2070,7 +2070,7 @@ class InboxPagingTest(ServerTestCase):
 
     def test_shown_rows_survive_refreshes_but_reset_on_reload(self) -> None:
         self.page.goto(self.url)
-        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        inbox = self.inbox(scenarios.ALL_YOUR_OPEN)
         rows = inbox.locator(".pr-list li")
         expect(rows).to_have_count(15)
 
