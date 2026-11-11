@@ -6,6 +6,7 @@
 mod agent;
 mod api;
 pub mod assets;
+mod attachments;
 mod auto_review;
 mod claude;
 mod cleanup;
@@ -274,8 +275,13 @@ pub async fn run() -> Result<()> {
     if let Some(shell) = args.shell {
         agents.terminals = terminal::Terminals::new(shell);
     }
-    if let Err(e) = agent::remove_orphaned_images(&db, agents.images()) {
-        tracing::warn!("can't remove orphaned images: {e:#}");
+    for (what, dir) in [
+        ("images", agents.images()),
+        ("attachments", agents.attachments()),
+    ] {
+        if let Err(e) = agent::remove_orphaned_session_dirs(&db, dir) {
+            tracing::warn!("can't remove orphaned {what}: {e:#}");
+        }
     }
 
     if let Err(e) = auto_review::start_watching(&db, repos.keys(), agent::now()) {
@@ -320,6 +326,7 @@ pub async fn run() -> Result<()> {
     ));
     // Shutting down doesn't wait for it; dropping it kills its claude.
     tokio::spawn(cleanup::prune_loop(state.clone()));
+    tokio::spawn(attachments::sweep_loop(state.agents.uploads().to_owned()));
     // Counts the sessions' unstaged changes off the request path.
     tokio::spawn(unstaged::run(state.clone()));
     // Listing the backends' models can take a while, so it starts now

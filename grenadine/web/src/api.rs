@@ -365,6 +365,7 @@ pub async fn send_agent_message(
     id: &str,
     prompt: String,
     images: Vec<PromptImage>,
+    attachments: Vec<String>,
     permission_mode: PermissionMode,
     model: Option<String>,
 ) -> Result<()> {
@@ -374,9 +375,34 @@ pub async fn send_agent_message(
             permission_mode,
             model,
             images,
+            attachments,
         })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
+}
+
+/// Whether the upload `id` is still waiting for its prompt.
+pub async fn upload_exists(id: &str) -> Result<bool> {
+    let resp = Request::get(&format!("/api/uploads/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(false);
+    }
+    check(Ok(resp)).await.map(|_| true)
+}
+
+/// Deletes an upload no prompt is going to take.
+pub async fn delete_upload(id: &str) -> Result<()> {
+    let resp = Request::delete(&format!("/api/uploads/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(());
+    }
+    check(Ok(resp)).await.map(|_| ())
 }
 
 pub async fn interrupt_agent(id: &str) -> Result<()> {

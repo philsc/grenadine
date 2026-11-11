@@ -676,6 +676,7 @@ async fn handoff(
         permission_mode,
         model,
         images: Vec::new(),
+        attachments: Vec::new(),
         draft: None,
     };
     let bypassed = backend == AgentBackend::Devin && turn_mode.as_str() == BYPASS;
@@ -1282,6 +1283,7 @@ mod tests {
                 permission_mode: PermissionMode::from("acceptEdits"),
                 model: Some("opus".into()),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             }
         );

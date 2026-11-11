@@ -10,6 +10,7 @@ mod debug;
 mod diffview;
 mod drafts;
 mod events;
+mod files;
 mod global_settings;
 mod highlight;
 mod image_drafts;
@@ -266,13 +267,18 @@ fn App() -> impl IntoView {
     let drafts = drafts::Drafts::load(open.as_deref());
     // Drop image drafts whose text draft is gone; the `agent.*` ones stay
     // like their text drafts do.
-    image_drafts::sweep(move |key| {
-        key.starts_with("agent.")
-            || drafts
-                .listed(open.as_deref())
-                .iter()
-                .any(|(_, id)| key == image_drafts::new_session_key(id))
-    });
+    let kept = {
+        let open = open.clone();
+        move |key: &str| {
+            key.starts_with("agent.")
+                || drafts
+                    .listed(open.as_deref())
+                    .iter()
+                    .any(|(_, id)| key == image_drafts::new_session_key(id))
+        }
+    };
+    files::sweep(kept.clone());
+    image_drafts::sweep(kept);
     provide_context(drafts);
     provide_context(global_settings::provide());
     provide_context(LocalResource::new(api::agent_backends));
