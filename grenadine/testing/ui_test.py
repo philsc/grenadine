@@ -2711,7 +2711,18 @@ class ReviewTest(ServerTestCase):
         # viewport, so the scroll anchoring that keeps this row's place
         # also moves scrollTop. Its place is what mustn't move.
         row = file.locator("tr.line").nth(150)
-        y = row.bounding_box()["y"]
+        # The rows are laid out plain, then again once the background
+        # highlighter answers; measure the highlighted ones. Until the
+        # browser's next rendering update after the scroll, the file's
+        # content-visibility still skips them, and bounding_box() finds
+        # no box.
+        expect(row.locator(".sy-paragraph")).to_have_count(1)
+        deadline = time.monotonic() + 15
+        while (box := row.bounding_box()) is None:
+            if time.monotonic() > deadline:
+                self.fail("the row never got a box")
+            self.page.wait_for_timeout(50)
+        y = box["y"]
         # A remount of the diff would lose the marker.
         file.evaluate("el => el.setAttribute('data-marker', '1')")
 
