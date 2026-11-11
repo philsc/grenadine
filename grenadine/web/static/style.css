@@ -1639,21 +1639,32 @@ textarea {
   flex-direction: column;
   gap: 8px;
 }
-.turn-prompt {
+.turn-msg {
+  display: flex;
+  flex-direction: column;
+}
+.turn-msg-user {
   align-self: flex-end;
+  align-items: flex-end;
   max-width: 85%;
+}
+.turn-time {
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 2px;
+}
+.turn-prompt {
   white-space: pre-wrap;
   background: var(--accent-bg);
   border-radius: 12px;
   padding: 6px 12px;
 }
 .turn-images {
-  align-self: flex-end;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
-  max-width: 85%;
+  max-width: 100%;
 }
 .turn-images img {
   display: block;

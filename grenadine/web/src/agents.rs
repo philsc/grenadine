@@ -520,6 +520,24 @@ fn CleanupSection(route: Signal<Route>) -> impl IntoView {
     }
 }
 
+/// A muted local time under a transcript message, when the event has
+/// one.
+fn turn_time(at: Option<i64>) -> Option<impl IntoView> {
+    at.map(|ms| {
+        let secs = ms.div_euclid(1000);
+        let now = (js_sys::Date::now() / 1000.0) as i64;
+        view! {
+            <time
+                class="turn-time"
+                datetime=crate::iso_datetime(secs)
+                title=crate::local_datetime(secs)
+            >
+                {crate::short_local_time(now, secs)}
+            </time>
+        }
+    })
+}
+
 /// A day, as the browser writes dates.
 fn date(unix_seconds: i64) -> String {
     js_sys::Date::new(&JsValue::from_f64(unix_seconds as f64 * 1000.0))
@@ -2716,6 +2734,20 @@ fn shown(events: &[Arc<AgentEvent>]) -> Vec<Arc<AgentEvent>> {
         .collect()
 }
 
+/// The seqs of prompts whose images come in the next event. A message's
+/// time goes under its last piece, which is the images there.
+fn prompts_followed_by_images(events: &[Arc<AgentEvent>]) -> HashSet<u64> {
+    events
+        .iter()
+        .zip(events.iter().skip(1))
+        .filter(|(e, next)| {
+            matches!(e.kind, AgentEventKind::Prompt(_))
+                && matches!(next.kind, AgentEventKind::Images(_))
+        })
+        .filter_map(|(e, _)| e.seq)
+        .collect()
+}
+
 /// The pieces of a `ToolResult` event's `kind`, when it is one.
 fn tool_result(e: &AgentEvent) -> Option<(&str, bool, &[PatchHunk], &[String])> {
     let AgentEventKind::ToolResult {
@@ -3004,6 +3036,9 @@ fn Transcript(
                 .collect::<HashMap<_, _>>()
         })
     });
+    // A prompt with images gets its time under the images, the last
+    // piece of the message.
+    let image_prompts = Memo::new(move |_| events.with(|e| prompts_followed_by_images(e)));
     // The `AskUserQuestion` answers the user gave, by tool use id.
     let given_answers = Memo::new(move |_| {
         events.with(|events| {
@@ -3220,23 +3255,35 @@ fn Transcript(
                         // A prompt can be only images.
                         AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
                         AgentEventKind::Prompt(p)
-                        | AgentEventKind::ApprovalResolved { message: Some(p), .. } => view! {
-                            <div class="turn-prompt">{p.clone()}</div>
-                        }.into_any(),
+                        | AgentEventKind::ApprovalResolved { message: Some(p), .. } => {
+                            let timed = move || !seq.is_some_and(|s| image_prompts.with(|set| set.contains(&s)));
+                            view! {
+                                <div class="turn-msg turn-msg-user">
+                                    <div class="turn-prompt">{p.clone()}</div>
+                                    {move || turn_time(at.filter(|_| timed()))}
+                                </div>
+                            }.into_any()
+                        }
                         AgentEventKind::Images(names) => view! {
-                            <div class="turn-images">
-                                {names.iter().map(|name| {
-                                    let url = format!("/api/agents/{id}/images/{name}");
-                                    view! {
-                                        <a href=url.clone() target="_blank" rel="noopener">
-                                            <img src=url.clone() alt="Image sent with the prompt" />
-                                        </a>
-                                    }
-                                }).collect_view()}
+                            <div class="turn-msg turn-msg-user">
+                                <div class="turn-images">
+                                    {names.iter().map(|name| {
+                                        let url = format!("/api/agents/{id}/images/{name}");
+                                        view! {
+                                            <a href=url.clone() target="_blank" rel="noopener">
+                                                <img src=url.clone() alt="Image sent with the prompt" />
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                                {turn_time(at)}
                             </div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
-                            <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
+                            <div class="turn-msg turn-msg-agent">
+                                <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
+                                {turn_time(at)}
+                            </div>
                         }.into_any(),
                         AgentEventKind::Thinking(t) => {
                             let html = markdown::to_html(t, &repo);
@@ -4302,6 +4349,26 @@ mod tests {
         .map(Arc::new);
         let seqs: Vec<_> = shown(&events).iter().filter_map(|e| e.seq).collect();
         assert_eq!(seqs, [1, 2, 4, 6, 7]);
+    }
+
+    #[test]
+    fn prompts_followed_by_images_marks_the_prompt() {
+        let event = |seq, kind| {
+            Arc::new(AgentEvent {
+                seq: Some(seq),
+                at: None,
+                kind,
+            })
+        };
+        let events = [
+            event(1, AgentEventKind::Prompt("hi".into())),
+            event(2, AgentEventKind::Images(vec!["a.png".into()])),
+            event(3, AgentEventKind::Prompt("bye".into())),
+            event(4, AgentEventKind::Text("on it".into())),
+            event(5, AgentEventKind::Images(vec!["b.png".into()])),
+            event(6, AgentEventKind::Prompt("later".into())),
+        ];
+        assert_eq!(prompts_followed_by_images(&events), HashSet::from([1]));
     }
 
     fn event(seq: Option<u64>, kind: AgentEventKind) -> Incoming {
