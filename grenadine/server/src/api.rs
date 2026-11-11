@@ -26,6 +26,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{self, Decision};
+use crate::attachments;
 use crate::github::{MergeAsync, ReviewItem};
 use crate::sync::State;
 use crate::{assets, auto_review, cleanup, mcp, terminal};
@@ -154,6 +155,16 @@ fn api_routes() -> Router<Arc<State>> {
             post(agent_message).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/{id}/images/{name}", get(agent_image))
+        .route(
+            "/api/agents/{id}/attachments/{dir}/{name}",
+            get(agent_attachment),
+        )
+        .route(
+            "/api/uploads",
+            // The upload checks the size itself, as the file streams in.
+            put(upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/uploads/{id}", get(uploaded).delete(delete_upload))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
         .route(
             "/api/agents/{id}/approvals",
@@ -1162,6 +1173,18 @@ async fn check_new_agent(state: &Arc<State>, req: &NewAgent) -> Option<Response>
     if let Some(e) = agent::check_images(&req.images) {
         return Some((StatusCode::BAD_REQUEST, e).into_response());
     }
+    // A repeated start of a draft returns the session the first start
+    // started, which claimed the uploads.
+    let started = || {
+        req.draft
+            .as_ref()
+            .is_some_and(|d| state.db.agent_by_draft(d).ok().flatten().is_some())
+    };
+    if let Some(e) = attachments::check(state.agents.uploads(), &req.attachments)
+        && !started()
+    {
+        return Some((StatusCode::BAD_REQUEST, e).into_response());
+    }
     if let Some(r) = offers(
         state,
         req.backend,
@@ -1373,11 +1396,14 @@ async fn agent_message(
     let Some(session) = find_agent(&state, &id)? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    // An image can say it all.
-    if msg.prompt.trim().is_empty() && msg.images.is_empty() {
+    // An image or a file can say it all.
+    if msg.prompt.trim().is_empty() && msg.images.is_empty() && msg.attachments.is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
     if let Some(e) = agent::check_images(&msg.images) {
+        return Ok((StatusCode::BAD_REQUEST, e).into_response());
+    }
+    if let Some(e) = attachments::check(state.agents.uploads(), &msg.attachments) {
         return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
     if let Some(r) = offers(
@@ -1391,15 +1417,127 @@ async fn agent_message(
         return Ok(r);
     }
     let images = agent::save_images(&state, &id, &msg.images).await?;
-    agent::send_with_images(
+    let files = attachments::claim(
+        state.agents.uploads(),
+        state.agents.attachments(),
+        &id,
+        &msg.attachments,
+    )
+    .await?;
+    agent::send_with_files(
         &state,
         &id,
         msg.prompt,
         images,
+        files,
         msg.permission_mode,
         msg.model,
     );
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+}
+
+/// Stores a file to go with a prompt that's being written; sending the
+/// prompt with the upload's id claims it.
+async fn upload(
+    AxState(state): St,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Response> {
+    let Some(name) = attachments::safe_name(&q.name) else {
+        return Ok((StatusCode::BAD_REQUEST, "not a usable file name").into_response());
+    };
+    let too_big = || {
+        let limit = attachments::human_size(attachments::MAX_UPLOAD_BYTES);
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("files can be at most {limit}"),
+        )
+            .into_response()
+    };
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if length.is_some_and(|n| n > attachments::MAX_UPLOAD_BYTES) {
+        return Ok(too_big());
+    }
+    match attachments::store(state.agents.uploads(), &name, body.into_data_stream()).await? {
+        Some(up) => Ok(Json(up).into_response()),
+        None => Ok(too_big()),
+    }
+}
+
+/// An upload that's waiting for its prompt; 404 once it's gone, e.g.
+/// because it expired.
+async fn uploaded(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    Ok(match attachments::upload(state.agents.uploads(), &id) {
+        Some(up) => Json(up).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+/// Deletes an upload that was taken off its prompt.
+async fn delete_upload(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    Ok(if attachments::delete(state.agents.uploads(), &id).await? {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// A file sent with one of the session's prompts, as a download. They
+/// never change.
+async fn agent_attachment(
+    AxState(state): St,
+    Path((id, dir, name)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    let Some(path) = attachments::file(state.agents.attachments(), &id, &dir, &name) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let size = file.metadata().await?.len();
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    Ok(immutable((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, size.to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition(&name)),
+        ],
+        body,
+    )))
+}
+
+/// A `Content-Disposition` that downloads a file as `name`: a plain ASCII
+/// fallback and the UTF-8 name percent-encoded (RFC 6266).
+fn content_disposition(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| match c {
+            ' '..='~' if c != '"' && c != '\\' => c,
+            _ => '_',
+        })
+        .collect();
+    let encoded: String = name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
 /// An image sent with one of the session's prompts. Images never change.
@@ -1611,6 +1749,91 @@ mod tests {
         // Reads need no origin.
         let inboxes = http.get(format!("http://{addr}/api/inboxes"));
         assert_eq!(status(inboxes).await, StatusCode::OK);
+    }
+
+    /// An upload waits under its id until a prompt claims it or it's
+    /// deleted; a prompt with an upload that's gone is refused.
+    #[tokio::test]
+    async fn uploads_wait_for_their_prompt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+        let http = reqwest::Client::new();
+        let origin = format!("http://{addr}");
+
+        let response = http
+            .put(format!(
+                "http://{addr}/api/uploads?name=..%2Fsome%20notes.txt"
+            ))
+            .header("Origin", &origin)
+            .body("hello")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let up: grenadine_core::api::Upload = response.json().await.unwrap();
+        assert_eq!((up.name.as_str(), up.size), ("some notes.txt", 5));
+        let url = format!("http://{addr}/api/uploads/{}", up.id);
+        let got: grenadine_core::api::Upload =
+            http.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(got, up);
+
+        let unnamed = http
+            .put(format!("http://{addr}/api/uploads?name=.."))
+            .header("Origin", &origin)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+
+        let delete = || http.delete(&url).header("Origin", &origin).send();
+        assert_eq!(delete().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(delete().await.unwrap().status(), StatusCode::NOT_FOUND);
+        let gone = http.get(&url).send().await.unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+
+        let start = http
+            .post(format!("http://{addr}/api/agents"))
+            .header("Origin", &origin)
+            .json(&serde_json::json!({
+                "repo": GENERAL,
+                "pr": null,
+                "prompt": "read it",
+                "permission_mode": "plan",
+                "attachments": [up.id],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            start
+                .text()
+                .await
+                .unwrap()
+                .contains("attach the file again")
+        );
+
+        let bogus = format!(
+            "http://{addr}/api/agents/{}/attachments/..%2F..%2Fetc/passwd",
+            agent::uuid()
+        );
+        let bogus = http.get(bogus).send().await.unwrap();
+        assert_eq!(bogus.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn attachments_download_under_their_names() {
+        assert_eq!(
+            content_disposition("a b.pdf"),
+            "attachment; filename=\"a b.pdf\"; filename*=UTF-8''a%20b.pdf"
+        );
+        assert_eq!(
+            content_disposition("ü\"x.txt"),
+            "attachment; filename=\"__x.txt\"; filename*=UTF-8''%C3%BC%22x.txt"
+        );
     }
 
     #[tokio::test]
@@ -2550,6 +2773,7 @@ mod tests {
             permission_mode: mode.into(),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let response = create_agent(AxState(state.clone()), Json(req("nonsense")))
@@ -2577,6 +2801,7 @@ mod tests {
             permission_mode: "auto".into(),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let response = create_agent(AxState(state), Json(req))

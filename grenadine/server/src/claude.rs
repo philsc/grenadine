@@ -136,9 +136,15 @@ fn parse_models(line: &str) -> Option<Vec<AgentModelInfo>> {
 }
 
 /// The stream-json user message that gives Claude `prompt` with the images
-/// in `dir` named `images`. The text goes last: Claude Code only takes a
-/// prompt for a slash command when its last block is the command.
-async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<String> {
+/// in `dir` named `images`, and `attached`, what it's told about the
+/// files attached to the prompt. The text goes last: Claude Code only
+/// takes a prompt for a slash command when its last block is the command.
+async fn user_message(
+    prompt: &str,
+    dir: &Path,
+    images: &[String],
+    attached: Option<&str>,
+) -> Result<String> {
     let mut content = Vec::new();
     for name in images {
         let bytes = tokio::fs::read(dir.join(name))
@@ -155,6 +161,9 @@ async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<Str
                 ),
             },
         }));
+    }
+    if let Some(attached) = attached {
+        content.push(json!({"type": "text", "text": attached}));
     }
     if !prompt.trim().is_empty() {
         content.push(json!({"type": "text", "text": prompt}));
@@ -180,6 +189,7 @@ async fn turn(
     let Turn {
         prompt,
         images,
+        attached,
         mode,
         model,
         mcp_url,
@@ -232,7 +242,13 @@ async fn turn(
     if let Some(model) = model.filter(|m| m != "default") {
         cmd.arg("--model").arg(model);
     }
-    let input = user_message(prompt, &state.agents.images().join(id), images).await?;
+    // The files attached to this prompt or earlier ones are read without
+    // asking for permission.
+    let attachments = state.agents.attachments().join(id);
+    if attachments.is_dir() {
+        cmd.arg("--add-dir").arg(attachments);
+    }
+    let input = user_message(prompt, &state.agents.images().join(id), images, attached).await?;
     let mut child = cmd
         .spawn()
         .with_context(|| format!("can't run {}", claude.display()))?;
