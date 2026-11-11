@@ -425,9 +425,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// The inverse of `days_from_civil`: (year, month, day). Only the
-/// non-wasm `local_datetime` uses it; under wasm `js_sys::Date` does.
-#[cfg(not(target_arch = "wasm32"))]
+/// The inverse of `days_from_civil`: (year, month, day).
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
@@ -439,6 +437,62 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `secs` (Unix seconds) as UTC "YYYY-MM-DDTHH:MM:SSZ", for a `<time>`
+/// element's `datetime` attribute.
+pub(crate) fn iso_datetime(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    let t = secs.rem_euclid(86400);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        t / 3600,
+        t / 60 % 60,
+        t % 60
+    )
+}
+
+/// (year, month, day, hour, minute) in local time under wasm, in UTC in
+/// the non-wasm tests.
+fn local_fields(secs: i64) -> (i64, i64, i64, i64, i64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+        (
+            d.get_full_year() as i64,
+            (d.get_month() + 1) as i64,
+            d.get_date() as i64,
+            d.get_hours() as i64,
+            d.get_minutes() as i64,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let t = secs.rem_euclid(86400);
+        (y, m, d, t / 3600, t / 60 % 60)
+    }
+}
+
+/// A compact local "10:34" for `then_secs`, prefixed with the date when
+/// it isn't on `now_secs`' local day: "Nov 9, 10:34" in the same year,
+/// "2025-11-09 10:34" in a different one.
+pub(crate) fn short_local_time(now_secs: i64, then_secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (now_y, now_m, now_d, ..) = local_fields(now_secs);
+    let (y, m, d, h, min) = local_fields(then_secs);
+    if (y, m, d) == (now_y, now_m, now_d) {
+        format!("{h:02}:{min:02}")
+    } else if y == now_y {
+        format!("{} {}, {:02}:{:02}", MONTHS[(m - 1) as usize], d, h, min)
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}")
+    }
 }
 
 /// An RFC 3339 timestamp like "2026-01-02T03:04:05Z" or
@@ -548,6 +602,50 @@ mod tests {
         assert_eq!(ago(3660, 60), "1h ago");
         assert_eq!(ago(86400 + 60, 60), "1d ago");
         assert_eq!(ago(86400 * 5 + 60, 60), "5d ago");
+    }
+
+    #[test]
+    fn iso_datetime_utc() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(iso_datetime(secs), "2026-11-10T18:34:06Z");
+        assert_eq!(iso_datetime(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_datetime(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn short_local_time_utc() {
+        let now = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        // The same day is a bare time.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2026-11-10T10:34:00Z").unwrap()),
+            "10:34"
+        );
+        // An earlier day in the same year gets a short date.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2026-11-09T10:34:00Z").unwrap()),
+            "Nov 9, 10:34"
+        );
+        // A different year gets the full ISO date.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2025-12-31T10:34:00Z").unwrap()),
+            "2025-12-31 10:34"
+        );
+        // Right across a day boundary the date still shows.
+        assert_eq!(
+            short_local_time(
+                rfc3339_secs("2026-11-10T00:01:00Z").unwrap(),
+                rfc3339_secs("2026-11-09T23:59:00Z").unwrap()
+            ),
+            "Nov 9, 23:59"
+        );
+        // Right across a year boundary the year shows.
+        assert_eq!(
+            short_local_time(
+                rfc3339_secs("2026-01-01T00:01:00Z").unwrap(),
+                rfc3339_secs("2025-12-31T23:59:00Z").unwrap()
+            ),
+            "2025-12-31 23:59"
+        );
     }
 
     #[test]

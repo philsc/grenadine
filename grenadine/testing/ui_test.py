@@ -5113,6 +5113,42 @@ class AgentTest(ServerTestCase):
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
 
+    def test_transcript_message_times(self) -> None:
+        # Prompts and agent texts carry a muted local time under them,
+        # with the full local timestamp in the title.
+        self.page.close()
+        self.page = self.browser.new_page(timezone_id="America/Los_Angeles")
+        self.addCleanup(self.page.close)
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("please write a note")
+        self.page.get_by_role("button", name="Start").click()
+
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note"])
+        expect(transcript.locator(".turn-text strong")).to_have_text(
+            "please write a note"
+        )
+        time = re.compile(r"^\d{2}:\d{2}$")
+        title = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC-0[78]:00$")
+        for msg in [".turn-msg-user", ".turn-msg-agent"]:
+            at = transcript.locator(f"{msg} .turn-time").first
+            expect(at).to_have_text(time)
+            expect(at).to_have_attribute("title", title)
+
+        # Agent text fills the transcript's width; the prompt's row hugs
+        # its right edge.
+        box = transcript.bounding_box()
+        agent = transcript.locator(".turn-msg-agent").first.bounding_box()
+        user = transcript.locator(".turn-msg-user").first.bounding_box()
+        assert box and agent and user
+        self.assertAlmostEqual(agent["x"], box["x"], delta=1)
+        self.assertAlmostEqual(agent["width"], box["width"], delta=1)
+        self.assertAlmostEqual(
+            user["x"] + user["width"], box["x"] + box["width"], delta=1
+        )
+        self.delete_session()
+
     def test_denied_approval_marks_the_row(self) -> None:
         # A denied request leaves no card behind: its mark and the
         # failure's dot are on the call's row.
@@ -7028,11 +7064,11 @@ class AgentTest(ServerTestCase):
         expect(plans).to_have_count(2)
         expect(plans.first).to_contain_text("Plan sent back")
         # The feedback stays in the transcript, between the two plans.
-        feedback = transcript.locator(".approval.plan ~ .turn-prompt")
+        feedback = transcript.locator(".approval.plan ~ .turn-msg .turn-prompt")
         expect(feedback).to_have_text("Add a title")
-        expect(transcript.locator(".turn-prompt ~ .approval.plan")).to_have_count(2)
+        expect(transcript.locator(".turn-msg-user ~ .approval.plan")).to_have_count(2)
         expect(
-            transcript.locator(".approval.plan ~ .turn-prompt ~ .approval.plan")
+            transcript.locator(".approval.plan ~ .turn-msg-user ~ .approval.plan")
         ).to_have_count(1)
         revised = plans.nth(1)
         expect(revised.locator(".plan-text")).to_contain_text("Also: Add a title")
