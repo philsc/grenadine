@@ -174,6 +174,18 @@ fn parse_mode(value: &str) -> AutoReview {
     }
 }
 
+/// The backends the server offers, in picker order, or all of them
+/// while its list is still loading or couldn't load.
+fn offered_backends() -> Vec<AgentBackend> {
+    match backends().get() {
+        Some(Ok(infos)) => AgentBackend::ALL
+            .into_iter()
+            .filter(|b| infos.iter().any(|i| i.backend == *b))
+            .collect(),
+        _ => AgentBackend::ALL.to_vec(),
+    }
+}
+
 /// The settings of the reviews of the viewer's own PRs, edited in `draft`,
 /// which is loaded.
 #[component]
@@ -211,6 +223,16 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
             &picked.get(),
         )
     });
+    // The offered backends; a saved one the server doesn't offer is
+    // still listed, marked and disabled, so the pick isn't lost.
+    let backend_options = Memo::new(move |_| match backends().get() {
+        Some(Ok(infos)) => {
+            let current = backend.get();
+            let missing = (!infos.iter().any(|i| i.backend == current)).then_some(current);
+            (offered_backends(), missing)
+        }
+        _ => (AgentBackend::ALL.to_vec(), None),
+    });
     view! {
         <fieldset class="settings-fields">
             <legend>"Auto-reviews"</legend>
@@ -234,7 +256,6 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
             </label>
             <label>"Review with"
                 <select
-                    prop:disabled=off
                     prop:value=move || get(|d| d.review_backend.as_str().to_owned())
                     on:change=move |ev| {
                         let backend = AgentBackend::parse(&event_target_value(&ev))
@@ -242,14 +263,41 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
                         edit(Box::new(move |d| d.review_backend = backend));
                     }
                 >
-                    {AgentBackend::ALL.into_iter().map(|b| view! {
-                        <option value=b.as_str()>{b.label()}</option>
-                    }).collect_view()}
+                    {move || {
+                        let (offered, missing) = backend_options.get();
+                        missing
+                            .map(|b| (b, format!("{} (not installed)", b.label()), true))
+                            .into_iter()
+                            .chain(offered.into_iter().map(|b| {
+                                (b, b.label().to_owned(), false)
+                            }))
+                            .map(|(b, label, disabled)| {
+                                let selected = move || backend.get() == b;
+                                view! {
+                                    <option
+                                        value=b.as_str()
+                                        disabled=disabled
+                                        selected=selected
+                                    >
+                                        {label}
+                                    </option>
+                                }
+                            })
+                            .collect_view()
+                    }}
                 </select>
             </label>
+            {move || backend_options.get().1.map(|b| view! {
+                <p class="hint muted">
+                    {format!(
+                        "{} isn't installed on the server, so reviews won't start \
+                         until you pick another backend.",
+                        b.label(),
+                    )}
+                </p>
+            })}
             <label>"Review model"
                 <select
-                    prop:disabled=off
                     prop:value=move || picked.get()
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
@@ -290,7 +338,6 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
                     type="text"
                     class="mono"
                     placeholder="None"
-                    prop:disabled=off
                     prop:value=move || get(|d| d.review_skill.clone().unwrap_or_default())
                     on:input=move |ev| {
                         let skill = event_target_value(&ev);
@@ -324,7 +371,7 @@ fn NewSessionFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
     view! {
         <fieldset class="settings-fields">
             <legend>"New sessions"</legend>
-            {AgentBackend::ALL.into_iter().map(|b| {
+            {move || offered_backends().into_iter().map(|b| {
                 let label = format!("{} permissions", b.agent_name());
                 view! {
                     <label>{label}
