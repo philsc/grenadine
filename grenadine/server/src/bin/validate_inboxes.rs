@@ -39,7 +39,7 @@ const REVIEWED_QUEUED: &str = "state:open archived:false reviewed-by:@me -author
 
 /// The default inboxes, in DEFAULT_INBOXES order.
 const INBOX_SHORT: &[&str] = &[
-    "NR", "NTR", "RET", "APP", "MRG", "DR", "DFO", "WR", "AMO", "WA", "MBM", "MBO", "AO", "UOM",
+    "NR", "NTR", "RET", "APP", "MRG", "DR", "DFO", "WR", "AYO", "WA", "YM", "MFO", "AO", "YU",
 ];
 
 fn keys(hits: &[Hit]) -> BTreeSet<PrKey> {
