@@ -207,6 +207,7 @@ pub fn delete_session(
                     let _ = s.remove_item(&draft_key(&id));
                     let _ = s.remove_item(&mode_key(&id));
                 }
+                forget_question_drafts(&id);
                 crate::terminal::forget(&id);
                 image_drafts::forget(&image_drafts::agent_key(&id));
                 deleted()
@@ -890,6 +891,65 @@ fn DraftEntry(id: String, route: Signal<Route>) -> impl IntoView {
 /// change what the others go on with.
 fn mode_key(id: &str) -> String {
     format!("grenadine.agent-permission-mode.{id}")
+}
+
+/// What the keys of a session's half-answered questions start with.
+fn question_draft_prefix(session: &str) -> String {
+    format!("grenadine.agent-question.{session}.")
+}
+
+/// Where the half-answered question card of the request `tool` in
+/// `session` is kept, so it survives switching to another session and
+/// back.
+fn question_draft_key(session: &str, tool: &str) -> String {
+    format!("{}{tool}", question_draft_prefix(session))
+}
+
+/// Drops every half-answered question card kept for `session`.
+fn forget_question_drafts(session: &str) {
+    let Some(s) = storage() else { return };
+    let prefix = question_draft_prefix(session);
+    let keys: Vec<String> = (0..s.length().unwrap_or(0))
+        .filter_map(|i| s.key(i).ok().flatten())
+        .filter(|k| k.starts_with(&prefix))
+        .collect();
+    for k in keys {
+        let _ = s.remove_item(&k);
+    }
+}
+
+/// What the user has picked and written so far for one of a card's
+/// questions.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+struct QuestionDraft {
+    picked: Vec<String>,
+    other: String,
+}
+
+impl QuestionDraft {
+    fn is_empty(&self) -> bool {
+        self.picked.is_empty() && self.other.is_empty()
+    }
+}
+
+/// The half-answered card kept under `key` for `questions`, one entry per
+/// question. Nothing is restored if it doesn't fit the questions any more,
+/// and picks that aren't among a question's options are dropped.
+fn load_question_draft(key: &str, questions: &[Question]) -> Vec<QuestionDraft> {
+    let stored: Option<Vec<QuestionDraft>> = storage()
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .and_then(|v| serde_json::from_str(&v).ok());
+    match stored {
+        Some(list) if list.len() == questions.len() => questions
+            .iter()
+            .zip(list)
+            .map(|(q, mut d)| {
+                d.picked.retain(|p| q.options.iter().any(|o| o.label == *p));
+                d
+            })
+            .collect(),
+        _ => vec![QuestionDraft::default(); questions.len()],
+    }
 }
 
 /// Where a session's "Show thinking" pick is kept. Each session has its
@@ -3776,11 +3836,14 @@ fn QuestionCard(
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
-    // The options picked and the text written for each question.
-    let picks: Vec<(RwSignal<Vec<String>>, RwSignal<String>)> = questions
-        .iter()
-        .map(|_| (RwSignal::new(Vec::new()), RwSignal::new(String::new())))
-        .collect();
+    // The options picked and the text written for each question, kept in
+    // local storage until the question is resolved.
+    let key = StoredValue::new(question_draft_key(&agent, &tool));
+    let picks: Vec<(RwSignal<Vec<String>>, RwSignal<String>)> =
+        load_question_draft(&key.get_value(), &questions)
+            .into_iter()
+            .map(|d| (RwSignal::new(d.picked), RwSignal::new(d.other)))
+            .collect();
     let questions = StoredValue::new(questions);
     let picks = StoredValue::new(picks);
     let collect_answers = move || {
@@ -3817,6 +3880,32 @@ fn QuestionCard(
     let state =
         Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)));
     let pending = move || state.get().is_none() && waiting.get();
+    // Keeps what's picked and written while the form is shown, and drops
+    // it otherwise: once the question is answered or skipped, here or
+    // elsewhere, or once nobody waits for an answer any more, e.g. after
+    // the session stopped (the server then expires the question). The
+    // picks stay in memory, so a status that's only late to say the
+    // session waits stores them again once it does.
+    Effect::new(move |_| {
+        let draft: Vec<QuestionDraft> = picks.with_value(|ps| {
+            ps.iter()
+                .map(|(picked, other)| QuestionDraft {
+                    picked: picked.get(),
+                    other: other.get(),
+                })
+                .collect()
+        });
+        let Some(s) = storage() else { return };
+        let key = key.get_value();
+        let _ = if !pending() || draft.iter().all(QuestionDraft::is_empty) {
+            s.remove_item(&key)
+        } else {
+            match serde_json::to_string(&draft) {
+                Ok(v) => s.set_item(&key, &v),
+                Err(_) => Ok(()),
+            }
+        };
+    });
     view! {
         <div class="approval questions" class:pending=pending>
             <p>

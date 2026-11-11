@@ -7081,6 +7081,45 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(transcript.locator(".question-answer")).to_have_text("Go ahead")
 
+    def test_half_answered_question_survives_leaving_the_session(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("question the plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        question = transcript.locator(".approval.questions")
+        other = question.get_by_label("Something else")
+        expect(question).to_contain_text("Claude asks")
+        session = self.page.url
+
+        # What's written comes back after going to another page and back.
+        other.fill("Change two things")
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(self.page.get_by_label("Prompt")).to_be_visible()
+        self.page.goto(session)
+        expect(other).to_have_value("Change two things")
+
+        # So does what's picked, also after a reload.
+        question.get_by_label("Go ahead").check()
+        expect(other).to_have_value("")
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(self.page.get_by_label("Prompt")).to_be_visible()
+        self.page.goto(session)
+        expect(question.get_by_label("Go ahead")).to_be_checked()
+        self.page.reload()
+        expect(question.get_by_label("Go ahead")).to_be_checked()
+        expect(question.get_by_label("Not yet")).not_to_be_checked()
+
+        # Once answered, nothing is kept for the question any more.
+        question.get_by_role("button", name="Answer").click()
+        expect(question).to_contain_text("Answered")
+        expect(question.locator(".question-answer")).to_have_text("Go ahead")
+        kept = self.page.evaluate(
+            "Object.keys(localStorage)"
+            ".filter(k => k.startsWith('grenadine.agent-question.'))"
+        )
+        self.assertEqual(kept, [])
+
     def test_approved_mode_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
         self.page.get_by_label("Prompt").fill("make a plan")
