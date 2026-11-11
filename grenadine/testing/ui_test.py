@@ -7498,12 +7498,59 @@ class AutoReviewTest(ServerTestCase):
         expect(transcript).to_contain_text(f"Review pull request {pr.url}")
         expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])
 
+    def test_review_with_lists_only_installed_backends(self) -> None:
+        # With only Devin installed, it's the only backend offered. The
+        # stored Claude stays picked, marked and disabled, so it isn't
+        # silently changed.
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(
+                json=[
+                    {
+                        "backend": "devin",
+                        "models": [
+                            {"value": "swe-2", "displayName": "SWE-2"},
+                            {"value": "swe-2-high", "displayName": "SWE-2 High"},
+                        ],
+                    }
+                ]
+            ),
+        )
+        dialog = self.settings(self.OFF_REPO)
+        review_with = dialog.get_by_label("Review with")
+        expect(review_with).to_have_value("claude")
+        options = review_with.locator("option")
+        expect(options).to_have_text(["Claude Code (not installed)", "Devin"])
+        expect(options.nth(0)).to_have_attribute("disabled", "")
+        expect(options.nth(1)).not_to_have_attribute("disabled", "")
+        expect(
+            dialog.locator(
+                ".hint",
+                has_text="Claude Code isn't installed on the server",
+            )
+        ).to_be_visible()
+        # New sessions offers permissions only for installed backends.
+        expect(dialog.get_by_label("Devin permissions")).to_be_visible()
+        expect(dialog.get_by_label("Claude permissions")).to_have_count(0)
+
+        # Picking an installed backend saves.
+        review_with.select_option(label="Devin")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        dialog = self.settings(self.OFF_REPO)
+        expect(dialog.get_by_label("Review with")).to_have_value("devin")
+        self.page.keyboard.press("Escape")
+        self.page.unroute("**/api/agents/backends")
+
     def test_reviews_can_be_turned_off(self) -> None:
         dialog = self.settings(self.OFF_REPO)
         dialog.get_by_label("Review my pull requests").select_option(label="Never")
-        expect(dialog.get_by_label("Review with")).to_be_disabled()
-        expect(dialog.get_by_label("Review model")).to_be_disabled()
-        expect(dialog.get_by_label("Review skill")).to_be_disabled()
+        # The fields stay editable: a review asked for from a PR's page
+        # still uses them.
+        expect(dialog.get_by_label("Review with")).to_be_enabled()
+        expect(dialog.get_by_label("Review model")).to_be_enabled()
+        expect(dialog.get_by_label("Review skill")).to_be_enabled()
+        expect(dialog.get_by_label("Review again after new pushes")).to_be_disabled()
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
         self.open_pr(self.OFF_REPO, "Unreviewed change")

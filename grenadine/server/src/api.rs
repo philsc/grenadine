@@ -1032,6 +1032,15 @@ async fn set_repo_settings(
         Ok(s) => s,
         Err(e) => return Ok((StatusCode::BAD_REQUEST, e).into_response()),
     };
+    if settings.review_backend != old.review_backend
+        && !state.agents.offered(settings.review_backend).await
+    {
+        let message = format!(
+            "{} isn't installed on the server",
+            settings.review_backend.label()
+        );
+        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+    }
     for (b, m) in &settings.review_models {
         if !state.agents.offers(*b, Some(m)).await {
             let message = format!("{} doesn't offer that model", b.label());
@@ -2088,6 +2097,96 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body(response).await, "Claude Code doesn't offer that model");
+    }
+
+    /// A review backend that isn't installed can't be picked.
+    #[tokio::test]
+    async fn repo_settings_check_the_review_backend() {
+        use grenadine_core::api::AgentBackend;
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        let settings = |backend: AgentBackend| {
+            Json(RepoSettings {
+                review_backend: backend,
+                ..RepoSettings::default()
+            })
+        };
+
+        // Whichever backend isn't installed can't be switched to.
+        let missing = if state.agents.offered(AgentBackend::Devin).await {
+            let response = set_repo_settings(
+                AxState(state.clone()),
+                path(),
+                settings(AgentBackend::Devin),
+            )
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            AgentBackend::Claude
+        } else {
+            AgentBackend::Devin
+        };
+        let stored = state
+            .db
+            .repo_settings(&fx.clone.slug)
+            .unwrap()
+            .review_backend;
+        let response = set_repo_settings(AxState(state.clone()), path(), settings(missing))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await,
+            format!("{} isn't installed on the server", missing.label())
+        );
+        // The rejected pick wasn't stored.
+        assert_eq!(
+            state
+                .db
+                .repo_settings(&fx.clone.slug)
+                .unwrap()
+                .review_backend,
+            stored
+        );
+    }
+
+    /// The stored backend being uninstalled doesn't keep other fields
+    /// from saving; only picking an uninstalled one is refused.
+    #[tokio::test]
+    async fn repo_settings_save_with_a_missing_backend() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        // The stored default is Claude Code, which test_state doesn't offer.
+        let response = set_repo_settings(
+            AxState(state.clone()),
+            path(),
+            Json(RepoSettings {
+                review_skill: Some("review".into()),
+                ..RepoSettings::default()
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved = state.db.repo_settings(&fx.clone.slug).unwrap();
+        assert_eq!(saved.review_skill.as_deref(), Some("review"));
     }
 
     #[tokio::test]
