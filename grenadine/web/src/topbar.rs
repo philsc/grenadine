@@ -104,6 +104,8 @@ fn reviews_waiting(reviews: &[AutoReviewEntry]) -> usize {
                     AutoReviewState::Queued
                     | AutoReviewState::Running
                     | AutoReviewState::Posted
+                    | AutoReviewState::Pushed
+                    | AutoReviewState::Superseded
                     | AutoReviewState::Cancelled => false,
                 }
         })
@@ -355,6 +357,7 @@ mod tests {
     fn review(state: AutoReviewState) -> AutoReviewEntry {
         AutoReviewEntry {
             id: 1,
+            kind: Default::default(),
             key: PrKey {
                 repo: "o/n".into(),
                 number: 1,

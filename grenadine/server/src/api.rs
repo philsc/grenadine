@@ -15,11 +15,11 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, Approval, AutoMerge,
-    AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL,
-    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges,
-    WrapUp, submit_blocker,
+    AutoReviewEntry, AutoRunKind, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr,
+    Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged,
+    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
+    PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview,
+    WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -108,6 +108,10 @@ fn api_routes() -> Router<Arc<State>> {
         .route(
             "/api/pr/{owner}/{name}/{number}/auto-reviews",
             get(pr_auto_reviews).post(ask_auto_review),
+        )
+        .route(
+            "/api/pr/{owner}/{name}/{number}/auto-fixes",
+            post(ask_auto_fix),
         )
         .route(
             "/api/pr/{owner}/{name}/{number}/queue",
@@ -1075,8 +1079,27 @@ async fn ask_auto_review(
     AxState(state): St,
     Path((owner, name, number)): Path<(String, String, u64)>,
 ) -> ApiResult<Response> {
-    let key = writable(owner, name, number, &state)?;
-    match auto_review::ask(&state, &key).await? {
+    ask_auto_run(&state, owner, name, number, AutoRunKind::Review).await
+}
+
+/// Queues a fixing run of the PR, which addresses its open comments and
+/// those of the PRs stacked on it.
+async fn ask_auto_fix(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    ask_auto_run(&state, owner, name, number, AutoRunKind::Fix).await
+}
+
+async fn ask_auto_run(
+    state: &Arc<State>,
+    owner: String,
+    name: String,
+    number: u64,
+    kind: AutoRunKind,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, state)?;
+    match auto_review::ask(state, &key, kind).await? {
         Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
         Err(why) => {
             let status = match why {

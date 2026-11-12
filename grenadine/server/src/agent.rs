@@ -1255,13 +1255,14 @@ fn take_stack_on_start(state: &Arc<State>, session: &AgentSession) -> Result<()>
     let Some(pr) = state.db.pr(&key(number))? else {
         return Ok(());
     };
-    let Some(stack) = &pr.stack else {
-        return Ok(());
+    let above = match pr.stack.as_ref().map(|stack| chain_above(stack, number)) {
+        Some(Above::Linear(above)) => above,
+        Some(Above::Fork { .. }) => return Ok(()),
+        None => Vec::new(),
     };
-    let Above::Linear(above) = chain_above(stack, number) else {
-        return Ok(());
-    };
-    if above.is_empty() {
+    // A fixing run takes its PR even when nothing is stacked on it: the
+    // lease it gets here refuses its push once someone else pushed.
+    if above.is_empty() && session.kind != SessionKind::AutoFix {
         return Ok(());
     }
     let mut prs = vec![taken_pr(&pr)?];
@@ -1704,7 +1705,7 @@ pub async fn await_approval(
     input: &Value,
     options: Vec<ApprovalOption>,
 ) -> Option<Decision> {
-    if matches!(state.db.agent(id), Ok(Some(s)) if s.kind == SessionKind::AutoReview) {
+    if matches!(state.db.agent(id), Ok(Some(s)) if s.kind.unattended()) {
         return Some(deny_unattended(state, id, tool_use, tool_name, input));
     }
     let rx = match request_approval(state, id, tool_use, tool_name, input, options) {
@@ -1727,7 +1728,7 @@ pub async fn await_approval(
 }
 
 /// What an unattended session is told when it asks for a tool.
-pub const UNATTENDED_DENIAL: &str = "This is an unattended review that nobody can answer or \
+pub const UNATTENDED_DENIAL: &str = "This is an unattended session that nobody can answer or \
      approve tools for. Go on without this tool.";
 
 /// Denies a request of an unattended session right away, showing the
@@ -1828,7 +1829,8 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
     // Before the interrupt, which would end the review on its own.
-    let reviewing = session.kind == SessionKind::AutoReview;
+    let reviewing = session.kind.unattended();
+    // A fixing run changes its worktree, but nobody goes on with it.
     if reviewing {
         state.db.cancel_auto_review(id, now())?;
     }
@@ -2159,8 +2161,12 @@ pub async fn land_now(
         .db
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
-    if session.kind == SessionKind::AutoReview {
-        bail!("an unattended review's work is never landed");
+    match (session.kind, target) {
+        (SessionKind::AutoReview, _) => bail!("an unattended review's work is never landed"),
+        (SessionKind::AutoFix, WrapUpTarget::Checkout) => {
+            bail!("an unattended fixing run only pushes to its pull requests")
+        }
+        _ => {}
     }
     let tool = match target {
         WrapUpTarget::PullRequest => "update_prs",
@@ -3818,7 +3824,7 @@ fn images_note() -> String {
 /// What agents are told about handing work off to a new session. An
 /// unattended review can't hand anything off.
 fn handoff_note(session: &AgentSession) -> Option<String> {
-    (session.kind != SessionKind::AutoReview).then(|| {
+    (!session.kind.unattended()).then(|| {
         "To hand work off to a new agent session with a fresh context, e.g. a follow-up task \
          the user asks to have done separately, call the grenadine MCP server's handoff tool."
             .into()
@@ -3891,7 +3897,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     );
     let starting_pr = session_pr(state, &session).await;
     let notes: Vec<_> = [
-        (session.kind == SessionKind::AutoReview).then(|| crate::auto_review::NOTE.to_owned()),
+        crate::auto_review::note(session.kind).map(str::to_owned),
         prs_note(&session),
         starting_pr
             .as_ref()

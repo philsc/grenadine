@@ -8,9 +8,9 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
-    AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed,
-    Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo,
-    SessionKind, Stack, ThreadCounts, Version, VersionKind,
+    AutoReviewEntry, AutoReviewState, AutoRunKind, CiStatus, CleanupItem, CostUnit, Inbox,
+    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment,
+    ReviewDecision, ReviewInfo, SessionKind, Stack, ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -477,6 +477,16 @@ const MIGRATIONS: &[Migration] = &[
     // Installs the default inboxes named in the second person, with
     // the closed ones split into merged and unmerged.
     Migration::ResetInboxes,
+    Migration::Sql(
+        r#"
+    -- An api::AutoRunKind: a review, or a fixing run that addresses the
+    -- PR's open comments. A PR has at most one of each queued or running.
+    ALTER TABLE auto_reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    DROP INDEX auto_reviews_active;
+    CREATE UNIQUE INDEX auto_reviews_active ON auto_reviews (repo, number, kind)
+        WHERE state IN ('queued', 'running');
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1837,7 +1847,8 @@ impl Db {
     pub fn interrupt_auto_reviews(&self, now: i64) -> Result<()> {
         self.conn().execute(
             "UPDATE auto_reviews SET state = 'failed', finished_at = ?,
-                error = 'The server stopped during the review.'
+                error = CASE kind WHEN 'fix' THEN 'The server stopped during the fixing run.'
+                             ELSE 'The server stopped during the review.' END
              WHERE state = 'running'",
             [now],
         )?;
@@ -1846,6 +1857,7 @@ impl Db {
 
     /// Records a review of `key` at `head_oid` starting. Returns its id,
     /// or `None` when the PR already has a review queued or running.
+    /// Fixing runs are only ever queued.
     pub fn start_auto_review(
         &self,
         key: &PrKey,
@@ -1854,27 +1866,30 @@ impl Db {
         url: &str,
         now: i64,
     ) -> Result<Option<i64>> {
-        self.insert_auto_review(key, head_oid, title, url, "running", false, now)
+        let kind = AutoRunKind::Review;
+        self.insert_auto_review(key, kind, head_oid, title, url, "running", false, now)
     }
 
-    /// Queues a review of `key` asked for from its page, at `head_oid`
-    /// for now. Returns its id, or `None` when the PR already has a
-    /// review queued or running.
+    /// Queues a review or fixing run of `key` asked for from its page, at
+    /// `head_oid` for now. Returns its id, or `None` when the PR already
+    /// has one of that kind queued or running.
     pub fn queue_auto_review(
         &self,
         key: &PrKey,
+        kind: AutoRunKind,
         head_oid: &str,
         title: &str,
         url: &str,
         now: i64,
     ) -> Result<Option<i64>> {
-        self.insert_auto_review(key, head_oid, title, url, "queued", true, now)
+        self.insert_auto_review(key, kind, head_oid, title, url, "queued", true, now)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn insert_auto_review(
         &self,
         key: &PrKey,
+        kind: AutoRunKind,
         head_oid: &str,
         title: &str,
         url: &str,
@@ -1885,10 +1900,21 @@ impl Db {
         let conn = self.conn();
         // The conflict is with auto_reviews_active.
         let n = conn.execute(
-            "INSERT INTO auto_reviews (repo, number, head_oid, title, url, state, manual, started_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO auto_reviews
+                (repo, number, kind, head_oid, title, url, state, manual, started_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
-            params![key.repo, key.number, head_oid, title, url, state, manual, now],
+            params![
+                key.repo,
+                key.number,
+                kind.as_str(),
+                head_oid,
+                title,
+                url,
+                state,
+                manual,
+                now
+            ],
         )?;
         Ok((n > 0).then(|| conn.last_insert_rowid()))
     }
@@ -2251,7 +2277,7 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
 
 const AUTO_REVIEW_COLUMNS: &str = "r.id, r.repo, r.number, r.title, r.url, r.head_oid, r.state, \
      r.agent_id, a.status, r.started_at, r.finished_at, COALESCE(a.cost, r.cost), \
-     COALESCE(a.cost_unit, r.cost_unit), r.error, r.manual \
+     COALESCE(a.cost_unit, r.cost_unit), r.error, r.manual, r.kind \
      FROM auto_reviews r LEFT JOIN agents a ON a.id = r.agent_id";
 
 fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> {
@@ -2273,6 +2299,7 @@ fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> 
         cost_unit: CostUnit::parse(&r.get::<_, String>(12)?).unwrap_or_default(),
         error: r.get(13)?,
         manual: r.get(14)?,
+        kind: AutoRunKind::parse(&r.get::<_, String>(15)?),
     })
 }
 
@@ -2281,6 +2308,8 @@ fn auto_review_state_str(s: AutoReviewState) -> &'static str {
         AutoReviewState::Queued => "queued",
         AutoReviewState::Running => "running",
         AutoReviewState::Posted => "posted",
+        AutoReviewState::Pushed => "pushed",
+        AutoReviewState::Superseded => "superseded",
         AutoReviewState::Unposted => "unposted",
         AutoReviewState::Failed => "failed",
         AutoReviewState::Cancelled => "cancelled",
@@ -2292,6 +2321,8 @@ fn parse_auto_review_state(s: &str) -> AutoReviewState {
         "queued" => AutoReviewState::Queued,
         "running" => AutoReviewState::Running,
         "posted" => AutoReviewState::Posted,
+        "pushed" => AutoReviewState::Pushed,
+        "superseded" => AutoReviewState::Superseded,
         "unposted" => AutoReviewState::Unposted,
         "cancelled" => AutoReviewState::Cancelled,
         _ => AutoReviewState::Failed,
@@ -3247,12 +3278,16 @@ mod tests {
             ]
         );
         assert!(all.iter().all(|r| r.cost == 0.5));
-        assert_eq!(db.queue_auto_review(&key, "a", "t", "u", 6).unwrap(), None);
+        assert_eq!(
+            db.queue_auto_review(&key, AutoRunKind::Review, "a", "t", "u", 6)
+                .unwrap(),
+            None
+        );
         db.finish_auto_review(3, AutoReviewState::Posted, None, 7)
             .unwrap();
         // The commit reviewed before can be reviewed again.
         assert!(
-            db.queue_auto_review(&key, "a", "t", "u", 8)
+            db.queue_auto_review(&key, AutoRunKind::Review, "a", "t", "u", 8)
                 .unwrap()
                 .is_some()
         );

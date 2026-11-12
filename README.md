@@ -166,3 +166,16 @@ The same dialog sets what new sessions in the repository start with:
 The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
 
 Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.
+
+### Addressing comments
+
+The Auto-review section in the sidebar of one of your open PRs also has an **Address comments** button. It starts a fixing run: an unattended session that addresses the open comments on that PR and on the PRs stacked on it, pushes the changes to all of them in one push, and answers the comments.
+
+These comments are open:
+
+- An inline thread that isn't resolved and whose last comment isn't yours. A thread that you or an auto-review started is also open until it has a reply.
+- A review summary or a comment on the PR itself that was posted after the last fixing run's answer.
+
+The session replies in each thread with what it changed, or why it changed nothing. It resolves the threads posted under your name and leaves the others to whoever started them. It answers summaries and other comments in one comment per PR.
+
+If someone pushes to one of the PRs while the run works, the run's push is refused, the run ends as superseded, and its changes are dropped. One fixing run works on a stack at a time; another one asked for in the same stack waits. A PR with several PRs stacked directly on it can't get one. Fixing runs count towards the limit of three, use the repository's review backend and model, and are listed in the Auto-reviews tab.
