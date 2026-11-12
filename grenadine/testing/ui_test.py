@@ -612,6 +612,22 @@ if review and "Quiet" not in review[1]:
         headers={"content-type": "application/json", "authorization": "Bearer " + os.environ["FAKE_GITHUB_TOKEN"]},
     )
     urllib.request.urlopen(request).close()
+# A fixing run commits a change, pushes it to its PR with update_prs and
+# answers on the PR. An "Answered" PR's run only answers.
+fix = re.search(r"Address the open review comments on pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
+if fix:
+    if "Answered" not in fix[1]:
+        with open("fixed.txt", "w") as f:
+            f.write("fixed")
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "Address the comments"], check=True)
+        update_prs({"prs": [{"commit": git("rev-parse", "HEAD"), "pr": int(fix[3])}]})
+    request = urllib.request.Request(
+        f"{os.environ['FAKE_GITHUB_API']}/repos/{fix[2]}/issues/{fix[3]}/comments",
+        data=json.dumps({"body": "<!-- grenadine:addressed -->\nDone."}).encode(),
+        headers={"content-type": "application/json", "authorization": "Bearer " + os.environ["FAKE_GITHUB_TOKEN"]},
+    )
+    urllib.request.urlopen(request).close()
 # `sleep N` stalls the turn for N seconds, holding the session running.
 if prompt.startswith("sleep "):
     time.sleep(float(prompt.removeprefix("sleep ")))
@@ -7542,6 +7558,62 @@ class AutoReviewTest(ServerTestCase):
             timeout=60_000
         )
         expect(box.locator(".agent-status")).to_have_text("posted")
+
+    def test_a_fixing_run_asked_for_from_the_pr_page(self) -> None:
+        self.turn_off_reviews(self.MANUAL_REPO)
+        repo = self.gh.repo(self.MANUAL_REPO)
+        pr = self.open_pr(self.MANUAL_REPO, "Commented change")
+        repo.comment(
+            pr,
+            author=scenarios.OTHER,
+            body="Rename this.",
+            path="commented-change.txt",
+            line=1,
+        )
+
+        def subjects(pr: Any) -> list[str]:
+            out = self.gh.git(
+                "-C",
+                str(repo.bare),
+                "rev-list",
+                "--format=%s",
+                "--no-commit-header",
+                f"refs/heads/main..refs/heads/{pr.head}",
+            )
+            return out.splitlines()
+
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{pr.number}")
+        fix = self.auto_review_box().locator(".auto-fix")
+        expect(fix).to_contain_text("1 open comment.")
+        fix.get_by_role("button", name="Address comments").click()
+        # It pushed a commit to the PR and answered on it; its session is
+        # gone, like a posted review's.
+        expect(fix.locator(".agent-status")).to_have_text("pushed", timeout=60_000)
+        self.assertEqual(subjects(pr), ["Address the comments", "Commented change"])
+        self.assertIn("grenadine:addressed", pr.issue_comments[-1].body)
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        entry = self.review_entry("Commented change")
+        expect(entry).to_contain_text("addressing comments")
+        expect(entry.locator("a.agent-item")).to_have_attribute(
+            "href", f"#/{self.MANUAL_REPO}/{pr.number}"
+        )
+
+        # A run that changes nothing only answers.
+        quiet = self.open_pr(self.MANUAL_REPO, "Answered change")
+        repo.issue_comment(quiet, author=scenarios.OTHER, body="Why this way?")
+        self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{quiet.number}")
+        expect(fix).to_contain_text("1 open comment.")
+        fix.get_by_role("button", name="Address comments").click()
+        expect(fix.locator(".agent-status")).to_have_text("answered", timeout=60_000)
+        self.assertEqual(subjects(quiet), ["Answered change"])
+        # Its answer closed the comment it answered.
+        expect(fix).to_contain_text("No open comments.")
+        expect(fix.get_by_role("button", name="Address comments")).to_be_disabled()
+        refused = self.api(
+            "POST", f"/api/pr/{self.MANUAL_REPO}/{quiet.number}/auto-fixes"
+        )
+        self.assertEqual(refused["status"], 409)
 
     def test_only_your_open_prs_have_the_section(self) -> None:
         theirs = self.open_pr(self.OFF_REPO, "Their change", author=scenarios.OTHER)

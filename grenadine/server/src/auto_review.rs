@@ -9,6 +9,15 @@
 //! repository's settings say. It's queued, and starts as soon as fewer
 //! than `MAX_RUNNING` reviews run, before the poller starts any. A PR has
 //! at most one review queued or running at a time.
+//!
+//! A fixing run is the other thing the PR's page can ask for: an
+//! unattended session that addresses the open comments on the PR and on
+//! the PRs stacked on it, pushes the changes to all of them at once, and
+//! answers the comments. It takes those PRs when it starts, with a lease
+//! on each one's head, so its push is refused when any of them was pushed
+//! to meanwhile. Fixing runs share the reviews' queue and limit, and
+//! only one runs in a stack at a time, since each rewrites the PRs above
+//! its own.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,13 +25,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use grenadine_core::api::{
-    AgentBackend, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState, NewAgent,
-    PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
+    AgentBackend, AgentEventKind, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState,
+    AutoRunKind, NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
 };
+use grenadine_core::feedback::{self, Feedback};
 
 use crate::agent;
 use crate::db::Db;
 use crate::github::{self, Hit};
+use crate::pr_plan::{Above, chain_above};
 use crate::sync::State;
 
 /// How many reviews run at once; due PRs beyond that wait for a later
@@ -50,7 +61,45 @@ pub const NOTE: &str = "This is an unattended pull request review. Nobody reads 
     it a second time. If you find nothing worth raising, post a short comment that says so. \
     Don't commit, push, or change the pull request's branch, title or description.";
 
-/// The mode a review on `backend` runs in. An unattended review denies
+/// What a fixing run's session is told beyond its prompt.
+pub const FIX_NOTE: &str = "This is an unattended session that addresses a pull request's review \
+    comments. Nobody reads or answers it while it runs, and it's deleted once it's done. Don't \
+    ask questions or wait for input. Tools that need approval are denied automatically, so work \
+    without them.\n\n\
+    For each comment listed in the prompt, decide whether it calls for a change. Don't make \
+    changes nobody asked for. A comment that is wrong, or that asks for something that would \
+    make the code worse, gets an answer that says why, and no change.\n\n\
+    Put each change into the pull request whose comment asked for it: amend that pull \
+    request's commits or add a commit on top of them, and rebase the commits of the pull \
+    requests above. Check that the code still builds and its tests pass where you can. Then \
+    call the grenadine MCP server's update_prs tool once, with one entry per pull request this \
+    session manages, bottom first, each naming the pull request's top commit and its number. \
+    If no comment called for a change, don't call update_prs.\n\n\
+    If update_prs refuses because a pull request's branch moved, someone pushed to it while \
+    you worked, and their push wins. Stop there: don't retry, don't rebase onto their commits, \
+    don't push any other way, and don't answer the comments. Say what happened and finish.\n\n\
+    Once the push went through, or when there was nothing to push, answer on GitHub with \
+    `gh`. Reply in every listed thread with what you changed, or why you changed nothing: \
+    `gh api repos/OWNER/REPO/pulls/NUMBER/comments/COMMENT_ID/replies -f body=...`. Resolve \
+    the threads the prompt marks as yours to resolve, and leave the others for whoever \
+    started them: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \
+    \"THREAD_ID\"}) { thread { id } } }'`. For each pull request that has review summaries or \
+    conversation comments listed, post one short comment on it that answers them, with \
+    `gh pr comment NUMBER --body ...`; its first line must be exactly \
+    `<!-- grenadine:addressed -->`. Don't change a pull request's title, description or \
+    target branch.";
+
+/// What a session of `kind` is told beyond its prompt, when it's
+/// unattended.
+pub fn note(kind: SessionKind) -> Option<&'static str> {
+    match kind {
+        SessionKind::Interactive => None,
+        SessionKind::AutoReview => Some(NOTE),
+        SessionKind::AutoFix => Some(FIX_NOTE),
+    }
+}
+
+/// The mode a review on `backend` runs in. A fixing run uses it too. An unattended review denies
 /// every approval request, so the mode itself has to let routine
 /// commands like `gh` through.
 fn review_mode(backend: AgentBackend) -> PermissionMode {
@@ -190,14 +239,15 @@ fn due(
     let new = settings
         .auto_review_since
         .is_some_and(|since| created_at >= since);
+    // The PR's fixing runs are in the list too.
+    let mut reviews = reviews.iter().filter(|r| r.kind == AutoRunKind::Review);
     let reviewed = if settings.rereview_on_push {
-        reviews.iter().any(|r| r.head_oid == hit.head_oid)
+        reviews.clone().any(|r| r.head_oid == hit.head_oid)
     } else {
-        !reviews.is_empty()
+        reviews.clone().next().is_some()
     };
-    let busy = reviews
-        .iter()
-        .any(|r| matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running));
+    let busy =
+        reviews.any(|r| matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running));
     wanted && hit.state == "OPEN" && new && !reviewed && !busy && running < MAX_RUNNING
 }
 
@@ -212,7 +262,7 @@ fn synced_head(detail: &PrDetail) -> Option<&str> {
         .map(|v| v.sha.as_str())
 }
 
-/// How many reviews are running.
+/// How many reviews and fixing runs are running.
 fn running(db: &Db) -> Result<usize> {
     Ok(db
         .auto_reviews()?
@@ -291,8 +341,16 @@ pub enum Refused {
     NotOpen,
     /// Someone else opened it.
     NotYours,
-    /// It already has a review queued or running.
+    /// It already has a review queued or running, or a fixing run when
+    /// that was asked for.
     Busy,
+    /// Several open PRs are stacked on `at`, the PR or one above it, so a
+    /// fixing run can't rebase the PRs above along with it.
+    Forked {
+        at: u64,
+    },
+    /// Neither the PR nor the ones stacked on it have open comments.
+    NothingOpen,
     /// The repository's review backend isn't offered; its label.
     NotOffered(&'static str),
 }
@@ -303,15 +361,62 @@ impl std::fmt::Display for Refused {
             Refused::NotSynced => write!(f, "the PR hasn't synced yet"),
             Refused::NotOpen => write!(f, "the PR isn't open"),
             Refused::NotYours => write!(f, "only your own PRs can be auto-reviewed"),
-            Refused::Busy => write!(f, "a review of this PR is already queued or running"),
+            Refused::Busy => write!(f, "one is already queued or running for this PR"),
+            Refused::Forked { at } => write!(
+                f,
+                "several pull requests are stacked on #{at}, and a fixing run can only rebase \
+                 one chain of them"
+            ),
+            Refused::NothingOpen => write!(
+                f,
+                "neither this PR nor the ones stacked on it have open comments"
+            ),
             Refused::NotOffered(backend) => write!(f, "{backend} isn't available"),
         }
     }
 }
 
-/// Queues a review of `key`, asked for from its page, and starts it if
-/// fewer than `MAX_RUNNING` reviews run. Returns the review's id.
-pub async fn ask(state: &Arc<State>, key: &PrKey) -> Result<std::result::Result<i64, Refused>> {
+/// The PRs a fixing run started from `detail`'s PR covers, bottom
+/// first: the PR and the open ones stacked on it, as far as they've
+/// synced.
+fn fix_chain(db: &Db, detail: &PrDetail) -> Result<std::result::Result<Vec<PrDetail>, Refused>> {
+    let number = detail.summary.key.number;
+    let above = match detail.stack.as_ref().map(|s| chain_above(s, number)) {
+        Some(Above::Fork { at, .. }) => return Ok(Err(Refused::Forked { at })),
+        Some(Above::Linear(above)) => above,
+        None => Vec::new(),
+    };
+    let mut chain = vec![detail.clone()];
+    for number in above {
+        let key = PrKey {
+            repo: detail.summary.key.repo.clone(),
+            number,
+        };
+        match db.pr(&key)? {
+            Some(d) if synced_head(&d).is_some() => chain.push(d),
+            _ => return Ok(Err(Refused::NotSynced)),
+        }
+    }
+    Ok(Ok(chain))
+}
+
+/// Whether the PRs `a` and `b` are in one stack, going by `a`'s.
+fn same_stack(a: &PrDetail, b: &PrKey) -> bool {
+    let key = &a.summary.key;
+    key.repo == b.repo
+        && (key.number == b.number
+            || a.stack
+                .as_ref()
+                .is_some_and(|s| s.prs.iter().any(|p| p.number == b.number)))
+}
+
+/// Queues a review or fixing run of `key`, asked for from its page, and
+/// starts it if fewer than `MAX_RUNNING` run. Returns its id.
+pub async fn ask(
+    state: &Arc<State>,
+    key: &PrKey,
+    kind: AutoRunKind,
+) -> Result<std::result::Result<i64, Refused>> {
     let Some(detail) = state.db.pr(key)? else {
         return Ok(Err(Refused::NotSynced));
     };
@@ -331,8 +436,18 @@ pub async fn ask(state: &Arc<State>, key: &PrKey) -> Result<std::result::Result<
     if !state.agents.offered(backend).await {
         return Ok(Err(Refused::NotOffered(backend.label())));
     }
+    if kind == AutoRunKind::Fix {
+        match fix_chain(&state.db, &detail)? {
+            Ok(chain) if chain.iter().all(|d| feedback::open(d).is_empty()) => {
+                return Ok(Err(Refused::NothingOpen));
+            }
+            Ok(_) => {}
+            Err(why) => return Ok(Err(why)),
+        }
+    }
     let queued = state.db.queue_auto_review(
         key,
+        kind,
         head,
         &detail.summary.title,
         &detail.summary.url,
@@ -341,7 +456,12 @@ pub async fn ask(state: &Arc<State>, key: &PrKey) -> Result<std::result::Result<
     let Some(id) = queued else {
         return Ok(Err(Refused::Busy));
     };
-    tracing::info!("{}#{}: a review was asked for", key.repo, key.number);
+    tracing::info!(
+        "{}#{}: a {} was asked for",
+        key.repo,
+        key.number,
+        kind.as_str()
+    );
     state.send(ServerEvent::AutoReviewsChanged);
     start_queued(state).await;
     Ok(Ok(id))
@@ -394,6 +514,15 @@ pub async fn start_queued(state: &Arc<State>) {
 
 async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
     let mut running = running(&state.db)?;
+    // The PRs with a fixing run going: another one in the same stack
+    // would rewrite the same PRs.
+    let mut fixing: Vec<PrKey> = state
+        .db
+        .auto_reviews()?
+        .into_iter()
+        .filter(|r| r.kind == AutoRunKind::Fix && r.state == AutoReviewState::Running)
+        .map(|r| r.key)
+        .collect();
     for review in state.db.queued_auto_reviews()? {
         if running >= MAX_RUNNING {
             break;
@@ -402,8 +531,7 @@ async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
         let Some(detail) = state.db.pr(key)? else {
             continue;
         };
-        if detail.summary.state != "OPEN" {
-            let why = "The PR was closed before its review started.";
+        let cancel = |why: &str| -> Result<()> {
             let ended = state.db.end_queued_auto_review(
                 review.id,
                 AutoReviewState::Cancelled,
@@ -413,11 +541,33 @@ async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
             if ended {
                 state.send(ServerEvent::AutoReviewsChanged);
             }
+            Ok(())
+        };
+        if detail.summary.state != "OPEN" {
+            cancel("The PR was closed before it started.")?;
             continue;
         }
         let Some(head) = synced_head(&detail) else {
             continue;
         };
+        let mut chain = Vec::new();
+        if review.kind == AutoRunKind::Fix {
+            if fixing.iter().any(|k| same_stack(&detail, k)) {
+                continue;
+            }
+            match fix_chain(&state.db, &detail)? {
+                Ok(prs) if prs.iter().all(|d| feedback::open(d).is_empty()) => {
+                    cancel("No open comments were left when it could start.")?;
+                    continue;
+                }
+                Ok(prs) => chain = prs,
+                Err(Refused::NotSynced) => continue,
+                Err(why) => {
+                    cancel(&format!("It couldn't start: {why}."))?;
+                    continue;
+                }
+            }
+        }
         let settings = state.db.repo_settings(&key.repo)?;
         if !state.agents.offered(settings.review_backend).await {
             continue;
@@ -429,8 +579,12 @@ async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
             &detail.summary.url,
             agent::now(),
         )?;
-        if begun && launch(state, review.id, key, head, &settings, &detail).await {
+        let kind = review.kind;
+        if begun && launch(state, review.id, kind, head, &settings, &detail, &chain).await {
             running += 1;
+            if kind == AutoRunKind::Fix {
+                fixing.push(key.clone());
+            }
         }
     }
     Ok(())
@@ -462,19 +616,23 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
             return false;
         }
     };
-    launch(state, id, key, &hit.head_oid, settings, detail).await
+    let kind = AutoRunKind::Review;
+    launch(state, id, kind, &hit.head_oid, settings, detail, &[]).await
 }
 
-/// Starts the session of the review `id` of `key` at `head`, which is
-/// recorded as running. Returns whether it's running.
+/// Starts the session of the review or fixing run `id` of `detail`'s PR
+/// at `head`, which is recorded as running. `chain` is what a fixing run
+/// covers, as `fix_chain` has it. Returns whether it's running.
 async fn launch(
     state: &Arc<State>,
     id: i64,
-    key: &PrKey,
+    kind: AutoRunKind,
     head: &str,
     settings: &RepoSettings,
     detail: &PrDetail,
+    chain: &[PrDetail],
 ) -> bool {
+    let key = &detail.summary.key;
     // A pick the backend doesn't offer fails the review rather than
     // keep it waiting: the settings were checked when they were saved,
     // so this means the backend's models changed since.
@@ -496,20 +654,39 @@ async fn launch(
         state.send(ServerEvent::AutoReviewsChanged);
         return false;
     }
-    tracing::info!("{}#{}: starting a review of {head}", key.repo, key.number);
+    tracing::info!(
+        "{}#{}: starting a {} of {head}",
+        key.repo,
+        key.number,
+        kind.as_str()
+    );
+    let (prompt, session_kind, title) = match kind {
+        AutoRunKind::Review => (
+            prompt(settings.review_skill.as_deref(), detail),
+            SessionKind::AutoReview,
+            format!("Review #{}: {}", key.number, detail.summary.title),
+        ),
+        AutoRunKind::Fix => (
+            fix_prompt(chain),
+            SessionKind::AutoFix,
+            format!(
+                "Address comments on #{}: {}",
+                key.number, detail.summary.title
+            ),
+        ),
+    };
     let req = NewAgent {
         backend: settings.review_backend,
         repo: key.repo.clone(),
         pr: Some(key.number),
-        prompt: prompt(settings.review_skill.as_deref(), detail),
+        prompt,
         permission_mode: review_mode(settings.review_backend),
         model: model.cloned(),
         images: Vec::new(),
         draft: None,
     };
-    let title = format!("Review #{}: {}", key.number, detail.summary.title);
     let (running, recorded) =
-        match agent::create_session(state, req, SessionKind::AutoReview, Some(title), None).await {
+        match agent::create_session(state, req, session_kind, Some(title), None).await {
             Ok(session) => (true, state.db.set_auto_review_session(id, &session.id)),
             Err(e) => {
                 tracing::warn!("{}#{}: can't start a review: {e:#}", key.repo, key.number);
@@ -610,6 +787,97 @@ fn stack_lines(detail: &PrDetail) -> Option<String> {
     ))
 }
 
+/// `text` as a Markdown quote, cut to a length that keeps a prompt with
+/// many comments readable.
+fn quoted(text: &str) -> String {
+    const MAX: usize = 2000;
+    let text = text.trim();
+    let cut = match text.char_indices().nth(MAX) {
+        Some((at, _)) => format!("{} […]", &text[..at]),
+        None => text.to_owned(),
+    };
+    cut.lines()
+        .map(|l| format!("  > {l}").trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The open feedback `open` on `detail`'s PR as a section of a fixing
+/// run's prompt.
+fn feedback_lines(detail: &PrDetail, open: &Feedback) -> String {
+    let pr = &detail.summary;
+    let viewer = detail.review.as_ref().map(|r| r.viewer.as_str());
+    let mut out = format!("## #{} {} ({})\n", pr.key.number, pr.title, pr.url);
+    for t in &open.threads {
+        let root = t.root;
+        let at = match root.line.or(root.original_line) {
+            Some(line) if !root.on_file => format!("{}:{line}", root.path),
+            _ => root.path.clone(),
+        };
+        let outdated = match root.line {
+            None if !root.on_file => ", on an older version of the code",
+            _ => "",
+        };
+        let resolve = match (&root.thread_id, Some(root.author.as_str()) == viewer) {
+            (Some(id), true) => format!("yours to resolve, thread id {id}"),
+            _ => "leave it unresolved".to_owned(),
+        };
+        out += &format!(
+            "\n- Thread on {at}{outdated} (comment id {}; {resolve}):\n  @{}:\n{}\n",
+            root.id,
+            root.author,
+            quoted(&root.body)
+        );
+        for reply in &t.replies {
+            out += &format!("  @{} replied:\n{}\n", reply.author, quoted(&reply.body));
+        }
+    }
+    let login =
+        |p: &grenadine_core::api::Person| p.login.clone().unwrap_or_else(|| "someone".into());
+    for r in &open.summaries {
+        out += &format!(
+            "\n- Review summary by @{} ({}):\n{}\n",
+            login(&r.author),
+            r.url,
+            quoted(&r.body)
+        );
+    }
+    for c in &open.comments {
+        out += &format!(
+            "\n- Conversation comment by @{} ({}):\n{}\n",
+            login(&c.author),
+            c.url,
+            quoted(&c.body)
+        );
+    }
+    out
+}
+
+/// The prompt of a fixing run that covers `chain`, bottom first: the
+/// open feedback on each of its PRs.
+fn fix_prompt(chain: &[PrDetail]) -> String {
+    let Some(first) = chain.first() else {
+        return String::new();
+    };
+    let pr = &first.summary;
+    let mut out = format!(
+        "Address the open review comments on pull request {}: \"{}\" ({}#{})",
+        pr.url, pr.title, pr.key.repo, pr.key.number
+    );
+    out += match chain.len() {
+        1 => ".",
+        _ => " and on the pull requests stacked on it, which this session manages too.",
+    };
+    out += " These are the comments, bottom pull request first:\n";
+    for detail in chain {
+        let open = feedback::open(detail);
+        if !open.is_empty() {
+            out += &format!("\n{}", feedback_lines(detail, &open));
+        }
+    }
+    out
+}
+
 /// Whether the viewer posted a review, a review comment or a comment on
 /// the PR at or after `since`, Unix seconds.
 fn posted_since(detail: &PrDetail, since: i64) -> bool {
@@ -637,7 +905,7 @@ fn posted_since(detail: &PrDetail, since: i64) -> bool {
 /// ended up `last`.
 pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus) {
     match state.db.agent(id) {
-        Ok(Some(s)) if s.kind == SessionKind::AutoReview => {}
+        Ok(Some(s)) if s.kind.unattended() => {}
         Ok(_) => return,
         Err(e) => {
             tracing::warn!("agent {id}: {e:#}");
@@ -694,12 +962,20 @@ async fn finish(
             grenadine_core::api::AgentEventKind::TurnEnded { error: None, .. }
         )
     });
-    match last {
-        AgentStatus::Idle if answered => {}
-        AgentStatus::Idle | AgentStatus::Interrupted => {
+    let fix = review.kind == AutoRunKind::Fix;
+    match (last, fix) {
+        (AgentStatus::Idle, _) if answered => {}
+        (AgentStatus::Idle | AgentStatus::Interrupted, false) => {
             return failed("The review was interrupted.");
         }
-        _ => return failed("The review's session failed."),
+        (AgentStatus::Idle | AgentStatus::Interrupted, true) => {
+            return failed("The fixing run was interrupted.");
+        }
+        (_, false) => return failed("The review's session failed."),
+        (_, true) => return failed("The fixing run's session failed."),
+    }
+    if fix {
+        return finish_fix(state, id, review).await;
     }
     for &delay in &state.posted_checks {
         tokio::select! {
@@ -731,11 +1007,98 @@ async fn finish(
         .finish_auto_review(review.id, AutoReviewState::Unposted, None, agent::now())
 }
 
+/// How a fixing run that didn't push ended, going by its PRs as they are
+/// now, each with the head it had when the run started at `started_at`:
+/// superseded when one of them moved, posted when the viewer answered on
+/// one of them since. `None` when neither shows yet.
+fn unpushed_outcome(
+    prs: &[(Option<String>, PrDetail)],
+    started_at: i64,
+) -> Option<AutoReviewState> {
+    let moved = prs
+        .iter()
+        .any(|(lease, detail)| lease.is_some() && synced_head(detail) != lease.as_deref());
+    let answered = prs
+        .iter()
+        .any(|(_, detail)| posted_since(detail, started_at));
+    match (moved, answered) {
+        (true, _) => Some(AutoReviewState::Superseded),
+        (false, true) => Some(AutoReviewState::Posted),
+        (false, false) => None,
+    }
+}
+
+/// Ends the fixing run `review`, whose session `id` finished its turn:
+/// as pushed when it landed its commits, as superseded when one of its
+/// PRs was pushed to since it started, and as posted when it only
+/// answered the comments. The session of any of those is deleted. One
+/// that did none of them is kept.
+async fn finish_fix(state: &Arc<State>, id: &str, review: &AutoReviewEntry) -> Result<()> {
+    let end = |as_: AutoReviewState| {
+        state
+            .db
+            .finish_auto_review(review.id, as_, None, agent::now())
+    };
+    let pushed = state
+        .db
+        .agent_events(id)?
+        .iter()
+        .any(|e| matches!(e.kind, AgentEventKind::Landed(_)));
+    if pushed {
+        end(AutoReviewState::Pushed)?;
+        tracing::info!(
+            "{}#{}: the fixes are pushed",
+            review.key.repo,
+            review.key.number
+        );
+        agent::delete(state, id).await?;
+        return Ok(());
+    }
+    // The PRs it took when it started, each with the head it had then.
+    let taken: Vec<(PrKey, Option<String>)> = state
+        .db
+        .agent(id)?
+        .map(|s| {
+            agent::landed_prs(&s)
+                .into_iter()
+                .map(|pr| {
+                    let key = PrKey {
+                        repo: review.key.repo.clone(),
+                        number: pr.number,
+                    };
+                    (key, pr.lease)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for &delay in &state.posted_checks {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = state.shutdown.cancelled() => return Ok(()),
+        }
+        let mut now = Vec::new();
+        for (key, lease) in &taken {
+            if state.resync_now(key).await
+                && let Some(detail) = state.db.pr(key)?
+            {
+                now.push((lease.clone(), detail));
+            }
+        }
+        if let Some(as_) = unpushed_outcome(&now, review.started_at) {
+            end(as_)?;
+            agent::delete(state, id).await?;
+            return Ok(());
+        }
+    }
+    end(AutoReviewState::Unposted)
+}
+
 #[cfg(test)]
 mod tests {
     use grenadine_core::api::{
         CostUnit, IssueComment, MergeInfo, MergeState, Person, PrKey, PrSummary, Review,
-        ReviewInfo, ReviewState, Stack, StackPr, ThreadCounts, Version, VersionKind,
+        ReviewComment, ReviewInfo, ReviewState, Side, Stack, StackPr, ThreadCounts, Version,
+        VersionKind,
     };
 
     use super::*;
@@ -764,6 +1127,7 @@ mod tests {
     fn entry(head: &str, state: AutoReviewState) -> AutoReviewEntry {
         AutoReviewEntry {
             id: 1,
+            kind: AutoRunKind::Review,
             key: PrKey {
                 repo: "o/n".into(),
                 number: 2,
@@ -1435,9 +1799,13 @@ sleep 30
             .unwrap();
         // Not while one runs, whichever commit.
         assert_eq!(db.start_auto_review(&key, "b", "t", "u", 11).unwrap(), None);
-        assert_eq!(db.queue_auto_review(&key, "b", "t", "u", 11).unwrap(), None);
+        assert_eq!(
+            db.queue_auto_review(&key, AutoRunKind::Review, "b", "t", "u", 11)
+                .unwrap(),
+            None
+        );
         assert!(
-            db.queue_auto_review(&other, "c", "t", "u", 11)
+            db.queue_auto_review(&other, AutoRunKind::Review, "c", "t", "u", 11)
                 .unwrap()
                 .is_some()
         );
@@ -1445,7 +1813,7 @@ sleep 30
         db.finish_auto_review(id, AutoReviewState::Posted, None, 12)
             .unwrap();
         let queued = db
-            .queue_auto_review(&key, "a", "t", "u", 13)
+            .queue_auto_review(&key, AutoRunKind::Review, "a", "t", "u", 13)
             .unwrap()
             .unwrap();
         assert_eq!(db.start_auto_review(&key, "a", "t", "u", 14).unwrap(), None);
@@ -1499,7 +1867,7 @@ sleep 30
         );
 
         // Old rows without a session go; a queued one isn't old.
-        db.queue_auto_review(&other, "d", "t", "u", 0)
+        db.queue_auto_review(&other, AutoRunKind::Review, "d", "t", "u", 0)
             .unwrap()
             .unwrap();
         assert!(db.prune_auto_reviews(25).unwrap());
@@ -1537,6 +1905,21 @@ sleep 30
     /// Stores PR `number` of the fixture's repository as synced at
     /// `head`, opened by `author`, `pr_state`, with the viewer "me".
     fn store_pr(state: &State, slug: &str, number: u64, head: &str, author: &str, pr_state: &str) {
+        store_full(state, slug, number, head, author, pr_state, &[], None);
+    }
+
+    /// `store_pr` of a PR with the inline `comments`, in `stack`.
+    #[allow(clippy::too_many_arguments)]
+    fn store_full(
+        state: &State,
+        slug: &str,
+        number: u64,
+        head: &str,
+        author: &str,
+        pr_state: &str,
+        comments: &[ReviewComment],
+        stack: Option<&Stack>,
+    ) {
         state
             .db
             .store_sync(
@@ -1571,12 +1954,152 @@ sleep 30
                     pushed_by_is_guess: false,
                     missing: false,
                 }],
-                &[],
-                None,
+                comments,
+                stack,
                 false,
                 None,
             )
             .unwrap();
+    }
+
+    /// An unresolved inline thread's first comment.
+    fn thread(id: u64, author: &str) -> ReviewComment {
+        ReviewComment {
+            id,
+            in_reply_to: None,
+            author: author.into(),
+            body: format!("Fix thing {id}.\nPlease."),
+            path: "src/a.rs".into(),
+            original_commit: "c".into(),
+            original_line: Some(7),
+            original_start_line: None,
+            line: Some(9),
+            start_line: None,
+            start_side: None,
+            side: Side::Right,
+            on_file: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            url: String::new(),
+            resolved: false,
+            resolved_by: None,
+            thread_id: Some(format!("T{id}")),
+            can_resolve: true,
+            pending: false,
+            node_id: None,
+        }
+    }
+
+    fn stack_of(prs: Vec<StackPr>) -> Stack {
+        Stack {
+            base_ref: "main".into(),
+            prs,
+            more_ancestors: false,
+            more_descendants: false,
+        }
+    }
+
+    /// A fixing run's prompt lists the open feedback of each PR it
+    /// covers, and says which threads are the viewer's to resolve.
+    #[test]
+    fn fix_prompts() {
+        let mut lower = detail(7, None);
+        lower.review = Some(review_info("me"));
+        let mut reply = thread(12, "ann");
+        reply.in_reply_to = Some(11);
+        reply.body = "Also this.".into();
+        let mut outdated = thread(13, "me");
+        outdated.line = None;
+        lower.comments = vec![thread(11, "ann"), reply, outdated];
+        let mut upper = detail(8, None);
+        upper.review = Some(ReviewInfo {
+            reviews: vec![Review {
+                author: person("ann"),
+                state: ReviewState::Commented,
+                body: "Rename it.".into(),
+                submitted_at: "2026-01-01T00:00:00Z".into(),
+                url: "r1".into(),
+                commit: None,
+            }],
+            comments: vec![IssueComment {
+                author: person("bob"),
+                body: "Add a test.".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                url: "c1".into(),
+            }],
+            ..review_info("me")
+        });
+        // A PR of the chain without open feedback isn't listed.
+        let mut quiet = detail(9, None);
+        quiet.review = Some(review_info("me"));
+
+        let prompt = fix_prompt(&[lower.clone(), upper, quiet]);
+        assert_eq!(
+            prompt,
+            "Address the open review comments on pull request https://github.com/o/n/pull/7: \
+             \"PR 7\" (o/n#7) and on the pull requests stacked on it, which this session \
+             manages too. These are the comments, bottom pull request first:\n\
+             \n\
+             ## #7 PR 7 (https://github.com/o/n/pull/7)\n\
+             \n\
+             - Thread on src/a.rs:9 (comment id 11; leave it unresolved):\n  @ann:\n  \
+             > Fix thing 11.\n  > Please.\n  @ann replied:\n  > Also this.\n\
+             \n\
+             - Thread on src/a.rs:7, on an older version of the code (comment id 13; yours to \
+             resolve, thread id T13):\n  @me:\n  > Fix thing 13.\n  > Please.\n\
+             \n\
+             ## #8 PR 8 (https://github.com/o/n/pull/8)\n\
+             \n\
+             - Review summary by @ann (r1):\n  > Rename it.\n\
+             \n\
+             - Conversation comment by @bob (c1):\n  > Add a test.\n"
+        );
+        assert!(fix_prompt(&[lower]).starts_with(
+            "Address the open review comments on pull request https://github.com/o/n/pull/7: \
+             \"PR 7\" (o/n#7). These are"
+        ));
+        // A long comment is cut.
+        assert!(quoted(&"x".repeat(5000)).ends_with("x […]"));
+    }
+
+    /// A fixing run that didn't push was superseded when one of its PRs
+    /// moved, and otherwise counts as posted once the viewer answered.
+    #[test]
+    fn how_an_unpushed_fix_ended() {
+        let at = |head: &str| {
+            let mut d = detail(7, None);
+            d.review = Some(review_info("me"));
+            d.versions = vec![Version {
+                number: 1,
+                sha: head.into(),
+                merge_base: None,
+                kind: VersionKind::Initial,
+                pushed_at: None,
+                pushed_by: None,
+                pushed_by_is_guess: false,
+                missing: false,
+            }];
+            d
+        };
+        let lease = |head: &str| Some(head.to_owned());
+        assert_eq!(unpushed_outcome(&[(lease("a"), at("a"))], 0), None);
+        assert_eq!(unpushed_outcome(&[], 0), None);
+        let mut answered = at("a");
+        let mut reply = thread(1, "me");
+        reply.created_at = "2026-01-02T00:00:00Z".into();
+        answered.comments = vec![reply];
+        let since = github::unix("2026-01-01T12:00:00Z").unwrap();
+        assert_eq!(
+            unpushed_outcome(
+                &[(lease("a"), at("a")), (lease("a"), answered.clone())],
+                since
+            ),
+            Some(AutoReviewState::Posted)
+        );
+        // Someone's push wins over the answers.
+        assert_eq!(
+            unpushed_outcome(&[(lease("a"), at("z")), (lease("a"), answered)], since),
+            Some(AutoReviewState::Superseded)
+        );
     }
 
     const STALL: &str = "#!/bin/sh
@@ -1604,7 +2127,10 @@ sleep 30
             .set_repo_settings(&slug, &settings(AutoReview::Off, false))
             .unwrap();
 
-        let id = ask(&state, &key).await.unwrap().unwrap();
+        let id = ask(&state, &key, AutoRunKind::Review)
+            .await
+            .unwrap()
+            .unwrap();
         let review = state.db.auto_review(id).unwrap().unwrap();
         assert_eq!(review.state, AutoReviewState::Running);
         assert!(review.manual);
@@ -1614,7 +2140,10 @@ sleep 30
             state.db.agent(&session).unwrap().unwrap().kind,
             SessionKind::AutoReview
         );
-        assert_eq!(ask(&state, &key).await.unwrap(), Err(Refused::Busy));
+        assert_eq!(
+            ask(&state, &key, AutoRunKind::Review).await.unwrap(),
+            Err(Refused::Busy)
+        );
 
         // Cancelling it deletes its session; then the same commit can be
         // reviewed again.
@@ -1623,7 +2152,10 @@ sleep 30
         let review = state.db.auto_review(id).unwrap().unwrap();
         assert_eq!(review.state, AutoReviewState::Cancelled);
         assert!(!cancel(&state, id).await.unwrap());
-        let again = ask(&state, &key).await.unwrap().unwrap();
+        let again = ask(&state, &key, AutoRunKind::Review)
+            .await
+            .unwrap()
+            .unwrap();
         let session = state
             .db
             .auto_review(again)
@@ -1647,9 +2179,18 @@ sleep 30
         };
         store_pr(&state, &slug, 2, &head, "other", "OPEN");
         store_pr(&state, &slug, 3, &head, "me", "MERGED");
-        assert_eq!(ask(&state, &pr(2)).await.unwrap(), Err(Refused::NotYours));
-        assert_eq!(ask(&state, &pr(3)).await.unwrap(), Err(Refused::NotOpen));
-        assert_eq!(ask(&state, &pr(4)).await.unwrap(), Err(Refused::NotSynced));
+        assert_eq!(
+            ask(&state, &pr(2), AutoRunKind::Review).await.unwrap(),
+            Err(Refused::NotYours)
+        );
+        assert_eq!(
+            ask(&state, &pr(3), AutoRunKind::Review).await.unwrap(),
+            Err(Refused::NotOpen)
+        );
+        assert_eq!(
+            ask(&state, &pr(4), AutoRunKind::Review).await.unwrap(),
+            Err(Refused::NotSynced)
+        );
         assert!(state.db.auto_reviews().unwrap().is_empty());
 
         // Nor while the review's backend isn't offered.
@@ -1668,7 +2209,7 @@ sleep 30
             )
             .unwrap();
         assert_eq!(
-            ask(&state, &pr(2)).await.unwrap(),
+            ask(&state, &pr(2), AutoRunKind::Review).await.unwrap(),
             Err(Refused::NotOffered("Devin"))
         );
     }
@@ -1697,24 +2238,30 @@ sleep 30
             .collect();
         store_pr(&state, &slug, 2, &head, "me", "OPEN");
         store_pr(&state, &slug, 3, &head, "me", "OPEN");
-        let id = ask(&state, &pr(2)).await.unwrap().unwrap();
+        let id = ask(&state, &pr(2), AutoRunKind::Review)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             state.db.auto_review(id).unwrap().unwrap().state,
             AutoReviewState::Queued
         );
         // A queued review is the PR's one review too.
-        assert_eq!(ask(&state, &pr(2)).await.unwrap(), Err(Refused::Busy));
+        assert_eq!(
+            ask(&state, &pr(2), AutoRunKind::Review).await.unwrap(),
+            Err(Refused::Busy)
+        );
         // One asked for at a commit that's no longer the head starts at
         // the head; a closed PR's is cancelled.
         let stale = state
             .db
-            .queue_auto_review(&pr(3), "old", "t", "u", 2)
+            .queue_auto_review(&pr(3), AutoRunKind::Review, "old", "t", "u", 2)
             .unwrap()
             .unwrap();
         store_pr(&state, &slug, 4, &head, "me", "CLOSED");
         let closed = state
             .db
-            .queue_auto_review(&pr(4), "old", "t", "u", 3)
+            .queue_auto_review(&pr(4), AutoRunKind::Review, "old", "t", "u", 3)
             .unwrap()
             .unwrap();
 
@@ -1741,8 +2288,196 @@ sleep 30
         assert_eq!(r.state, AutoReviewState::Cancelled);
         assert_eq!(
             r.error.as_deref(),
-            Some("The PR was closed before its review started.")
+            Some("The PR was closed before it started.")
         );
+    }
+
+    /// A fixing run asked for from the PR's page takes the PR, with a
+    /// lease on its head, and the PRs stacked on it; one runs per stack.
+    #[tokio::test]
+    async fn asking_for_a_fix() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let pr = |number| PrKey {
+            repo: slug.clone(),
+            number,
+        };
+        let fix = AutoRunKind::Fix;
+
+        // Nothing to address.
+        store_pr(&state, &slug, 2, &head, "me", "OPEN");
+        assert_eq!(
+            ask(&state, &pr(2), fix).await.unwrap(),
+            Err(Refused::NothingOpen)
+        );
+        // Someone else's PR isn't fixed either.
+        store_full(
+            &state,
+            &slug,
+            5,
+            &head,
+            "other",
+            "OPEN",
+            &[thread(1, "ann")],
+            None,
+        );
+        assert_eq!(
+            ask(&state, &pr(5), fix).await.unwrap(),
+            Err(Refused::NotYours)
+        );
+
+        // A lone PR: the session takes it, so that its push has a lease.
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(1, "ann")],
+            None,
+        );
+        let id = ask(&state, &pr(2), fix).await.unwrap().unwrap();
+        let run = state.db.auto_review(id).unwrap().unwrap();
+        assert_eq!((run.kind, run.state), (fix, AutoReviewState::Running));
+        let session = state
+            .db
+            .agent(&run.session.clone().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.kind, SessionKind::AutoFix);
+        assert_eq!(session.title, "Address comments on #2: PR 2");
+        let taken: Vec<_> = agent::landed_prs(&session)
+            .into_iter()
+            .map(|p| (p.number, p.lease))
+            .collect();
+        assert_eq!(taken, [(2, Some(head.clone()))]);
+        assert_eq!(ask(&state, &pr(2), fix).await.unwrap(), Err(Refused::Busy));
+        // A review of the same PR can still be asked for.
+        let review = ask(&state, &pr(2), AutoRunKind::Review)
+            .await
+            .unwrap()
+            .unwrap();
+        for id in [id, review] {
+            assert!(cancel(&state, id).await.unwrap());
+        }
+
+        // A stack: #3 on #2, #4 on #3. The comments are on #3 only, and a
+        // run from #2 covers them.
+        let stack = stack_of(vec![
+            stack_pr(2, None, "OPEN"),
+            stack_pr(3, Some(2), "OPEN"),
+            stack_pr(4, Some(3), "OPEN"),
+        ]);
+        store_full(&state, &slug, 2, &head, "me", "OPEN", &[], Some(&stack));
+        store_full(
+            &state,
+            &slug,
+            3,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(1, "ann")],
+            Some(&stack),
+        );
+        store_full(&state, &slug, 4, &head, "me", "OPEN", &[], Some(&stack));
+        assert_eq!(
+            ask(&state, &pr(4), fix).await.unwrap(),
+            Err(Refused::NothingOpen)
+        );
+        let lower = ask(&state, &pr(2), fix).await.unwrap().unwrap();
+        let run = state.db.auto_review(lower).unwrap().unwrap();
+        assert_eq!(run.state, AutoReviewState::Running);
+        let session = state.db.agent(&run.session.unwrap()).unwrap().unwrap();
+        let taken: Vec<_> = agent::landed_prs(&session)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(taken, [2, 3, 4]);
+        // Another one in the stack waits for it, though there's room.
+        let upper = ask(&state, &pr(3), fix).await.unwrap().unwrap();
+        let queued = state.db.auto_review(upper).unwrap().unwrap();
+        assert_eq!(queued.state, AutoReviewState::Queued);
+        assert!(cancel(&state, lower).await.unwrap());
+        start_queued(&state).await;
+        let run = state.db.auto_review(upper).unwrap().unwrap();
+        assert_eq!(run.state, AutoReviewState::Running);
+        assert!(cancel(&state, upper).await.unwrap());
+
+        // Two PRs stacked on #2: neither chain can be picked.
+        let forked = stack_of(vec![
+            stack_pr(2, None, "OPEN"),
+            stack_pr(3, Some(2), "OPEN"),
+            stack_pr(4, Some(2), "OPEN"),
+        ]);
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(1, "ann")],
+            Some(&forked),
+        );
+        assert_eq!(
+            ask(&state, &pr(2), fix).await.unwrap(),
+            Err(Refused::Forked { at: 2 })
+        );
+        // A PR above it that hasn't synced keeps it waiting.
+        let unsynced = stack_of(vec![
+            stack_pr(2, None, "OPEN"),
+            stack_pr(9, Some(2), "OPEN"),
+        ]);
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(1, "ann")],
+            Some(&unsynced),
+        );
+        assert_eq!(
+            ask(&state, &pr(2), fix).await.unwrap(),
+            Err(Refused::NotSynced)
+        );
+    }
+
+    /// A fixing run that neither pushed nor answered is kept, and it was
+    /// told how to work.
+    #[tokio::test]
+    async fn a_fix_that_did_nothing_is_kept() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), SUCCEED);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let key = PrKey {
+            repo: slug.clone(),
+            number: 2,
+        };
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(1, "ann")],
+            None,
+        );
+        let id = ask(&state, &key, AutoRunKind::Fix).await.unwrap().unwrap();
+        let run = ended(&state).await;
+        assert_eq!((run.id, run.state), (id, AutoReviewState::Unposted));
+        assert!(state.db.agent(&run.session.unwrap()).unwrap().is_some());
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.contains("addresses a pull request's review"), "{args}");
+        assert!(!args.contains("unattended pull request review"), "{args}");
     }
 
     /// A queued review can be cancelled before it starts.
@@ -1757,7 +2492,7 @@ sleep 30
         };
         let id = state
             .db
-            .queue_auto_review(&key, "a", "t", "u", 1)
+            .queue_auto_review(&key, AutoRunKind::Review, "a", "t", "u", 1)
             .unwrap()
             .unwrap();
         assert!(cancel(&state, id).await.unwrap());

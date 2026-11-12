@@ -37,7 +37,7 @@ fn agent_hash(id: &str) -> String {
 pub fn session_hash(id: &str, kind: SessionKind) -> String {
     match kind {
         SessionKind::Interactive => agent_hash(id),
-        SessionKind::AutoReview => crate::auto_reviews::hash(id),
+        SessionKind::AutoReview | SessionKind::AutoFix => crate::auto_reviews::hash(id),
     }
 }
 
@@ -2315,7 +2315,7 @@ pub fn AgentView(
             return;
         }
         if let Some(s) = current.get() {
-            let review = s.kind == SessionKind::AutoReview;
+            let review = s.kind.unattended();
             if review != read_only {
                 let _ = window().location().replace(&session_hash(&s.id, s.kind));
             }

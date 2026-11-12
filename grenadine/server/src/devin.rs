@@ -19,7 +19,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind, ApprovalOption,
-    PermissionMode, SessionKind,
+    PermissionMode,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1391,7 +1391,7 @@ async fn permission(
             // as a next prompt would start turns nobody reads.
             let review = matches!(
                 state.db.agent(&id),
-                Ok(Some(s)) if s.kind == SessionKind::AutoReview
+                Ok(Some(s)) if s.kind.unattended()
             );
             if !d.allow {
                 // The feedback becomes the next prompt; a rejected plan

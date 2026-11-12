@@ -353,6 +353,25 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         })
     });
     // The PR's latest synced commit, the one a review would start from.
+    // What a fixing run would address here, and whether open PRs are
+    // stacked on this one, whose comments it would address too.
+    let open_comments = Memo::new(move |_| {
+        detail.with(|d| {
+            d.as_ref()
+                .map_or(0, |d| grenadine_core::feedback::open(d).len())
+        })
+    });
+    let stacked_on = Memo::new(move |_| {
+        detail.with(|d| {
+            d.as_ref().is_some_and(|d| {
+                let number = d.summary.key.number;
+                d.stack
+                    .iter()
+                    .flat_map(|s| &s.prs)
+                    .any(|p| p.parent == Some(number) && p.state == "OPEN")
+            })
+        })
+    });
     let head = Memo::new(move |_| {
         detail.with(|d| {
             d.as_ref().and_then(|d| {
@@ -444,7 +463,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                             // Its own closure, so that a refetch of the PR
                             // doesn't remount it.
                             {move || own_open.get().then(|| view! {
-                                <crate::auto_reviews::PrSection key=auto_review_key.clone() head=head />
+                                <crate::auto_reviews::PrSection key=auto_review_key.clone() head=head
+                                    open=open_comments stacked=stacked_on />
                             })}
                             <crate::review::SidebarReview
                                 pr=Signal::derive(move || match pr.get() {

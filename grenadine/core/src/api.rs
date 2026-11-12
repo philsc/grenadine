@@ -87,8 +87,15 @@ pub enum AutoReviewState {
     Queued,
     /// Its session is working on it.
     Running,
-    /// Its session posted on the PR, and was deleted.
+    /// Its session posted on the PR, and was deleted. For a fixing run:
+    /// it answered the comments without changing the code.
     Posted,
+    /// A fixing run's session pushed its changes to the PR, and was
+    /// deleted.
+    Pushed,
+    /// A fixing run whose PRs were pushed to while it worked, so its
+    /// own push was refused; its session was deleted.
+    Superseded,
     /// Its session finished without posting anything on the PR; the
     /// session is kept.
     Unposted,
@@ -100,11 +107,45 @@ pub enum AutoReviewState {
     Cancelled,
 }
 
+/// What an unattended session the server started on one of the viewer's
+/// PRs does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoRunKind {
+    /// Reviews the PR and posts the review on it.
+    #[default]
+    Review,
+    /// Addresses the open comments on the PR and the PRs stacked on it,
+    /// and pushes the changes to them.
+    Fix,
+}
+
+impl AutoRunKind {
+    /// The value the database names it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoRunKind::Review => "review",
+            AutoRunKind::Fix => "fix",
+        }
+    }
+
+    /// The kind `as_str` names; unknown ones are reviews.
+    pub fn parse(s: &str) -> AutoRunKind {
+        match s {
+            "fix" => AutoRunKind::Fix,
+            _ => AutoRunKind::Review,
+        }
+    }
+}
+
 /// A review of one of the viewer's PRs that the server started, by
-/// itself or when asked to from the PR's page.
+/// itself or when asked to from the PR's page; or a fixing run, which
+/// addresses the PR's open comments.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutoReviewEntry {
     pub id: i64,
+    #[serde(default)]
+    pub kind: AutoRunKind,
     pub key: PrKey,
     pub title: String,
     pub url: String,
@@ -1393,14 +1434,24 @@ pub enum SessionKind {
     /// The server, to review one of the viewer's PRs unattended. It's
     /// listed in the Auto-reviews tab rather than the Agents tab.
     AutoReview,
+    /// The server, to address the open comments on one of the viewer's
+    /// PRs unattended and push the changes. It's listed with the
+    /// auto-reviews.
+    AutoFix,
 }
 
 impl SessionKind {
+    /// Nobody answers the session: it's a review or a fixing run.
+    pub fn unattended(self) -> bool {
+        self != SessionKind::Interactive
+    }
+
     /// The value the database names it with.
     pub fn as_str(self) -> &'static str {
         match self {
             SessionKind::Interactive => "interactive",
             SessionKind::AutoReview => "auto_review",
+            SessionKind::AutoFix => "auto_fix",
         }
     }
 
@@ -1408,6 +1459,7 @@ impl SessionKind {
     pub fn parse(s: &str) -> SessionKind {
         match s {
             "auto_review" => SessionKind::AutoReview,
+            "auto_fix" => SessionKind::AutoFix,
             _ => SessionKind::Interactive,
         }
     }

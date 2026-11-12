@@ -2792,6 +2792,16 @@ body.resizing-sidebar * {
   align-items: center;
   margin-top: 8px;
 }
+/* The fixing run's part, under the review's. */
+.auto-review-part.auto-fix {
+  margin-top: 12px;
+}
+.auto-review-part h3 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
 .merge-status {
   margin: 4px 0;
   font-weight: 600;

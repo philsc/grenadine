@@ -540,7 +540,9 @@ async fn update_prs(
                 .context("`prs` must be a list of {commit, pr, branch} objects")?,
         ),
     };
-    if let Some(number) = session.pr {
+    // A fixing run was started to push to its PR, and nobody is there to
+    // approve it.
+    if let Some(number) = session.pr.filter(|_| session.kind != SessionKind::AutoFix) {
         let key = PrKey {
             repo: session.repo.clone(),
             number,
@@ -636,7 +638,7 @@ async fn handoff(
     tool_use: &str,
     args: &Value,
 ) -> anyhow::Result<String> {
-    if session.kind == SessionKind::AutoReview {
+    if session.kind.unattended() {
         bail!("{}", agent::UNATTENDED_DENIAL);
     }
     let prompt = args["prompt"].as_str().unwrap_or_default();
@@ -1925,6 +1927,34 @@ mod tests {
             let (text, failed) = tool(&state, name, json!({})).await;
             assert!(failed && text.contains("review"), "{name}: {text}");
         }
+    }
+
+    /// A fixing run was started to push to its PR, so `update_prs` goes
+    /// on without asking, which nobody could answer; it fails here on
+    /// the unconfigured repo. It can't land on the checkout or hand off.
+    #[tokio::test]
+    async fn a_fixing_run_pushes_without_asking() {
+        let state = state_with(|s| {
+            s.kind = SessionKind::AutoFix;
+            s.pr = Some(24);
+        });
+        let (text, failed) = tool(&state, "update_prs", json!({})).await;
+        assert!(failed, "{text}");
+        assert!(!text.contains("didn't allow"), "{text}");
+        let asked = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::ApprovalRequested { .. }));
+        assert!(!asked);
+        let (text, failed) = tool(&state, "land_on_checkout", json!({})).await;
+        assert!(
+            failed && text.contains("only pushes to its pull requests"),
+            "{text}"
+        );
+        let (text, failed) = tool(&state, "handoff", json!({"prompt": "Do it"})).await;
+        assert!(failed && text == agent::UNATTENDED_DENIAL, "{text}");
     }
 
     /// A landing call that comes again while the first still runs, as

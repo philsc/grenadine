@@ -3,7 +3,7 @@
 //! section of a PR's sidebar that shows its latest review and asks for
 //! another.
 
-use grenadine_core::api::{AutoReviewEntry, AutoReviewState, PrKey};
+use grenadine_core::api::{AutoReviewEntry, AutoReviewState, AutoRunKind, PrKey};
 use leptos::prelude::*;
 
 use crate::agents::{cost, status_class, status_label};
@@ -17,11 +17,18 @@ pub fn hash(id: &str) -> String {
     format!("{LIST}/{id}")
 }
 
-fn state_label(s: AutoReviewState) -> &'static str {
+fn state_label(kind: AutoRunKind, s: AutoReviewState) -> &'static str {
+    let fix = kind == AutoRunKind::Fix;
     match s {
         AutoReviewState::Queued => "queued",
+        AutoReviewState::Running if fix => "addressing…",
         AutoReviewState::Running => "reviewing…",
+        // A fixing run that answered the comments and changed nothing.
+        AutoReviewState::Posted if fix => "answered",
         AutoReviewState::Posted => "posted",
+        AutoReviewState::Pushed => "pushed",
+        AutoReviewState::Superseded => "superseded",
+        AutoReviewState::Unposted if fix => "did nothing",
         AutoReviewState::Unposted => "didn't post",
         AutoReviewState::Failed => "failed",
         AutoReviewState::Cancelled => "cancelled",
@@ -32,10 +39,10 @@ fn state_class(s: AutoReviewState) -> &'static str {
     match s {
         AutoReviewState::Queued => "agent-status waiting",
         AutoReviewState::Running => "agent-status running",
-        AutoReviewState::Posted => "agent-status posted",
+        AutoReviewState::Posted | AutoReviewState::Pushed => "agent-status posted",
         AutoReviewState::Unposted => "agent-status waiting",
         AutoReviewState::Failed => "agent-status failed",
-        AutoReviewState::Cancelled => "agent-status",
+        AutoReviewState::Superseded | AutoReviewState::Cancelled => "agent-status",
     }
 }
 
@@ -84,8 +91,10 @@ fn Entry(review: AutoReviewEntry, route: Signal<Route>) -> impl IntoView {
         review.head_oid.chars().take(8).collect::<String>(),
         cost(review.cost, review.cost_unit),
     ];
-    if review.manual {
-        meta.push("asked for".into());
+    match (review.kind, review.manual) {
+        (AutoRunKind::Fix, _) => meta.push("addressing comments".into()),
+        (AutoRunKind::Review, true) => meta.push("asked for".into()),
+        (AutoRunKind::Review, false) => {}
     }
     let meta = meta.join(" · ");
     view! {
@@ -130,6 +139,12 @@ pub fn Overview() -> impl IntoView {
                 "section of its page's sidebar. A pull request has at most one review queued "
                 "or running at a time."
             </p>
+            <p class="muted">
+                "Address comments, in the same section, starts a session that addresses the "
+                "open comments on the pull request and on the ones stacked on it, pushes the "
+                "changes, and answers the comments. If you push to one of them meanwhile, its "
+                "push is refused and yours stays. One runs per stack at a time."
+            </p>
         </div>
     }
 }
@@ -141,16 +156,24 @@ fn badge(review: &AutoReviewEntry) -> AnyView {
             view! { <span class=status_class(status)>{status_label(status)}</span> }.into_any()
         }
         (state, _) => {
-            view! { <span class=state_class(state)>{state_label(state)}</span> }.into_any()
+            view! { <span class=state_class(state)>{state_label(review.kind, state)}</span> }
+                .into_any()
         }
     }
 }
 
 /// The section of the sidebar of one of the viewer's open PRs: how its
-/// latest review went, and a button that asks for another. `head` is the
-/// PR's latest synced commit.
+/// latest review and its latest fixing run went, and buttons that ask for
+/// another of each. `head` is the PR's latest synced commit, `open` how
+/// many of its comments a fixing run would address, and `stacked` whether
+/// open PRs are stacked on it, whose comments a fixing run addresses too.
 #[component]
-pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl IntoView {
+pub fn PrSection(
+    key: PrKey,
+    #[prop(into)] head: Signal<Option<String>>,
+    #[prop(into)] open: Signal<usize>,
+    #[prop(into)] stacked: Signal<bool>,
+) -> impl IntoView {
     let updates = expect_context::<Updates>();
     let reviews = {
         let key = key.clone();
@@ -164,16 +187,17 @@ pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl
     let error = RwSignal::new(None::<String>);
     // A request on its way, so a second click doesn't send another.
     let sending = RwSignal::new(false);
-    let send = move |cancel: Option<i64>, key: PrKey| {
+    let send = move |cancel: Option<i64>, kind: AutoRunKind, key: PrKey| {
         if sending.get_untracked() {
             return;
         }
         sending.set(true);
         error.set(None);
         leptos::task::spawn_local(async move {
-            let done = match cancel {
-                Some(id) => api::cancel_auto_review(id).await,
-                None => api::ask_auto_review(&key).await,
+            let done = match (cancel, kind) {
+                (Some(id), _) => api::cancel_auto_review(id).await,
+                (None, AutoRunKind::Review) => api::ask_auto_review(&key).await,
+                (None, AutoRunKind::Fix) => api::ask_auto_fix(&key).await,
             };
             sending.set(false);
             if let Err(e) = done {
@@ -182,20 +206,40 @@ pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl
             reviews.refetch();
         });
     };
-    let body = move || {
-        let latest = match reviews.get() {
-            None => return view! { <p class="muted">"Loading…"</p> }.into_any(),
-            Some(Err(e)) => return view! { <p class="error">{e}</p> }.into_any(),
-            Some(Ok(list)) => list.into_iter().next(),
-        };
+    // The latest run of `kind` and the button that asks for another.
+    let part = move |kind: AutoRunKind, latest: Option<AutoReviewEntry>, key: PrKey| {
+        let fix = kind == AutoRunKind::Fix;
         let now = (js_sys::Date::now() / 1000.0) as i64;
-        let key = key.clone();
+        let ask = {
+            let key = key.clone();
+            move |label: &'static str| {
+                // Nothing to address here or above.
+                let idle = move || fix && open.get() == 0 && !stacked.get();
+                let key = key.clone();
+                view! {
+                    <button type="button" prop:disabled=move || sending.get() || idle()
+                        on:click=move |_| send(None, kind, key.clone())>{label}</button>
+                }
+            }
+        };
+        let comments = fix.then(|| {
+            view! {
+                <p class="muted auto-fix-open">
+                    {move || match (open.get(), stacked.get()) {
+                        (0, false) => "No open comments.".to_owned(),
+                        (0, true) => "No open comments on this PR.".to_owned(),
+                        (1, _) => "1 open comment.".to_owned(),
+                        (n, _) => format!("{n} open comments."),
+                    }}
+                </p>
+            }
+        });
         let Some(r) = latest else {
             return view! {
-                <p class="muted">"Not reviewed yet."</p>
+                {(!fix).then(|| view! { <p class="muted">"Not reviewed yet."</p> })}
+                {comments}
                 <div class="form-buttons">
-                    <button type="button" prop:disabled=move || sending.get()
-                        on:click=move |_| send(None, key.clone())>"Review now"</button>
+                    {ask(if fix { "Address comments" } else { "Review now" })}
                 </div>
             }
             .into_any();
@@ -213,7 +257,8 @@ pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl
             _ if queued => format!("asked {}", ago(now, r.started_at)),
             _ => format!("started {}", ago(now, r.started_at)),
         });
-        let moved = !active && head.get().is_some_and(|h| h != r.head_oid);
+        // A fixing run moves the head itself.
+        let moved = !fix && !active && head.get().is_some_and(|h| h != r.head_oid);
         let session = r.session.clone().filter(|_| active).map(|id| {
             view! { <a class="auto-review-session" href=hash(&id)>"Open session"</a> }
         });
@@ -222,27 +267,53 @@ pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl
             view! {
                 {session}
                 <button type="button" prop:disabled=move || sending.get()
-                    on:click=move |_| send(Some(id), key.clone())>"Cancel"</button>
+                    on:click=move |_| send(Some(id), kind, key.clone())>"Cancel"</button>
             }
             .into_any()
         } else {
-            view! {
-                <button type="button" prop:disabled=move || sending.get()
-                    on:click=move |_| send(None, key.clone())>"Review again"</button>
-            }
+            ask(if fix {
+                "Address comments"
+            } else {
+                "Review again"
+            })
             .into_any()
         };
+        let waits = match fix {
+            true => "Waits for a free slot, and for a fixing run in this stack to end.",
+            false => "Waits for one of the running reviews to end.",
+        };
+        let superseded = r.state == AutoReviewState::Superseded;
         view! {
             <p class="auto-review-state">
                 {badge(&r)}
                 <span class="muted">{meta.join(" · ")}</span>
             </p>
             {r.error.clone().map(|e| view! { <p class="muted auto-review-error">{e}</p> })}
-            {queued.then(|| view! {
-                <p class="muted">"Waits for one of the running reviews to end."</p>
-            })}
+            {queued.then(|| view! { <p class="muted">{waits}</p> })}
             {moved.then(|| view! { <p class="muted">"A newer version was pushed since."</p> })}
+            {superseded.then(|| view! {
+                <p class="muted">"The PR was pushed to while it ran, so its changes were dropped."</p>
+            })}
+            {(!active).then_some(comments)}
             <div class="form-buttons">{buttons}</div>
+        }
+        .into_any()
+    };
+    let body = move || {
+        let list = match reviews.get() {
+            None => return view! { <p class="muted">"Loading…"</p> }.into_any(),
+            Some(Err(e)) => return view! { <p class="error">{e}</p> }.into_any(),
+            Some(Ok(list)) => list,
+        };
+        let latest = |kind| list.iter().find(|r| r.kind == kind).cloned();
+        view! {
+            <div class="auto-review-part">
+                {part(AutoRunKind::Review, latest(AutoRunKind::Review), key.clone())}
+            </div>
+            <div class="auto-review-part auto-fix">
+                <h3>"Comments"</h3>
+                {part(AutoRunKind::Fix, latest(AutoRunKind::Fix), key.clone())}
+            </div>
         }
         .into_any()
     };

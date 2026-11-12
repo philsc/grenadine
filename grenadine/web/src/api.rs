@@ -118,7 +118,19 @@ pub async fn ask_auto_review(key: &PrKey) -> Result<()> {
     .map(|_| ())
 }
 
-/// Cancels a queued or running review.
+/// Asks for a fixing run of the PR, which addresses its open comments
+/// and those of the PRs stacked on it.
+pub async fn ask_auto_fix(key: &PrKey) -> Result<()> {
+    check(
+        Request::post(&format!("{}/auto-fixes", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Cancels a queued or running review or fixing run.
 pub async fn cancel_auto_review(id: i64) -> Result<()> {
     check(
         Request::delete(&format!("/api/auto-reviews/{id}"))
