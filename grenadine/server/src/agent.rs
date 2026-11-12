@@ -2176,6 +2176,9 @@ pub async fn land_now(
         (SessionKind::AutoFix, WrapUpTarget::Checkout) => {
             bail!("an unattended fixing run only pushes to its pull requests")
         }
+        (SessionKind::AutoFix, WrapUpTarget::PullRequest) => {
+            adopt_newcomers(state, &session).await?
+        }
         _ => {}
     }
     let tool = match target {
@@ -2198,20 +2201,113 @@ pub async fn land_now(
     }
 }
 
-/// After the fixing run `session` pushed `landed`, has the other
-/// sessions that manage those PRs know: each gets a lease on the PRs at
-/// their new tips, the tips as refs to rebase onto, and a note for its
-/// agent's next turn.
+/// Before the fixing run `session` pushes: PRs that were stacked on its
+/// top PR since it started would keep the old commits. They join the
+/// run's PRs, each with a lease, and the push is put off with an error
+/// that tells the agent to rebase them too.
+async fn adopt_newcomers(state: &Arc<State>, session: &AgentSession) -> Result<()> {
+    let landed = landed_prs(session);
+    let Some(top) = landed.last() else {
+        return Ok(());
+    };
+    let key = |number| PrKey {
+        repo: session.repo.clone(),
+        number,
+    };
+    let Some(detail) = state.db.pr(&key(top.number))? else {
+        return Ok(());
+    };
+    let list = |numbers: &[u64]| {
+        numbers
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let stop = "Stop here: say so and finish without pushing.";
+    let above = match detail.stack.as_ref().map(|s| chain_above(s, top.number)) {
+        Some(Above::Linear(above)) if !above.is_empty() => above,
+        Some(Above::Fork { at, children }) => bail!(
+            "while this session worked, {} were stacked on #{at}, and it can only rebase one \
+             chain of pull requests. {stop}",
+            list(&children)
+        ),
+        _ => return Ok(()),
+    };
+    let mut added = Vec::new();
+    for n in &above {
+        let Some(pr) = state.db.pr(&key(*n))? else {
+            state.sync_once(key(*n));
+            bail!(
+                "#{n} was stacked on #{} while this session worked and hasn't synced yet. \
+                 Call update_prs again in a minute",
+                top.number
+            );
+        };
+        if pr.summary.author != detail.summary.author {
+            bail!(
+                "while this session worked, #{n}, which isn't the user's, was stacked on \
+                 #{}, and this session's push would leave it on the old commits. {stop}",
+                top.number
+            );
+        }
+        added.push(taken_pr(&pr)?);
+    }
+    let cloned = state
+        .repos
+        .get(&session.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?;
+    {
+        let _guard = cloned.git_lock.lock().await;
+        let repo = cloned.repo.clone();
+        let fetch = added.clone();
+        tokio::task::spawn_blocking(move || {
+            fetch.iter().try_for_each(|p| {
+                repo.fetch_branch(&p.branch, &format!("{STACK_REF}/{}", p.number))
+                    .map(|_| ())
+            })
+        })
+        .await??;
+    }
+    let mut all = landed.clone();
+    all.extend(added.clone());
+    state
+        .db
+        .set_agent_landed(&session.id, &Landed::from_prs(all))?;
+    let mut heads = BTreeMap::new();
+    for p in &added {
+        state.db.add_agent_pr(&session.id, &key(p.number), "OPEN")?;
+        if let Some(head) = &p.lease {
+            heads.insert(p.number, head.clone());
+        }
+    }
+    crate::auto_review::record_heads(state, &session.id, &heads, true)?;
+    state.send(ServerEvent::AgentsChanged);
+    let lines = added
+        .iter()
+        .map(|p| {
+            format!(
+                "- #{} {} on branch `{}`, fetched as {STACK_REF}/{}",
+                p.number, p.url, p.branch, p.number
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "nothing was pushed: while this session worked, these pull requests were stacked on \
+         #{}, bottom first:\n{lines}\nThis session manages them now too. Rebase their \
+         commits onto this session's commits, then call update_prs again with an entry for \
+         every pull request this session manages, these included",
+        top.number
+    )
+}
+
+/// After the fixing run `session` pushed `landed`, records where its
+/// PRs are now, and has the other sessions that manage those PRs know:
+/// each gets a lease on the PRs at their new tips, the tips as refs to
+/// rebase onto, and a note for its agent's next turn.
 async fn tell_managers(state: &Arc<State>, session: &AgentSession, landed: &Landed) -> Result<()> {
     let prs = landed.prs();
-    let numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
-    if state
-        .db
-        .pr_managers(&session.repo, &numbers, &session.id)?
-        .is_empty()
-    {
-        return Ok(());
-    }
     let cloned = state
         .repos
         .get(&session.repo)
@@ -2229,6 +2325,7 @@ async fn tell_managers(state: &Arc<State>, session: &AgentSession, landed: &Land
         })
         .await??
     };
+    crate::auto_review::record_heads(state, &session.id, &tips, false)?;
     let told = state
         .db
         .pushed_by_another(&session.repo, &session.id, &tips)?;
@@ -7619,6 +7716,89 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
             wait_for_turns(&state, &owner.id, n).await;
             assert_eq!(turns(n), hears, "turn {n}");
         }
+    }
+
+    /// A PR that was stacked on a fixing run's top PR while it worked
+    /// would keep the old commits, so the run's push waits: the PR joins
+    /// the run's PRs, and the agent is told to rebase it too.
+    #[tokio::test]
+    async fn a_fixing_run_takes_along_a_pr_stacked_on_it_meanwhile() {
+        use crate::git::tests::{commit, run};
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let heads = push_chain(&fx, &[(42, "pr-c", 41, "pr-b")]);
+        let two = open_stack(&[(40, None, &heads[&40]), (41, Some(40), &heads[&41])]);
+        store_chain(&state, &fx, &heads, &CHAIN[..2], &two);
+        let req = NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: Some(40),
+            prompt: "address".into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            draft: None,
+        };
+        let fixer = create_session(&state, req, SessionKind::AutoFix, None, None)
+            .await
+            .unwrap();
+        wait_for_turns(&state, &fixer.id, 1).await;
+        let id = &fixer.id;
+        let fixer = state.db.agent(id).unwrap().unwrap();
+        let worktree = Path::new(&fixer.worktree);
+        let fixed = commit(worktree, "g41", "41 fixed\n");
+
+        // #42 shows up on #41.
+        store_chain(&state, &fx, &heads, &CHAIN, &chain_stack(&heads));
+        let spec = |commit: &str, pr| PrSpec {
+            commit: commit.to_owned(),
+            pr: Some(pr),
+            branch: None,
+        };
+        let err = land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(vec![spec(&heads[&40], 40), spec(&fixed, 41)]),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("nothing was pushed"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "#42 u on branch `pr-c`, fetched as {STACK_REF}/42"
+            )),
+            "{text}"
+        );
+        assert_eq!(upstream_tip(&fx, "pr-b"), heads[&41]);
+        let managed: Vec<_> = landed_prs(&state.db.agent(id).unwrap().unwrap())
+            .into_iter()
+            .map(|p| (p.number, p.lease))
+            .collect();
+        assert_eq!(managed.len(), 3);
+        assert_eq!(managed[2], (42, Some(heads[&42].clone())));
+
+        // With #42's commit on top, everything is pushed.
+        run(worktree, &["cherry-pick", &format!("{STACK_REF}/42")]);
+        let top = run(worktree, &["rev-parse", "HEAD"]);
+        land_now(
+            &state,
+            id,
+            WrapUpTarget::PullRequest,
+            Some(vec![
+                spec(&heads[&40], 40),
+                spec(&fixed, 41),
+                spec(&top, 42),
+            ]),
+            &begin_landing(&state, id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(upstream_tip(&fx, "pr-b"), fixed);
+        assert_eq!(upstream_tip(&fx, "pr-c"), top);
     }
 
     /// The first push to a taken PR doesn't go through when its branch

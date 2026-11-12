@@ -374,6 +374,9 @@ mod tests {
             cost: 0.0,
             cost_unit: CostUnit::Usd,
             error: None,
+            round: None,
+            heads: Default::default(),
+            start_heads: Default::default(),
         }
     }
 

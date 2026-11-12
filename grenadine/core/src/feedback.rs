@@ -37,6 +37,16 @@ impl Feedback<'_> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Only what `viewer` posted, which includes what an auto-review
+    /// did: the threads they started, and their summaries and comments.
+    pub fn by(mut self, viewer: &str) -> Self {
+        let theirs = |p: &crate::api::Person| p.login.as_deref() == Some(viewer);
+        self.threads.retain(|t| t.root.author == viewer);
+        self.summaries.retain(|r| theirs(&r.author));
+        self.comments.retain(|c| theirs(&c.author));
+        self
+    }
 }
 
 /// The open feedback on `detail`'s PR; none before its reviews synced.
@@ -199,6 +209,7 @@ mod tests {
         ];
         let open = open_in("me", &comments, &[], &[]);
         assert_eq!(roots(&open), [1, 4, 8, 12]);
+        assert_eq!(roots(&open.clone().by("me")), [8, 12]);
         assert_eq!(open.threads[1].replies.len(), 2);
         assert_eq!(open.len(), 4);
     }
@@ -224,6 +235,7 @@ mod tests {
         assert_eq!(bodies, ["New points."]);
         let bodies: Vec<_> = open_now.comments.iter().map(|c| &c.body).collect();
         assert_eq!(bodies, ["After.", "Later."]);
+        assert!(open_now.by("me").is_empty());
 
         // Without a mark, everything with a body is open.
         let unmarked: Vec<_> = conversation

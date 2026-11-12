@@ -20,6 +20,16 @@
 //! next turn. Fixing runs share the reviews' queue and limit, and
 //! only one runs in a stack at a time, since each rewrites the PRs above
 //! its own.
+//!
+//! With `RepoSettings::fix_rounds`, a stack of the viewer's PRs gets
+//! rounds of both by itself. A round reviews each PR of the stack whose
+//! changes weren't reviewed yet, and once those reviews are done, one
+//! fixing run addresses what they raised, starting at the lowest PR
+//! with such comments. Its push starts the next round. The rounds are
+//! counted since the last push that wasn't a fixing run's, and the loop
+//! ends early when a round's reviews raise nothing or its fixing run
+//! pushes nothing. Each poll works out where a stack stands from its
+//! PRs' heads and the `auto_reviews` rows, so nothing else is stored.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +38,8 @@ use std::time::Duration;
 use anyhow::Result;
 use grenadine_core::api::{
     AgentBackend, AgentEventKind, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState,
-    AutoRunKind, NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
+    AutoRunKind, MAX_FIX_ROUNDS, NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings,
+    ServerEvent, SessionKind,
 };
 use grenadine_core::feedback::{self, Feedback};
 
@@ -166,6 +177,12 @@ pub fn to_save(
             ));
         }
     }
+    if new.fix_rounds > MAX_FIX_ROUNDS {
+        return Err(format!(
+            "{} rounds of review and fixes are too many: at most {MAX_FIX_ROUNDS}",
+            new.fix_rounds
+        ));
+    }
     let turned_on = old.auto_review == AutoReview::Off && new.auto_review != AutoReview::Off;
     let auto_review_since = match (turned_on, old.auto_review_since) {
         (false, Some(since)) => Some(since),
@@ -223,6 +240,82 @@ pub async fn search(state: &State) -> Result<Vec<Hit>> {
     }
 }
 
+/// What a PR's stack's loop says about reviewing the PR's head.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Seen {
+    /// An earlier review saw the same changes at another head: the PR
+    /// was only rebased since.
+    same_changes: bool,
+    /// The head is where a fixing run of the loop pushed it, and whether
+    /// the loop has rounds left. The next round reviews it whatever the
+    /// settings say about new pushes; after the last round nothing does.
+    after_fix: Option<bool>,
+}
+
+/// Where a stack's loop stands.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LoopState {
+    /// The rounds done since the last push that wasn't a fixing run's.
+    used: u32,
+    /// The loop's latest fixing run, when nobody else pushed since.
+    last: Option<AutoReviewEntry>,
+    /// The loop ran in this stack before.
+    ran: bool,
+    /// A PR shows the head its latest fixing run found it at, though the
+    /// run pushed it elsewhere: GitHub hasn't caught up with the push.
+    stale: bool,
+}
+
+/// `LoopState` of a stack from the fixing runs that the server started
+/// in it, newest first, and its open PRs' heads now.
+fn loop_state(fixes: &[AutoReviewEntry], heads: &BTreeMap<u64, String>) -> LoopState {
+    let latest = fixes.first();
+    // A PR that was merged or closed since doesn't count as pushed to.
+    let last = latest.filter(|l| {
+        !l.heads.is_empty()
+            && l.heads
+                .iter()
+                .all(|(n, head)| heads.get(n).is_none_or(|now| now == head))
+    });
+    let stale = latest.is_some_and(|l| {
+        heads.iter().any(|(n, now)| {
+            l.heads.get(n).is_some_and(|left| left != now) && l.start_heads.get(n) == Some(now)
+        })
+    });
+    LoopState {
+        used: last.and_then(|l| l.round).unwrap_or(0),
+        last: last.cloned(),
+        ran: latest.is_some(),
+        stale,
+    }
+}
+
+impl LoopState {
+    /// `Seen::after_fix` of the PR `number` at `head` with `rounds`
+    /// rounds allowed.
+    fn after_fix(&self, number: u64, head: &str, rounds: u32) -> Option<bool> {
+        self.last
+            .as_ref()
+            .filter(|l| l.state == AutoReviewState::Pushed)
+            .filter(|l| l.heads.get(&number).is_some_and(|h| h == head))
+            .map(|_| self.used < rounds)
+    }
+
+    /// Whether the loop is over until someone else pushes: its rounds
+    /// are used up, its last fixing run pushed nothing, or the settings
+    /// give a stack only one loop and it had it. It also waits while
+    /// GitHub lags behind its last push.
+    fn over(&self, settings: &RepoSettings) -> bool {
+        self.stale
+            || self.used >= settings.fix_rounds
+            || self
+                .last
+                .as_ref()
+                .is_some_and(|l| l.state != AutoReviewState::Pushed)
+            || (self.ran && self.last.is_none() && !settings.rereview_on_push)
+    }
+}
+
 /// Whether `hit` gets a review now. `created_at` is when the PR was
 /// opened, in Unix seconds; `reviews` are its earlier reviews; `running`
 /// counts the reviews of any PR that are running.
@@ -232,6 +325,7 @@ fn due(
     created_at: i64,
     reviews: &[AutoReviewEntry],
     running: usize,
+    seen: Seen,
 ) -> bool {
     let wanted = match settings.auto_review {
         AutoReview::Off => false,
@@ -243,10 +337,11 @@ fn due(
         .is_some_and(|since| created_at >= since);
     // The PR's fixing runs are in the list too.
     let mut reviews = reviews.iter().filter(|r| r.kind == AutoRunKind::Review);
-    let reviewed = if settings.rereview_on_push {
-        reviews.clone().any(|r| r.head_oid == hit.head_oid)
-    } else {
-        reviews.clone().next().is_some()
+    let at_head = seen.same_changes || reviews.clone().any(|r| r.head_oid == hit.head_oid);
+    let reviewed = match seen.after_fix {
+        Some(more) => at_head || !more,
+        None if settings.rereview_on_push => at_head,
+        None => reviews.clone().next().is_some(),
     };
     let busy =
         reviews.any(|r| matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running));
@@ -294,10 +389,17 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
             return;
         }
     };
+    let stacks = match stacks(state, hits) {
+        Ok(stacks) => stacks,
+        Err(e) => {
+            tracing::warn!("can't work out the stacks' loops: {e:#}");
+            Vec::new()
+        }
+    };
     let mut settings = BTreeMap::new();
     for hit in hits {
         let key = &hit.key;
-        let checked = (|| -> Result<Option<(RepoSettings, PrDetail)>> {
+        let checked = async {
             let s = match settings.get(&key.repo) {
                 Some(s) => s,
                 None => settings
@@ -308,17 +410,22 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
                 return Ok(None);
             };
             let reviews = state.db.auto_reviews_of(key)?;
-            if !due(hit, s, github::unix(&created_at)?, &reviews, running) {
-                return Ok(None);
-            }
             // A sync that failed or is behind the search waits for the
             // next poll.
-            Ok(state
+            let Some(detail) = state
                 .db
                 .pr(key)?
                 .filter(|d| synced_head(d) == Some(hit.head_oid.as_str()))
-                .map(|d| (s.clone(), d)))
-        })();
+            else {
+                return Ok(None);
+            };
+            let seen = seen(state, &stacks, hit, s, &detail, &reviews).await;
+            if !due(hit, s, github::unix(&created_at)?, &reviews, running, seen) {
+                return Ok(None);
+            }
+            anyhow::Ok(Some((s.clone(), detail)))
+        }
+        .await;
         match checked {
             Ok(Some((s, detail))) => {
                 if start(state, hit, &s, &detail).await {
@@ -333,6 +440,271 @@ pub async fn start_due(state: &Arc<State>, hits: &[Hit]) {
             ),
         }
     }
+    match queue_loop_fixes(state, &stacks).await {
+        Ok(false) => {}
+        Ok(true) => {
+            state.send(ServerEvent::AutoReviewsChanged);
+            if let Err(e) = start_queued_locked(state).await {
+                tracing::warn!("can't start the queued fixing runs: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("can't go on with the stacks' loops: {e:#}"),
+    }
+}
+
+/// The viewer's open PRs of one stack in a repository whose settings ask
+/// for rounds of review and fixes, and where the stack's loop stands.
+struct LoopStack {
+    settings: RepoSettings,
+    /// Bottom first, each as synced at the head the search saw.
+    prs: Vec<(Hit, PrDetail)>,
+    state: LoopState,
+}
+
+/// How many PRs of its stack are below `number`.
+fn depth(detail: &PrDetail, number: u64) -> usize {
+    let Some(stack) = &detail.stack else {
+        return 0;
+    };
+    let parent = |n: u64| {
+        stack
+            .prs
+            .iter()
+            .find(|p| p.number == n)
+            .and_then(|p| p.parent)
+    };
+    let (mut depth, mut at) = (0, number);
+    while let Some(p) = parent(at) {
+        depth += 1;
+        at = p;
+        if depth > stack.prs.len() {
+            break;
+        }
+    }
+    depth
+}
+
+/// The stacks among `hits` that get loops. One with a PR that hasn't
+/// synced at its head is left out until it has.
+fn stacks(state: &State, hits: &[Hit]) -> Result<Vec<LoopStack>> {
+    let mut out: Vec<LoopStack> = Vec::new();
+    let mut settings = BTreeMap::new();
+    for hit in hits {
+        let key = &hit.key;
+        let s = match settings.get(&key.repo) {
+            Some(s) => s,
+            None => settings
+                .entry(key.repo.clone())
+                .or_insert(state.db.repo_settings(&key.repo)?),
+        };
+        if s.fix_rounds == 0 || s.auto_review == AutoReview::Off {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|stack| stack.prs.iter().any(|(h, _)| h.key == *key))
+        {
+            continue;
+        }
+        let Some(detail) = state.db.pr(key)? else {
+            continue;
+        };
+        let mut prs = Vec::new();
+        for other in hits.iter().filter(|h| same_stack(&detail, &h.key)) {
+            match state.db.pr(&other.key)? {
+                Some(d) if synced_head(&d) == Some(other.head_oid.as_str()) => {
+                    prs.push((other.clone(), d))
+                }
+                _ => {
+                    prs.clear();
+                    break;
+                }
+            }
+        }
+        if prs.is_empty() {
+            continue;
+        }
+        prs.sort_by_key(|(h, d)| (depth(d, h.key.number), h.key.number));
+        let mut fixes = Vec::new();
+        for (h, _) in &prs {
+            fixes.extend(
+                state
+                    .db
+                    .auto_reviews_of(&h.key)?
+                    .into_iter()
+                    .filter(|r| r.kind == AutoRunKind::Fix && r.round.is_some()),
+            );
+        }
+        fixes.sort_by_key(|r| std::cmp::Reverse((r.started_at, r.id)));
+        let heads = prs
+            .iter()
+            .map(|(h, _)| (h.key.number, h.head_oid.clone()))
+            .collect();
+        out.push(LoopStack {
+            settings: s.clone(),
+            prs,
+            state: loop_state(&fixes, &heads),
+        });
+    }
+    Ok(out)
+}
+
+/// The ids of the changes a PR had at each of its versions, by merge
+/// base and head; they don't change, so they're worked out once.
+static CHANGES: std::sync::Mutex<BTreeMap<(String, String), String>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Whether a review of `detail`'s PR at another head saw the changes it
+/// has now: it was rebased since, and nothing else.
+async fn same_changes(state: &State, detail: &PrDetail, reviews: &[AutoReviewEntry]) -> bool {
+    let Some(cloned) = state.repos.get(&detail.summary.key.repo) else {
+        return false;
+    };
+    let range = |sha: &str| {
+        let v = detail
+            .versions
+            .iter()
+            .find(|v| v.sha == sha && !v.missing)?;
+        Some((v.merge_base.clone()?, v.sha.clone()))
+    };
+    let Some(now) = synced_head(detail).and_then(range) else {
+        return false;
+    };
+    let before: Vec<(String, String)> = reviews
+        .iter()
+        .filter(|r| r.kind == AutoRunKind::Review && r.head_oid != now.1)
+        .filter_map(|r| range(&r.head_oid))
+        .collect();
+    if before.is_empty() {
+        return false;
+    }
+    let repo = cloned.repo.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let id = |range: &(String, String)| -> Option<String> {
+            if let Some(id) = CHANGES.lock().unwrap().get(range) {
+                return Some(id.clone());
+            }
+            let id = repo.changes_id(&range.0, &range.1).ok()?;
+            CHANGES.lock().unwrap().insert(range.clone(), id.clone());
+            Some(id)
+        };
+        let now = id(&now)?;
+        Some(!now.is_empty() && before.iter().any(|b| id(b).as_ref() == Some(&now)))
+    })
+    .await;
+    matches!(found, Ok(Some(true)))
+}
+
+/// `Seen` of `hit`, whose PR is `detail` and has the `reviews`.
+async fn seen(
+    state: &State,
+    stacks: &[LoopStack],
+    hit: &Hit,
+    settings: &RepoSettings,
+    detail: &PrDetail,
+    reviews: &[AutoReviewEntry],
+) -> Seen {
+    let after_fix = stacks
+        .iter()
+        .find(|stack| stack.prs.iter().any(|(h, _)| h.key == hit.key))
+        .and_then(|stack| {
+            stack
+                .state
+                .after_fix(hit.key.number, &hit.head_oid, settings.fix_rounds)
+        });
+    // Only a head that no review saw can be a rebase of one that did.
+    let at_head = reviews
+        .iter()
+        .any(|r| r.kind == AutoRunKind::Review && r.head_oid == hit.head_oid);
+    let rereviews = settings.rereview_on_push || after_fix.is_some();
+    Seen {
+        same_changes: rereviews && !at_head && same_changes(state, detail, reviews).await,
+        after_fix,
+    }
+}
+
+/// What a fixing run of `detail`'s PR addresses there: everything open
+/// when it was asked for, and only what's posted under the viewer's
+/// name, such as an auto-review's comments, when the loop started it.
+fn to_address(detail: &PrDetail, asked_for: bool) -> Feedback<'_> {
+    let open = feedback::open(detail);
+    match &detail.review {
+        Some(review) if !asked_for => open.by(&review.viewer),
+        _ => open,
+    }
+}
+
+/// Queues the next fixing run of each of `stacks` whose round's reviews
+/// are done and raised something. Returns whether it queued any.
+async fn queue_loop_fixes(state: &Arc<State>, stacks: &[LoopStack]) -> Result<bool> {
+    let mut queued = false;
+    for stack in stacks {
+        let s = &stack.settings;
+        if stack.state.over(s) {
+            continue;
+        }
+        let last = stack.state.last.as_ref();
+        // The round's reviews: none on its way or still to start, and
+        // one that came after the last fixing run.
+        let (mut waiting, mut reviewed) = (false, false);
+        for (hit, detail) in &stack.prs {
+            let rows = state.db.auto_reviews_of(&hit.key)?;
+            waiting |= rows
+                .iter()
+                .any(|r| matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running));
+            let Some(created_at) = state.db.pr_created_at(&hit.key)? else {
+                waiting = true;
+                continue;
+            };
+            let seen = Seen {
+                same_changes: same_changes(state, detail, &rows).await,
+                after_fix: stack
+                    .state
+                    .after_fix(hit.key.number, &hit.head_oid, s.fix_rounds),
+            };
+            // Whatever the limit: one that waits for room is still due.
+            waiting |= due(hit, s, github::unix(&created_at)?, &rows, 0, seen);
+            reviewed |= rows.iter().any(|r| {
+                r.kind == AutoRunKind::Review
+                    && r.state == AutoReviewState::Posted
+                    && (r.head_oid == hit.head_oid || seen.same_changes)
+                    && last.is_none_or(|l| r.started_at >= l.finished_at.unwrap_or(l.started_at))
+            });
+        }
+        if waiting || !reviewed {
+            continue;
+        }
+        let Some((hit, detail)) = stack
+            .prs
+            .iter()
+            .find(|(_, d)| !to_address(d, false).is_empty())
+        else {
+            continue;
+        };
+        // A stack that forks or has someone else's PR above gets none.
+        if fix_chain(&state.db, detail)?.is_err() {
+            continue;
+        }
+        let round = stack.state.used + 1;
+        let id = state.db.queue_loop_fix(
+            &hit.key,
+            &hit.head_oid,
+            &detail.summary.title,
+            &detail.summary.url,
+            round,
+            agent::now(),
+        )?;
+        if id.is_some() {
+            tracing::info!(
+                "{}#{}: round {round} of {}: queued a fixing run",
+                hit.key.repo,
+                hit.key.number,
+                s.fix_rounds
+            );
+            queued = true;
+        }
+    }
+    Ok(queued)
 }
 
 /// Why a review can't be asked for.
@@ -353,6 +725,11 @@ pub enum Refused {
     },
     /// Neither the PR nor the ones stacked on it have open comments.
     NothingOpen,
+    /// Someone else's PR is stacked on it, which a fixing run would
+    /// rewrite.
+    NotYoursAbove {
+        number: u64,
+    },
     /// The repository's review backend isn't offered; its label.
     NotOffered(&'static str),
 }
@@ -368,6 +745,10 @@ impl std::fmt::Display for Refused {
                 f,
                 "several pull requests are stacked on #{at}, and a fixing run can only rebase \
                  one chain of them"
+            ),
+            Refused::NotYoursAbove { number } => write!(
+                f,
+                "#{number}, which is stacked on it, isn't yours, and a fixing run would rewrite it"
             ),
             Refused::NothingOpen => write!(
                 f,
@@ -395,6 +776,9 @@ fn fix_chain(db: &Db, detail: &PrDetail) -> Result<std::result::Result<Vec<PrDet
             number,
         };
         match db.pr(&key)? {
+            Some(d) if d.summary.author != detail.summary.author => {
+                return Ok(Err(Refused::NotYoursAbove { number }));
+            }
             Some(d) if synced_head(&d).is_some() => chain.push(d),
             _ => return Ok(Err(Refused::NotSynced)),
         }
@@ -558,7 +942,7 @@ async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
                 continue;
             }
             match fix_chain(&state.db, &detail)? {
-                Ok(prs) if prs.iter().all(|d| feedback::open(d).is_empty()) => {
+                Ok(prs) if prs.iter().all(|d| to_address(d, review.manual).is_empty()) => {
                     cancel("No open comments were left when it could start.")?;
                     continue;
                 }
@@ -582,7 +966,22 @@ async fn start_queued_locked(state: &Arc<State>) -> Result<()> {
             agent::now(),
         )?;
         let kind = review.kind;
-        if begun && launch(state, review.id, kind, head, &settings, &detail, &chain).await {
+        if begun && kind == AutoRunKind::Fix {
+            // Where the run found its PRs, to tell a later push by
+            // someone else from its own.
+            let heads = chain
+                .iter()
+                .filter_map(|d| Some((d.summary.key.number, synced_head(d)?.to_owned())))
+                .collect();
+            state.db.add_auto_fix_heads(review.id, &heads, true)?;
+        }
+        let asked_for = review.manual;
+        if begun
+            && launch(
+                state, review.id, kind, asked_for, head, &settings, &detail, &chain,
+            )
+            .await
+        {
             running += 1;
             if kind == AutoRunKind::Fix {
                 fixing.push(key.clone());
@@ -619,16 +1018,19 @@ async fn start(state: &Arc<State>, hit: &Hit, settings: &RepoSettings, detail: &
         }
     };
     let kind = AutoRunKind::Review;
-    launch(state, id, kind, &hit.head_oid, settings, detail, &[]).await
+    launch(state, id, kind, false, &hit.head_oid, settings, detail, &[]).await
 }
 
 /// Starts the session of the review or fixing run `id` of `detail`'s PR
 /// at `head`, which is recorded as running. `chain` is what a fixing run
-/// covers, as `fix_chain` has it. Returns whether it's running.
+/// covers, as `fix_chain` has it, and `asked_for` whether it was asked
+/// for from the PR's page. Returns whether it's running.
+#[allow(clippy::too_many_arguments)]
 async fn launch(
     state: &Arc<State>,
     id: i64,
     kind: AutoRunKind,
+    asked_for: bool,
     head: &str,
     settings: &RepoSettings,
     detail: &PrDetail,
@@ -669,7 +1071,7 @@ async fn launch(
             format!("Review #{}: {}", key.number, detail.summary.title),
         ),
         AutoRunKind::Fix => (
-            fix_prompt(chain),
+            fix_prompt(chain, asked_for),
             SessionKind::AutoFix,
             format!(
                 "Address comments on #{}: {}",
@@ -856,8 +1258,9 @@ fn feedback_lines(detail: &PrDetail, open: &Feedback) -> String {
 }
 
 /// The prompt of a fixing run that covers `chain`, bottom first: the
-/// open feedback on each of its PRs.
-fn fix_prompt(chain: &[PrDetail]) -> String {
+/// feedback on each of its PRs that it's to address, as `to_address`
+/// has it.
+fn fix_prompt(chain: &[PrDetail], asked_for: bool) -> String {
     let Some(first) = chain.first() else {
         return String::new();
     };
@@ -872,7 +1275,7 @@ fn fix_prompt(chain: &[PrDetail]) -> String {
     };
     out += " These are the comments, bottom pull request first:\n";
     for detail in chain {
-        let open = feedback::open(detail);
+        let open = to_address(detail, asked_for);
         if !open.is_empty() {
             out += &format!("\n{}", feedback_lines(detail, &open));
         }
@@ -1007,6 +1410,22 @@ async fn finish(
     state
         .db
         .finish_auto_review(review.id, AutoReviewState::Unposted, None, agent::now())
+}
+
+/// Records where the fixing run of session `id` left PRs, `heads` by
+/// PR number: where it pushed them, or with `found`, where it found
+/// ones that joined it. A head recorded here isn't taken for someone
+/// else's push later.
+pub fn record_heads(
+    state: &State,
+    id: &str,
+    heads: &BTreeMap<u64, String>,
+    found: bool,
+) -> Result<()> {
+    if let Some(run) = state.db.auto_review_of(id)? {
+        state.db.add_auto_fix_heads(run.id, heads, found)?;
+    }
+    Ok(())
 }
 
 /// How a fixing run that didn't push ended, going by its PRs as they are
@@ -1146,6 +1565,9 @@ mod tests {
             cost: 0.0,
             cost_unit: CostUnit::Usd,
             error: None,
+            round: None,
+            heads: Default::default(),
+            start_heads: Default::default(),
         }
     }
 
@@ -1162,31 +1584,45 @@ mod tests {
     #[test]
     fn due_prs() {
         let s = settings(AutoReview::NonDraft, false);
-        assert!(due(&hit(false, "a"), &s, 100, &[], 0));
+        assert!(due(&hit(false, "a"), &s, 100, &[], 0, Seen::default()));
         // Opened before reviews started, a draft, or too many running.
-        assert!(!due(&hit(false, "a"), &s, 99, &[], 0));
-        assert!(!due(&hit(true, "a"), &s, 100, &[], 0));
-        assert!(!due(&hit(false, "a"), &s, 100, &[], MAX_RUNNING));
+        assert!(!due(&hit(false, "a"), &s, 99, &[], 0, Seen::default()));
+        assert!(!due(&hit(true, "a"), &s, 100, &[], 0, Seen::default()));
+        assert!(!due(
+            &hit(false, "a"),
+            &s,
+            100,
+            &[],
+            MAX_RUNNING,
+            Seen::default()
+        ));
         let s = settings(AutoReview::IncludingDrafts, false);
-        assert!(due(&hit(true, "a"), &s, 100, &[], 0));
+        assert!(due(&hit(true, "a"), &s, 100, &[], 0, Seen::default()));
         let s = settings(AutoReview::Off, false);
-        assert!(!due(&hit(false, "a"), &s, 100, &[], 0));
+        assert!(!due(&hit(false, "a"), &s, 100, &[], 0, Seen::default()));
         let s = RepoSettings {
             auto_review_since: None,
             ..settings(AutoReview::NonDraft, false)
         };
-        assert!(!due(&hit(false, "a"), &s, 100, &[], 0));
+        assert!(!due(&hit(false, "a"), &s, 100, &[], 0, Seen::default()));
 
         // Without re-reviews, a PR is reviewed once.
         let s = settings(AutoReview::NonDraft, false);
         let done = [entry("a", AutoReviewState::Posted)];
-        assert!(!due(&hit(false, "b"), &s, 100, &done, 0));
+        assert!(!due(&hit(false, "b"), &s, 100, &done, 0, Seen::default()));
         // With them, each head is, but not while a review is running.
         let s = settings(AutoReview::NonDraft, true);
-        assert!(!due(&hit(false, "a"), &s, 100, &done, 0));
-        assert!(due(&hit(false, "b"), &s, 100, &done, 0));
+        assert!(!due(&hit(false, "a"), &s, 100, &done, 0, Seen::default()));
+        assert!(due(&hit(false, "b"), &s, 100, &done, 0, Seen::default()));
         let running = [entry("a", AutoReviewState::Running)];
-        assert!(!due(&hit(false, "b"), &s, 100, &running, 0));
+        assert!(!due(
+            &hit(false, "b"),
+            &s,
+            100,
+            &running,
+            0,
+            Seen::default()
+        ));
     }
 
     #[test]
@@ -1228,6 +1664,14 @@ mod tests {
             ..off.clone()
         };
         assert!(to_save(&off, plugin, 0).is_ok());
+
+        let rounds = |n| RepoSettings {
+            fix_rounds: n,
+            ..off.clone()
+        };
+        let saved = to_save(&off, rounds(MAX_FIX_ROUNDS), 0).unwrap();
+        assert_eq!(saved.fix_rounds, MAX_FIX_ROUNDS);
+        assert!(to_save(&off, rounds(MAX_FIX_ROUNDS + 1), 0).is_err());
     }
 
     #[test]
@@ -2034,7 +2478,7 @@ sleep 30
         let mut quiet = detail(9, None);
         quiet.review = Some(review_info("me"));
 
-        let prompt = fix_prompt(&[lower.clone(), upper, quiet]);
+        let prompt = fix_prompt(&[lower.clone(), upper, quiet], true);
         assert_eq!(
             prompt,
             "Address the open review comments on pull request https://github.com/o/n/pull/7: \
@@ -2055,7 +2499,7 @@ sleep 30
              \n\
              - Conversation comment by @bob (c1):\n  > Add a test.\n"
         );
-        assert!(fix_prompt(&[lower]).starts_with(
+        assert!(fix_prompt(&[lower], true).starts_with(
             "Address the open review comments on pull request https://github.com/o/n/pull/7: \
              \"PR 7\" (o/n#7). These are"
         ));
@@ -2480,6 +2924,365 @@ sleep 30
         let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         assert!(args.contains("addresses a pull request's review"), "{args}");
         assert!(!args.contains("unattended pull request review"), "{args}");
+    }
+
+    fn loop_fix(round: u32, state: AutoReviewState, heads: &[(u64, &str)]) -> AutoReviewEntry {
+        AutoReviewEntry {
+            kind: AutoRunKind::Fix,
+            round: Some(round),
+            heads: heads.iter().map(|(n, h)| (*n, (*h).to_owned())).collect(),
+            finished_at: Some(5),
+            ..entry("x", state)
+        }
+    }
+
+    /// The rounds count from the last push that wasn't a fixing run's.
+    #[test]
+    fn where_a_loop_stands() {
+        let heads = |prs: &[(u64, &str)]| -> BTreeMap<u64, String> {
+            prs.iter().map(|(n, h)| (*n, (*h).to_owned())).collect()
+        };
+        let pushed = AutoReviewState::Pushed;
+        let rounds = |n| RepoSettings {
+            fix_rounds: n,
+            ..settings(AutoReview::NonDraft, false)
+        };
+
+        // Never ran.
+        let fresh = loop_state(&[], &heads(&[(2, "a")]));
+        assert_eq!(fresh, LoopState::default());
+        assert!(!fresh.over(&rounds(1)) && fresh.over(&rounds(0)));
+        assert_eq!(fresh.after_fix(2, "a", 3), None);
+
+        // Its second run pushed #2 and #3 to where they are now. #4 was
+        // merged since, which isn't a push.
+        let fixes = [
+            loop_fix(2, pushed, &[(2, "b"), (3, "c"), (4, "d")]),
+            loop_fix(1, pushed, &[(2, "a")]),
+        ];
+        let now = heads(&[(2, "b"), (3, "c")]);
+        let st = loop_state(&fixes, &now);
+        assert_eq!((st.used, st.ran), (2, true));
+        assert_eq!(st.after_fix(2, "b", 3), Some(true));
+        assert_eq!(st.after_fix(2, "b", 2), Some(false));
+        // A PR that joined the stack since isn't the loop's push.
+        assert_eq!(st.after_fix(5, "e", 3), None);
+        assert!(st.over(&rounds(2)) && !st.over(&rounds(3)));
+
+        // Someone pushed to #3: the count starts over, when pushes are
+        // reviewed again at all.
+        let st = loop_state(&fixes, &heads(&[(2, "b"), (3, "z")]));
+        assert_eq!((st.used, st.last.is_some(), st.ran), (0, false, true));
+        assert_eq!(st.after_fix(2, "b", 3), None);
+        assert!(st.over(&rounds(3)));
+        let again = RepoSettings {
+            rereview_on_push: true,
+            ..rounds(3)
+        };
+        assert!(!st.over(&again));
+
+        // #2 still shows the head the run found it at: GitHub is behind,
+        // and that's nobody's push.
+        let mut lagging = loop_fix(1, pushed, &[(2, "b"), (3, "c")]);
+        lagging.start_heads = heads(&[(2, "a"), (3, "c")]);
+        let st = loop_state(
+            std::slice::from_ref(&lagging),
+            &heads(&[(2, "a"), (3, "c")]),
+        );
+        assert!(st.stale && st.over(&again));
+        assert_eq!(st.after_fix(2, "a", 3), None);
+        let st = loop_state(
+            std::slice::from_ref(&lagging),
+            &heads(&[(2, "b"), (3, "c")]),
+        );
+        assert!(!st.stale && !st.over(&again));
+
+        // A run that pushed nothing ends the loop until the next push.
+        for ended in [
+            AutoReviewState::Posted,
+            AutoReviewState::Unposted,
+            AutoReviewState::Failed,
+        ] {
+            let st = loop_state(&[loop_fix(1, ended, &[(2, "a")])], &heads(&[(2, "a")]));
+            assert!(st.over(&again), "{ended:?}");
+            assert_eq!(st.after_fix(2, "a", 3), None);
+        }
+    }
+
+    /// A head that the loop pushed is reviewed for the next round even
+    /// when pushes aren't otherwise, and not after the last round; a
+    /// rebase of reviewed changes isn't reviewed again.
+    #[test]
+    fn due_in_a_loop() {
+        let once = settings(AutoReview::NonDraft, false);
+        let again = settings(AutoReview::NonDraft, true);
+        let done = [entry("a", AutoReviewState::Posted)];
+        let seen = |same_changes, after_fix| Seen {
+            same_changes,
+            after_fix,
+        };
+        assert!(due(
+            &hit(false, "b"),
+            &once,
+            100,
+            &done,
+            0,
+            seen(false, Some(true))
+        ));
+        assert!(!due(
+            &hit(false, "b"),
+            &once,
+            100,
+            &done,
+            0,
+            seen(false, Some(false))
+        ));
+        assert!(!due(
+            &hit(false, "b"),
+            &again,
+            100,
+            &done,
+            0,
+            seen(false, Some(false))
+        ));
+        assert!(!due(
+            &hit(false, "a"),
+            &once,
+            100,
+            &done,
+            0,
+            seen(false, Some(true))
+        ));
+        assert!(!due(
+            &hit(false, "b"),
+            &once,
+            100,
+            &done,
+            0,
+            seen(true, Some(true))
+        ));
+        assert!(!due(
+            &hit(false, "b"),
+            &again,
+            100,
+            &done,
+            0,
+            seen(true, None)
+        ));
+        // A fixing run isn't a review of the head.
+        let fixed = [AutoReviewEntry {
+            kind: AutoRunKind::Fix,
+            ..entry("b", AutoReviewState::Pushed)
+        }];
+        assert!(due(
+            &hit(false, "b"),
+            &once,
+            100,
+            &fixed,
+            0,
+            Seen::default()
+        ));
+    }
+
+    /// With rounds of review and fixes, a stack whose reviews are done
+    /// gets a fixing run for what they raised, and the head it pushes
+    /// gets the next round's review.
+    #[tokio::test]
+    async fn a_loop_goes_round() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), STALL);
+        let slug = fx.clone.slug.clone();
+        let head = fx.clone.head().unwrap();
+        let key = PrKey {
+            repo: slug.clone(),
+            number: 2,
+        };
+        let at = |head: &str| Hit {
+            key: key.clone(),
+            head_oid: head.to_owned(),
+            ..hit(false, head)
+        };
+        let rounds = |n, rereview| {
+            let s = RepoSettings {
+                fix_rounds: n,
+                ..settings(AutoReview::NonDraft, rereview)
+            };
+            state.db.set_repo_settings(&slug, &s).unwrap();
+        };
+        let runs = |kind| -> Vec<AutoReviewEntry> {
+            let mut all = state.db.auto_reviews_of(&key).unwrap();
+            all.retain(|r| r.kind == kind);
+            all
+        };
+        // Ends the latest run of `kind` as `state`, deleting its session.
+        let end = async |kind, as_: AutoReviewState| {
+            let run = runs(kind).remove(0);
+            assert_eq!(run.state, AutoReviewState::Running, "{run:?}");
+            let session = run.session.clone().unwrap();
+            state
+                .db
+                .finish_auto_review(run.id, as_, None, agent::now())
+                .unwrap();
+            agent::delete(&state, &session).await.unwrap();
+            run
+        };
+        rounds(2, false);
+
+        // Another reviewer's comment doesn't get the loop going, and
+        // neither does an auto-review's before the review is done.
+        let mine = thread(1, "me");
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(3, "ann")],
+            None,
+        );
+        start_due(&state, &[at(&head)]).await;
+        assert_eq!(runs(AutoRunKind::Review).len(), 1);
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            std::slice::from_ref(&mine),
+            None,
+        );
+        start_due(&state, &[at(&head)]).await;
+        assert!(runs(AutoRunKind::Fix).is_empty());
+        end(AutoRunKind::Review, AutoReviewState::Posted).await;
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            &[thread(3, "ann")],
+            None,
+        );
+        start_due(&state, &[at(&head)]).await;
+        assert!(runs(AutoRunKind::Fix).is_empty());
+
+        // Round 1's fixing run addresses the review's comment.
+        store_full(
+            &state,
+            &slug,
+            2,
+            &head,
+            "me",
+            "OPEN",
+            std::slice::from_ref(&mine),
+            None,
+        );
+        start_due(&state, &[at(&head)]).await;
+        let fix = runs(AutoRunKind::Fix).remove(0);
+        assert_eq!((fix.round, fix.manual), (Some(1), false));
+        assert_eq!(fix.heads, BTreeMap::from([(2, head.clone())]));
+        assert_eq!(fix.start_heads, fix.heads);
+        // While it runs, nothing else starts.
+        start_due(&state, &[at(&head)]).await;
+        assert_eq!(
+            (
+                runs(AutoRunKind::Fix).len(),
+                runs(AutoRunKind::Review).len()
+            ),
+            (1, 1)
+        );
+
+        // It pushed: the new head is reviewed, though pushes otherwise
+        // aren't, and round 2's fixing run follows that review.
+        let second = crate::git::tests::commit(&fx.clone.path, "second", "second\n");
+        record_heads(
+            &state,
+            fix.session.as_deref().unwrap(),
+            &BTreeMap::from([(2, second.clone())]),
+            false,
+        )
+        .unwrap();
+        end(AutoRunKind::Fix, AutoReviewState::Pushed).await;
+        store_full(
+            &state,
+            &slug,
+            2,
+            &second,
+            "me",
+            "OPEN",
+            std::slice::from_ref(&mine),
+            None,
+        );
+        start_due(&state, &[at(&second)]).await;
+        assert!(runs(AutoRunKind::Fix).len() == 1, "the review comes first");
+        let review = end(AutoRunKind::Review, AutoReviewState::Posted).await;
+        assert_eq!(review.head_oid, second);
+        start_due(&state, &[at(&second)]).await;
+        let fix = runs(AutoRunKind::Fix).remove(0);
+        assert_eq!(fix.round, Some(2));
+
+        // After the last round's push nothing more happens.
+        let third = crate::git::tests::commit(&fx.clone.path, "third", "third\n");
+        record_heads(
+            &state,
+            fix.session.as_deref().unwrap(),
+            &BTreeMap::from([(2, third.clone())]),
+            false,
+        )
+        .unwrap();
+        end(AutoRunKind::Fix, AutoReviewState::Pushed).await;
+        store_full(
+            &state,
+            &slug,
+            2,
+            &third,
+            "me",
+            "OPEN",
+            std::slice::from_ref(&mine),
+            None,
+        );
+        start_due(&state, &[at(&third)]).await;
+        assert_eq!(
+            (
+                runs(AutoRunKind::Fix).len(),
+                runs(AutoRunKind::Review).len()
+            ),
+            (2, 2)
+        );
+
+        // Nor after the user's own push, unless pushes are reviewed
+        // again: then the loop starts over.
+        let fourth = crate::git::tests::commit(&fx.clone.path, "fourth", "fourth\n");
+        store_full(
+            &state,
+            &slug,
+            2,
+            &fourth,
+            "me",
+            "OPEN",
+            std::slice::from_ref(&mine),
+            None,
+        );
+        start_due(&state, &[at(&fourth)]).await;
+        assert_eq!(
+            (
+                runs(AutoRunKind::Fix).len(),
+                runs(AutoRunKind::Review).len()
+            ),
+            (2, 2)
+        );
+        rounds(2, true);
+        start_due(&state, &[at(&fourth)]).await;
+        assert_eq!(runs(AutoRunKind::Review).len(), 3);
+        end(AutoRunKind::Review, AutoReviewState::Posted).await;
+        start_due(&state, &[at(&fourth)]).await;
+        let fix = runs(AutoRunKind::Fix).remove(0);
+        assert_eq!(fix.round, Some(1));
+        end(AutoRunKind::Fix, AutoReviewState::Cancelled).await;
     }
 
     /// A queued review can be cancelled before it starts.

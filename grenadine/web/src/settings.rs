@@ -1,6 +1,6 @@
 //! A repository's settings, edited in a dialog over the agents' pages.
 
-use grenadine_core::api::{AgentBackend, AutoReview, PermissionMode, RepoSettings};
+use grenadine_core::api::{AgentBackend, AutoReview, MAX_FIX_ROUNDS, PermissionMode, RepoSettings};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -333,6 +333,33 @@ fn ReviewFields(draft: RwSignal<Option<RepoSettings>>) -> impl IntoView {
                 />
                 "Review again after new pushes"
             </label>
+            <label>"Rounds of review and fixes"
+                <select
+                    prop:disabled=off
+                    on:change=move |ev| {
+                        let rounds = event_target_value(&ev).parse().unwrap_or(0);
+                        edit(Box::new(move |d| d.fix_rounds = rounds));
+                    }
+                >
+                    {(0..=MAX_FIX_ROUNDS).map(|n| {
+                        let selected = move || {
+                            draft.with(|d| d.as_ref().is_some_and(|d| d.fix_rounds == n))
+                        };
+                        let label = match n {
+                            0 => "None: only review".to_owned(),
+                            1 => "1 round".to_owned(),
+                            n => format!("{n} rounds"),
+                        };
+                        view! { <option value=n.to_string() selected=selected>{label}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            <p class="hint muted">
+                "In a round, each pull request of a stack is reviewed, and then one session "
+                "addresses what the reviews raised and pushes the changes, which starts the "
+                "next round. Other people's comments wait for Address comments on the pull "
+                "request's page."
+            </p>
             <label>"Review skill"
                 <input
                     type="text"

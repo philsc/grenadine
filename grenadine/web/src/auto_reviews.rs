@@ -92,7 +92,10 @@ fn Entry(review: AutoReviewEntry, route: Signal<Route>) -> impl IntoView {
         cost(review.cost, review.cost_unit),
     ];
     match (review.kind, review.manual) {
-        (AutoRunKind::Fix, _) => meta.push("addressing comments".into()),
+        (AutoRunKind::Fix, _) => meta.push(match review.round {
+            Some(round) => format!("addressing comments, round {round}"),
+            None => "addressing comments".into(),
+        }),
         (AutoRunKind::Review, true) => meta.push("asked for".into()),
         (AutoRunKind::Review, false) => {}
     }
@@ -248,6 +251,9 @@ pub fn PrSection(
         let active = matches!(r.state, AutoReviewState::Queued | AutoReviewState::Running);
         let queued = r.state == AutoReviewState::Queued;
         let mut meta = vec![short];
+        if let Some(round) = r.round {
+            meta.push(format!("round {round}"));
+        }
         // Nothing's spent before it starts, and little early on.
         if !active || r.cost > 0.0 {
             meta.push(cost(r.cost, r.cost_unit));
