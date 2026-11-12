@@ -2385,6 +2385,109 @@ body.resizing-sidebar * {
   justify-content: space-between;
 }
 
+/* The sidebar's tabs, above whichever tab's body shows. */
+.pr-sidebar-head {
+  flex: none;
+  padding: 4px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pr-sidebar-tabs {
+  display: flex;
+  gap: 2px;
+  align-self: stretch;
+}
+.pr-sidebar-tab {
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px 4px 0 0;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+}
+.pr-sidebar-tab:hover {
+  color: var(--fg);
+}
+.pr-sidebar-tab.selected {
+  color: var(--fg);
+  box-shadow: inset 0 -2px var(--accent);
+}
+.pr-sidebar-tab-count {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--bg-subtle);
+  font-size: 11px;
+  text-align: center;
+}
+.pr-sidebar-body[hidden] {
+  display: none;
+}
+
+/* The Threads tab: a filter, then the threads by file. */
+.thread-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 12px;
+}
+.thread-chip {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.thread-chip.on {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--fg);
+}
+.thread-chip-count {
+  font-weight: 600;
+}
+.pr-sidebar-body .thread-file {
+  margin-bottom: 20px;
+}
+.thread-file-path {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: normal;
+  overflow-wrap: anywhere;
+}
+.listed-thread {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.listed-thread-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  background: var(--bg-subtle);
+  font-size: 12px;
+}
+.listed-thread.resolved .listed-thread-where {
+  color: var(--fg-muted);
+}
+.threads-empty {
+  margin: 16px 0;
+}
+/* A thread the sidebar jumps to sits below the toolbar and its file's
+   sticky header. */
+.pr .thread {
+  scroll-margin-top: calc(var(--toolbar-height, 0px) + 48px);
+}
+
 /* The agents panel pinned under the sidebar's body, like the terminal
    panel under a session's transcript. */
 .pr-agents-panel {

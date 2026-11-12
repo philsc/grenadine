@@ -25,7 +25,7 @@ use crate::api;
 use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, mark, plain_lines};
 use crate::inboxes::load_flag;
-use crate::pr::{Anchor, Placed, ThreadView, ThreadWhere, range_label};
+use crate::pr::{Anchor, Placed, ThreadJump, ThreadView, ThreadWhere, range_label};
 
 const CONTEXT: usize = 3;
 
@@ -477,39 +477,73 @@ fn scroll_to(path: &str) {
 /// moving the file, since files the browser skipped lay out at their real
 /// heights once they're near the viewport. User input stops it.
 fn rescroll_to(path: String) {
-    rescroll_step(path, 60, 0, Rc::new(RescrollGuard::new()));
+    rescroll_step(
+        file_id(&path),
+        0,
+        60,
+        0,
+        Rc::new(RescrollGuard::new()),
+        Rc::new(|| {}),
+    );
 }
 
-fn rescroll_step(path: String, tries: u8, stable: u8, guard: Rc<RescrollGuard>) {
+/// Like `rescroll_to`, for the element with the DOM id `id`, which may
+/// take a while to show up, e.g. while a diff loads or a file renders.
+/// Calls `done` once it stopped, whether it got there or not.
+pub(crate) fn scroll_to_element(id: String, done: impl Fn() + 'static) {
+    rescroll_step(id, 200, 60, 0, Rc::new(RescrollGuard::new()), Rc::new(done));
+}
+
+/// One step of `rescroll_to`: `wait` is how many more steps to wait for
+/// the element, `tries` how many more to scroll it.
+fn rescroll_step(
+    id: String,
+    wait: u8,
+    tries: u8,
+    stable: u8,
+    guard: Rc<RescrollGuard>,
+    done: Rc<dyn Fn()>,
+) {
     if guard.cancelled.get() {
+        done();
         return;
     }
-    let Some(section) = document().get_element_by_id(&file_id(&path)) else {
+    let Some(el) = document().get_element_by_id(&id) else {
+        if wait == 0 {
+            done();
+        } else {
+            set_timeout(
+                move || rescroll_step(id, wait - 1, tries, stable, guard, done),
+                Duration::from_millis(50),
+            );
+        }
         return;
     };
-    let Some(main) = section.closest(".main").ok().flatten() else {
+    let Some(main) = el.closest(".main").ok().flatten() else {
+        done();
         return;
     };
     let margin = window()
-        .get_computed_style(&section)
+        .get_computed_style(&el)
         .ok()
         .flatten()
         .and_then(|s| s.get_property_value("scroll-margin-top").ok())
         .and_then(|v| v.strip_suffix("px").and_then(|v| v.parse().ok()))
         .unwrap_or(0.0);
-    let top = section.get_bounding_client_rect().top();
+    let top = el.get_bounding_client_rect().top();
     let target = main.get_bounding_client_rect().top() + margin;
     let stable = if (top - target).abs() <= 1.0 {
         stable + 1
     } else {
-        section.scroll_into_view();
+        el.scroll_into_view();
         0
     };
     if stable >= 8 || tries == 0 {
+        done();
         return;
     }
     set_timeout(
-        move || rescroll_step(path, tries - 1, stable, guard),
+        move || rescroll_step(id, 0, tries - 1, stable, guard, done),
         Duration::from_millis(50),
     );
 }
@@ -1210,6 +1244,16 @@ fn FileView(
             .and_then(|f| f.get(c.path()))
             .unwrap_or(!initial.all_rebase && initial.added + initial.removed <= BIG_FILE),
     );
+    // A thread the sidebar jumps to shows: its file expands.
+    if let Some(ThreadJump(jump)) = use_context::<ThreadJump>() {
+        Effect::new(move |_| {
+            if let Some(id) = jump.get()
+                && comments.with(|c| c.iter().any(|p| p.thread.root.id == id))
+            {
+                expanded.set(true);
+            }
+        });
+    }
     // Roughly: the changed lines and the context around each block.
     let rows = if expanded.get_untracked() {
         initial.added + initial.removed + initial.blocks * (2 * CONTEXT + 1)

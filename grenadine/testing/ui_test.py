@@ -38,8 +38,11 @@ from grenadine.testing.fake_github import (
     TEAM,
     TEAM_SLUG,
     TOKEN,
+    VIEWER,
     CheckRun,
+    Comment,
     FakeGitHub,
+    PendingReview,
     PullRequest,
     Review,
 )
@@ -1786,7 +1789,7 @@ class InboxTest(ServerTestCase):
         for label in ("Failing (1)", "Passed (1)", "Skipped (1)"):
             self.check_group(label).locator(".check-group-header").click()
 
-        body = self.page.locator(".pr-sidebar-body")
+        body = self.page.locator(".pr-overview")
         self.assertGreater(body.evaluate("el => el.scrollHeight - el.clientHeight"), 0)
         body.evaluate("el => el.scrollTop = el.scrollHeight")
 
@@ -4267,6 +4270,138 @@ PASTE_IMAGE = """async (box) => {
     data.items.add(new File([blob], "screenshot.png", {type: "image/png"}));
     box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
 }"""
+
+
+class ThreadsTabTest(ServerTestCase):
+    """The PR sidebar's Threads tab."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.cases = scenarios.versions_cases(gh)
+        grow = cls.cases.prs[scenarios.GROW]
+        shas = cls.cases.shas[scenarios.GROW]
+        repo = gh.repo(scenarios.REPO)
+        # GROW has an open thread with a reply and a resolved one; two
+        # more open ones, and the viewer's pending draft.
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Left over from v1.",
+            path=scenarios.STEPS_PY,
+            line=9,
+            commit=shas[0],
+        )
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Doubling, eh?",
+            path=scenarios.STEPS_PY,
+            line=20,
+            commit=shas[-1],
+        )
+        grow.pending = PendingReview(
+            id=f"PRR_{gh.next_comment_id()}",
+            comments=[
+                Comment(
+                    id=gh.next_comment_id(),
+                    author=VIEWER,
+                    body="My draft note.",
+                    path=scenarios.STEPS_PY,
+                    commit=shas[-1],
+                    line=12,
+                    created_at=gh.tick(),
+                )
+            ],
+        )
+
+    def open_threads(self, height: int = 900) -> None:
+        pr = self.cases.prs[scenarios.GROW]
+        self.page.set_viewport_size({"width": 1800, "height": height})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.page.get_by_role("tab", name=re.compile("^Threads")).click()
+
+    def threads(self) -> Locator:
+        return self.page.locator(".pr-threads .listed-thread")
+
+    def chip(self, name: str) -> Locator:
+        return self.page.locator(".thread-chip", has_text=name)
+
+    def test_lists_open_and_pending_threads_by_default(self) -> None:
+        self.open_threads()
+        tab = self.page.get_by_role("tab", name=re.compile("^Threads"))
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(tab.locator(".pr-sidebar-tab-count")).to_have_text("3")
+        expect(self.page.locator(".pr-overview")).to_be_hidden()
+
+        expect(self.chip("Open")).to_have_attribute("aria-pressed", "true")
+        expect(self.chip("Resolved")).to_have_attribute("aria-pressed", "false")
+        expect(self.chip("Pending")).to_have_attribute("aria-pressed", "true")
+        expect(self.page.locator(".thread-chip-count")).to_have_text(["3", "1", "1"])
+
+        # By line, each with its whole conversation.
+        threads = self.threads()
+        expect(threads.locator(".thread-jump")).to_have_text(
+            ["Line 1", "Line 9", "Line 12", "Line 20"]
+        )
+        expect(threads.nth(0).locator(".comment")).to_have_count(2)
+        expect(threads.nth(0)).to_contain_text("To explain.")
+        expect(threads.nth(2).locator(".pending-badge")).to_have_text("Pending")
+        expect(self.page.locator(".pr-threads .thread-file-path")).to_have_text(
+            [scenarios.STEPS_PY]
+        )
+
+        # Resolved threads join the list, and the open ones can go.
+        self.chip("Resolved").click()
+        expect(threads).to_have_count(5)
+        resolved = threads.nth(1)
+        expect(resolved).to_contain_text("Rename this.")
+        expect(resolved.locator(".thread-resolved")).to_have_text(
+            "Resolved by Other Person"
+        )
+        self.chip("Open").click()
+        expect(threads.locator(".thread-jump")).to_have_text(["Line 4", "Line 12"])
+
+        # The tab and the filter survive a reload.
+        self.page.reload()
+        expect(self.threads().locator(".thread-jump")).to_have_text(
+            ["Line 4", "Line 12"]
+        )
+        self.page.get_by_role("tab", name="Overview").click()
+        expect(self.page.locator(".pr-overview")).to_be_visible()
+        expect(self.page.locator(".pr-threads")).to_be_hidden()
+        self.page.reload()
+        expect(self.page.locator(".pr-overview")).to_be_visible()
+
+    def test_replies_in_the_tab_stay_out_of_the_diff(self) -> None:
+        self.open_threads()
+        self.threads().nth(0).get_by_role("button", name="Reply").click()
+        expect(self.page.locator(".pr-threads textarea")).to_have_count(1)
+        expect(self.page.locator(".pr .thread textarea")).to_have_count(0)
+
+    def test_a_listed_thread_shows_in_the_diff(self) -> None:
+        self.open_threads(height=400)
+        self.chip("Resolved").click()
+        resolved = self.threads().filter(has_text="Rename this.")
+        expect(resolved).to_have_count(1)
+        thread_id = resolved.get_attribute("data-thread")
+        target = self.page.locator(f"#thread-{thread_id}")
+        # Resolved threads start folded in the diff.
+        expect(target.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "false"
+        )
+        self.page.locator(".pr-page .main").evaluate(
+            "el => el.scrollTop = el.scrollHeight"
+        )
+        expect(target).not_to_be_in_viewport()
+
+        resolved.locator(".thread-jump").click()
+        expect(target.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "true"
+        )
+        expect(target).to_be_in_viewport()
 
 
 class AgentTest(ServerTestCase):
