@@ -76,7 +76,7 @@ pub struct Selection {
     pub head: u32,
 }
 
-fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
+pub(crate) fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
     let mut roots: Vec<Thread> = Vec::new();
     let mut index: HashMap<u64, usize> = HashMap::new();
     for c in comments.iter().filter(|c| c.in_reply_to.is_none()) {
@@ -106,7 +106,8 @@ fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
 /// - inline at GitHub's mapped-forward line, when Head is the latest version;
 /// - on its file, when the diff's files include it (`diff_paths`; `None`
 ///   while the diff hasn't loaded);
-/// - otherwise in the side panel.
+/// - otherwise in the side panel, as are threads on files the loaded diff
+///   doesn't show. While it loads, threads with a line stay inline.
 ///
 /// Left-side comments were made against the PR's base at the time, so they
 /// only go inline when the diff's left side is Head's merge-base.
@@ -180,16 +181,21 @@ pub fn place(
                 .find(|v| v.sha == thread.root.original_commit)
                 .map(|v| v.number)
         };
+        // A file the loaded diff doesn't show, e.g. one hidden as
+        // rebase-only, can't hold the thread at all.
+        let shown = diff_paths.is_none_or(|p| p.contains(&thread.root.path));
         match anchor {
-            Some(anchor) => inline
-                .entry(thread.root.path.clone())
-                .or_default()
-                .push(Placed {
-                    anchor,
-                    start,
-                    fallback: None,
-                    thread,
-                }),
+            Some(anchor) if shown => {
+                inline
+                    .entry(thread.root.path.clone())
+                    .or_default()
+                    .push(Placed {
+                        anchor,
+                        start,
+                        fallback: None,
+                        thread,
+                    })
+            }
             None if diff_paths.is_some_and(|p| p.contains(&thread.root.path)) => inline
                 .entry(thread.root.path.clone())
                 .or_default()
@@ -202,7 +208,7 @@ pub fn place(
                     }),
                     thread,
                 }),
-            None => panel.push(Unplaced {
+            _ => panel.push(Unplaced {
                 version: version(),
                 thread,
             }),
@@ -237,6 +243,28 @@ fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u3
 pub fn range_label(start: (Side, u32), end: (Side, u32)) -> String {
     let line = |(side, l)| format!("{}{l}", if side == Side::Left { "-" } else { "+" });
     format!("Lines {} to {}", line(start), line(end))
+}
+
+/// The versions the diff compares: `chosen` when it still makes sense,
+/// else Base against `pinned`.
+fn selected(pr: &PrDetail, chosen: Option<Selection>, pinned: u32) -> Selection {
+    let latest = pr.versions.len() as u32;
+    let default = Selection {
+        base: 0,
+        head: pinned.clamp(1, latest.max(1)),
+    };
+    match chosen {
+        Some(s)
+            if s.head >= 1
+                && s.head <= latest
+                && s.base < s.head
+                && !pr.versions[s.head as usize - 1].missing
+                && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
+        {
+            s
+        }
+        _ => default,
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -301,6 +329,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         error: RwSignal::new(None),
     });
     provide_context(OpenBoxes::new());
+    provide_context(ThreadJump(RwSignal::new(None)));
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
     // The page's clock, ticking so the relative times stay fresh.
@@ -339,6 +368,7 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         }
     });
     let panel_key = key.clone();
+    let threads_key = key.clone();
     let review_key = key.clone();
     let auto_review_key = key.clone();
     // The viewer's own open PR, which gets an Auto-review section.
@@ -366,11 +396,25 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     });
     // The latest detail, for PrBody: while it stays mounted a refetch
     // that leaves the PR unready keeps the last one rather than a gap.
-    let current = Memo::new(move |prev| {
-        detail
-            .get()
-            .or_else(|| prev.cloned())
-            .expect("PrBody only mounts once the PR is ready")
+    let last = Memo::new(move |prev: Option<&Option<Arc<PrDetail>>>| {
+        detail.get().or_else(|| prev.cloned().flatten())
+    });
+    let current = Memo::new(move |_| last.get().expect("PrBody only mounts once the PR is ready"));
+    // Selections that no longer make sense fall back to the default.
+    let selection = Memo::new(move |prev: Option<&Selection>| {
+        last.with(|pr| match pr {
+            Some(pr) => selected(pr, chosen.get(), pinned.get()),
+            None => prev.copied().unwrap_or(Selection { base: 0, head: 1 }),
+        })
+    });
+    provide_context(VersionJump { chosen, selection });
+    // Which sidebar tab shows: Overview or Threads.
+    let threads_tab = RwSignal::new(load_flag("pr-sidebar-threads", false));
+    let open_threads = Memo::new(move |_| {
+        last.with(|d| {
+            d.as_ref()
+                .map_or(0, |d| crate::pr_threads::counts(&d.comments)[0])
+        })
     });
 
     view! {
@@ -404,13 +448,14 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         {move || {
             ready.get().then(|| {
                 view! {
-                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older pinned=pinned sidebar=sidebar.shown_signal() />
+                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older pinned=pinned selection=selection sidebar=sidebar.shown_signal() />
                 }
             })
         }}
         </main>
         {move || {
             let panel_key = panel_key.clone();
+            let threads_key = threads_key.clone();
             let review_key = review_key.clone();
             let auto_review_key = auto_review_key.clone();
             if !ready.get() {
@@ -418,10 +463,38 @@ pub fn PrView(key: PrKey) -> impl IntoView {
             } else if sidebar.shown() {
                 view! {
                     <SidePanel sidebar=sidebar class="pr-sidebar">
-                        <div class="pr-sidebar-body">
-                            <div class="sidebar-head">
-                                {sidebar.button(false)}
+                        <div class="sidebar-head pr-sidebar-head">
+                            <div class="pr-sidebar-tabs" role="tablist">
+                                <button
+                                    type="button"
+                                    role="tab"
+                                    class="pr-sidebar-tab"
+                                    class:selected=move || !threads_tab.get()
+                                    aria-selected=move || (!threads_tab.get()).to_string()
+                                    on:click=move |_| {
+                                        threads_tab.set(false);
+                                        save_flag("pr-sidebar-threads", false);
+                                    }
+                                >
+                                    "Overview"
+                                </button>
+                                <button
+                                    type="button"
+                                    role="tab"
+                                    class="pr-sidebar-tab"
+                                    class:selected=move || threads_tab.get()
+                                    aria-selected=move || (threads_tab.get()).to_string()
+                                    on:click=move |_| {
+                                        threads_tab.set(true);
+                                        save_flag("pr-sidebar-threads", true);
+                                    }
+                                >
+                                    "Threads " <span class="pr-sidebar-tab-count">{move || open_threads.get()}</span>
+                                </button>
                             </div>
+                            {sidebar.button(false)}
+                        </div>
+                        <div class="pr-sidebar-body pr-overview" role="tabpanel" hidden=move || threads_tab.get()>
                             // Up top, so merging after a review needs no
                             // scrolling back up. Merging is the only thing
                             // here that needs `ReviewTarget`; provided
@@ -460,6 +533,9 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                                 _ => ().into_any(),
                             }}
                         </div>
+                        <div class="pr-sidebar-body pr-threads" role="tabpanel" hidden=move || !threads_tab.get()>
+                            <crate::pr_threads::ThreadsTab key=threads_key detail=last sidebar=sidebar />
+                        </div>
                         <crate::pr_agents::PrAgentPanel key=panel_key />
                     </SidePanel>
                 }
@@ -475,7 +551,29 @@ pub fn PrView(key: PrKey) -> impl IntoView {
 /// Threads the user folded or unfolded, by root comment ID. Threads not in
 /// here are folded exactly when they're resolved.
 #[derive(Clone, Copy)]
-struct Folded(RwSignal<HashMap<u64, bool>>);
+pub(crate) struct Folded(pub(crate) RwSignal<HashMap<u64, bool>>);
+
+/// The thread, by root comment ID, the main column is to show: set by the
+/// sidebar's Threads tab, cleared once the diff scrolled to it or gave up.
+#[derive(Clone, Copy)]
+pub(crate) struct ThreadJump(pub(crate) RwSignal<Option<u64>>);
+
+/// What the names of the reply and edit boxes of the threads below start
+/// with. A thread shows both in the diff and in the sidebar's Threads
+/// tab; each place gets its own boxes. Missing in the diff.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftScope(pub(crate) &'static str);
+
+/// The prefix `DraftScope` gives the boxes below, if any.
+fn draft_scope() -> &'static str {
+    use_context::<DraftScope>().map_or("", |s| s.0)
+}
+
+/// The DOM id of the thread whose root comment is `id`, where the diff or
+/// the panel of threads it doesn't show has it.
+pub(crate) fn thread_dom_id(id: u64) -> String {
+    format!("thread-{id}")
+}
 
 /// What the markdown of one PR needs: its repo for links.
 #[derive(Clone)]
@@ -542,6 +640,9 @@ fn PrBody(
     /// The version the right side stays on while the user picks none.
     /// `PrView` holds it so the sidebar's merge box can merge it too.
     pinned: RwSignal<u32>,
+    /// The versions the diff compares. `PrView` holds it so the sidebar's
+    /// threads can jump to a version too.
+    selection: Memo<Selection>,
     /// The sidebar shows, and with it the merge box; the main column
     /// shows the merge box only while it's hidden.
     sidebar: Signal<bool>,
@@ -635,33 +736,16 @@ fn PrBody(
             .filter(|c| c.pending)
             .map(|c| edit_draft(&pr.summary.key, c.id))
             .collect();
-        expect_context::<OpenBoxes>()
-            .close_unless(&edit_prefix(&pr.summary.key), |d| pending.contains(d));
+        let boxes = expect_context::<OpenBoxes>();
+        for scope in ["", crate::pr_threads::DRAFT_SCOPE] {
+            boxes.close_unless(&format!("{scope}{}", edit_prefix(&pr.summary.key)), |d| {
+                d.strip_prefix(scope).is_some_and(|d| pending.contains(d))
+            });
+        }
     });
     // The version the right side stays on while the user picks none, so
     // a later push doesn't move the diff they're reading.
     pinned.set(first.versions.len() as u32);
-    let selection = Memo::new(move |_| {
-        let pr = pr.get();
-        let latest = pr.versions.len() as u32;
-        let default = Selection {
-            base: 0,
-            head: pinned.get().clamp(1, latest.max(1)),
-        };
-        match chosen.get() {
-            // Selections that no longer make sense fall back to the default.
-            Some(s)
-                if s.head >= 1
-                    && s.head <= latest
-                    && s.base < s.head
-                    && !pr.versions[s.head as usize - 1].missing
-                    && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
-            {
-                s
-            }
-            _ => default,
-        }
-    });
     // Only when both sides sit on different bases does a rebase bring in
     // upstream changes.
     let upstream = Memo::new(move |_| {
@@ -697,7 +781,6 @@ fn PrBody(
         };
         left.map(|left| (left, head.sha.clone(), upstream.get()))
     });
-    provide_context(VersionJump { chosen, selection });
     // The paths of the files the loaded diff shows, set by DiffView;
     // `None` until it has loaded them.
     let diff_paths = RwSignal::new(None::<Arc<HashSet<String>>>);
@@ -717,6 +800,83 @@ fn PrBody(
     });
     let inline = Memo::new(move |_| Arc::new(placed.get().0));
     let panel = Memo::new(move |_| placed.get().1);
+    // A thread the sidebar jumps to: one the selected diff can't show
+    // switches to the version it was made on, like its "on vN" button.
+    // Then it unfolds and the main column scrolls to it.
+    let jump = expect_context::<ThreadJump>().0;
+    let Folded(folded) = expect_context::<Folded>();
+    // The jump that switched versions and the one that is scrolling, so
+    // that each happens once per jump.
+    let switched = StoredValue::new(None::<u64>);
+    let scrolling = StoredValue::new(None::<u64>);
+    Effect::new(move |_| {
+        let Some(id) = jump.get() else {
+            scrolling.set_value(None);
+            switched.set_value(None);
+            return;
+        };
+        let (inline, panel) = placed.with(|(inline, panel)| {
+            (
+                inline.values().flatten().any(|p| p.thread.root.id == id),
+                panel
+                    .iter()
+                    .find(|u| u.thread.root.id == id)
+                    .map(|u| u.version),
+            )
+        });
+        if !inline {
+            // Until the diff loaded, threads on its files sit in the panel.
+            // (A diff that fails to load never does: the effect below
+            // drops the jump once the user picks other versions.)
+            if diff_paths.with(Option::is_none) {
+                return;
+            }
+            match panel {
+                // The thread is gone.
+                None => {
+                    jump.set(None);
+                    return;
+                }
+                Some(Some(v)) if switched.get_value() != Some(id) => {
+                    switched.set_value(Some(id));
+                    let s = selection.get_untracked();
+                    if s.head != v {
+                        let base = if s.base < v { s.base } else { 0 };
+                        chosen.set(Some(Selection { base, head: v }));
+                        return;
+                    }
+                }
+                // On no known version, or still not in the diff of its
+                // own: it stays in the panel.
+                _ => {}
+            }
+        }
+        if scrolling.get_value() == Some(id) {
+            return;
+        }
+        scrolling.set_value(Some(id));
+        folded.update(|m| {
+            m.insert(id, false);
+        });
+        crate::diffview::scroll_to_element(thread_dom_id(id), move || {
+            if jump.try_get_untracked() == Some(Some(id)) {
+                jump.set(None);
+            }
+        });
+    });
+    // Versions picked by hand while a jump waits end it, so that it
+    // can't later switch the diff back, e.g. after a diff that failed to
+    // load. The jump's own switch is the one change it expects.
+    Effect::new(move |prev: Option<Selection>| {
+        let s = selection.get();
+        if prev.is_some_and(|p| p != s)
+            && let Some(id) = jump.get_untracked()
+            && !(switched.get_value() == Some(id) && chosen.get_untracked() == Some(s))
+        {
+            jump.set(None);
+        }
+        s
+    });
     // GitHub anchors new comments to the PR's diff from the merge base
     // to the head, and refuses lines outside it. Against an earlier
     // version, a line can be changed in the diff shown but not in
@@ -1615,7 +1775,7 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
     // Open while the comment is being edited, in the same set as the boxes
     // for new comments so that a refetch doesn't close it.
     let boxes = expect_context::<OpenBoxes>();
-    let draft = edit_draft(&target.key, comment.id);
+    let draft = format!("{}{}", draft_scope(), edit_draft(&target.key, comment.id));
     let editing = {
         let draft = draft.clone();
         Signal::derive(move || boxes.is_open(&draft))
@@ -1729,7 +1889,7 @@ pub fn ThreadView(
         }
     };
     view! {
-        <div class="thread" class:resolved=resolved class:collapsed=collapsed>
+        <div class="thread" id=thread_dom_id(id) class:resolved=resolved class:collapsed=collapsed>
             <button
                 type="button"
                 class="thread-header"
@@ -1756,7 +1916,7 @@ pub fn ThreadView(
 /// Replying to a thread and resolving it, under its comments. Not for a
 /// thread of the viewer's pending review, which isn't on the PR yet.
 #[component]
-fn ThreadActions(root: ReviewComment) -> impl IntoView {
+pub(crate) fn ThreadActions(root: ReviewComment) -> impl IntoView {
     let (Some(target), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id) else {
         return ().into_any();
     };
@@ -1795,6 +1955,7 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
         }
     };
     let can_resolve = root.can_resolve;
+    let scope = draft_scope();
     view! {
         <div class="thread-actions">
             {move || {
@@ -1814,7 +1975,7 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
                     )
                 };
                 view! {
-                    <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…"
+                    <ComposerToggle draft=format!("{scope}reply.{thread}") label="Reply" placeholder="Reply…"
                         send_label=label send=send alt=alt>
                         {can_resolve.then(|| view! {
                             <button type="button" disabled=move || busy.get() on:click=move |e| toggle.run(e)>
@@ -1841,7 +2002,8 @@ struct VersionJump {
 /// What a thread shown away from its lines says about where it was made:
 /// `children` — its path, line or range — followed by an "on vN" button
 /// that diffs vN against the current base (or Base), or "on an unknown
-/// version" when no version has its commit. The side panel and the
+/// version" when no version has its commit. On the version the diff
+/// already shows, "on vN" is plain text: the button would do nothing. The side panel and the
 /// file-level fallback threads share it.
 #[component]
 pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl IntoView {
@@ -1850,7 +2012,9 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
         {children()}
         " "
         {match version {
-            Some(v) => view! {
+            Some(v) => (move || if jump.selection.get().head == v {
+                view! { <span>{format!("on v{v}")}</span> }.into_any()
+            } else { view! {
                 <button
                     class="link"
                     on:click=move |_| {
@@ -1862,6 +2026,7 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
                     {format!("on v{v}")}
                 </button>
             }
+            .into_any() })
             .into_any(),
             None => view! { <span class="muted">"on an unknown version"</span> }.into_any(),
         }}
@@ -1870,6 +2035,16 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
 
 #[component]
 fn CommentPanel(threads: Memo<Vec<Unplaced>>) -> impl IntoView {
+    // A thread the sidebar jumps to shows: the panel opens.
+    let details = NodeRef::<leptos::html::Details>::new();
+    let jump = expect_context::<ThreadJump>().0;
+    Effect::new(move |_| {
+        if let (Some(id), Some(d)) = (jump.get(), details.get())
+            && threads.with(|t| t.iter().any(|u| u.thread.root.id == id))
+        {
+            d.set_open(true);
+        }
+    });
     move || {
         let threads = threads.get();
         if threads.is_empty() {
@@ -1904,8 +2079,8 @@ fn CommentPanel(threads: Memo<Vec<Unplaced>>) -> impl IntoView {
             })
             .collect_view();
         view! {
-            <details class="comment-panel">
-                <summary>{format!("{count} comment threads on other versions")}</summary>
+            <details class="comment-panel" node_ref=details>
+                <summary>{format!("{count} comment threads the diff doesn't show")}</summary>
                 <ul>{items}</ul>
             </details>
         }
@@ -2224,6 +2399,31 @@ mod tests {
         assert!(inline.is_empty());
         assert_eq!(panel.len(), 1);
         assert_eq!(panel[0].version, Some(1));
+    }
+
+    #[test]
+    fn placement_skips_files_the_diff_does_not_show() {
+        let versions = [version(1, "a"), version(2, "b")];
+        // Made on the head, so it has a line to go on.
+        let comments = [comment(1, "b", Side::Right, 10, Some(10))];
+        let sel = Selection { base: 0, head: 2 };
+
+        // Its file is hidden, e.g. as rebase-only: the side panel, with
+        // its version.
+        let (inline, panel) = place(
+            &comments,
+            &versions,
+            sel,
+            Some(&HashSet::from(["other.rs".to_owned()])),
+        );
+        assert!(inline.is_empty());
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].version, Some(2));
+
+        // While the diff loads, it stays on its line.
+        let (inline, panel) = place(&comments, &versions, sel, None);
+        assert_eq!(inline["f.rs"][0].anchor, Anchor::Line(Side::Right, 10));
+        assert!(panel.is_empty());
     }
 
     #[test]
