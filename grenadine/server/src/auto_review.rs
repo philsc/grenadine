@@ -13,9 +13,11 @@
 //! A fixing run is the other thing the PR's page can ask for: an
 //! unattended session that addresses the open comments on the PR and on
 //! the PRs stacked on it, pushes the changes to all of them at once, and
-//! answers the comments. It takes those PRs when it starts, with a lease
-//! on each one's head, so its push is refused when any of them was pushed
-//! to meanwhile. Fixing runs share the reviews' queue and limit, and
+//! answers the comments. It works on those PRs with a lease on each
+//! one's head as it was when the run started, so its push is refused
+//! when any of them was pushed to meanwhile. A session that manages the
+//! PRs goes on managing them, and hears about the run's push on its
+//! next turn. Fixing runs share the reviews' queue and limit, and
 //! only one runs in a stack at a time, since each rewrites the PRs above
 //! its own.
 

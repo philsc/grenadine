@@ -178,4 +178,6 @@ These comments are open:
 
 The session replies in each thread with what it changed, or why it changed nothing. It resolves the threads posted under your name and leaves the others to whoever started them. It answers summaries and other comments in one comment per PR.
 
+An agent session that manages the PRs keeps managing them while a fixing run works on them, and can push to them. After the run's push, that session's agent is told on its next turn which PRs moved, and to rebase its work onto the new commits before it pushes again.
+
 If someone pushes to one of the PRs while the run works, the run's push is refused, the run ends as superseded, and its changes are dropped. One fixing run works on a stack at a time; another one asked for in the same stack waits. A PR with several PRs stacked directly on it can't get one. Fixing runs count towards the limit of three, use the repository's review backend and model, and are listed in the Auto-reviews tab.
