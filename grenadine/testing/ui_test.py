@@ -617,8 +617,8 @@ if review and "Quiet" not in review[1]:
 fix = re.search(r"Address the open review comments on pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
 if fix:
     if "Answered" not in fix[1]:
-        with open("fixed.txt", "w") as f:
-            f.write("fixed")
+        with open("fixed.txt", "a") as f:
+            f.write("fixed\n")
         subprocess.run(["git", "add", "-A"], check=True)
         subprocess.run(["git", "commit", "--quiet", "-m", "Address the comments"], check=True)
         update_prs({"prs": [{"commit": git("rev-parse", "HEAD"), "pr": int(fix[3])}]})
@@ -7454,12 +7454,15 @@ class AutoReviewTest(ServerTestCase):
     DEVIN_REPO = "test/devin"
     # Reviews are only asked for from the PRs' pages.
     MANUAL_REPO = "test/manual"
+    # Reviews and fixing runs go in rounds.
+    LOOP_REPO = "test/loop"
     REPOS: ClassVar[list[str]] = [
         scenarios.REPO,
         QUIET_REPO,
         OFF_REPO,
         DEVIN_REPO,
         MANUAL_REPO,
+        LOOP_REPO,
     ]
     POLL_INTERVAL: ClassVar[int] = 1
 
@@ -7614,6 +7617,64 @@ class AutoReviewTest(ServerTestCase):
             "POST", f"/api/pr/{self.MANUAL_REPO}/{quiet.number}/auto-fixes"
         )
         self.assertEqual(refused["status"], 409)
+
+    def test_rounds_of_review_and_fixes(self) -> None:
+        dialog = self.settings(self.LOOP_REPO)
+        rounds = dialog.get_by_label("Rounds of review and fixes")
+        expect(rounds).to_have_value("0")
+        rounds.select_option(label="2 rounds")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        expect(
+            self.settings(self.LOOP_REPO).get_by_label("Rounds of review and fixes")
+        ).to_have_value("2")
+        self.page.keyboard.press("Escape")
+
+        # Each review's "Looks good." is posted under the viewer's name,
+        # so the round's fixing run addresses it, and its push gets the
+        # next round's review. After two rounds the loop is over.
+        pr = self.open_pr(self.LOOP_REPO, "Loop change")
+
+        def runs() -> list[tuple[str, str, Any]]:
+            with urllib.request.urlopen(
+                f"{self.url}api/pr/{self.LOOP_REPO}/{pr.number}/auto-reviews"
+            ) as resp:
+                return [
+                    (r.get("kind", "review"), r["state"], r.get("round"))
+                    for r in json.load(resp)
+                ]
+
+        done = [
+            ("fix", "pushed", 2),
+            ("review", "posted", None),
+            ("fix", "pushed", 1),
+            ("review", "posted", None),
+        ]
+        repo = self.gh.repo(self.LOOP_REPO)
+        deadline = time.monotonic() + 90
+        while runs() != done:
+            self.assertLess(time.monotonic(), deadline, f"the loop got to {runs()}")
+            # The fake only knows of a fixing run's push once it's told.
+            repo.record_git_push(pr.head)
+            time.sleep(0.3)
+        time.sleep(4)
+        self.assertEqual(runs(), done)
+        out = self.gh.git(
+            "-C",
+            str(repo.bare),
+            "rev-list",
+            "--format=%s",
+            "--no-commit-header",
+            f"refs/heads/main..refs/heads/{pr.head}",
+        )
+        self.assertEqual(
+            out.splitlines(),
+            ["Address the comments", "Address the comments", "Loop change"],
+        )
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        self.page.goto(f"{self.url}#/{self.LOOP_REPO}/{pr.number}")
+        fix = self.auto_review_box().locator(".auto-fix")
+        expect(fix.locator(".auto-review-state")).to_contain_text("round 2")
 
     def test_only_your_open_prs_have_the_section(self) -> None:
         theirs = self.open_pr(self.OFF_REPO, "Their change", author=scenarios.OTHER)

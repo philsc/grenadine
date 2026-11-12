@@ -437,6 +437,30 @@ class FakeRepo:
                 pr.touch()
         return after
 
+    def record_git_push(self, branch: str, *, actor: str = VIEWER) -> bool:
+        """Logs a push to `branch` that reached the repository through git,
+        as grenadine's own pushes do, rather than through `push`. Returns
+        whether there was one."""
+        after = self.gh.git(
+            "-C", str(self.bare), "rev-parse", f"refs/heads/{branch}"
+        ).strip()
+        before = self.tip(branch)
+        if after == before:
+            return False
+        self.pushes.setdefault(branch, []).append(
+            Push(
+                before=before or ZERO_SHA,
+                after=after,
+                at=self.gh.tick(),
+                actor=actor,
+                force=False,
+            )
+        )
+        for pr in self.prs.values():
+            if pr.head == branch:
+                pr.touch()
+        return True
+
     def open_pr(
         self,
         title: str,

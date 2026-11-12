@@ -53,6 +53,10 @@ pub struct RepoSettings {
     pub review_models: BTreeMap<AgentBackend, String>,
     /// Review a PR again when new commits are pushed to it.
     pub rereview_on_push: bool,
+    /// How many rounds of reviews and a fixing run a stack of the
+    /// viewer's PRs gets by itself, at most `MAX_FIX_ROUNDS`; 0 only
+    /// reviews.
+    pub fix_rounds: u32,
     /// Unix seconds. PRs opened before this aren't reviewed, so turning
     /// reviews on doesn't review every PR that's already open. The
     /// server sets it; what a page sends is ignored.
@@ -65,6 +69,10 @@ pub struct RepoSettings {
     /// backend without one starts in `PermissionMode::plan`.
     pub session_modes: BTreeMap<AgentBackend, PermissionMode>,
 }
+
+/// The most rounds of reviews and a fixing run a repository's settings
+/// take.
+pub const MAX_FIX_ROUNDS: u32 = 5;
 
 /// Which of the viewer's open PRs an auto-review session reviews.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +175,19 @@ pub struct AutoReviewEntry {
     pub cost_unit: CostUnit,
     /// Why it failed, for `Failed`.
     pub error: Option<String>,
+    /// Which round of its stack's loop a fixing run is, when the server
+    /// started it by itself after the round's reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// The heads a fixing run left its PRs at, by PR number: as it found
+    /// them, and where it pushed them once it did. A head that differs
+    /// later was pushed by someone else.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub heads: BTreeMap<u64, String>,
+    /// The heads a fixing run found its PRs at. One that shows up again
+    /// after the run pushed is GitHub lagging, not someone's push.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub start_heads: BTreeMap<u64, String>,
 }
 
 /// Identifies a PR across the configured repositories.

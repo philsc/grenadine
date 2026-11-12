@@ -494,6 +494,16 @@ const MIGRATIONS: &[Migration] = &[
     ALTER TABLE agents ADD COLUMN pending_note TEXT;
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- For a fixing run: which round of its stack's loop it is, when the
+    -- server started it by itself, and the heads it found its PRs at
+    -- and left them at, JSON objects by PR number.
+    ALTER TABLE auto_reviews ADD COLUMN round INTEGER;
+    ALTER TABLE auto_reviews ADD COLUMN heads TEXT;
+    ALTER TABLE auto_reviews ADD COLUMN start_heads TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -2022,6 +2032,66 @@ impl Db {
         Ok((n > 0).then(|| conn.last_insert_rowid()))
     }
 
+    /// Queues round `round` of a stack's loop: a fixing run of `key`
+    /// that the server starts by itself. Returns its id, or `None` when
+    /// the PR already has a fixing run queued or running.
+    pub fn queue_loop_fix(
+        &self,
+        key: &PrKey,
+        head_oid: &str,
+        title: &str,
+        url: &str,
+        round: u32,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        let kind = AutoRunKind::Fix;
+        let id = self.insert_auto_review(key, kind, head_oid, title, url, "queued", false, now)?;
+        if let Some(id) = id {
+            self.conn().execute(
+                "UPDATE auto_reviews SET round = ? WHERE id = ?",
+                params![round, id],
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// Records that the fixing run `id` left the PRs in `heads` at those
+    /// commits, on top of what's recorded for its other PRs. With
+    /// `found`, that's also where it found them.
+    pub fn add_auto_fix_heads(
+        &self,
+        id: i64,
+        heads: &BTreeMap<u64, String>,
+        found: bool,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let columns: &[&str] = match found {
+            true => &["heads", "start_heads"],
+            false => &["heads"],
+        };
+        for column in columns {
+            let old: Option<String> = tx
+                .query_row(
+                    &format!("SELECT {column} FROM auto_reviews WHERE id = ?"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let mut all: BTreeMap<u64, String> = old
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            all.extend(heads.iter().map(|(n, h)| (*n, h.clone())));
+            tx.execute(
+                &format!("UPDATE auto_reviews SET {column} = ? WHERE id = ?"),
+                params![serde_json::to_string(&all)?, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The queued reviews, oldest first.
     pub fn queued_auto_reviews(&self) -> Result<Vec<AutoReviewEntry>> {
         let conn = self.conn();
@@ -2380,7 +2450,8 @@ fn agent_from_row_unchecked(r: &rusqlite::Row) -> rusqlite::Result<(AgentSession
 
 const AUTO_REVIEW_COLUMNS: &str = "r.id, r.repo, r.number, r.title, r.url, r.head_oid, r.state, \
      r.agent_id, a.status, r.started_at, r.finished_at, COALESCE(a.cost, r.cost), \
-     COALESCE(a.cost_unit, r.cost_unit), r.error, r.manual, r.kind \
+     COALESCE(a.cost_unit, r.cost_unit), r.error, r.manual, r.kind, r.round, r.heads, \
+     r.start_heads \
      FROM auto_reviews r LEFT JOIN agents a ON a.id = r.agent_id";
 
 fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> {
@@ -2403,6 +2474,15 @@ fn auto_review_from_row(r: &rusqlite::Row) -> rusqlite::Result<AutoReviewEntry> 
         error: r.get(13)?,
         manual: r.get(14)?,
         kind: AutoRunKind::parse(&r.get::<_, String>(15)?),
+        round: r.get(16)?,
+        heads: r
+            .get::<_, Option<String>>(17)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
+        start_heads: r
+            .get::<_, Option<String>>(18)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default(),
     })
 }
 

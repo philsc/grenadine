@@ -180,4 +180,16 @@ The session replies in each thread with what it changed, or why it changed nothi
 
 An agent session that manages the PRs keeps managing them while a fixing run works on them, and can push to them. After the run's push, that session's agent is told on its next turn which PRs moved, and to rebase its work onto the new commits before it pushes again.
 
+### Rounds of review and fixes
+
+**Rounds of review and fixes** in the repository's settings has grenadine do both by itself, up to five times. It's off by default. A round goes like this:
+
+1. Each PR of a stack whose changes weren't reviewed yet is reviewed. A PR that was only rebased isn't reviewed again.
+2. Once those reviews are done, one fixing run starts at the lowest PR that has open comments posted under your name, which is what an auto-review's are. Other people's comments wait for Address comments.
+3. The fixing run's push starts the next round.
+
+The loop ends early when a round's reviews raise nothing, or when its fixing run pushes nothing. After the last round's push there's no further review.
+
+The rounds are counted from the last push that wasn't a fixing run's. With "Review again after new pushes", your next push to the stack starts the loop over; without it, a stack gets one loop. A PR that you add to the stack is reviewed in the round that's going on. One that's stacked on a fixing run's PRs while it works is rebased by that run along with the others.
+
 If someone pushes to one of the PRs while the run works, the run's push is refused, the run ends as superseded, and its changes are dropped. One fixing run works on a stack at a time; another one asked for in the same stack waits. A PR with several PRs stacked directly on it can't get one. Fixing runs count towards the limit of three, use the repository's review backend and model, and are listed in the Auto-reviews tab.

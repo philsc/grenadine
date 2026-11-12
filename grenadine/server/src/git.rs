@@ -196,6 +196,40 @@ impl Repo {
             .collect()
     }
 
+    /// An id of the changes between `base` and `head` that is the same
+    /// for the same changes on another base, as after a rebase; empty
+    /// when there are none.
+    pub fn changes_id(&self, base: &str, head: &str) -> Result<String> {
+        let diff = self
+            .command()
+            .args(["diff", "--no-color", "--no-ext-diff", base, head])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run git")?;
+        if !diff.status.success() {
+            bail!(
+                "git diff {base} {head} failed: {}",
+                String::from_utf8_lossy(&diff.stderr).trim()
+            );
+        }
+        let mut child = self
+            .command()
+            .args(["patch-id", "--stable"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to run git")?;
+        // It prints only once it has read everything, so writing first
+        // can't block on its output.
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&diff.stdout)?;
+        }
+        let out = child.wait_with_output()?;
+        let id = String::from_utf8_lossy(&out.stdout);
+        Ok(id.split_whitespace().next().unwrap_or_default().to_owned())
+    }
+
     /// Fetches the tip of a branch over HTTPS from the GitHub repository
     /// into `local_ref` and returns it.
     pub fn fetch_branch(&self, branch: &str, local_ref: &str) -> Result<String> {
@@ -717,6 +751,26 @@ fn parse_raw_diff(out: &str) -> Result<Vec<FileChange>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The same changes on another base have the same id.
+    #[test]
+    fn changes_ids_survive_a_rebase() {
+        let fx = fixture();
+        let path = &fx.clone.path;
+        run(path, &["config", "user.name", "t"]);
+        run(path, &["config", "user.email", "t@example.com"]);
+        let base = fx.clone.head().unwrap();
+        let change = commit(path, "changed", "1\n");
+        run(path, &["checkout", "-q", &base]);
+        let other = commit(path, "other", "x\n");
+        run(path, &["cherry-pick", &change]);
+        let rebased = run(path, &["rev-parse", "HEAD"]);
+        let id = |base: &str, head: &str| fx.clone.changes_id(base, head).unwrap();
+        assert_eq!(id(&base, &change), id(&other, &rebased));
+        assert_ne!(id(&base, &change), id(&base, &other));
+        assert_eq!(id(&change, &change), "");
+        assert!(fx.clone.changes_id("nope", &change).is_err());
+    }
 
     #[test]
     fn slugs() {
