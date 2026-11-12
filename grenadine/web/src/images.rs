@@ -1,9 +1,12 @@
 //! Images that go with a prompt: pasted into its text box, dropped on its
 //! form or picked from a file, shown as thumbnails until the prompt is
 //! sent. They're kept with the prompt's draft in IndexedDB (see
-//! `image_drafts`), so they survive leaving the form and reloads.
+//! `image_drafts`), so they survive leaving the form and reloads. Files
+//! that aren't images Claude takes go to `files` instead.
 
 use grenadine_core::api::PromptImage;
+
+use crate::files::Files;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::prelude::*;
@@ -67,53 +70,65 @@ async fn read(file: web_sys::File) -> Result<PromptImage, String> {
     })
 }
 
-/// The image files in `files`.
-fn image_files(files: Option<web_sys::FileList>) -> Vec<web_sys::File> {
+/// The images Claude takes in a prompt. Other files, including images of
+/// other kinds such as SVGs, go as files the agent reads.
+const INLINE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Whether `file` goes in the prompt as an image.
+fn inline(file: &web_sys::File) -> bool {
+    INLINE_TYPES.contains(&file.type_().as_str())
+}
+
+/// The files in `files`.
+fn list(files: Option<web_sys::FileList>) -> Vec<web_sys::File> {
     let Some(files) = files else {
         return Vec::new();
     };
-    (0..files.length())
-        .filter_map(|i| files.get(i))
-        .filter(|f| f.type_().starts_with("image/"))
-        .collect()
+    (0..files.length()).filter_map(|i| files.get(i)).collect()
 }
 
-/// Reads `files` and adds them to `images`, or says in `error` why one
-/// couldn't be read.
-fn add(
-    files: Vec<web_sys::File>,
-    images: RwSignal<Vec<PromptImage>>,
-    error: RwSignal<Option<String>>,
-) {
-    for file in files {
-        spawn_local(async move {
-            match read(file).await {
-                Ok(image) => images.update(|i| i.push(image)),
-                Err(e) => error.set(Some(e)),
-            }
-        });
+/// What goes with a prompt: its images and its other files.
+#[derive(Clone, Copy)]
+pub struct Attached {
+    pub images: RwSignal<Vec<PromptImage>>,
+    pub files: Files,
+}
+
+impl Attached {
+    pub fn is_empty(self) -> bool {
+        self.images.with(Vec::is_empty) && self.files.is_empty()
+    }
+
+    /// Adds `files`: images are read into `images`, or attached as files
+    /// when the browser can't read them; the rest are attached as files.
+    fn add(self, files: Vec<web_sys::File>) {
+        let (images, others): (Vec<_>, Vec<_>) = files.into_iter().partition(inline);
+        self.files.add(others);
+        for file in images {
+            spawn_local(async move {
+                match read(file.clone()).await {
+                    Ok(image) => self.images.update(|i| i.push(image)),
+                    Err(_) => self.files.add(vec![file]),
+                }
+            });
+        }
     }
 }
 
-/// Takes the images pasted into a text box. Copying from a spreadsheet or
+/// Takes the files pasted into a text box. Copying from a spreadsheet or
 /// a document can put a picture of the text on the clipboard too; then
 /// the text is what's pasted.
-pub fn paste(
-    ev: web_sys::ClipboardEvent,
-    images: RwSignal<Vec<PromptImage>>,
-    error: RwSignal<Option<String>>,
-) {
+pub fn paste(ev: web_sys::ClipboardEvent, attached: Attached) {
     let Some(data) = ev.clipboard_data() else {
         return;
     };
-    if data.get_data("text/plain").is_ok_and(|t| !t.is_empty()) {
+    let files = list(data.files());
+    let text = data.get_data("text/plain").is_ok_and(|t| !t.is_empty());
+    if files.is_empty() || (text && files.iter().all(inline)) {
         return;
     }
-    let files = image_files(data.files());
-    if !files.is_empty() {
-        ev.prevent_default();
-        add(files, images, error);
-    }
+    ev.prevent_default();
+    attached.add(files);
 }
 
 /// Lets files be dropped on a form.
@@ -126,16 +141,12 @@ pub fn drag_over(ev: web_sys::DragEvent) {
     }
 }
 
-/// Takes the images dropped on a form.
-pub fn drop(
-    ev: web_sys::DragEvent,
-    images: RwSignal<Vec<PromptImage>>,
-    error: RwSignal<Option<String>>,
-) {
-    let files = image_files(ev.data_transfer().and_then(|d| d.files()));
+/// Takes the files dropped on a form.
+pub fn drop(ev: web_sys::DragEvent, attached: Attached) {
+    let files = list(ev.data_transfer().and_then(|d| d.files()));
     if !files.is_empty() {
         ev.prevent_default();
-        add(files, images, error);
+        attached.add(files);
     }
 }
 
@@ -172,23 +183,20 @@ pub fn Attachments(images: RwSignal<Vec<PromptImage>>) -> impl IntoView {
     }
 }
 
-/// A button that adds images picked from files to `images`.
+/// A button that attaches files picked from the disk.
 #[component]
-pub fn AttachButton(
-    images: RwSignal<Vec<PromptImage>>,
-    error: RwSignal<Option<String>>,
-) -> impl IntoView {
+pub fn AttachButton(attached: Attached) -> impl IntoView {
     let input = NodeRef::<leptos::html::Input>::new();
     let picked = move |_| {
         let Some(input) = input.get() else { return };
-        add(image_files(input.files()), images, error);
+        attached.add(list(input.files()));
         // Picking the same file again is a change too.
         input.set_value("");
     };
     view! {
-        <label class="attach-image" title="Attach images; you can also paste or drop them">
-            "Attach image"
-            <input node_ref=input type="file" accept="image/*" multiple on:change=picked />
+        <label class="attach-image" title="Attach images or other files; you can also paste or drop them">
+            "Attach files"
+            <input node_ref=input type="file" multiple on:change=picked />
         </label>
     }
 }

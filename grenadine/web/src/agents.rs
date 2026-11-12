@@ -22,8 +22,9 @@ use wasm_bindgen::prelude::*;
 use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
+use crate::files::{self, FileChips, Files};
 use crate::image_drafts;
-use crate::images::{self, AttachButton, Attachments};
+use crate::images::{self, AttachButton, Attached, Attachments};
 use crate::inboxes::{load_flag, save_flag, storage};
 use crate::settings::{Settings, SettingsButton};
 use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
@@ -211,6 +212,7 @@ pub fn delete_session(
                 forget_question_drafts(&id);
                 crate::terminal::forget(&id);
                 image_drafts::forget(&image_drafts::agent_key(&id));
+                files::forget(&image_drafts::agent_key(&id));
                 deleted()
             }
             Err(e) => failed(e),
@@ -1369,8 +1371,11 @@ pub fn NewSession(
     // The draft's model goes until the backend changes.
     let model = model_signal(backend.into());
     model.set(saved.model);
-    // The images pasted so far, kept with the draft in IndexedDB.
+    // The images pasted so far, kept with the draft in IndexedDB, and the
+    // other files, kept in localStorage.
     let images = image_drafts::draft_images(image_drafts::new_session_key(&draft));
+    let files = Files::draft(image_drafts::new_session_key(&draft));
+    let attached = Attached { images, files };
     let error = RwSignal::new(None::<String>);
     let textarea = NodeRef::<leptos::html::Textarea>::new();
     // The prompt gets the focus, with the caret at the end of any draft
@@ -1405,6 +1410,7 @@ pub fn NewSession(
                 mode_picked,
                 model,
                 has_images: images.with(|i| !i.is_empty()),
+                has_files: !files.is_empty(),
                 ..d.clone()
             }
         });
@@ -1423,7 +1429,11 @@ pub fn NewSession(
 
     let handoff = StoredValue::new(handoff);
     let start = move || {
-        if busy() || none_installed() || prompt.with_untracked(|p| p.trim().is_empty()) {
+        if busy()
+            || none_installed()
+            || prompt.with_untracked(|p| p.trim().is_empty())
+            || files.pending_untracked()
+        {
             return;
         }
         let pr = match number.get_untracked().trim() {
@@ -1445,6 +1455,7 @@ pub fn NewSession(
         let raw_prompt = prompt.get_untracked();
         let model = model_arg(model);
         let images = images.get_untracked();
+        let attachments = files.ids();
         let id = id.get_value();
         drafts.set_starting(&id, true);
         // The last attempt's error doesn't carry into this one.
@@ -1475,6 +1486,7 @@ pub fn NewSession(
                 },
                 model,
                 images,
+                attachments,
                 draft: Some(id.clone()),
             };
             // A proposal starts once its request is allowed with it. Its
@@ -1570,7 +1582,7 @@ pub fn NewSession(
                     start();
                 }
                 on:dragover=images::drag_over
-                on:drop=move |ev| images::drop(ev, images, error)
+                on:drop=move |ev| images::drop(ev, attached)
             >
                 <h2>{if proposed { "Hand off to a new session" } else { "New session" }}</h2>
                 {pr.clone().map(|key| view! {
@@ -1639,7 +1651,7 @@ pub fn NewSession(
                     aria-label="Prompt"
                     prop:value=move || prompt.get()
                     on:input=move |ev| prompt.set(event_target_value(&ev))
-                    on:paste=move |ev| images::paste(ev, images, error)
+                    on:paste=move |ev| images::paste(ev, attached)
                     on:keydown=move |ev| {
                         if submits(&ev) {
                             ev.prevent_default();
@@ -1648,6 +1660,7 @@ pub fn NewSession(
                     }
                 ></textarea>
                 <Attachments images=images />
+                <FileChips files=files />
                 {move || {
                     let hints = view! {
                         <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
@@ -1689,11 +1702,11 @@ pub fn NewSession(
                     <button
                         type="submit"
                         class="primary"
-                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty())
+                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty()) || files.pending()
                     >
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
-                    <AttachButton images=images error=error />
+                    <AttachButton attached=attached />
                     {proposed.then(|| view! {
                         <input
                             type="text"
@@ -2794,15 +2807,21 @@ fn shown(events: &[Arc<AgentEvent>]) -> Vec<Arc<AgentEvent>> {
         .collect()
 }
 
-/// The seqs of prompts whose images come in the next event. A message's
-/// time goes under its last piece, which is the images there.
-fn prompts_followed_by_images(events: &[Arc<AgentEvent>]) -> HashSet<u64> {
+/// The seqs of prompts whose images or files come in the next event, and
+/// of images whose prompt's files do. A message's time goes under its
+/// last piece, which is the images or the files there.
+fn pieces_followed_by_more(events: &[Arc<AgentEvent>]) -> HashSet<u64> {
     events
         .iter()
         .zip(events.iter().skip(1))
         .filter(|(e, next)| {
-            matches!(e.kind, AgentEventKind::Prompt(_))
-                && matches!(next.kind, AgentEventKind::Images(_))
+            matches!(
+                (&e.kind, &next.kind),
+                (
+                    AgentEventKind::Prompt(_),
+                    AgentEventKind::Images(_) | AgentEventKind::Attachments(_),
+                ) | (AgentEventKind::Images(_), AgentEventKind::Attachments(_))
+            )
         })
         .filter_map(|(e, _)| e.seq)
         .collect()
@@ -3098,7 +3117,7 @@ fn Transcript(
     });
     // A prompt with images gets its time under the images, the last
     // piece of the message.
-    let image_prompts = Memo::new(move |_| events.with(|e| prompts_followed_by_images(e)));
+    let more_follows = Memo::new(move |_| events.with(|e| pieces_followed_by_more(e)));
     // The `AskUserQuestion` answers the user gave, by tool use id.
     let given_answers = Memo::new(move |_| {
         events.with(|events| {
@@ -3316,7 +3335,7 @@ fn Transcript(
                         AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
                         AgentEventKind::Prompt(p)
                         | AgentEventKind::ApprovalResolved { message: Some(p), .. } => {
-                            let timed = move || !seq.is_some_and(|s| image_prompts.with(|set| set.contains(&s)));
+                            let timed = move || !seq.is_some_and(|s| more_follows.with(|set| set.contains(&s)));
                             view! {
                                 <div class="turn-msg turn-msg-user">
                                     <div class="turn-prompt">{p.clone()}</div>
@@ -3324,6 +3343,26 @@ fn Transcript(
                                 </div>
                             }.into_any()
                         }
+                        AgentEventKind::Attachments(sent) => view! {
+                            <div class="turn-msg turn-msg-user">
+                                <div class="turn-files">
+                                    {sent.iter().map(|f| {
+                                        let url = format!(
+                                            "/api/agents/{id}/attachments/{}/{}",
+                                            f.dir,
+                                            js_sys::encode_uri_component(&f.name),
+                                        );
+                                        view! {
+                                            <a class="file-chip" href=url download=f.name.clone() title="Download the file">
+                                                <span class="prompt-file-name">{f.name.clone()}</span>
+                                                <span class="prompt-file-status">{files::human_size(f.size)}</span>
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                                {turn_time(at)}
+                            </div>
+                        }.into_any(),
                         AgentEventKind::Images(names) => view! {
                             <div class="turn-msg turn-msg-user">
                                 <div class="turn-images">
@@ -3336,7 +3375,7 @@ fn Transcript(
                                         }
                                     }).collect_view()}
                                 </div>
-                                {turn_time(at)}
+                                {move || turn_time(at.filter(|_| !seq.is_some_and(|s| more_follows.with(|set| set.contains(&s)))))}
                             </div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
@@ -3773,7 +3812,9 @@ fn PlanCard(
         busy.set(true);
         error.set(None);
         spawn_local(async move {
-            if let Err(e) = api::send_agent_message(&agent, prompt, Vec::new(), next, model).await {
+            if let Err(e) =
+                api::send_agent_message(&agent, prompt, Vec::new(), Vec::new(), next, model).await
+            {
                 error.set(Some(e));
             }
             busy.set(false);
@@ -4258,10 +4299,13 @@ fn Composer(
     let backend = Signal::derive(move || session.with(|s| s.backend));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
-    // The images pasted so far, kept with the draft in IndexedDB.
+    // The images pasted so far, kept with the draft in IndexedDB, and the
+    // other files, kept in localStorage.
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
+    let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
+    let attached = Attached { images, files };
     let error = RwSignal::new(None::<String>);
-    let blank = move || prompt.with(|p| p.trim().is_empty()) && images.with(Vec::is_empty);
+    let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
         session.with(|s| {
             matches!(
@@ -4272,19 +4316,23 @@ fn Composer(
     };
 
     let send = move || {
-        if blank() {
+        if blank() || files.pending_untracked() {
             return;
         }
         let text = prompt.get_untracked();
-        let attached = images.get_untracked();
+        let sent_images = images.get_untracked();
+        let ids = files.ids();
         let mode = mode.get_untracked();
         let model = model_arg(model);
         spawn_local(async move {
-            match api::send_agent_message(&id.get_value(), text, attached, mode, model).await {
+            match api::send_agent_message(&id.get_value(), text, sent_images, ids, mode, model)
+                .await
+            {
                 Ok(()) => {
                     prompt.set(String::new());
                     images.set(Vec::new());
                     image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
+                    files.sent();
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
@@ -4307,7 +4355,7 @@ fn Composer(
                 send();
             }
             on:dragover=images::drag_over
-            on:drop=move |ev| images::drop(ev, images, error)
+            on:drop=move |ev| images::drop(ev, attached)
         >
             <textarea
                 rows="3"
@@ -4315,7 +4363,7 @@ fn Composer(
                 placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
-                on:paste=move |ev| images::paste(ev, images, error)
+                on:paste=move |ev| images::paste(ev, attached)
                 on:keydown=move |ev| {
                     if submits(&ev) {
                         ev.prevent_default();
@@ -4324,12 +4372,13 @@ fn Composer(
                 }
             ></textarea>
             <Attachments images=images />
+            <FileChips files=files />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode backend=backend />
                 <ModelSelect model=model backend=backend />
-                <button type="submit" class="primary" disabled=blank>"Send"</button>
-                <AttachButton images=images error=error />
+                <button type="submit" class="primary" disabled=move || blank() || files.pending()>"Send"</button>
+                <AttachButton attached=attached />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
                 <div class="composer-status">
                     {move || active_model.get().map(|m| view! { <span class="agent-model" title="Model">{m}</span> })}
@@ -4441,7 +4490,7 @@ mod tests {
     }
 
     #[test]
-    fn prompts_followed_by_images_marks_the_prompt() {
+    fn pieces_followed_by_more_marks_all_but_the_last() {
         let event = |seq, kind| {
             Arc::new(AgentEvent {
                 seq: Some(seq),
@@ -4456,8 +4505,16 @@ mod tests {
             event(4, AgentEventKind::Text("on it".into())),
             event(5, AgentEventKind::Images(vec!["b.png".into()])),
             event(6, AgentEventKind::Prompt("later".into())),
+            event(7, AgentEventKind::Prompt("read it".into())),
+            event(8, AgentEventKind::Images(vec!["c.png".into()])),
+            event(9, AgentEventKind::Attachments(Vec::new())),
+            event(10, AgentEventKind::Prompt("and this".into())),
+            event(11, AgentEventKind::Attachments(Vec::new())),
         ];
-        assert_eq!(prompts_followed_by_images(&events), HashSet::from([1]));
+        assert_eq!(
+            pieces_followed_by_more(&events),
+            HashSet::from([1, 7, 8, 10])
+        );
     }
 
     fn event(seq: Option<u64>, kind: AgentEventKind) -> Incoming {

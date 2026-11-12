@@ -1731,6 +1731,10 @@ pub struct NewAgent {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     /// The web draft the session starts from, if any. A second start with
     /// the same draft returns the session the first one started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1750,6 +1754,10 @@ pub struct AgentMessage {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// An image sent with a prompt.
@@ -1759,6 +1767,27 @@ pub struct PromptImage {
     pub media_type: String,
     /// The image's bytes, base64-encoded.
     pub data: String,
+}
+
+/// A file uploaded to go with a prompt, which `PUT /api/uploads` stored
+/// until a prompt claims it by `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    pub id: String,
+    /// The file's name, made safe to use as a path component.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+/// A file sent with a prompt, which the agent reads from disk and
+/// `/api/agents/{id}/attachments/{dir}/{name}` serves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub dir: String,
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
 }
 
 /// Where wrapping up a session puts its commits.
@@ -1930,6 +1959,8 @@ pub enum AgentEventKind {
     /// The images sent with the prompt before it, by their names under
     /// `/api/agents/{id}/images/`.
     Images(Vec<String>),
+    /// The files sent with the prompt before it.
+    Attachments(Vec<Attachment>),
     /// A piece of assistant text while it streams in. Never stored; the
     /// complete `Text` follows.
     TextDelta(String),

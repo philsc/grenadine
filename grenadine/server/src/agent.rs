@@ -18,8 +18,8 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrDetail,
-    PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, Attachment, GENERAL, Landed, LandedPr, NewAgent, PermissionMode,
+    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -170,6 +170,9 @@ pub trait Backend: Send + Sync {
 pub struct Turn<'a> {
     pub prompt: &'a str,
     pub images: &'a [String],
+    /// What the agent is told about the files attached to the prompt, if
+    /// any; it goes in the prompt, before its text.
+    pub attached: Option<&'a str>,
     pub mode: &'a PermissionMode,
     /// `None` or `default` keeps the backend's default.
     pub model: Option<String>,
@@ -515,6 +518,11 @@ pub struct Agents {
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
     /// is `images` next to `worktrees`.
     images: PathBuf,
+    /// Files uploaded for prompts that aren't sent yet, `uploads` next to
+    /// `worktrees`; see `attachments`.
+    uploads: PathBuf,
+    /// The files sent with prompts, `attachments` next to `worktrees`.
+    attachments: PathBuf,
     /// Where Claude Code reaches this server, e.g. `http://127.0.0.1:8765`.
     base_url: String,
     /// Whether each session's processes go into their own systemd user
@@ -566,11 +574,12 @@ struct Live {
     landing: bool,
 }
 
-/// A prompt with the names of its images, and the mode and model its turn
-/// goes with.
+/// A prompt with the names of its images and its attached files, and the
+/// mode and model its turn goes with.
 struct Queued {
     prompt: String,
     images: Vec<String>,
+    attachments: Vec<Attachment>,
     mode: PermissionMode,
     model: Option<String>,
 }
@@ -601,7 +610,7 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
-fn random_hex(n: usize) -> String {
+pub(crate) fn random_hex(n: usize) -> String {
     random_bytes::<32>()[..n]
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -962,6 +971,8 @@ impl Agents {
             claude: claude::Claude::new(claude),
             devin: devin::Devin::new(devin),
             images: worktrees.with_file_name("images"),
+            uploads: worktrees.with_file_name("uploads"),
+            attachments: worktrees.with_file_name("attachments"),
             worktrees,
             base_url,
             slices,
@@ -1001,6 +1012,16 @@ impl Agents {
     /// Where the images sent with prompts go.
     pub fn images(&self) -> &Path {
         &self.images
+    }
+
+    /// Where files uploaded for prompts wait to be sent.
+    pub fn uploads(&self) -> &Path {
+        &self.uploads
+    }
+
+    /// Where the files sent with prompts go, in a directory per session.
+    pub fn attachments(&self) -> &Path {
+        &self.attachments
     }
 
     /// Runs `f` on the session's live state, creating it if needed.
@@ -1189,6 +1210,15 @@ pub async fn create_session(
     {
         return Ok(session);
     }
+    // Claimed before the session shows up: the page drops a started
+    // draft's uploads once it sees the draft's session.
+    let attachments = crate::attachments::claim(
+        &state.agents.uploads,
+        &state.agents.attachments,
+        &id,
+        &req.attachments,
+    )
+    .await?;
     match state.db.create_agent(&session) {
         Ok(()) => {}
         Err(e) if req.draft.is_some() && unique_violation(&e) => {
@@ -1212,11 +1242,12 @@ pub async fn create_session(
     if kind == SessionKind::Interactive {
         crate::summary::start(state, &id, session.backend, &req.prompt);
     }
-    send_with_images(
+    send_with_files(
         state,
         &id,
         req.prompt,
         images,
+        attachments,
         req.permission_mode,
         req.model,
     );
@@ -1388,15 +1419,17 @@ pub fn send(
     mode: PermissionMode,
     model: Option<String>,
 ) {
-    send_with_images(state, id, prompt, Vec::new(), mode, model);
+    send_with_files(state, id, prompt, Vec::new(), Vec::new(), mode, model);
 }
 
-/// Queues a prompt with the images `save_images` saved for it.
-pub fn send_with_images(
+/// Queues a prompt with the images `save_images` saved for it and the
+/// files `attachments::claim` claimed for it.
+pub fn send_with_files(
     state: &Arc<State>,
     id: &str,
     prompt: String,
     images: Vec<String>,
+    attachments: Vec<Attachment>,
     mode: PermissionMode,
     model: Option<String>,
 ) {
@@ -1404,6 +1437,7 @@ pub fn send_with_images(
         l.queue.push_back(Queued {
             prompt,
             images,
+            attachments,
             mode,
             model,
         });
@@ -1480,10 +1514,10 @@ pub fn image_file(state: &State, id: &str, name: &str) -> Option<(PathBuf, &'sta
     Some((state.agents.images.join(id).join(name), media_type(name)?))
 }
 
-/// Removes the images of sessions that are gone, e.g. those of sessions
-/// deleted while the server was down.
-pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
-    let Ok(dirs) = std::fs::read_dir(images) else {
+/// Removes the directories in `dir` of sessions that are gone, e.g. the
+/// images or attachments of sessions deleted while the server was down.
+pub fn remove_orphaned_session_dirs(db: &crate::db::Db, dir: &Path) -> Result<()> {
+    let Ok(dirs) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     let owned: std::collections::BTreeSet<String> = db
@@ -1602,6 +1636,7 @@ pub fn queue_next(state: &State, id: &str, prompt: String, mode: Option<Permissi
         l.queue.push_front(Queued {
             prompt,
             images: Vec::new(),
+            attachments: Vec::new(),
             mode: mode.clone().unwrap_or(turn_mode),
             model,
         });
@@ -1891,11 +1926,16 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             workspace.starts_with(&worktree)
         }))
     });
-    match tokio::fs::remove_dir_all(state.agents.images.join(id)).await {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            tracing::warn!("can't remove the images of agent {id}: {e}");
+    for (what, dir) in [
+        ("images", &state.agents.images),
+        ("attachments", &state.agents.attachments),
+    ] {
+        match tokio::fs::remove_dir_all(dir.join(id)).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("can't remove the {what} of agent {id}: {e}");
+            }
+            _ => {}
         }
-        _ => {}
     }
     if reviewing {
         state.db.auto_review_session_deleted(id)?;
@@ -3854,6 +3894,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     let Queued {
         prompt,
         images,
+        attachments,
         mode,
         model,
     } = queued;
@@ -3864,6 +3905,9 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
     if !images.is_empty() {
         emit(state, id, AgentEventKind::Images(images.clone()))?;
+    }
+    if !attachments.is_empty() {
+        emit(state, id, AgentEventKind::Attachments(attachments.clone()))?;
     }
     // Nothing of a general session's is lost with its directory, so one
     // that went away comes back. A repo session's worktree is made here,
@@ -3904,10 +3948,12 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     .into_iter()
     .flatten()
     .collect();
+    let attached = crate::attachments::note(&state.agents.attachments, id, &attachments);
     let sink = TurnSink::new(state, id, &session.repo);
     let turn = Turn {
         prompt: &prompt,
         images: &images,
+        attached: attached.as_deref(),
         mode: &mode,
         model,
         mcp_url: &mcp_url,
@@ -4370,6 +4416,7 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
         };
         let (a, b) = tokio::join!(
             create(&state, req(Some("d1"))),
@@ -4413,6 +4460,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         }
     }
@@ -4687,11 +4735,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         assert!(check_images(&[bmp]).is_some());
         let names = save_images(&state, id, &[png]).await.unwrap();
-        send_with_images(
+        send_with_files(
             &state,
             id,
             "what's this?".into(),
             names.clone(),
+            Vec::new(),
             PermissionMode::from("auto"),
             None,
         );
@@ -4725,6 +4774,87 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(image_file(&state, id, "../../etc/passwd").is_none());
         assert!(delete(&state, id).await.unwrap());
         assert!(!file.exists());
+    }
+
+    /// A prompt's attached files move to the session's attachments, which
+    /// claude may read, and it's told where they are in the prompt. They
+    /// stay for the transcript and go with the session.
+    #[tokio::test]
+    async fn sends_attachments() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {log}
+cat >> {log}
+echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+"#,
+            log = log.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let session = start(&state, "plain text").await;
+        let id = &session.id;
+        let first = std::fs::read_to_string(&log).unwrap();
+        // Without attachments, claude gets no directory beyond its own.
+        assert!(!first.contains("--add-dir"), "{first}");
+        std::fs::remove_file(&log).unwrap();
+
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"%PDF-1.4"),
+        )]);
+        let up = crate::attachments::store(state.agents.uploads(), "report.pdf", bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let files = crate::attachments::claim(
+            state.agents.uploads(),
+            state.agents.attachments(),
+            id,
+            std::slice::from_ref(&up.id),
+        )
+        .await
+        .unwrap();
+        send_with_files(
+            &state,
+            id,
+            "summarize it".into(),
+            Vec::new(),
+            files.clone(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        let events = wait_for_turns(&state, id, 2).await;
+        assert!(
+            events.contains(&AgentEventKind::Attachments(files.clone())),
+            "{events:?}"
+        );
+
+        // The notes in --append-system-prompt carry newlines of their
+        // own, so the arguments span lines up to the input message.
+        let log = std::fs::read_to_string(&log).unwrap();
+        let dir = state.agents.attachments().join(id);
+        assert!(
+            log.contains(&format!("--add-dir {}", dir.display())),
+            "{log}"
+        );
+        let message: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        let path = dir.join(&up.id).join("report.pdf");
+        assert_eq!(
+            message["message"]["content"],
+            json!([
+                {"type": "text", "text": format!(
+                    "The user attached these files to this message. Read them with your \
+                     tools as needed:\n- {} (8 B)",
+                    path.display()
+                )},
+                {"type": "text", "text": "summarize it"},
+            ])
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.4");
+        assert!(delete(&state, id).await.unwrap());
+        assert!(!dir.exists());
     }
 
     /// Reads the prompt's text from the stream-json message on stdin into
@@ -4761,6 +4891,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 permission_mode: PermissionMode::from("auto"),
                 model: Some("sonnet".into()),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -4889,6 +5020,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -4939,6 +5071,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let err = create(&state, new(Some(1))).await.unwrap_err().to_string();
@@ -5041,6 +5174,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5127,6 +5261,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5385,6 +5520,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5570,6 +5706,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5606,6 +5743,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5765,6 +5903,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5861,6 +6000,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -8414,6 +8554,7 @@ pub(crate) mod devin_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -8634,6 +8775,71 @@ pub(crate) mod devin_tests {
             assert_eq!(ended, [Some(cost)]);
             assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, cost);
         }
+    }
+
+    /// A Devin session's first prompt claims its uploads, and Devin is
+    /// told where the files are in a block before the prompt's text.
+    #[tokio::test]
+    async fn a_devin_prompt_lists_its_attachments() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = fake(
+            dir.path(),
+            scenario("turn-files", vec![json!({"end": "end_turn"})]),
+        );
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"a,b\n"),
+        )]);
+        let up = crate::attachments::store(state.agents.uploads(), "data.csv", bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+                attachments: vec![up.id.clone()],
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        assert!(crate::attachments::upload(state.agents.uploads(), &up.id).is_none());
+        let path = state
+            .agents
+            .attachments()
+            .join(&session.id)
+            .join(&up.id)
+            .join("data.csv");
+        assert_eq!(std::fs::read(&path).unwrap(), b"a,b\n");
+        let prompt = fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["method"] == "session/prompt")
+            .unwrap();
+        let blocks = prompt["params"]["prompt"].as_array().unwrap();
+        let texts: Vec<_> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        // The notes come first.
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(
+            texts[1..],
+            [
+                format!(
+                    "The user attached these files to this message. Read them with your tools \
+                     as needed:\n- {} (4 B)",
+                    path.display()
+                )
+                .as_str(),
+                "hi"
+            ]
+        );
     }
 
     /// A Devin session's turn goes over ACP: the session id is stored,
@@ -8864,6 +9070,7 @@ mod devin_job_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -9021,6 +9228,7 @@ esac
                     permission_mode: "accept-edits".into(),
                     model: None,
                     images: Vec::new(),
+                    attachments: Vec::new(),
                     draft: None,
                 },
             )

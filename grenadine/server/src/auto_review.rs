@@ -505,6 +505,7 @@ async fn launch(
         permission_mode: review_mode(settings.review_backend),
         model: model.cloned(),
         images: Vec::new(),
+        attachments: Vec::new(),
         draft: None,
     };
     let title = format!("Review #{}: {}", key.number, detail.summary.title);
@@ -1070,6 +1071,7 @@ mod tests {
             permission_mode: PermissionMode::new("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let title = Some("Review #2: t".to_owned());
@@ -1230,6 +1232,7 @@ sleep 30
             permission_mode: review_mode(AgentBackend::Devin),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let title = Some("Review #2: t".to_owned());
