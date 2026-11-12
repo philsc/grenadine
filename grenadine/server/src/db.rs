@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
     AutoReviewEntry, AutoReviewState, AutoRunKind, CiStatus, CleanupItem, CostUnit, Inbox,
-    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment,
+    InboxEdit, Landed, LandedPr, Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment,
     ReviewDecision, ReviewInfo, SessionKind, Stack, ThreadCounts, Version, VersionKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -487,6 +487,13 @@ const MIGRATIONS: &[Migration] = &[
         WHERE state IN ('queued', 'running');
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- What the session's agent is told at the start of its next turn,
+    -- once: something that happened to its pull requests meanwhile.
+    ALTER TABLE agents ADD COLUMN pending_note TEXT;
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -636,6 +643,29 @@ pub struct SyncMark {
 }
 
 /// The landed PRs of every session of `repo` but `except` that has any.
+/// Makes the PRs of `landed` session `to`'s landed PRs, `source` the PR
+/// it started from, and has them join its PRs.
+fn give_prs(
+    tx: &Connection,
+    to: &str,
+    repo: &str,
+    landed: &Landed,
+    source: Option<u64>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE agents SET landed = ?, pr_number = ? WHERE id = ?",
+        params![serde_json::to_string(landed)?, source, to],
+    )?;
+    for pr in landed.prs() {
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
+             VALUES (?, ?, ?, 'OPEN')",
+            params![to, repo, pr.number],
+        )?;
+    }
+    Ok(())
+}
+
 fn landed_in(conn: &Connection, repo: &str, except: &str) -> Result<Vec<(String, Landed)>> {
     let mut stmt = conn.prepare(
         "SELECT id, landed, branch FROM agents WHERE repo = ? AND id != ? AND landed IS NOT NULL",
@@ -1716,19 +1746,92 @@ impl Db {
             )?;
             from.insert(id, lost.iter().map(|pr| pr.number).collect());
         }
-        tx.execute(
-            "UPDATE agents SET landed = ?, pr_number = ? WHERE id = ?",
-            params![serde_json::to_string(landed)?, source, to],
-        )?;
-        for number in &taken {
-            tx.execute(
-                "INSERT OR IGNORE INTO agent_prs (agent_id, repo, number, state)
-                 VALUES (?, ?, ?, 'OPEN')",
-                params![to, repo, number],
-            )?;
-        }
+        give_prs(&tx, to, repo, landed, source)?;
         tx.commit()?;
         Ok(from)
+    }
+
+    /// Like `take_prs`, but the other sessions keep the PRs among their
+    /// landed PRs: a fixing run works on them for a while, and whoever
+    /// managed them goes on managing them.
+    pub fn borrow_prs(
+        &self,
+        to: &str,
+        repo: &str,
+        landed: &Landed,
+        source: Option<u64>,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        give_prs(&tx, to, repo, landed, source)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records that the PRs in `tips`, each with its branch's new tip,
+    /// were pushed to by the session `by`: every other session of `repo`
+    /// that manages one gets a lease on it at that tip, as if it had
+    /// just taken the PR over, since its worktree doesn't have the new
+    /// commits. Returns those sessions with their PRs that moved.
+    pub fn pushed_by_another(
+        &self,
+        repo: &str,
+        by: &str,
+        tips: &BTreeMap<u64, String>,
+    ) -> Result<BTreeMap<String, Vec<LandedPr>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mut out = BTreeMap::new();
+        for (id, theirs) in landed_in(&tx, repo, by)? {
+            let mut prs = theirs.prs();
+            let mut moved = Vec::new();
+            for pr in &mut prs {
+                if let Some(tip) = tips.get(&pr.number) {
+                    pr.lease = Some(tip.clone());
+                    moved.push(pr.clone());
+                }
+            }
+            if moved.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE agents SET landed = ? WHERE id = ?",
+                params![serde_json::to_string(&Landed::from_prs(prs))?, id],
+            )?;
+            out.insert(id, moved);
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Adds `note` to what session `id`'s agent is told at the start of
+    /// its next turn.
+    pub fn add_agent_note(&self, id: &str, note: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET pending_note =
+                CASE WHEN pending_note IS NULL THEN ?1 ELSE pending_note || char(10, 10) || ?1 END
+             WHERE id = ?2",
+            params![note, id],
+        )?;
+        Ok(())
+    }
+
+    /// What session `id`'s agent is to be told at the start of its next
+    /// turn, which this forgets.
+    pub fn take_agent_note(&self, id: &str) -> Result<Option<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let note = tx
+            .query_row("SELECT pending_note FROM agents WHERE id = ?", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        if note.is_some() {
+            tx.execute("UPDATE agents SET pending_note = NULL WHERE id = ?", [id])?;
+        }
+        tx.commit()?;
+        Ok(note)
     }
 
     /// Records that the session opened the PR `key`, which is in `state`,

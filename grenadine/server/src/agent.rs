@@ -1275,12 +1275,22 @@ fn take_stack_on_start(state: &Arc<State>, session: &AgentSession) -> Result<()>
             }
         }
     }
-    state.db.take_prs(
-        &session.id,
-        &session.repo,
-        &Landed::from_prs(prs),
-        Some(number),
-    )?;
+    let landed = Landed::from_prs(prs);
+    match session.kind {
+        // A fixing run only works on the PRs for a while: whoever
+        // manages them goes on doing so, and may push to them meanwhile,
+        // which the run's leases then notice.
+        SessionKind::AutoFix => {
+            state
+                .db
+                .borrow_prs(&session.id, &session.repo, &landed, Some(number))?
+        }
+        _ => {
+            state
+                .db
+                .take_prs(&session.id, &session.repo, &landed, Some(number))?;
+        }
+    }
     Ok(())
 }
 
@@ -2176,11 +2186,85 @@ pub async fn land_now(
         Step::Landed { landed, notes } => {
             record_landed(state, id, &landed)?;
             emit(state, id, AgentEventKind::Landed(landed.clone()))?;
+            if session.kind == SessionKind::AutoFix
+                && let Err(e) = tell_managers(state, &session, &landed).await
+            {
+                tracing::warn!("agent {id}: can't tell the PRs' sessions about the push: {e:#}");
+            }
             Ok((landed, notes))
         }
         Step::Ask { reason, prompt } => Err(ask_again(&reason, &prompt, tool)),
         Step::NameBranches { .. } | Step::Pushed { .. } => Err(pushed_unopened()),
     }
+}
+
+/// After the fixing run `session` pushed `landed`, has the other
+/// sessions that manage those PRs know: each gets a lease on the PRs at
+/// their new tips, the tips as refs to rebase onto, and a note for its
+/// agent's next turn.
+async fn tell_managers(state: &Arc<State>, session: &AgentSession, landed: &Landed) -> Result<()> {
+    let prs = landed.prs();
+    let numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+    if state
+        .db
+        .pr_managers(&session.repo, &numbers, &session.id)?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let cloned = state
+        .repos
+        .get(&session.repo)
+        .ok_or_else(|| anyhow!("{} is not a configured repository", session.repo))?;
+    let tips: BTreeMap<u64, String> = {
+        let _guard = cloned.git_lock.lock().await;
+        let repo = cloned.repo.clone();
+        tokio::task::spawn_blocking(move || {
+            prs.iter()
+                .map(|p| {
+                    let tip = repo.fetch_branch(&p.branch, &format!("{STACK_REF}/{}", p.number))?;
+                    Ok((p.number, tip))
+                })
+                .collect::<Result<_>>()
+        })
+        .await??
+    };
+    let told = state
+        .db
+        .pushed_by_another(&session.repo, &session.id, &tips)?;
+    for (id, moved) in &told {
+        state.db.add_agent_note(id, &pushed_note(moved))?;
+    }
+    if !told.is_empty() {
+        state.send(ServerEvent::AgentsChanged);
+    }
+    Ok(())
+}
+
+/// What a session's agent is told once a fixing run pushed to `moved`,
+/// PRs the session manages, each with its new tip as its lease.
+fn pushed_note(moved: &[LandedPr]) -> String {
+    let lines = moved
+        .iter()
+        .map(|p| {
+            format!(
+                "- #{} {} on branch `{}`: now at {}, fetched as {STACK_REF}/{}",
+                p.number,
+                p.url,
+                p.branch,
+                p.lease.as_deref().unwrap_or("an unknown commit"),
+                p.number
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Since this session's last turn, an unattended session that addressed review comments \
+         pushed new commits to pull requests this session manages:\n{lines}\nThis worktree \
+         doesn't have those commits. Before you change or push these pull requests again, \
+         rebase this session's work onto them, e.g. onto the top one's fetched ref, so that \
+         the next update_prs call doesn't drop them. Tell the user that you did."
+    )
 }
 
 fn record_landed(state: &Arc<State>, id: &str, landed: &Landed) -> Result<()> {
@@ -3896,8 +3980,17 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         state.agents.secret(id)
     );
     let starting_pr = session_pr(state, &session).await;
+    // Told once: the turn after this one doesn't hear it again.
+    let pending = match state.db.take_agent_note(id) {
+        Ok(note) => note,
+        Err(e) => {
+            tracing::warn!("agent {id}: {e:#}");
+            None
+        }
+    };
     let notes: Vec<_> = [
         crate::auto_review::note(session.kind).map(str::to_owned),
+        pending,
         prs_note(&session),
         starting_pr
             .as_ref()
@@ -7425,6 +7518,107 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert_eq!(upstream_tip(&fx, "pr-c"), new[2]);
         assert_eq!(run(&fx.upstream, &["rev-parse", "pr-a~1"]), main);
         assert_eq!(upstream_tip(&fx, &session.branch), "");
+    }
+
+    /// A fixing run works on PRs that another session manages without
+    /// taking them from it. Once it pushed, that session has a lease on
+    /// them at their new tips, the tips as refs, and a note that its
+    /// agent hears on its next turn only.
+    #[tokio::test]
+    async fn a_fixing_runs_push_tells_the_prs_session() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = wrap_up_state(&fx, dir.path());
+        let heads = push_chain(&fx, &[(42, "pr-c", 41, "pr-b")]);
+        store_chain(&state, &fx, &heads, &CHAIN, &chain_stack(&heads));
+        let owner = start_from_pr(&state, "fix it", 40).await;
+        let managed = |id: &str| -> Vec<(u64, Option<String>)> {
+            landed_prs(&state.db.agent(id).unwrap().unwrap())
+                .into_iter()
+                .map(|p| (p.number, p.lease))
+                .collect()
+        };
+        let before = managed(&owner.id);
+        assert_eq!(before.len(), 3);
+
+        let req = NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: Some(41),
+            prompt: "address".into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            draft: None,
+        };
+        let fixer = create_session(&state, req, SessionKind::AutoFix, None, None)
+            .await
+            .unwrap();
+        wait_for_turns(&state, &fixer.id, 1).await;
+        let fixer = state.db.agent(&fixer.id).unwrap().unwrap();
+        // It works on #41 and #42, which their session still manages.
+        let borrowed: Vec<u64> = managed(&fixer.id).iter().map(|p| p.0).collect();
+        assert_eq!(borrowed, [41, 42]);
+        assert_eq!(managed(&owner.id), before);
+
+        let worktree = Path::new(&fixer.worktree);
+        let new = [
+            crate::git::tests::commit(worktree, "g41", "41 fixed\n"),
+            crate::git::tests::commit(worktree, "g42", "42 fixed\n"),
+        ];
+        run(worktree, &["reset", "-q", "--hard", &new[1]]);
+        let specs = [41, 42]
+            .into_iter()
+            .zip(&new)
+            .map(|(pr, commit)| PrSpec {
+                commit: commit.clone(),
+                pr: Some(pr),
+                branch: None,
+            })
+            .collect();
+        land_now(
+            &state,
+            &fixer.id,
+            WrapUpTarget::PullRequest,
+            Some(specs),
+            &begin_landing(&state, &fixer.id).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(upstream_tip(&fx, "pr-b"), new[0]);
+        assert_eq!(upstream_tip(&fx, "pr-c"), new[1]);
+
+        // #40 wasn't the run's; the other two are leased at their tips.
+        assert_eq!(
+            managed(&owner.id),
+            [
+                before[0].clone(),
+                (41, Some(new[0].clone())),
+                (42, Some(new[1].clone())),
+            ]
+        );
+        let fetched = run(&fx.clone.path, &["rev-parse", &format!("{STACK_REF}/42")]);
+        assert_eq!(fetched, new[1]);
+
+        let told = "an unattended session that addressed review comments pushed";
+        let turns = |n| {
+            let args = std::fs::read_to_string(dir.path().join("log.args")).unwrap();
+            let all: Vec<_> = args.lines().filter(|l| l.contains(&owner.id)).collect();
+            assert_eq!(all.len(), n, "{args}");
+            all.last().unwrap().contains(told)
+        };
+        for (n, hears) in [(2, true), (3, false)] {
+            send(
+                &state,
+                &owner.id,
+                "go on".into(),
+                PermissionMode::from("auto"),
+                None,
+            );
+            wait_for_turns(&state, &owner.id, n).await;
+            assert_eq!(turns(n), hears, "turn {n}");
+        }
     }
 
     /// The first push to a taken PR doesn't go through when its branch
