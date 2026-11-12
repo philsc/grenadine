@@ -18,6 +18,7 @@ mod inboxes;
 mod markdown;
 mod pr;
 mod pr_agents;
+mod pr_threads;
 mod review;
 mod settings;
 mod sidebar;

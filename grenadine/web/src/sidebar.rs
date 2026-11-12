@@ -249,6 +249,14 @@ impl Sidebar {
         }
     }
 
+    /// Closes the sidebar when it's an overlay, so that what it points
+    /// to on the page shows; a column stays.
+    pub fn hide_overlay(&self) {
+        if !self.wide.get_untracked() {
+            self.open.set(false);
+        }
+    }
+
     /// `shown` for the view's `then` and `derive`.
     pub fn shown_signal(&self) -> Signal<bool> {
         let this = *self;
