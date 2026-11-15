@@ -31,7 +31,10 @@ rust_library(
         ],
     ),
     crate_name = "grenadine_server",
-    deps = all_crate_deps(normal = True) + ["//grenadine/core"],
+    deps = all_crate_deps(normal = True) + [
+        "//grenadine/core",
+        "//grenadine/server/whisper",
+    ],
 )
 
 # The server with the web UI's files embedded.

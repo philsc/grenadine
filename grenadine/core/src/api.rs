@@ -2383,3 +2383,44 @@ mod tests {
         }
     }
 }
+
+/// What `/api/dictation` reports: whether the server can transcribe
+/// dictation, which it can when it was given a Whisper model.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DictationInfo {
+    pub available: bool,
+}
+
+/// A text message from the page on a dictation socket. The page sends
+/// `Start` first, then the audio as binary messages of 16 kHz mono
+/// samples, each a little-endian i16, and `Stop` when the user stops.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DictationCommand {
+    /// `prompt` is the text before the cursor, which helps Whisper with
+    /// names and spelling.
+    Start {
+        prompt: String,
+    },
+    Stop,
+}
+
+/// A message from the server on a dictation socket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DictationEvent {
+    /// A finished phrase. It doesn't change anymore.
+    Final {
+        text: String,
+    },
+    /// The phrase being spoken as heard so far; it replaces the previous
+    /// interim text. Empty when there's nothing to preview.
+    Interim {
+        text: String,
+    },
+    /// After `Stop`: every phrase was sent and the socket closes.
+    Done,
+    Error {
+        message: String,
+    },
+}
