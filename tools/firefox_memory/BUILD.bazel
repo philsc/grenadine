@@ -1,0 +1,41 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+# Captures Firefox about:memory reports as timestamped .json.gz files:
+# bazel run //tools/firefox_memory:capture -- --out=DIR
+py_binary(
+    name = "capture",
+    srcs = ["capture.py"],
+    main = "capture.py",
+)
+
+py_library(
+    name = "capture_lib",
+    srcs = ["capture.py"],
+)
+
+# Summarizes the localhost processes of saved reports:
+# bazel run //tools/firefox_memory:summarize -- FILE_OR_DIR...
+py_binary(
+    name = "summarize",
+    srcs = ["summarize.py"],
+    main = "summarize.py",
+)
+
+py_library(
+    name = "summarize_lib",
+    srcs = ["summarize.py"],
+)
+
+py_test(
+    name = "capture_test",
+    size = "small",
+    srcs = ["capture_test.py"],
+    deps = [":capture_lib"],
+)
+
+py_test(
+    name = "summarize_test",
+    size = "small",
+    srcs = ["summarize_test.py"],
+    deps = [":summarize_lib"],
+)

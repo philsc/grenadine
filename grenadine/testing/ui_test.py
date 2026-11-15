@@ -1929,7 +1929,9 @@ class InboxTest(ServerTestCase):
         ).to_be_visible()
         expect(self.page.locator(".debug")).to_contain_text("of 5,000 points left")
         expect(
-            self.page.locator(".usage-table:not(.usage-reports):not(.usage-sessions)")
+            self.page.locator(
+                ".usage-table:not(.usage-reports):not(.usage-sessions):not(.page-memory)"
+            )
         ).to_contain_text("Inbox search")
         expect(self.page.locator(".usage-reports")).to_contain_text(scenarios.REPO)
 
@@ -1947,6 +1949,41 @@ class InboxTest(ServerTestCase):
                 ".usage-sessions, .debug p.muted:has-text('systemd user manager')"
             ).first
         ).to_be_visible()
+
+    def test_debug_tab_shows_page_memory(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.goto(self.url)
+        # A real link click, so the router's hash navigation logs a `nav`
+        # entry for the PR page.
+        self.row(pr.title).locator("a.pr-item").click()
+        expect(self.page).to_have_url(re.compile(f"#/{scenarios.REPO}/{pr.number}$"))
+        self.page.get_by_role("link", name="Debug", exact=True).click()
+        expect(self.page.locator(".debug h2", has_text="Page memory")).to_be_visible()
+        for row in (
+            "Wasm memory",
+            "DOM elements",
+            "Blobs",
+            "Changes",
+            "Highlight cache",
+            "Shapes",
+            "Log entries",
+        ):
+            expect(self.page.locator(".debug .page-memory")).to_contain_text(row)
+        with self.page.expect_download() as download:
+            self.page.get_by_role("button", name="Download log").click()
+        log = json.loads(download.value.path().read_text())
+        entries = log["current"]
+        self.assertTrue(entries)
+        nav_routes = [e["route"] for e in entries if e["kind"] == "nav"]
+        self.assertTrue(
+            any(f"#/{scenarios.REPO}/{pr.number}" in r for r in nav_routes),
+            f"no nav entry for the PR page: {nav_routes}",
+        )
+        entry = entries[0]
+        for key in ("at", "kind", "route", "wasm_bytes", "dom_elements", "caches"):
+            self.assertIn(key, entry)
+        for cache in ("blobs", "changes", "highlight", "shapes"):
+            self.assertIn(cache, entry["caches"])
 
     def test_a_slow_sync_status_fetch_does_not_undo_a_newer_event(self) -> None:
         # The page refetches the sync status on InboxesChanged, which a

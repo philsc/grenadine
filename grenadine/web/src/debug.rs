@@ -13,7 +13,7 @@ use leptos::prelude::*;
 use crate::{
     Updates,
     agents::status_label,
-    api,
+    api, memlog,
     topbar::{hm, hms},
 };
 
@@ -464,6 +464,28 @@ pub fn Debug() -> impl IntoView {
                 None => view! { <p class="muted">"Loading…"</p> }.into_any(),
                 Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
                 Some(Ok(u)) => view! { <UsageView usage=u /> }.into_any(),
+            }}
+            <h2>"Page memory"</h2>
+            {move || {
+                tick.track();
+                let (wasm, dom) = memlog::page_size();
+                let c = memlog::caches();
+                let (log, previous) = memlog::lengths();
+                let dotted = |n: usize, unit: String| format!("{} · {}", thousands(n as u32), unit);
+                view! {
+                    <table class="usage-table page-memory">
+                        <tbody>
+                            <tr><td>"Wasm memory"</td><td class="num">{bytes(wasm)}</td></tr>
+                            <tr><td>"DOM elements"</td><td class="num">{thousands(dom)}</td></tr>
+                            <tr><td>"Blobs"</td><td class="num">{dotted(c.blobs.entries, bytes(c.blobs.bytes.unwrap_or_default()))}</td></tr>
+                            <tr><td>"Changes"</td><td class="num">{dotted(c.changes.entries, thousands(c.changes.files.unwrap_or_default() as u32) + " files")}</td></tr>
+                            <tr><td>"Highlight cache"</td><td class="num">{dotted(c.highlight.entries, bytes(c.highlight.bytes.unwrap_or_default()))}</td></tr>
+                            <tr><td>"Shapes"</td><td class="num">{thousands(c.shapes.entries as u32)}</td></tr>
+                            <tr><td>"Log entries"</td><td class="num">{format!("{log} / {previous}")}</td></tr>
+                        </tbody>
+                    </table>
+                    <p><button on:click=|_| memlog::download()>"Download log"</button></p>
+                }
             }}
         </div>
     }

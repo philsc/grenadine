@@ -249,6 +249,23 @@ pub fn blob(id: &str) -> Option<Arc<Blob>> {
     BLOBS.with_borrow(|m| m.get(id).cloned())
 }
 
+/// The blob cache's entry count and the size of its cached text.
+pub fn blob_cache_stats() -> (usize, u64) {
+    BLOBS.with_borrow(|m| {
+        (
+            m.len(),
+            m.values()
+                .map(|b| b.text.as_deref().map_or(0, str::len) as u64)
+                .sum(),
+        )
+    })
+}
+
+/// The changes cache's entry count and the total files it holds.
+pub fn changes_cache_stats() -> (usize, usize) {
+    CHANGES.with_borrow(|m| (m.len(), m.values().map(|c| c.files.len()).sum()))
+}
+
 /// The configured repositories.
 pub async fn repos() -> Result<Vec<String>> {
     check(Request::get("/api/repos").send().await)
@@ -628,4 +645,54 @@ pub async fn disable_auto_merge(key: &PrKey) -> Result<()> {
     )
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use grenadine_core::api::{ChangeStatus, FileChange};
+
+    use super::*;
+
+    #[test]
+    fn the_caches_report_their_sizes() {
+        let change = |path: &str| FileChange {
+            status: ChangeStatus::Modified,
+            old_path: Some(path.to_owned()),
+            new_path: Some(path.to_owned()),
+            old_blob: None,
+            new_blob: None,
+        };
+        CHANGES.with_borrow_mut(|m| {
+            m.insert(
+                ("r".into(), "a".into(), "b".into()),
+                Arc::new(Changes {
+                    files: vec![change("x"), change("y")],
+                }),
+            );
+            m.insert(
+                ("r".into(), "b".into(), "c".into()),
+                Arc::new(Changes {
+                    files: vec![change("z")],
+                }),
+            );
+        });
+        BLOBS.with_borrow_mut(|m| {
+            m.insert(
+                "a".into(),
+                Arc::new(Blob {
+                    text: Some("hello".into()),
+                    size: 5,
+                }),
+            );
+            m.insert(
+                "b".into(),
+                Arc::new(Blob {
+                    text: None,
+                    size: 100,
+                }),
+            );
+        });
+        assert_eq!(changes_cache_stats(), (2, 3));
+        assert_eq!(blob_cache_stats(), (2, 5));
+    }
 }

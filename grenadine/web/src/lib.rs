@@ -16,6 +16,7 @@ mod image_drafts;
 mod images;
 mod inboxes;
 mod markdown;
+mod memlog;
 mod pr;
 mod pr_agents;
 mod review;
@@ -398,6 +399,7 @@ pub fn start() {
     }
     leptos::mount::mount_to_body(App);
     highlight::warm();
+    memlog::start();
 }
 
 /// A relative timestamp like "5m ago" for a status.

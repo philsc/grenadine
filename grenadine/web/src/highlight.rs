@@ -473,6 +473,19 @@ fn code_key(lang: &str) -> String {
     format!("\0{lang}")
 }
 
+/// The highlight cache's entry count and the size of its cached lines.
+pub fn cache_stats() -> (usize, u64) {
+    CACHE.with_borrow(|c| {
+        (
+            c.blobs.len(),
+            c.blobs
+                .values()
+                .map(|lines| lines.iter().map(|l| l.len() as u64).sum::<u64>())
+                .sum(),
+        )
+    })
+}
+
 /// A code block's ID: a hash covering the language token and the code,
 /// so the same code in different languages doesn't collide.
 pub fn code_id(lang: &str, code: &str) -> String {
@@ -1388,6 +1401,17 @@ mod tests {
         }
         assert!(cached("p", "0").is_none());
         assert!(cached("p", &CACHE_SIZE.to_string()).is_some());
+    }
+
+    #[test]
+    fn cache_stats_counts_entries_and_bytes() {
+        store(
+            &("p.rs".into(), "7".into()),
+            Arc::new(vec!["ab".to_owned(), "c".to_owned()]),
+        );
+        let (entries, bytes) = cache_stats();
+        assert!(entries >= 1);
+        assert!(bytes >= 3);
     }
 
     #[test]
