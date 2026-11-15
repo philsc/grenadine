@@ -1029,6 +1029,11 @@ fn adopt_start(draft: &str, session: &str) {
     }
 }
 
+/// The mode stored under `key`, if any.
+fn stored_mode(key: &str) -> Option<String> {
+    storage().and_then(|s| s.get_item(key).ok().flatten())
+}
+
 /// The mode a prompt to `backend` goes with when `stored` was picked
 /// last: `stored` if the backend offers it, or else its default.
 fn offered_mode(backend: AgentBackend, stored: Option<&str>) -> PermissionMode {
@@ -1041,26 +1046,57 @@ fn offered_mode(backend: AgentBackend, stored: Option<&str>) -> PermissionMode {
 /// The permission mode the session's next prompt goes with: the last
 /// one picked for it, or the backend's default mode. `backend` is `None`
 /// until the session is in; until then the stored mode is neither checked
-/// nor stored again.
-fn mode_signal(id: &str, backend: Signal<Option<AgentBackend>>) -> RwSignal<PermissionMode> {
+/// nor stored again. A session started from `draft`, e.g. by an agent's
+/// handoff, takes the mode the draft started it in.
+fn mode_signal(
+    id: &str,
+    backend: Signal<Option<AgentBackend>>,
+    draft: Memo<Option<String>>,
+) -> RwSignal<PermissionMode> {
     let key = mode_key(id);
-    let stored = storage().and_then(|s| s.get_item(&key).ok().flatten());
+    let stored = stored_mode(&key);
     let mode = RwSignal::new(match (backend.get_untracked(), stored) {
         (Some(b), stored) => offered_mode(b, stored.as_deref()),
         (None, Some(stored)) => PermissionMode::new(stored),
         (None, None) => offered_mode(AgentBackend::default(), None),
     });
-    Effect::new(move |_| {
-        let Some(backend) = backend.get() else { return };
-        let m = mode.get_untracked();
-        let offered = offered_mode(backend, Some(m.as_str()));
-        if offered != m {
-            mode.set(offered);
+    // A session that wasn't in yet is looked up again once it is, and so
+    // is one whose draft shows up: the sidebar may have moved the draft's
+    // start mode onto it meanwhile, which the mode read above mustn't
+    // replace. The draft's start keys are moved here too, right before
+    // the mode is read, so the sidebar's `adopt_start`, whether it runs
+    // before or after this, can't come between the two.
+    let stale = StoredValue::new(backend.get_untracked().is_none());
+    Effect::new({
+        let (id, key) = (id.to_owned(), key.clone());
+        move |seen: Option<Option<String>>| {
+            let seen = seen.flatten();
+            let Some(backend) = backend.get() else {
+                return seen;
+            };
+            let draft = draft.get();
+            let arrived = draft.is_some() && draft != seen;
+            if arrived && let Some(d) = &draft {
+                adopt_start(d, &id);
+            }
+            let mut m = mode.get_untracked();
+            if stale.get_value() || arrived {
+                stale.set_value(false);
+                if let Some(stored) = stored_mode(&key) {
+                    m = PermissionMode::new(stored);
+                }
+            }
+            let offered = offered_mode(backend, Some(m.as_str()));
+            if offered != mode.get_untracked() {
+                mode.set(offered);
+            }
+            draft
         }
     });
     Effect::new(move |_| {
         let mode = mode.get();
         if backend.with(Option::is_some)
+            && !stale.get_value()
             && let Some(s) = storage()
         {
             let _ = s.set_item(&key, mode.as_str());
@@ -2359,7 +2395,12 @@ pub fn AgentView(
     });
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
-    let mode = mode_signal(&id, backend);
+    // A session the page didn't start itself, e.g. one an agent's handoff
+    // started, takes the mode and model its draft started it with once
+    // the session says which draft that was. The sidebar may get there
+    // first.
+    let draft = Memo::new(move |_| current.with(|s| s.as_ref().and_then(|s| s.draft.clone())));
+    let mode = mode_signal(&id, backend, draft);
     // The model the session last said it runs; the stream's is newer
     // than the loaded session's.
     let reported = Signal::derive(move || {
@@ -2368,28 +2409,14 @@ pub fn AgentView(
             .or_else(|| current.with(|s| s.as_ref().and_then(|s| s.model.clone())))
     });
     let model = session_model_signal(&id);
-    // A session the page didn't start itself, e.g. one an agent's handoff
-    // started, takes the mode and model its draft started it with once
-    // the session says which draft that was. The sidebar may get there
-    // first.
-    let draft = Memo::new(move |_| current.with(|s| s.as_ref().and_then(|s| s.draft.clone())));
+    // Like the mode, the model is read again once the draft shows up,
+    // right after its start keys are moved, whoever moves them.
     Effect::new({
         let id = id.clone();
         move |_| {
             let Some(d) = draft.get() else { return };
-            let started = |key: String| storage().and_then(|s| s.get_item(&key).ok().flatten());
-            let (started_mode, started_model) =
-                (started(start_mode_key(&d)), started(start_model_key(&d)));
-            if started_mode.is_none() && started_model.is_none() {
-                return;
-            }
             adopt_start(&d, &id);
-            if let Some(m) = started_mode {
-                mode.set(PermissionMode::new(m));
-            }
-            if started_model.is_some() {
-                model.set(session_pick(started_model));
-            }
+            model.set(session_pick(stored_session_model(&id)));
         }
     });
     // Whether the session is a general one, so the pane below only
