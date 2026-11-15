@@ -210,6 +210,7 @@ pub fn delete_session(
                 if let Some(s) = storage() {
                     let _ = s.remove_item(&draft_key(&id));
                     let _ = s.remove_item(&mode_key(&id));
+                    let _ = s.remove_item(&session_model_key(&id));
                 }
                 forget_question_drafts(&id);
                 crate::terminal::forget(&id);
@@ -443,7 +444,7 @@ pub fn Sidebar(
                 continue;
             }
             let open = route.with_untracked(|r| matches!(r, Route::Draft(x) if *x == *d));
-            adopt_start_mode(d, &s.id);
+            adopt_start(d, &s.id);
             drafts.remove(d);
             if open {
                 go(&agent_hash(&s.id));
@@ -592,6 +593,7 @@ pub fn CleanupView() -> impl IntoView {
         if busy.get_untracked() || ids.is_empty() {
             return;
         }
+        let picked = model.get_untracked();
         let req = NewCleanupSession {
             ids,
             repo: repo.get_untracked(),
@@ -603,9 +605,11 @@ pub fn CleanupView() -> impl IntoView {
         spawn_local(async move {
             match api::create_cleanup_session(&req).await {
                 Ok(session) => {
-                    // The server starts it out planning.
+                    // The server starts it out planning, with the model
+                    // picked here.
                     if let Some(s) = storage() {
                         let _ = s.set_item(&mode_key(&session.id), PermissionMode::plan().as_str());
+                        let _ = s.set_item(&session_model_key(&session.id), &picked);
                     }
                     go(&agent_hash(&session.id));
                 }
@@ -988,15 +992,40 @@ fn start_mode_key(draft: &str) -> String {
     format!("grenadine.agent-start-mode.{draft}")
 }
 
-/// Moves a draft's start mode onto the session it became, once: a
-/// second call finds no start key and leaves what the page has stored
-/// since alone.
-fn adopt_start_mode(draft: &str, session: &str) {
-    if let Some(s) = storage()
-        && let Ok(Some(mode)) = s.get_item(&start_mode_key(draft))
-    {
+/// The model a draft's session starts with, kept like its start mode.
+fn start_model_key(draft: &str) -> String {
+    format!("grenadine.agent-start-model.{draft}")
+}
+
+/// Keeps the mode and model a draft's session starts with until its page
+/// takes them over.
+fn save_start(draft: &str, mode: &PermissionMode, model: &str) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(&start_mode_key(draft), mode.as_str());
+        let _ = s.set_item(&start_model_key(draft), model);
+    }
+}
+
+/// Drops a draft's start mode and model, for a start that didn't happen.
+fn forget_start(draft: &str) {
+    if let Some(s) = storage() {
+        let _ = s.remove_item(&start_mode_key(draft));
+        let _ = s.remove_item(&start_model_key(draft));
+    }
+}
+
+/// Moves a draft's start mode and model onto the session it became,
+/// once: a second call finds no start keys and leaves what the page has
+/// stored since alone.
+fn adopt_start(draft: &str, session: &str) {
+    let Some(s) = storage() else { return };
+    if let Ok(Some(mode)) = s.get_item(&start_mode_key(draft)) {
         let _ = s.set_item(&mode_key(session), &mode);
         let _ = s.remove_item(&start_mode_key(draft));
+    }
+    if let Ok(Some(model)) = s.get_item(&start_model_key(draft)) {
+        let _ = s.set_item(&session_model_key(session), &model);
+        let _ = s.remove_item(&start_model_key(draft));
     }
 }
 
@@ -1085,6 +1114,12 @@ const BACKEND_KEY: &str = "grenadine.agent-backend";
 /// What the model picker shows for the backend's configured default.
 pub(crate) const DEFAULT_MODEL: &str = "default";
 
+/// What a session's model picker shows for the model the session runs
+/// now. Its prompts ask for no model, which a resumed session takes as
+/// staying on its own, with all of its name: the name it reports may be
+/// missing parts of it, e.g. Claude Code's `[1m]`.
+const CURRENT_MODEL: &str = "";
+
 /// The models a picker of `backend`'s models offers: `models`, a
 /// "Default" entry first unless the list has one, and `picked` marked
 /// "(not listed)" when the list doesn't have it.
@@ -1103,7 +1138,7 @@ pub(crate) fn model_options(
             },
         );
     }
-    if !options.iter().any(|m| m.value == picked) {
+    if picked != CURRENT_MODEL && !options.iter().any(|m| m.value == picked) {
         options.push(AgentModelInfo {
             display_name: format!("{picked} (not listed)"),
             description: format!("{} didn't list this model", backend.label()),
@@ -1133,6 +1168,18 @@ fn save_model(backend: AgentBackend, model: &str) {
     }
 }
 
+/// Where the model a session's next prompt goes with is kept. Each
+/// session has its own, apart from the backend's last pick that new
+/// sessions start with, so that picking one for a session doesn't move
+/// the others onto it.
+fn session_model_key(id: &str) -> String {
+    format!("{MODEL_KEY}.session.{id}")
+}
+
+fn stored_session_model(id: &str) -> Option<String> {
+    storage().and_then(|s| s.get_item(&session_model_key(id)).ok().flatten())
+}
+
 /// The backend picked last; the default at first.
 pub(crate) fn last_backend() -> AgentBackend {
     storage()
@@ -1147,9 +1194,9 @@ fn save_backend(backend: AgentBackend) {
     }
 }
 
-/// The model the next prompt goes with: the last one picked for the
+/// The model a new session starts with: the last one picked for the
 /// backend, again whenever the backend changes. `ModelSelect` saves the
-/// picks.
+/// picks. A session's page has its own, `session_model_signal`.
 fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
     let model = RwSignal::new(last_model(backend.get_untracked()));
     Effect::watch(
@@ -1160,47 +1207,110 @@ fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
     model
 }
 
+/// The model session `id`'s next prompt goes with: the one picked for it
+/// last, or else the one it runs now. A pick lives in this browser only,
+/// so a session started elsewhere, or before picks were kept per
+/// session, stays on its model. A session started with the backend's
+/// default runs that, so staying on its model is the same. `ModelSelect`
+/// saves the picks.
+fn session_model_signal(id: &str) -> RwSignal<String> {
+    RwSignal::new(session_pick(stored_session_model(id)))
+}
+
+/// What a session's picker shows for `stored`, the model picked for it
+/// or for the draft it started from: the backend's default, which a
+/// session's picker doesn't offer, and no pick both stay on the model
+/// the session runs.
+fn session_pick(stored: Option<String>) -> String {
+    stored
+        .filter(|m| m != DEFAULT_MODEL)
+        .unwrap_or_else(|| CURRENT_MODEL.to_owned())
+}
+
+/// On a session's page, the session `ModelSelect`'s picks are kept for,
+/// and the model it reported running, which the picker's entry for
+/// staying on it names.
+#[derive(Clone, Copy)]
+struct SessionPick {
+    id: StoredValue<String>,
+    reported: Signal<Option<String>>,
+}
+
 /// Where a session's half-written follow-up is kept, so it survives
 /// switching to another session and back.
 fn draft_key(id: &str) -> String {
     format!("grenadine.agent-draft.{id}")
 }
 
-/// The model a request asks for; `None` leaves it to the backend's
-/// default.
+/// The model a request asks for; `None` leaves it to the backend: its
+/// default for a new session, a resumed one's own model.
 fn model_arg(model: RwSignal<String>) -> Option<String> {
-    Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL)
+    Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL && m != CURRENT_MODEL)
 }
 
 /// Picks one of `backend`'s models. Until they're listed, or when they
 /// can't be, its configured default is offered, and the model picked
-/// last stays, marked as not listed.
+/// last stays, marked as not listed. The picks are saved for `session`,
+/// or else as the backend's last pick.
 #[component]
-fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl IntoView {
+fn ModelSelect(
+    model: RwSignal<String>,
+    backend: Signal<AgentBackend>,
+    #[prop(optional)] session: Option<SessionPick>,
+) -> impl IntoView {
     let models = listed_models(backend);
     // Models that couldn't be listed when the page loaded may be now.
     if models.get_untracked().is_some_and(|m| m.is_empty()) {
         backends().refetch();
     }
     let options = Memo::new(move |_| {
-        model_options(
+        let mut options = model_options(
             models.get().unwrap_or_default(),
             backend.get(),
             &model.get(),
-        )
+        );
+        // A session can always stay on the model it runs. It can't go
+        // back to the backend's default: asking for no model keeps a
+        // resumed session on its own, and what the default resolves to
+        // isn't known here.
+        if let Some(s) = session {
+            options.retain(|m| m.value != DEFAULT_MODEL);
+            let name = s.reported.get();
+            options.insert(
+                0,
+                AgentModelInfo {
+                    value: CURRENT_MODEL.into(),
+                    display_name: match &name {
+                        Some(n) => format!("Current ({n})"),
+                        None => "Current".into(),
+                    },
+                    description: "The model the session runs now".into(),
+                },
+            );
+        }
+        options
     });
-    // A pick that's no longer offered goes back to the default. Without
-    // a list there's no telling, and the pick stays.
+    // A pick that's no longer offered goes back to the default, or on a
+    // session's page to the model the session runs. Without a list
+    // there's no telling, and the pick stays.
+    let fallback = if session.is_some() {
+        CURRENT_MODEL
+    } else {
+        DEFAULT_MODEL
+    };
     Effect::new(move |_| {
         let stale = models.with(|ms| {
             ms.as_ref().is_some_and(|ms| {
                 !ms.is_empty()
-                    && model
-                        .with_untracked(|m| m != DEFAULT_MODEL && !ms.iter().any(|i| &i.value == m))
+                    && model.with_untracked(|m| {
+                        m != DEFAULT_MODEL
+                            && m != CURRENT_MODEL
+                            && !ms.iter().any(|i| &i.value == m)
+                    })
             })
         });
         if stale {
-            model.set(DEFAULT_MODEL.into());
+            model.set(fallback.into());
         }
     });
     view! {
@@ -1210,11 +1320,19 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
             title=move || format!("The model {} runs with", backend.get().agent_name())
             prop:value=move || model.get()
             on:change=move |ev| {
-                // Only a pick is saved, under the backend it was picked
-                // for; a model reset because the backend doesn't offer it
-                // isn't, so it can't overwrite another backend's pick.
+                // Only a pick is saved, for the session or under the
+                // backend it was picked for; a model reset because the
+                // backend doesn't offer it isn't, so it can't overwrite
+                // another backend's pick.
                 let picked = event_target_value(&ev);
-                save_model(backend.get_untracked(), &picked);
+                match session {
+                    Some(s) => {
+                        if let Some(st) = storage() {
+                            let _ = st.set_item(&session_model_key(&s.id.get_value()), &picked);
+                        }
+                    }
+                    None => save_model(backend.get_untracked(), &picked),
+                }
                 model.set(picked);
             }
         >
@@ -1455,6 +1573,7 @@ pub fn NewSession(
         let mode = mode.get_untracked();
         let mode_picked = mode_picked.get_untracked();
         let raw_prompt = prompt.get_untracked();
+        let picked = model.get_untracked();
         let model = model_arg(model);
         let images = images.get_untracked();
         let attachments = files.ids();
@@ -1496,9 +1615,7 @@ pub fn NewSession(
             // moves the start mode onto it and removes the draft, as it
             // does for a start whose answer the page missed.
             if let Some(h) = handoff.get_value() {
-                if let Some(s) = storage() {
-                    let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
-                }
+                save_start(&id, &req.permission_mode, &picked);
                 let approval = Approval {
                     id: h.tool,
                     allow: true,
@@ -1509,26 +1626,24 @@ pub fn NewSession(
                     handoff: Some(req),
                 };
                 if let Err(e) = api::approve(&h.agent, &approval).await {
-                    if let Some(s) = storage() {
-                        let _ = s.remove_item(&start_mode_key(&id));
-                    }
+                    forget_start(&id);
                     drafts.set_start_error(&id, Some(e));
                 }
                 drafts.set_starting(&id, false);
                 return;
             }
             // The session shows before this answer arrives, and its page
-            // would lose the mode it starts in without the start key.
-            if let Some(s) = storage() {
-                let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
-            }
+            // would lose the mode and model it starts with without the
+            // start keys.
+            save_start(&id, &req.permission_mode, &picked);
             // The form may be unmounted by the time the start answers, so
             // only what outlives it is touched here.
             match api::create_agent(&req).await {
                 Ok(session) => {
                     drafts.remove(&id);
-                    // Its follow-ups go on in the mode it started in.
-                    adopt_start_mode(&id, &session.id);
+                    // Its follow-ups go on in the mode and with the model
+                    // it started with.
+                    adopt_start(&id, &session.id);
                     // Go to the session only while its draft is still
                     // open; the user may have moved on while it started.
                     if crate::current_hash() == drafts::hash(&id) {
@@ -1536,9 +1651,7 @@ pub fn NewSession(
                     }
                 }
                 Err(e) => {
-                    if let Some(s) = storage() {
-                        let _ = s.remove_item(&start_mode_key(&id));
-                    }
+                    forget_start(&id);
                     drafts.set_start_error(&id, Some(e));
                 }
             }
@@ -2247,22 +2360,38 @@ pub fn AgentView(
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
     let mode = mode_signal(&id, backend);
+    // The model the session last said it runs; the stream's is newer
+    // than the loaded session's.
+    let reported = Signal::derive(move || {
+        live_model
+            .get()
+            .or_else(|| current.with(|s| s.as_ref().and_then(|s| s.model.clone())))
+    });
+    let model = session_model_signal(&id);
     // A session the page didn't start itself, e.g. one an agent's handoff
-    // started, takes the mode its draft started it in once the session
-    // says which draft that was. The sidebar may get there first.
+    // started, takes the mode and model its draft started it with once
+    // the session says which draft that was. The sidebar may get there
+    // first.
     let draft = Memo::new(move |_| current.with(|s| s.as_ref().and_then(|s| s.draft.clone())));
     Effect::new({
         let id = id.clone();
         move |_| {
             let Some(d) = draft.get() else { return };
-            let started = storage().and_then(|s| s.get_item(&start_mode_key(&d)).ok().flatten());
-            if let Some(m) = started {
-                adopt_start_mode(&d, &id);
+            let started = |key: String| storage().and_then(|s| s.get_item(&key).ok().flatten());
+            let (started_mode, started_model) =
+                (started(start_mode_key(&d)), started(start_model_key(&d)));
+            if started_mode.is_none() && started_model.is_none() {
+                return;
+            }
+            adopt_start(&d, &id);
+            if let Some(m) = started_mode {
                 mode.set(PermissionMode::new(m));
+            }
+            if started_model.is_some() {
+                model.set(session_pick(started_model));
             }
         }
     });
-    let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
     // Whether the session is a general one, so the pane below only
     // remounts when that flips, not on every session update.
     let general =
@@ -2359,9 +2488,7 @@ pub fn AgentView(
                                     let (tokens, window) = live_usage.get();
                                     session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
                                 });
-                                let active_model = Signal::derive(move || {
-                                    live_model.get().or_else(|| session.with(|s| s.model.clone()))
-                                });
+                                let active_model = reported;
                                 view! {
                                     {if compact {
                                         view! {
@@ -4194,9 +4321,7 @@ fn HandoffCard(
         Effect::new(move |_| {
             if matches!(state.get(), Some(Answer::Denied | Answer::Expired)) {
                 drafts.remove(&draft);
-                if let Some(s) = storage() {
-                    let _ = s.remove_item(&start_mode_key(&draft));
-                }
+                forget_start(&draft);
             }
         });
     }
@@ -4449,7 +4574,7 @@ fn Composer(
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode backend=backend />
-                <ModelSelect model=model backend=backend />
+                <ModelSelect model=model backend=backend session=SessionPick { id, reported: active_model } />
                 <button type="submit" class="primary" disabled=move || blank() || files.pending()>"Send"</button>
                 <AttachButton attached=attached />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}

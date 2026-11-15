@@ -4733,6 +4733,87 @@ class AgentTest(ServerTestCase):
         backend.select_option(label="Devin")
         expect(model).to_have_value("swe-2-high")
 
+    def test_sessions_keep_their_own_models(self) -> None:
+        def start(model: str, prompt: str) -> str:
+            self.page.goto(self.url + "#/agents")
+            self.page.get_by_label("Repository").select_option(label="General")
+            self.page.get_by_label("Permissions").select_option(label="Auto")
+            self.page.get_by_label("Model").select_option(model)
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+            expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+            return self.page.url.split("/")[-1]
+
+        def send(text: str) -> str | None:
+            with self.page.expect_request(
+                re.compile(r"/api/agents/.*/messages$")
+            ) as req:
+                self.page.get_by_label("Follow-up").fill(text)
+                self.page.get_by_label("Follow-up").press("Enter")
+            # The box empties once the send is answered; text typed
+            # before then would be emptied with it.
+            expect(self.page.get_by_label("Follow-up")).to_have_value("")
+            return req.value.post_data_json["model"]
+
+        picker = self.page.locator(".composer .agent-model-select")
+        first = start("sonnet", "first")
+        expect(picker).to_have_value("sonnet")
+        second = start("haiku", "second")
+        expect(picker).to_have_value("haiku")
+        # A session can't go back to the backend's default, which would
+        # only keep it on its model.
+        expect(picker.locator('option[value="default"]')).to_have_count(0)
+        # A pick for one session is that session's alone: neither the
+        # other session nor the next new one starts with it.
+        picker.select_option("")
+        self.page.goto(f"{self.url}#/agents/{first}")
+        expect(self.page.locator(".transcript .turn-prompt").first).to_have_text(
+            "first"
+        )
+        expect(picker).to_have_value("sonnet")
+        self.assertEqual(send("again"), "sonnet")
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.get_by_label("Model")).to_have_value("haiku")
+
+        # A session with no pick of its own in this browser, e.g. one
+        # started in another, stays on the model it runs: its prompts ask
+        # for none, so the resumed session keeps all of its model's name,
+        # which the reported one may lack parts of.
+        third = start("haiku", "third")
+        self.page.evaluate(
+            f"() => localStorage.removeItem('grenadine.agent-model.session.{third}')"
+        )
+        self.page.reload()
+        expect(picker).to_have_value("")
+        expect(picker.locator("option:checked")).to_have_text("Current (haiku)")
+        self.assertIsNone(send("onwards"))
+        # Staying on it can be picked again after picking another.
+        picker.select_option("sonnet")
+        picker.select_option("")
+        self.assertIsNone(send("still"))
+        # A pick the backend no longer lists goes back to staying on the
+        # session's model, which is what asking for none does.
+        self.page.evaluate(
+            f"() => localStorage.setItem('grenadine.agent-model.session.{third}', 'gone')"
+        )
+        self.page.reload()
+        # Unlike Claude Code, the fake claude resumes on its default when
+        # asked for no model, so the entry's name may have changed.
+        expect(picker).to_have_value("")
+        expect(picker.locator("option:checked")).to_have_text(
+            re.compile(r"^Current \(")
+        )
+
+        # Deleting a session forgets its pick.
+        self.delete_session()
+        for id in (first, second):
+            self.delete_session_via_api(id)
+        kept = self.page.evaluate(
+            "() => Object.keys(localStorage).filter(k => k.startsWith('grenadine.agent-model.session.'))"
+        )
+        self.assertNotIn(f"grenadine.agent-model.session.{third}", kept)
+
     def test_a_draft_leaves_a_backend_no_longer_offered(self) -> None:
         # The last session was Devin's, but Devin can't list its models
         # any more, so the server offers Claude Code alone.
@@ -5341,9 +5422,13 @@ class AgentTest(ServerTestCase):
         )
         self.page.get_by_role("link", name="Agents").click()
         expect(item).not_to_have_class(re.compile(r"\bselected\b"))
-        # New sessions start with the model picked last.
-        expect(model).to_have_value("sonnet")
+        # New sessions start with the model picked last for one, not with
+        # the one this session's follow-ups go with.
+        expect(model).to_have_value("default")
         item.click()
+        expect(self.page.locator(".composer .agent-model-select")).to_have_value(
+            "sonnet"
+        )
         expect(transcript.locator(".turn-prompt")).to_have_text(
             ["please write a note", "thanks\nso much", "write more"]
         )
@@ -5649,6 +5734,7 @@ class AgentTest(ServerTestCase):
         # The session starts as the user edits it.
         card.get_by_label("Prompt").fill("say goodbye")
         card.get_by_label("Permissions").select_option(label="Ask for everything")
+        card.get_by_label("Model").select_option("haiku")
         card.get_by_role("button", name="Start").click()
         expect(transcript.locator(".approval.pending")).to_have_count(0)
         expect(transcript.locator(".approval")).to_contain_text("Handed off: say hello")
@@ -5667,6 +5753,10 @@ class AgentTest(ServerTestCase):
         expect(child.locator(".turn-end.muted")).to_have_count(1)
         # Its follow-ups go on in the mode the user started it in.
         expect(self.page.locator(".composer .agent-mode")).to_have_value("manual")
+        # And with the model it started with.
+        expect(self.page.locator(".composer .agent-model-select")).to_have_value(
+            "haiku"
+        )
         origin = self.page.locator(".handed-off-from")
         expect(origin).to_have_text("Handed off from hand off say hello")
         origin.get_by_role("link").click()
@@ -6311,6 +6401,44 @@ class AgentTest(ServerTestCase):
         expect(permissions).to_have_value("acceptEdits")
         self.page.reload()
         expect(permissions).to_have_value("acceptEdits")
+
+    def test_a_session_started_on_the_default_model_stays_on_its_own(
+        self,
+    ) -> None:
+        # A session the server started from a draft the sidebar doesn't
+        # have, e.g. a handoff's, is adopted by its own page. A start on
+        # the backend's default, which a session's picker doesn't offer,
+        # shows as staying on the session's model.
+        resp = self.page.request.post(
+            f"{self.url}api/agents",
+            headers={"Origin": self.url.rstrip("/")},
+            data={
+                "backend": "claude",
+                "repo": scenarios.REPO,
+                "prompt": "say default",
+                "permission_mode": "auto",
+                "draft": "defaultdraft1",
+            },
+        )
+        self.assertEqual(resp.status, 200, resp.text())
+        session_id = resp.json()["id"]
+        self.page.goto(self.url + "#/agents")
+        self.page.evaluate(
+            "() => {"
+            " localStorage.setItem('grenadine.agent-start-mode.defaultdraft1', 'auto');"
+            " localStorage.setItem('grenadine.agent-start-model.defaultdraft1', 'default');"
+            " }"
+        )
+        self.page.goto(f"{self.url}#/agents/{session_id}")
+        model = self.page.locator(".composer .agent-model-select")
+        expect(model).to_have_value("")
+        expect(model.locator("option:checked")).to_have_text(re.compile(r"^Current\b"))
+        # The page took the start over.
+        start = self.page.evaluate(
+            "() => localStorage.getItem('grenadine.agent-start-model.defaultdraft1')"
+        )
+        self.assertIsNone(start)
+        self.delete_session()
 
     def test_a_draft_whose_session_started_is_cleaned_up(self) -> None:
         # The server can start a draft's session without the page seeing
