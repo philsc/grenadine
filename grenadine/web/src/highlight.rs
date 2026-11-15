@@ -9,6 +9,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use grenadine_core::api::Blob;
+use syntect::dumps::from_uncompressed_data;
 use syntect::highlighting::ThemeSet;
 use syntect::html::{
     ClassStyle, ClassedHTMLGenerator, css_for_theme_with_class_style, line_tokens_to_classed_spans,
@@ -28,7 +29,13 @@ thread_local! {
 }
 
 fn with_syntaxes<R>(f: impl FnOnce(&SyntaxSet) -> R) -> R {
-    SYNTAXES.with(|cell| f(cell.get_or_init(SyntaxSet::load_defaults_newlines)))
+    SYNTAXES.with(|cell| f(cell.get_or_init(load_syntaxes)))
+}
+
+/// syntect's own syntaxes plus the ones in src/syntaxes/, dumped at build
+/// time by syntax_dump.rs.
+fn load_syntaxes() -> SyntaxSet {
+    from_uncompressed_data(include_bytes!(env!("SYNTAXES_DUMP"))).expect("a bad syntax dump")
 }
 
 /// The stylesheet for both themes. Every rule is scoped to
@@ -1257,6 +1264,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bundled_syntaxes_keep_the_defaults() {
+        let defaults = SyntaxSet::load_defaults_newlines();
+        with_syntaxes(|set| {
+            for syntax in defaults.syntaxes() {
+                for ext in &syntax.file_extensions {
+                    assert!(set.find_syntax_by_extension(ext).is_some(), "{ext}");
+                }
+            }
+            assert_eq!(set.syntaxes().len(), defaults.syntaxes().len() + 1);
+        });
+    }
+
+    const SALT: &str = "\
+{# Made-up state for the tests. #}
+{% set port = pillar.get('web:port', 8080) %}
+nginx:
+  pkg.installed:
+    - name: {{ pillar['web']['package'] | default(\"nginx\") }}
+  service.running:
+    - enable: True
+{%- if grains['os'] == 'Debian' %}
+    - watch:
+      - file: /etc/nginx/nginx.conf
+{%- endif %}
+";
+
+    /// The `sy-` classes on the spans of one highlighted line, each span's
+    /// classes joined by spaces.
+    fn span_classes(line: &str) -> Vec<String> {
+        line.split("<span class=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap().to_owned())
+            .collect()
+    }
+
+    fn has_class(line: &str, class: &str) -> bool {
+        span_classes(line)
+            .iter()
+            .any(|c| c.split(' ').any(|c| c == class))
+    }
+
+    #[test]
+    fn salt_states_highlight_as_yaml_with_jinja() {
+        with_syntaxes(|set| {
+            assert_eq!(
+                syntax_for(set, "states/web.sls").unwrap().name,
+                "Salt State"
+            );
+        });
+        let lines = highlight_lines("states/web.sls", SALT);
+        assert_eq!(lines.len(), SALT.lines().count());
+        assert!(has_class(&lines[0], "sy-comment"), "{}", lines[0]);
+        assert!(has_class(&lines[1], "sy-control"), "{}", lines[1]);
+        assert!(has_class(&lines[1], "sy-string"), "{}", lines[1]);
+        assert!(has_class(&lines[1], "sy-numeric"), "{}", lines[1]);
+        // YAML keys around the Jinja, including the one after a value that
+        // holds a Jinja expression.
+        for i in [2, 3, 5] {
+            assert!(has_class(&lines[i], "sy-entity"), "{}", lines[i]);
+        }
+        assert!(has_class(&lines[4], "sy-embedded"), "{}", lines[4]);
+        assert!(has_class(&lines[4], "sy-filter"), "{}", lines[4]);
+        assert!(has_class(&lines[7], "sy-control"), "{}", lines[7]);
+        assert!(has_class(&lines[8], "sy-entity"), "{}", lines[8]);
+        assert!(has_class(&lines[10], "sy-control"), "{}", lines[10]);
+    }
+
+    #[test]
+    fn salt_fences_highlight_in_markdown() {
+        let html = highlight_code("sls", "{{ x }}\nkey: value\n").unwrap();
+        assert!(html.contains("sy-jinja"), "{html}");
     }
 
     const RUST: &str = "/* a comment\n   over lines */\nfn main() {\n    let s = \"a < b\";\n}\n";

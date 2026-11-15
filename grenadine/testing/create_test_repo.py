@@ -1147,6 +1147,19 @@ SYNTAX_FILES: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "all:\n\techo building\n",
         [("building", "building everything")],
     ),
+    "syntax/top.sls": (
+        (
+            "{% set port = pillar.get('web:port', 8080) %}\n"
+            "web:\n"
+            "  pkg.installed:\n"
+            "    - name: {{ pillar.get('web:package', 'nginx') }}\n"
+            "{%- if grains['os'] == 'Debian' %}\n"
+            "  service.running:\n"
+            "    - enable: True\n"
+            "{%- endif %}\n"
+        ),
+        [("8080", "8443")],
+    ),
     "syntax/notes.unknownext": (
         "Plain text in a file whose extension nothing recognizes.\n",
         [("Plain", "Unhighlighted")],
@@ -1174,7 +1187,8 @@ def diff_syntax(fx: Fixture) -> None:
     fx.push_branch(f"case/{case}")
     notes = (
         "One small edit per language. BUILD.bazel and .bzl files highlight as "
-        "Python, and .ts/.tsx as JavaScript. notes.unknownext has no "
+        "Python, .ts/.tsx as JavaScript, and top.sls as YAML with Jinja tags. "
+        "notes.unknownext has no "
         "highlighting. huge.py is over 20,000 lines, so it isn't highlighted."
     )
     fx.open_pr(
