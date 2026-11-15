@@ -30,6 +30,11 @@ const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
 /// page. 0 turns the check off.
 const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 
+/// How long Claude Code may go on after an answer before the session
+/// shows as waiting on a background task. Without a background task, it
+/// exits right after the answer.
+const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The `initialize` control request the Agent SDK starts with. Claude Code
 /// answers it without calling a model.
 const INITIALIZE: &str =
@@ -251,10 +256,33 @@ async fn turn(
 
     let stderr = crate::agent::stderr_tail(child.stderr.take().unwrap());
     let mut lines = OutputLines::new(child.stdout.take().unwrap(), stopper);
-    while let Some(line) = lines.next(state).await? {
+    // When a process still running after its answer shows as waiting on
+    // a background task. The short grace keeps a process that's just
+    // exiting from showing as one. Lines the transcript skips, like a
+    // background subagent's, don't put the deadline off.
+    let mut deadline = None;
+    loop {
+        let line = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, lines.next(state)).await {
+                Ok(line) => line?,
+                Err(_) => {
+                    sink.background();
+                    deadline = None;
+                    continue;
+                }
+            },
+            None => lines.next(state).await?,
+        };
+        let Some(line) = line else {
+            break;
+        };
         match parse_line(&line) {
             Parsed::Started { model } => sink.started(id, model)?,
             Parsed::Events(events) => {
+                if let Some(last) = events.last() {
+                    deadline = matches!(last, AgentEventKind::TurnEnded { error: None, .. })
+                        .then(|| tokio::time::Instant::now() + BACKGROUND_GRACE);
+                }
                 for kind in events {
                     sink.event(kind)?;
                 }

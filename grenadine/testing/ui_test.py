@@ -630,6 +630,10 @@ if long:
         padding = ("0123456789abcdef" * ((size // 16) + 1))[:size]
         result(tool_use, f"result {i}: {padding}")
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
+# `background N` keeps the process going for N seconds after its answer,
+# as Claude Code does for a background task.
+if prompt.startswith("background "):
+    time.sleep(float(prompt.removeprefix("background ")))
 """
 
 
@@ -7550,6 +7554,51 @@ class AgentTest(ServerTestCase):
         expect(plan).to_contain_text("Unanswered plan")
         expect(plan.get_by_role("button", name="Approve plan")).to_have_count(0)
 
+    def test_waiting_on_a_background_task(self) -> None:
+        tab = self.page.locator(".topbar-tabs a").filter(has_text="Agents")
+        count = tab.locator(".count")
+        # Sessions left waiting by earlier tests may already count.
+        with urllib.request.urlopen(f"{self.url}api/agents") as resp:
+            base = sum(
+                1
+                for s in json.load(resp)
+                if s["kind"] == "interactive"
+                and s["status"]
+                in {"idle", "awaiting_approval", "interrupted", "failed", "background"}
+            )
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("background 8")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".turn-end")).to_have_text(["Done · $0.01"])
+
+        # Answered, but its process is still holding a background task.
+        status = self.page.locator(".agent-status-line .agent-status")
+        expect(status).to_have_text("waiting on background task", timeout=10_000)
+        expect(self.page.locator(".activity")).to_contain_text(
+            "Waiting on a background task"
+        )
+        expect(count).to_have_text(str(base + 1))
+        follow_up = self.page.get_by_label("Follow-up")
+        expect(follow_up).to_have_attribute(
+            "placeholder",
+            re.compile("^Queue a follow-up for when the background task finishes"),
+        )
+        expect(self.page.get_by_role("button", name="Stop")).to_be_visible()
+
+        # A follow-up waits for the process, then runs.
+        follow_up.fill("after it")
+        follow_up.press("Enter")
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt").last).to_have_text(
+            "after it", timeout=20_000
+        )
+        expect(status).to_have_text("idle", timeout=20_000)
+        expect(self.page.locator(".turn-end")).to_have_text(
+            ["Done · $0.01", "Done · $0.01"]
+        )
+
     def test_tab_counts_waiting_sessions(self) -> None:
         tab = self.page.locator(".topbar-tabs a").filter(has_text="Agents")
         count = tab.locator(".count")
@@ -7560,7 +7609,7 @@ class AgentTest(ServerTestCase):
                 for s in json.load(resp)
                 if s["kind"] == "interactive"
                 and s["status"]
-                in {"idle", "awaiting_approval", "interrupted", "failed"}
+                in {"idle", "awaiting_approval", "interrupted", "failed", "background"}
             )
         self.page.goto(self.url + "#/agents")
         expect_tab_count(count, base)

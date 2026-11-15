@@ -1821,12 +1821,13 @@ impl Db {
     /// interrupted, since their Claude Code processes are gone.
     pub fn interrupt_agents(&self) -> Result<()> {
         self.conn().execute(
-            "UPDATE agents SET status = ? WHERE status IN (?, ?, ?)",
+            "UPDATE agents SET status = ? WHERE status IN (?, ?, ?, ?)",
             params![
                 status_str(AgentStatus::Interrupted),
                 status_str(AgentStatus::Creating),
                 status_str(AgentStatus::Running),
-                status_str(AgentStatus::AwaitingApproval)
+                status_str(AgentStatus::AwaitingApproval),
+                status_str(AgentStatus::Background)
             ],
         )?;
         Ok(())
@@ -2303,6 +2304,7 @@ fn status_str(s: AgentStatus) -> &'static str {
         AgentStatus::Creating => "creating",
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "running",
+        AgentStatus::Background => "background",
         AgentStatus::AwaitingApproval => "awaiting_approval",
         AgentStatus::Interrupted => "interrupted",
         AgentStatus::Failed => "failed",
@@ -2314,6 +2316,7 @@ fn parse_status(s: &str) -> AgentStatus {
         "creating" => AgentStatus::Creating,
         "idle" => AgentStatus::Idle,
         "running" => AgentStatus::Running,
+        "background" => AgentStatus::Background,
         "awaiting_approval" => AgentStatus::AwaitingApproval,
         "interrupted" => AgentStatus::Interrupted,
         _ => AgentStatus::Failed,
@@ -3325,6 +3328,12 @@ mod tests {
             .unwrap();
         db.create_agent(&agent("c", AgentStatus::Failed)).unwrap();
         db.create_agent(&agent("d", AgentStatus::Creating)).unwrap();
+        db.create_agent(&agent("e", AgentStatus::Background))
+            .unwrap();
+        assert_eq!(
+            db.agent("e").unwrap(),
+            Some(agent("e", AgentStatus::Background))
+        );
         assert_eq!(
             db.agent("a").unwrap(),
             Some(agent("a", AgentStatus::Running))
@@ -3383,11 +3392,12 @@ mod tests {
         assert_eq!(db.agent("a").unwrap().unwrap().landed, Some(landed));
 
         db.interrupt_agents().unwrap();
-        // Newest first: d, c, b, a.
+        // Newest first: e, d, c, b, a.
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();
         assert_eq!(
             statuses,
             [
+                AgentStatus::Interrupted,
                 AgentStatus::Interrupted,
                 AgentStatus::Failed,
                 AgentStatus::Interrupted,

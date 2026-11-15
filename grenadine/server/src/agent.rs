@@ -553,6 +553,9 @@ struct Live {
     stopper: Option<Stopper>,
     /// The user stopped the current turn.
     interrupted: bool,
+    /// The agent has answered, and its process goes on for a background
+    /// task. A resolved permission request goes back to this wait.
+    background: bool,
     /// Permission requests by tool use ID.
     pending: HashMap<String, PendingRequest>,
     /// The mode and model the running turn goes with, for follow-ups a
@@ -584,6 +587,7 @@ impl Live {
             running: false,
             stopper: None,
             interrupted: false,
+            background: false,
             pending: HashMap::new(),
             turn: None,
             wrap_up: None,
@@ -1624,6 +1628,17 @@ fn expires(tool_name: &str) -> bool {
     tool_name != "ExitPlanMode"
 }
 
+/// The status of a session whose turn is going on with no permission
+/// request left: still waiting on a background task after an answer,
+/// e.g. when the task is a subagent that asked, or else working.
+fn working(state: &State, id: &str) -> AgentStatus {
+    if state.agents.with_live(id, |l| l.background) {
+        AgentStatus::Background
+    } else {
+        AgentStatus::Running
+    }
+}
+
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         // `approve` and `interrupt` take the request out before they
@@ -1643,7 +1658,7 @@ impl Drop for PendingGuard<'_> {
             Ok(Some(s)) if s.status == AgentStatus::AwaitingApproval
         );
         if waiting && !still_pending {
-            set_status(self.state, self.id, AgentStatus::Running);
+            set_status(self.state, self.id, working(self.state, self.id));
         }
     }
 }
@@ -1801,7 +1816,7 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
         },
     )?;
     if !still_pending {
-        set_status(state, id, AgentStatus::Running);
+        set_status(state, id, working(state, id));
     }
     Ok(true)
 }
@@ -1928,6 +1943,7 @@ async fn run(state: Arc<State>, id: String) {
             let prompt = l.queue.pop_front();
             l.running = prompt.is_some();
             l.interrupted = false;
+            l.background = false;
             l.turn = prompt.as_ref().map(|q| (q.mode.clone(), q.model.clone()));
             (prompt, l.wrap_up.is_some())
         });
@@ -1962,6 +1978,7 @@ async fn run(state: Arc<State>, id: String) {
         let interrupted = state.agents.with_live(&id, |l| {
             l.stopper = None;
             l.turn = None;
+            l.background = false;
             l.interrupted
         });
         let status = if interrupted {
@@ -3992,6 +4009,22 @@ impl<'a> TurnSink<'a> {
             _ => None,
         };
         store_images(self.state, self.id, worktree, &mut kind)?;
+        // A background task that finishes wakes the agent up again, even
+        // for a message that only reports usage. A result's window and
+        // end don't. A permission request still waiting keeps its status.
+        let wakes = !matches!(
+            kind,
+            AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
+        );
+        if wakes {
+            let woken = self.state.agents.with_live(self.id, |l| {
+                let woken = std::mem::take(&mut l.background);
+                (woken, l.pending.is_empty())
+            });
+            if woken == (true, true) {
+                set_status(self.state, self.id, AgentStatus::Running);
+            }
+        }
         if let AgentEventKind::Usage { tokens, window } = kind {
             return record_usage(self.state, self.id, tokens, window);
         }
@@ -4011,6 +4044,23 @@ impl<'a> TurnSink<'a> {
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
+    }
+
+    /// The agent answered, but its process goes on running for a
+    /// background task. Its next event shows it working again. A
+    /// permission request waiting meanwhile, e.g. from a subagent in the
+    /// background, keeps its status until it's answered.
+    pub fn background(&mut self) {
+        if self.ended != Some(true) {
+            return;
+        }
+        let show = self.state.agents.with_live(self.id, |l| {
+            let started = !std::mem::replace(&mut l.background, true);
+            started && l.pending.is_empty()
+        });
+        if show {
+            set_status(self.state, self.id, AgentStatus::Background);
+        }
     }
 
     /// Adds what the turn's process has cost since it was last billed to
@@ -4913,6 +4963,219 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
         assert_eq!(session.cost, 0.5);
+    }
+
+    /// Waits until the session's status is `status`.
+    async fn wait_for_status(state: &State, id: &str, status: AgentStatus) {
+        for _ in 0..1500 {
+            if state.db.agent(id).unwrap().unwrap().status == status {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never became {status:?}");
+    }
+
+    /// A claude that goes on after its answer, for a background task,
+    /// shows as waiting on it, and as working again when the task wakes it
+    /// up. A prompt sent meanwhile waits for the process to exit.
+    #[tokio::test]
+    async fn shows_a_wait_for_a_background_task() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count");
+        let script = format!(
+            r#"#!/bin/sh
+{READ_PROMPT}
+echo x >> {count}
+if [ "$prompt" != go ]; then
+  echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Later"}}]}},"parent_tool_use_id":null}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
+  exit
+fi
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Started"}}]}},"parent_tool_use_id":null}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
+sleep 3
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Done"}}]}},"parent_tool_use_id":null}}'
+sleep 1
+echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}}'
+sleep 3
+"#,
+            count = count.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        let id = &session.id;
+        wait_for_status(&state, id, AgentStatus::Background).await;
+        send(
+            &state,
+            id,
+            "next".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_status(&state, id, AgentStatus::Running).await;
+        wait_for_status(&state, id, AgentStatus::Background).await;
+        // The prompt is still waiting for the first process.
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        let transcript = wait_for_turns(&state, id, 3).await;
+
+        let ended = |cost| AgentEventKind::TurnEnded {
+            error: None,
+            cost: Some(cost),
+        };
+        assert_eq!(
+            transcript,
+            [
+                AgentEventKind::Prompt("go".into()),
+                AgentEventKind::Text("Started".into()),
+                ended(0.25),
+                AgentEventKind::Text("Done".into()),
+                ended(0.5),
+                AgentEventKind::Prompt("next".into()),
+                AgentEventKind::Text("Later".into()),
+                ended(0.25),
+            ]
+        );
+        assert_eq!(
+            state.db.agent(id).unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
+    }
+
+    /// A permission request during the wait on a background task, as a
+    /// subagent in the background makes, shows while it waits and goes
+    /// back to the wait once it's answered, also when it came first.
+    #[tokio::test]
+    async fn an_approval_returns_to_the_background_wait() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\n");
+        let id = "s";
+        state
+            .db
+            .create_agent(&AgentSession {
+                status: AgentStatus::Running,
+                ..AgentSession::fixture(id, "owner/name")
+            })
+            .unwrap();
+        let status = || state.db.agent(id).unwrap().unwrap().status;
+        let ask = |tool_use: &str| {
+            request_approval(&state, id, tool_use, "Bash", &json!({}), Vec::new()).unwrap()
+        };
+        let allow = |tool_use: &str| {
+            let decision = Decision {
+                allow: true,
+                ..Default::default()
+            };
+            assert!(approve(&state, id, tool_use, decision).unwrap());
+        };
+        let mut sink = TurnSink::new(&state, id, "owner/name");
+        sink.event(AgentEventKind::TurnEnded {
+            error: None,
+            cost: None,
+        })
+        .unwrap();
+
+        sink.background();
+        assert_eq!(status(), AgentStatus::Background);
+        let _rx = ask("t1");
+        assert_eq!(status(), AgentStatus::AwaitingApproval);
+        allow("t1");
+        assert_eq!(status(), AgentStatus::Background);
+
+        // A request from before the wait keeps its status.
+        let mut sink = TurnSink::new(&state, id, "owner/name");
+        state.agents.with_live(id, |l| l.background = false);
+        sink.event(AgentEventKind::TurnEnded {
+            error: None,
+            cost: None,
+        })
+        .unwrap();
+        let _rx = ask("t2");
+        sink.background();
+        assert_eq!(status(), AgentStatus::AwaitingApproval);
+        allow("t2");
+        assert_eq!(status(), AgentStatus::Background);
+
+        // The agent's next event ends the wait.
+        sink.event(AgentEventKind::Text("Done".into())).unwrap();
+        assert_eq!(status(), AgentStatus::Running);
+        assert!(!state.agents.with_live(id, |l| l.background));
+
+        // So does a message that only reports usage, unlike a result's
+        // window.
+        sink.background();
+        assert_eq!(status(), AgentStatus::Background);
+        sink.event(AgentEventKind::Usage {
+            tokens: None,
+            window: Some(200_000),
+        })
+        .unwrap();
+        assert_eq!(status(), AgentStatus::Background);
+        sink.event(AgentEventKind::Usage {
+            tokens: Some(10),
+            window: None,
+        })
+        .unwrap();
+        assert_eq!(status(), AgentStatus::Running);
+    }
+
+    /// Lines the transcript skips, like a background subagent's, don't
+    /// keep a session that has answered from showing the wait.
+    #[tokio::test]
+    async fn skipped_lines_dont_put_off_the_background_wait() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Started"}]},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_1"}'
+  sleep 0.5
+done
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_status(&state, &session.id, AgentStatus::Background).await;
+        // The subagent's lines are still coming.
+        assert!(state.agents.with_live(&session.id, |l| l.running));
+        wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
     }
 
     /// A general session runs in an empty directory of its own, outside any

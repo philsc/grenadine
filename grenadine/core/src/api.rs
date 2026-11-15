@@ -1314,6 +1314,10 @@ pub enum AgentStatus {
     Running,
     /// The agent is waiting for the user to allow or deny a tool call.
     AwaitingApproval,
+    /// The agent has answered, but its process is still running and
+    /// waits for a background task, e.g. a long command, to finish.
+    /// Prompts sent meanwhile wait for the process to exit.
+    Background,
     /// The user stopped the last turn, or the server restarted during it.
     Interrupted,
     /// The last turn ended with an error.

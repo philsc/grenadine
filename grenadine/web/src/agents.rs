@@ -51,6 +51,7 @@ pub fn status_label(s: AgentStatus) -> &'static str {
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "working…",
         AgentStatus::AwaitingApproval => "needs approval",
+        AgentStatus::Background => "waiting on background task",
         AgentStatus::Interrupted => "interrupted",
         AgentStatus::Failed => "failed",
     }
@@ -62,6 +63,7 @@ pub fn status_class(s: AgentStatus) -> &'static str {
         AgentStatus::Idle => "agent-status",
         AgentStatus::Running => "agent-status running",
         AgentStatus::AwaitingApproval => "agent-status waiting",
+        AgentStatus::Background => "agent-status waiting",
         AgentStatus::Interrupted => "agent-status",
         AgentStatus::Failed => "agent-status failed",
     }
@@ -2291,7 +2293,10 @@ pub fn AgentView(
             s.as_ref().is_some_and(|s| {
                 matches!(
                     s.status,
-                    AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                    AgentStatus::Creating
+                        | AgentStatus::Running
+                        | AgentStatus::AwaitingApproval
+                        | AgentStatus::Background
                 )
             })
         });
@@ -2742,7 +2747,10 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     };
@@ -2937,7 +2945,7 @@ fn current_activity(
 }
 
 /// The line above the composer that shows what the agent is doing, while
-/// it works or waits for an approval. Everything it reads from the
+/// it works or waits for an approval or a background task. Everything it reads from the
 /// transcript sits behind a memo, so the `now` tick only reformats the
 /// times rather than rescanning it.
 #[component]
@@ -2967,6 +2975,15 @@ fn ActivityBar(
         })
     });
     let turn_at = Signal::derive(move || turn.get().and_then(|e| e.at));
+    let answered_at = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.kind, AgentEventKind::TurnEnded { .. }))
+                .and_then(|e| e.at)
+        })
+    });
     view! {
         {move || {
             match session.with(|s| s.status) {
@@ -2983,6 +3000,15 @@ fn ActivityBar(
                     view! {
                         <p class="activity waiting">
                             "Waiting for your approval"
+                            {waited.map(|d| format!(" · {d}"))}
+                        </p>
+                    }.into_any()
+                }
+                AgentStatus::Background => {
+                    let waited = answered_at.get().map(|at| elapsed(now.get() - at));
+                    view! {
+                        <p class="activity waiting" title="The agent has answered, and its process keeps running until a background task it started finishes. Stop ends the task too.">
+                            "Waiting on a background task"
                             {waited.map(|d| format!(" · {d}"))}
                         </p>
                     }.into_any()
@@ -3155,7 +3181,10 @@ fn Transcript(
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     });
@@ -4266,7 +4295,10 @@ fn Composer(
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     };
@@ -4312,7 +4344,7 @@ fn Composer(
             <textarea
                 rows="3"
                 aria-label="Follow-up"
-                placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
+                placeholder=move || if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:paste=move |ev| images::paste(ev, images, error)
