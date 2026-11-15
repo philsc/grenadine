@@ -9,6 +9,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::dictation::{Dictation, DictationLine, RecordButton};
 use crate::inboxes::storage;
 use crate::pr::PrLinks;
 use crate::{api, markdown};
@@ -267,7 +268,8 @@ fn send_hint() -> &'static str {
 /// A markdown text box with Write and Preview tabs. `draft` names the box
 /// in `OpenBoxes`, which keeps whether it shows its preview, and `repo` is
 /// where markdown references in the preview point. `on_submit` runs on
-/// Ctrl+Enter.
+/// Ctrl+Enter. `dictation` goes into the box, which then binds its
+/// textarea; the caller places its `RecordButton`.
 #[component]
 pub fn MarkdownEditor(
     text: RwSignal<String>,
@@ -278,12 +280,15 @@ pub fn MarkdownEditor(
     #[prop(default = 4)] rows: u32,
     #[prop(optional)] on_submit: Option<Callback<()>>,
     #[prop(optional)] autofocus: bool,
+    #[prop(optional)] dictation: Option<Dictation>,
 ) -> impl IntoView {
     let boxes = expect_context::<OpenBoxes>();
     let draft = StoredValue::new(draft);
     let preview = Signal::derive(move || draft.with_value(|d| boxes.preview(d)));
     let set_preview = move |on: bool| draft.with_value(|d| boxes.set_preview(d, on));
-    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let textarea =
+        dictation.map_or_else(NodeRef::<leptos::html::Textarea>::new, Dictation::textarea);
+    let dictating = move || dictation.is_some_and(Dictation::busy);
     if autofocus {
         Effect::new(move |_| {
             if let Some(t) = textarea.get() {
@@ -303,6 +308,8 @@ pub fn MarkdownEditor(
         <textarea
             node_ref=textarea
             class="markdown-editor"
+            class:dictating=dictating
+            prop:readOnly=dictating
             rows=rows
             aria-label=label
             placeholder=placeholder
@@ -312,6 +319,7 @@ pub fn MarkdownEditor(
             on:keydown=move |ev| {
                 if let Some(cb) = on_submit
                     && submits(&ev)
+                    && !dictating()
                 {
                     ev.prevent_default();
                     cb.run(());
@@ -328,6 +336,7 @@ pub fn MarkdownEditor(
             });
             view! { <div class="markdown composer-preview" inner_html=html></div> }
         })}
+        {dictation.map(|d| view! { <DictationLine dictation=d /> })}
     }
 }
 
@@ -363,8 +372,9 @@ pub fn Composer(
     let (alt_label, alt_send) = alt.unzip();
     let (send, alt_send) = (StoredValue::new(send), StoredValue::new(alt_send));
     let draft = StoredValue::new(draft);
+    let dictation = Dictation::new(text, NodeRef::new());
     let empty = move || text.with(|t| t.trim().is_empty());
-    let blocked = move || !allow_empty && empty();
+    let blocked = move || (!allow_empty && empty()) || dictation.busy();
     // Sends with the main button's action, or with `alt`'s.
     let submit_with = move |use_alt: bool| {
         if blocked() || busy.get_untracked() {
@@ -397,6 +407,7 @@ pub fn Composer(
                 placeholder=placeholder
                 on_submit=submit
                 autofocus=autofocus
+                dictation=dictation
             />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
@@ -407,6 +418,7 @@ pub fn Composer(
                     <button type="button" disabled=move || blocked() || busy.get()
                         on:click=move |_| submit_with(true)>{l}</button>
                 })}
+                <RecordButton dictation=dictation />
                 <button type="button" disabled=move || busy.get() on:click=move |_| {
                     text.set(String::new());
                     draft.with_value(|d| boxes.close(d));

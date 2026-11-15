@@ -12,10 +12,12 @@ import base64
 import datetime
 import http.client
 import json
+import math
 import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import wave
 import zoneinfo
 from collections.abc import Callable
 from pathlib import Path
@@ -728,6 +731,13 @@ class ServerTestCase(unittest.TestCase):
     REPOS: ClassVar[list[str]] = [scenarios.REPO]
     # Seconds between the server's polls of GitHub.
     POLL_INTERVAL: ClassVar[int] = 60
+    # More flags for the server.
+    SERVER_FLAGS: ClassVar[list[str]] = []
+
+    @classmethod
+    def chrome_args(cls, tmp: Path) -> list[str]:
+        """More flags for Chrome; `tmp` is the class's directory."""
+        return []
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -815,6 +825,7 @@ class ServerTestCase(unittest.TestCase):
                 "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
+                *cls.SERVER_FLAGS,
             ],
             env,
         )
@@ -848,7 +859,9 @@ class ServerTestCase(unittest.TestCase):
         )
         chrome_env["FONTCONFIG_FILE"] = str(fonts_conf)
         cls.browser = cls.playwright.chromium.launch(
-            executable_path=os.environ["CHROME"], env=chrome_env
+            executable_path=os.environ["CHROME"],
+            env=chrome_env,
+            args=cls.chrome_args(tmp),
         )
         cls.addClassCleanup(cls.browser.close)
 
@@ -9609,6 +9622,73 @@ class CleanupTest(ServerTestCase):
             ).click()
             expect(items).to_have_count(n)
         expect(select_all).to_have_count(0)
+
+
+def write_speech(path: Path) -> None:
+    """Writes a WAV that sounds enough like speech to the server: bursts of
+    syllable-like tones, 2 s each, with 1 s pauses."""
+    rate = 16000
+    samples = []
+    for _ in range(3):
+        samples += [0.0] * rate
+        for i in range(2 * rate):
+            t = i / rate
+            tones = sum(math.sin(2 * math.pi * f * t) for f in (220, 660, 1320)) / 3
+            # Four syllables a second.
+            samples.append(0.5 * tones * (0.6 + 0.4 * math.sin(2 * math.pi * 4 * t)))
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(v * 32767)) for v in samples))
+
+
+class DictationTest(ServerTestCase):
+    """Dictating into text boxes, with a fake transcriber and microphone.
+    The fake transcribes each phrase as "phrase N." and previews it as
+    "hearing N"."""
+
+    SERVER_FLAGS: ClassVar[list[str]] = ["--fake-dictation"]
+
+    @classmethod
+    def chrome_args(cls, tmp: Path) -> list[str]:
+        speech = tmp / "speech.wav"
+        write_speech(speech)
+        return [
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+            f"--use-file-for-fake-audio-capture={speech}",
+        ]
+
+    def test_dictates_at_the_cursor(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("Before after")
+        prompt.evaluate("t => t.setSelectionRange(6, 6)")
+        start = self.page.get_by_role("button", name="Start", exact=True)
+
+        self.page.get_by_role("button", name="Record").click()
+        # The box is read-only and can't be sent while recording.
+        expect(prompt).to_have_js_property("readOnly", True)
+        expect(start).to_be_disabled()
+        # The phrase being spoken shows under the box, and finished
+        # phrases go where the cursor was.
+        expect(self.page.locator(".dictation-interim")).to_contain_text("hearing")
+        expect(prompt).to_have_value("Before phrase 1. after")
+
+        self.page.get_by_role("button", name=re.compile("Stop")).click()
+        expect(prompt).to_have_js_property("readOnly", False)
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # Stopping finished the phrase being spoken, if there was one.
+        expect(prompt).to_have_value(
+            re.compile(r"^Before phrase 1\.( phrase \d\.)* after$")
+        )
+        expect(start).to_be_enabled()
+        # The cursor is after the inserted text.
+        value = prompt.input_value()
+        self.assertEqual(
+            prompt.evaluate("t => t.selectionStart"), len(value) - len(" after")
+        )
 
 
 if __name__ == "__main__":

@@ -9,10 +9,11 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval, AutoMerge,
     AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState,
-    EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged,
-    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SessionProcesses,
-    SubmitReview, SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
+    DictationInfo, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress,
+    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, ReviewerCandidates,
+    ReviewerChange, SessionProcesses, SubmitReview, SyncStatus, SystemStats, TerminalInfo,
+    WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -269,6 +270,15 @@ pub fn blob(id: &str) -> Option<Arc<Blob>> {
 /// The configured repositories.
 pub async fn repos() -> Result<Vec<String>> {
     check(Request::get("/api/repos").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether the server transcribes dictation.
+pub async fn dictation_info() -> Result<DictationInfo> {
+    check(Request::get("/api/dictation").send().await)
         .await?
         .json()
         .await

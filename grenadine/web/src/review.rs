@@ -16,6 +16,7 @@ use crate::api;
 use crate::composer::{
     ComposerToggle, MarkdownEditor, OpenBoxes, comment_draft_key, draft_signal, sender,
 };
+use crate::dictation::{Dictation, DictationLine, RecordButton};
 use crate::hash_for;
 use crate::inboxes::CiIcon;
 use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget, review_version, version_at};
@@ -1117,7 +1118,13 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
         let draft = draft.clone();
         Signal::derive(move || boxes.error(&draft))
     };
-    let blocker = move || body.with(|b| submit_blocker(event.get(), b, pending.get()));
+    let dictation = Dictation::new(body, NodeRef::new());
+    let blocker = move || {
+        if dictation.busy() {
+            return Some("Stop dictating first.");
+        }
+        body.with(|b| submit_blocker(event.get(), b, pending.get()))
+    };
     let (key, name) = (StoredValue::new(key), StoredValue::new(draft.clone()));
     let submit = move |_| {
         if blocker().is_some() {
@@ -1209,6 +1216,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
                     label="Review summary"
                     placeholder="Leave a summary (optional for approvals)…"
                     rows=5
+                    dictation=dictation
                 />
                 <div class="review-choices">
                     {choice(ReviewEvent::Comment, "Comment", "Feedback without approving")}
@@ -1221,6 +1229,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
                         disabled=move || busy.get() || blocker().is_some() on:click=submit>
                         {move || if busy.get() { "Submitting…" } else { "Submit review" }}
                     </button>
+                    <RecordButton dictation=dictation />
                     {move || reviewing.get().then(|| view! {
                         <button type="button" class="danger" disabled=move || busy.get() on:click=discard>"Discard review"</button>
                     })}
@@ -1565,10 +1574,27 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         why.join("\n")
     });
     let merge_base = stack_base.clone();
+    let message_box = NodeRef::<leptos::html::Textarea>::new();
+    let dictation = Dictation::with_text(
+        Signal::derive(move || {
+            message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
+        }),
+        SignalSetter::map(move |body| {
+            message.update(|m| {
+                if let Some(m) = m {
+                    m.1 = body;
+                }
+            })
+        }),
+        message_box,
+    );
     let merge = move |_| {
         let (Some(m), Some(head)) = (chosen(), head.clone()) else {
             return;
         };
+        if dictation.busy() {
+            return;
+        }
         let (last, rest) = landing.split_last().expect("the merged PR lands");
         let numbers = match rest.is_empty() {
             true => format!("#{last}"),
@@ -1632,7 +1658,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
                     }).collect_view()}
                 </select>
                 <button type="button" class=if admin { "danger" } else { "primary" }
-                    disabled=move || busy() || merged.get() || is_blocked || target.head_oid.is_none()
+                    disabled=move || busy() || merged.get() || is_blocked || target.head_oid.is_none() || dictation.busy()
                     title=if admin { "Merges without waiting for the branch's rules, which you may bypass" } else { "" }
                     on:click=merge>
                     {move || match (busy(), merged.get(), admin) {
@@ -1661,15 +1687,26 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
                     }
                 })}
             </div>
-            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| view! {
+            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| {
+                // The recording goes with the box, or it would go on with
+                // no Stop when the method changes.
+                on_cleanup(move || dictation.cancel());
+                view! {
                 <div class="merge-message">
                     <input type="text" aria-label="Commit title"
                         prop:value=move || message.with(|m| m.as_ref().map(|m| m.0.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.0 = event_target_value(&ev) }) />
-                    <textarea rows="6" aria-label="Commit message"
+                    <textarea rows="6" aria-label="Commit message" node_ref=message_box
+                        class:dictating=move || dictation.busy()
+                        prop:readOnly=move || dictation.busy()
                         prop:value=move || message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.1 = event_target_value(&ev) })></textarea>
+                    <DictationLine dictation=dictation />
+                    <div class="form-buttons">
+                        <RecordButton dictation=dictation />
+                    </div>
                 </div>
+                }
             })}
             {move || error().map(|e| view! { <p class="error">{e}</p> })}
         </div>
