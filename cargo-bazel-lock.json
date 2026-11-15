@@ -1,5 +1,5 @@
 {
-  "checksum": "7cc13924f111d03ea9b3ab11e0e2b54bdbca2ccca033bd77c7071c7de72ac522",
+  "checksum": "d2dd45c6ea1459a2bdf8af5633f4b5a67fc35647975732cca06bf6d50db53023",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16545,9 +16545,16 @@
             "AbortSignal",
             "AddEventListenerOptions",
             "AnimationEvent",
+            "AudioContext",
+            "AudioDestinationNode",
+            "AudioNode",
+            "AudioWorklet",
+            "AudioWorkletNode",
+            "BaseAudioContext",
             "BeforeUnloadEvent",
             "BinaryType",
             "Blob",
+            "BlobPropertyBag",
             "CanvasRenderingContext2d",
             "CharacterData",
             "ClipboardEvent",
@@ -16663,9 +16670,16 @@
             "IntersectionObserverInit",
             "KeyboardEvent",
             "Location",
+            "MediaDevices",
             "MediaQueryList",
+            "MediaStream",
+            "MediaStreamAudioSourceNode",
+            "MediaStreamConstraints",
+            "MediaStreamTrack",
             "MessageEvent",
+            "MessagePort",
             "MouseEvent",
+            "Navigator",
             "Node",
             "NodeList",
             "ObserverCallback",
@@ -16724,6 +16738,7 @@
             "WorkerGlobalScope",
             "WorkerOptions",
             "WorkerType",
+            "Worklet",
             "WritableStream",
             "WritableStreamDefaultController",
             "WritableStreamDefaultWriter",
@@ -16736,7 +16751,6 @@
           ],
           "selects": {
             "wasm32-unknown-unknown": [
-              "BlobPropertyBag",
               "ServiceWorkerGlobalScope"
             ]
           }

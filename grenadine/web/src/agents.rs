@@ -21,6 +21,7 @@ use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use crate::composer::draft_signal;
+use crate::dictation::{Dictation, DictationLine, RecordButton};
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
 use crate::files::{self, FileChips, Files};
@@ -1561,6 +1562,7 @@ pub fn NewSession(
     let attached = Attached { images, files };
     let error = RwSignal::new(None::<String>);
     let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let dictation = Dictation::new(prompt, textarea);
     // The prompt gets the focus, with the caret at the end of any draft
     // text; a proposal in a transcript leaves the focus alone.
     let focus = handoff.is_none();
@@ -1614,6 +1616,7 @@ pub fn NewSession(
     let start = move || {
         if busy()
             || none_installed()
+            || dictation.busy()
             || prompt.with_untracked(|p| p.trim().is_empty())
             || files.pending_untracked()
         {
@@ -1808,6 +1811,8 @@ pub fn NewSession(
                 <textarea
                     node_ref=textarea
                     class="agent-prompt"
+                    class:dictating=move || dictation.busy()
+                    prop:readOnly=move || dictation.busy()
                     rows="5"
                     placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
                     aria-label="Prompt"
@@ -1821,6 +1826,7 @@ pub fn NewSession(
                         }
                     }
                 ></textarea>
+                <DictationLine dictation=dictation />
                 <Attachments images=images />
                 <FileChips files=files />
                 {move || {
@@ -1864,10 +1870,11 @@ pub fn NewSession(
                     <button
                         type="submit"
                         class="primary"
-                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty()) || files.pending()
+                        disabled=move || busy() || none_installed() || dictation.busy() || prompt.with(|p| p.trim().is_empty()) || files.pending()
                     >
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
+                    <RecordButton dictation=dictation />
                     <AttachButton attached=attached />
                     {asks_why.then(|| view! {
                         <input
@@ -4116,6 +4123,8 @@ fn PlanCard(
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
+    let feedback_box = NodeRef::<leptos::html::Textarea>::new();
+    let dictation = Dictation::new(feedback, feedback_box);
     // The mode the backend prefers the turn to go on in.
     let then = RwSignal::new(PermissionMode::new(backend.plan_default_mode()));
     let state = {
@@ -4171,7 +4180,8 @@ fn PlanCard(
         });
     };
     let answer = StoredValue::new(answer);
-    let pending = move || state.get().is_none() && open.get();
+    let pending = Memo::new(move |_| state.get().is_none() && open.get());
+    let pending = move || pending.get();
     view! {
         <div class="approval plan" class:pending=pending>
             <p>
@@ -4184,20 +4194,30 @@ fn PlanCard(
                 }}
             </p>
             <div class="plan-text markdown" inner_html=plan></div>
-            {move || pending().then(|| view! {
+            {move || pending().then(|| {
+                // The recording goes with the box, or it would go on with
+                // no Stop when the plan is answered elsewhere.
+                on_cleanup(move || dictation.cancel());
+                view! {
                 <textarea
+                    node_ref=feedback_box
                     class="plan-feedback"
+                    class:dictating=move || dictation.busy()
+                    prop:readOnly=move || dictation.busy()
                     rows="2"
                     aria-label="Feedback"
                     placeholder=format!("Anything to add? {} gets this with your approval, or when it keeps planning.", backend.agent_name())
                     prop:value=move || feedback.get()
                     on:input=move |ev| feedback.set(event_target_value(&ev))
                 ></textarea>
+                <DictationLine dictation=dictation />
                 <div class="form-buttons">
                     <label>"Then " <ModeSelect mode=then backend=Signal::stored(backend) after_plan=true label="After the plan" /></label>
-                    <button class="primary" disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(true))>"Approve plan"</button>
-                    <button disabled=move || busy.get() on:click=move |_| answer.with_value(|a| a(false))>"Keep planning"</button>
+                    <button class="primary" disabled=move || busy.get() || dictation.busy() on:click=move |_| answer.with_value(|a| a(true))>"Approve plan"</button>
+                    <button disabled=move || busy.get() || dictation.busy() on:click=move |_| answer.with_value(|a| a(false))>"Keep planning"</button>
+                    <RecordButton dictation=dictation />
                 </div>
+                }
             })}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
         </div>
@@ -4682,6 +4702,8 @@ fn Composer(
     let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
     let attached = Attached { images, files };
     let error = RwSignal::new(None::<String>);
+    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let dictation = Dictation::new(prompt, textarea);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
         session.with(|s| {
@@ -4696,7 +4718,11 @@ fn Composer(
     };
 
     let send = move || {
-        if blank() || files.pending_untracked() || writing_handoff.get_untracked() {
+        if blank()
+            || dictation.busy()
+            || files.pending_untracked()
+            || writing_handoff.get_untracked()
+        {
             return;
         }
         let text = prompt.get_untracked();
@@ -4745,8 +4771,11 @@ fn Composer(
             on:drop=move |ev| images::drop(ev, attached)
         >
             <textarea
+                node_ref=textarea
                 rows="3"
                 aria-label="Follow-up"
+                prop:readOnly=move || dictation.busy()
+                class:dictating=move || dictation.busy()
                 placeholder=move || if writing_handoff.get() { "Writing a handoff… You can reply once it's written.".to_owned() } else if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
@@ -4758,13 +4787,15 @@ fn Composer(
                     }
                 }
             ></textarea>
+            <DictationLine dictation=dictation />
             <Attachments images=images />
             <FileChips files=files />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode backend=backend />
                 <ModelSelect model=model backend=backend session=SessionPick { id, reported: active_model } />
-                <button type="submit" class="primary" disabled=move || blank() || files.pending() || writing_handoff.get()>"Send"</button>
+                <button type="submit" class="primary" disabled=move || blank() || dictation.busy() || files.pending() || writing_handoff.get()>"Send"</button>
+                <RecordButton dictation=dictation />
                 <AttachButton attached=attached />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
                 <div class="composer-status">

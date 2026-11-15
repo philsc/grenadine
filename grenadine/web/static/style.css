@@ -2127,6 +2127,32 @@ textarea {
     transform: rotate(360deg);
   }
 }
+/* Dictation: the box is read-only while recording, and the phrase being
+   spoken shows greyed out under it. */
+textarea.dictating {
+  outline: 2px solid var(--del-fg);
+  outline-offset: -1px;
+  cursor: not-allowed;
+}
+.dictation-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--fg-muted);
+}
+.dictation-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--del-fg);
+}
+button.record.recording {
+  color: var(--del-fg);
+}
 .composer {
   padding: 8px 0 0;
   display: flex;

@@ -13,6 +13,7 @@ See [AGENTS.md](AGENTS.md) for building, testing and linting.
 - [Inbox filters](#inbox-filters)
 - [Default inboxes](#default-inboxes)
 - [Auto-reviews](#auto-reviews)
+- [Dictation](#dictation)
 
 ## Inbox filters
 
@@ -166,3 +167,29 @@ The same dialog sets what new sessions in the repository start with:
 The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
 
 Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.
+
+## Dictation
+
+Grenadine's text boxes have a Record button for dictating instead of typing. Agents only ever get text: Claude can't take audio, so grenadine transcribes the speech locally with [whisper.cpp](https://github.com/ggml-org/whisper.cpp), on the CPU.
+
+While recording, the box is read-only. Grenadine cuts the speech into phrases at pauses and inserts each finished phrase where the cursor was. The phrase being spoken shows greyed out under the box until you pause. Stop finishes the last phrase and makes the box editable again, so you can edit the text before you send it.
+
+Dictation is off unless the server gets a Whisper model. Download a model for the finished phrases and a smaller one for the preview of the phrase being spoken:
+
+```sh
+mkdir -p ~/.local/share/grenadine/whisper && cd ~/.local/share/grenadine/whisper
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin
+```
+
+Then start the server with them:
+
+```sh
+bazel run //grenadine/server -- --repo=PATH \
+  --whisper-model=$HOME/.local/share/grenadine/whisper/ggml-small.en-q5_1.bin \
+  --whisper-preview-model=$HOME/.local/share/grenadine/whisper/ggml-base.en-q5_1.bin
+```
+
+Without `--whisper-preview-model`, the preview uses `--whisper-model` too, and updates less often. Bigger models such as `large-v3-turbo` are more accurate but too slow for live dictation on a laptop CPU. The models are loaded on the first recording.
+
+Browsers only let pages use the microphone over HTTPS or on `localhost`, so Record isn't shown on a page opened over plain HTTP from another machine.
