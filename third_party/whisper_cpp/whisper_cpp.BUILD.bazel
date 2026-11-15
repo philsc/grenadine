@@ -1,0 +1,136 @@
+# whisper.cpp and ggml, built for the CPU only, the way their CMake build
+# builds them with GGML_NATIVE=OFF, GGML_AVX2=ON and without OpenMP (ggml then
+# uses its own thread pool). The sources and defines follow ggml/src,
+# ggml/src/ggml-cpu and src's CMakeLists.txt; check them when updating the
+# version in MODULE.bazel.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+VERSION = "1.9.5"
+
+COPTS = [
+    "-O3",
+    "-w",
+]
+
+DEFINES = [
+    "_XOPEN_SOURCE=600",
+    "_GNU_SOURCE",
+    "GGML_SCHED_MAX_COPIES=4",
+    "NDEBUG",
+]
+
+# Every x86-64 CPU since Haswell (2013) and Zen has these.
+X86_FLAGS = [
+    "-msse4.2",
+    "-mavx",
+    "-mavx2",
+    "-mfma",
+    "-mf16c",
+    "-mbmi2",
+]
+
+X86_DEFINES = [
+    "GGML_SSE42",
+    "GGML_AVX",
+    "GGML_AVX2",
+    "GGML_FMA",
+    "GGML_F16C",
+    "GGML_BMI2",
+]
+
+genrule(
+    name = "ggml_version",
+    outs = ["ggml/src/ggml-version.h"],
+    cmd = "printf '#pragma once\\n#define GGML_VERSION \"%s\"\\n#define GGML_COMMIT \"unknown\"\\n' " + VERSION + " > $@",
+)
+
+cc_library(
+    name = "ggml_headers",
+    hdrs = glob(["ggml/include/*.h"]),
+    includes = ["ggml/include"],
+)
+
+cc_library(
+    name = "ggml_base",
+    srcs = [
+        "ggml/src/ggml.c",
+        "ggml/src/ggml.cpp",
+        "ggml/src/ggml-alloc.c",
+        "ggml/src/ggml-backend.cpp",
+        "ggml/src/ggml-backend-meta.cpp",
+        "ggml/src/ggml-opt.cpp",
+        "ggml/src/ggml-quants.c",
+        "ggml/src/ggml-threading.cpp",
+        "ggml/src/gguf.cpp",
+        ":ggml_version",
+    ] + glob([
+        "ggml/src/*.h",
+        # ggml-quants.c includes one of the CPU backend's headers.
+        "ggml/src/ggml-cpu/**/*.h",
+    ]),
+    copts = COPTS,
+    includes = ["ggml/src"],
+    local_defines = DEFINES,
+    linkopts = [
+        "-lpthread",
+        "-lm",
+    ],
+    deps = [":ggml_headers"],
+)
+
+cc_library(
+    name = "ggml_cpu",
+    srcs = [
+        "ggml/src/ggml-cpu/amx/amx.cpp",
+        "ggml/src/ggml-cpu/amx/mmq.cpp",
+        "ggml/src/ggml-cpu/arch/x86/quants.c",
+        "ggml/src/ggml-cpu/arch/x86/repack.cpp",
+        "ggml/src/ggml-cpu/binary-ops.cpp",
+        "ggml/src/ggml-cpu/ggml-cpu.c",
+        "ggml/src/ggml-cpu/ggml-cpu.cpp",
+        "ggml/src/ggml-cpu/hbm.cpp",
+        "ggml/src/ggml-cpu/ops.cpp",
+        "ggml/src/ggml-cpu/quants.c",
+        "ggml/src/ggml-cpu/repack.cpp",
+        "ggml/src/ggml-cpu/tiled/tiled.cpp",
+        "ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
+        "ggml/src/ggml-cpu/traits.cpp",
+        "ggml/src/ggml-cpu/unary-ops.cpp",
+        "ggml/src/ggml-cpu/vec.cpp",
+    ] + glob(["ggml/src/ggml-cpu/**/*.h"]),
+    copts = COPTS + X86_FLAGS,
+    includes = ["ggml/src/ggml-cpu"],
+    local_defines = DEFINES + X86_DEFINES + ["GGML_USE_CPU_REPACK"],
+    deps = [":ggml_base"],
+)
+
+cc_library(
+    name = "ggml",
+    srcs = [
+        "ggml/src/ggml-backend-dl.cpp",
+        "ggml/src/ggml-backend-reg.cpp",
+    ],
+    copts = COPTS,
+    defines = ["GGML_USE_CPU"],
+    linkopts = ["-ldl"],
+    local_defines = DEFINES,
+    deps = [
+        ":ggml_base",
+        ":ggml_cpu",
+    ],
+)
+
+cc_library(
+    name = "whisper",
+    srcs = [
+        "src/aneforge/whisper-aneforge.cpp",
+        "src/whisper.cpp",
+    ] + glob(["src/*.h", "src/aneforge/*.h"]),
+    hdrs = ["include/whisper.h"],
+    copts = COPTS,
+    includes = ["include"],
+    local_defines = DEFINES + ["WHISPER_VERSION=\\\"" + VERSION + "\\\""],
+    visibility = ["//visibility:public"],
+    deps = [":ggml"],
+)
