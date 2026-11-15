@@ -608,6 +608,9 @@ if mode == "plan":
 review = re.search(r"Review pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
 if review and "Slow" in review[1]:
     time.sleep(60)
+# A "Paced" one's takes long enough to open its page while it runs.
+if review and "Paced" in review[1]:
+    time.sleep(5)
 if review and "Quiet" not in review[1]:
     request = urllib.request.Request(
         f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
@@ -7714,7 +7717,7 @@ class AutoReviewTest(ServerTestCase):
         expect(box.locator(".agent-status")).to_have_text("working…")
         expect(box.get_by_role("button", name=re.compile("Review"))).to_have_count(0)
         expect(box.get_by_role("link", name="Open session")).to_have_attribute(
-            "href", re.compile(r"^#/auto-reviews/[0-9a-f-]{36}$")
+            "href", re.compile(r"^#/auto-reviews/review/\d+$")
         )
         conflict = self.api(
             "POST", f"/api/pr/{self.MANUAL_REPO}/{pr.number}/auto-reviews"
@@ -7783,6 +7786,15 @@ class AutoReviewTest(ServerTestCase):
         expect(box.locator(".agent-status")).to_have_text("queued")
         expect(box).to_contain_text("Waits for one of the running reviews to end.")
         expect(box.get_by_role("link", name="Open session")).to_have_count(0)
+        # Its page in the Auto-reviews tab says so, rather than showing the
+        # PR.
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        self.review_entry("Slow queued 3").locator("a.agent-item").click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
+        expect(self.page.locator(".agent-header .agent-status")).to_have_text("queued")
+        expect(self.page.locator(".agent-header")).to_contain_text(
+            "Waits to start until one of the running reviews ends."
+        )
 
         # Cancelling a running one starts it.
         self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{prs[0].number}")
@@ -7803,20 +7815,66 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("button", name=f"Settings for {slug}").click()
         return self.page.get_by_role("dialog", name=f"{slug} settings")
 
-    def test_a_posted_review_deletes_its_session(self) -> None:
-        pr = self.open_pr(scenarios.REPO, "Add the feature")
+    def test_a_posted_review_keeps_its_transcript(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Paced feature")
         self.page.goto(self.url + "#/auto-reviews")
-        entry = self.review_entry("Add the feature")
+        entry = self.review_entry("Paced feature")
+        # While it runs, its page shows its session.
+        entry.locator("a.agent-item").click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
+        expect(self.page.locator(".agent-actions")).to_contain_text(
+            "This review runs unattended"
+        )
         expect(entry.locator(".agent-status")).to_have_text("posted", timeout=30_000)
         self.assertEqual([c.body for c in pr.issue_comments], ["Looks good."])
-        # Its session is gone, and the entry links to the PR instead,
-        # with an icon that opens it on GitHub.
-        expect(entry.locator("a.agent-item")).to_have_attribute(
-            "href", f"#/{scenarios.REPO}/{pr.number}"
-        )
+
+        # Its session is gone, and the page that was open shows what the
+        # session said, with nothing left to stop or delete.
+        def shows_the_transcript() -> None:
+            header = self.page.locator(".agent-header")
+            expect(header.locator("h1")).to_have_text(
+                f"Review #{pr.number}: Paced feature"
+            )
+            expect(header.locator(".agent-status")).to_have_text("posted")
+            expect(
+                header.get_by_role("link", name=f"{scenarios.REPO}#{pr.number}")
+            ).to_have_attribute("href", f"#/{scenarios.REPO}/{pr.number}")
+            expect(self.page.locator(".transcript")).to_contain_text(
+                f"Review pull request {pr.url}"
+            )
+            expect(self.page.get_by_role("button", name="Delete")).to_have_count(0)
+            expect(self.page.get_by_label("Follow-up")).to_have_count(0)
+            expect(entry.locator("a.agent-item")).to_have_class(
+                re.compile(r"\bselected\b")
+            )
+
+        shows_the_transcript()
         expect(entry.get_by_role("link", name="Open on GitHub")).to_have_attribute(
             "href", pr.url
         )
+        # So does a reload, which no longer has the session to go by.
+        self.page.reload()
+        shows_the_transcript()
+
+        # The kept transcript can't change, so other sessions' changes
+        # don't fetch it again.
+        review = self.page.url.rsplit("/", 1)[1]
+        fetches: list[str] = []
+        self.page.on(
+            "request",
+            lambda r: (
+                fetches.append(r.url)
+                if r.url.endswith(f"/api/auto-reviews/{review}")
+                else None
+            ),
+        )
+        self.open_pr(scenarios.REPO, "Another feature")
+        expect(
+            self.review_entry("Another feature").locator(".agent-status")
+        ).to_have_text("posted", timeout=30_000)
+        self.assertEqual(fetches, [])
+        shows_the_transcript()
+
         self.page.get_by_role("link", name="Agents").click()
         expect(self.page.locator(".agent-sidebar")).not_to_contain_text("Review #")
 
@@ -7860,7 +7918,7 @@ class AutoReviewTest(ServerTestCase):
 
         # Its page shows the prompt, with the skill, and takes none.
         entry.locator("a.agent-item").click()
-        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/[0-9a-f-]{36}$"))
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"/code-review Review pull request {pr.url}")
         expect(transcript).to_contain_text("Quiet change")

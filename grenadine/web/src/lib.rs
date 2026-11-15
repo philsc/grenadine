@@ -76,6 +76,9 @@ pub enum Route {
     AutoReviews,
     /// `#/auto-reviews/<id>`: the session doing one of them.
     AutoReview(String),
+    /// `#/auto-reviews/review/<id>`: one of them, by its own id, with
+    /// its session while it has one and its transcript once it's gone.
+    AutoReviewPage(i64),
     /// `#/debug`: what the server spends on GitHub.
     Debug,
 }
@@ -115,6 +118,7 @@ fn route_from_hash(hash: &str) -> Route {
         ["agents", "cleanup"] => Some(Route::Cleanup),
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         ["auto-reviews"] => Some(Route::AutoReviews),
+        ["auto-reviews", "review", id] => id.parse().ok().map(Route::AutoReviewPage),
         ["auto-reviews", id] if !id.is_empty() => Some(Route::AutoReview(id.to_owned())),
         ["debug"] => Some(Route::Debug),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
@@ -313,7 +317,7 @@ fn App() -> impl IntoView {
     let on_agents = Memo::new(move |_| agents.with(Option::is_some));
     let reviews = Memo::new(move |_| {
         route.with(|r| match r {
-            Route::AutoReviews | Route::AutoReview(_) => Some(r.clone()),
+            Route::AutoReviews | Route::AutoReview(_) | Route::AutoReviewPage(_) => Some(r.clone()),
             _ => None,
         })
     });
@@ -370,6 +374,7 @@ fn App() -> impl IntoView {
                     <auto_reviews::Sidebar route=route.into() />
                     {move || reviews.get().map(|r| match r {
                         Route::AutoReview(id) => view! { <agents::AgentView id=id read_only=true /> }.into_any(),
+                        Route::AutoReviewPage(id) => view! { <auto_reviews::ReviewPage id=id /> }.into_any(),
                         _ => view! { <main class="main"><auto_reviews::Overview /></main> }.into_any(),
                     })}
                 </div>
@@ -726,6 +731,11 @@ mod tests {
             route_from_hash("#/auto-reviews/abc"),
             Route::AutoReview("abc".into())
         );
+        assert_eq!(
+            route_from_hash("#/auto-reviews/review/7"),
+            Route::AutoReviewPage(7)
+        );
+        assert_eq!(route_from_hash("#/auto-reviews/review/x"), Route::Inboxes);
         assert_eq!(route_from_hash("#/auto-reviews/"), Route::Inboxes);
         assert_eq!(route_from_hash("#/debug"), Route::Debug);
         // An owner called "agents" still has PRs.

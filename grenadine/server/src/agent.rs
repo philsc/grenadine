@@ -1898,7 +1898,21 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
         _ => {}
     }
     if reviewing {
-        state.db.auto_review_session_deleted(id)?;
+        // The review's page shows the session as it is now, with its
+        // latest cost; a turn that was interrupted above may not have
+        // recorded that it ended.
+        let mut saved = match state.db.agent_unchecked(id)? {
+            Some((s, _)) => s,
+            None => scanned.clone(),
+        };
+        if matches!(
+            saved.status,
+            AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+        ) {
+            saved.status = AgentStatus::Interrupted;
+        }
+        saved.unstaged = 0;
+        state.db.auto_review_session_deleted(&saved)?;
     }
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);

@@ -128,6 +128,19 @@ pub struct AutoReviewEntry {
     pub error: Option<String>,
 }
 
+/// A review's page: the review, and once its session is deleted, what
+/// the session was and said.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutoReviewDetail {
+    pub review: AutoReviewEntry,
+    /// The deleted session as it was last; `None` while it exists, and
+    /// for reviews whose session was deleted before transcripts were
+    /// kept or that never had one.
+    pub saved: Option<AgentSession>,
+    /// The deleted session's transcript.
+    pub events: Vec<AgentEvent>,
+}
+
 /// Identifies a PR across the configured repositories.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PrKey {
@@ -1321,6 +1334,10 @@ pub enum AgentStatus {
 }
 
 /// An agent session working in its own git worktree.
+///
+/// A deleted auto-review session is kept as this, in JSON, so a new
+/// field needs `#[serde(default)]` (or to be an `Option`) for the copies
+/// saved before it to still parse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
     /// The session's ID, a UUID.
@@ -1922,6 +1939,11 @@ impl ApprovalKind {
 }
 
 /// Something that happened in an agent session's transcript.
+///
+/// A deleted auto-review session's events are kept as these, in JSON,
+/// for as long as the review, so a variant shouldn't be removed or
+/// renamed, and a new field needs `#[serde(default)]` (or to be an
+/// `Option`), for the transcripts saved before to still parse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEventKind {

@@ -477,6 +477,22 @@ const MIGRATIONS: &[Migration] = &[
     // Installs the default inboxes named in the second person, with
     // the closed ones split into merged and unmerged.
     Migration::ResetInboxes,
+    Migration::Sql(
+        r#"
+    -- What a review's session was and said, kept when the session is
+    -- deleted so that the review's page can still show it. saved is the
+    -- api::AgentSession as JSON; NULL while the session exists, and for
+    -- reviews whose session was deleted before these were kept.
+    ALTER TABLE auto_reviews ADD COLUMN saved TEXT;
+    CREATE TABLE auto_review_events (
+        review_id INTEGER NOT NULL REFERENCES auto_reviews (id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        at INTEGER,
+        PRIMARY KEY (review_id, seq)
+    );
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -1996,18 +2012,90 @@ impl Db {
         Ok(())
     }
 
-    /// Detaches the review of session `agent_id` from it as the session is
-    /// deleted, keeping the session's cost.
-    pub fn auto_review_session_deleted(&self, agent_id: &str) -> Result<()> {
-        self.conn().execute(
+    /// Detaches the review of `session` from it as the session is
+    /// deleted, keeping the session's cost, the session as it is now and
+    /// its transcript.
+    pub fn auto_review_session_deleted(&self, session: &AgentSession) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let saved = serde_json::to_string(session)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO auto_review_events (review_id, seq, event, at)
+             SELECT r.id, e.seq, e.event, e.at
+             FROM agent_events e JOIN auto_reviews r ON r.agent_id = e.agent_id
+             WHERE e.agent_id = ?",
+            [&session.id],
+        )?;
+        tx.execute(
             "UPDATE auto_reviews SET
                 cost = COALESCE((SELECT cost FROM agents WHERE id = ?1), cost),
                 cost_unit = COALESCE((SELECT cost_unit FROM agents WHERE id = ?1), cost_unit),
+                saved = ?2,
                 agent_id = NULL
              WHERE agent_id = ?1",
-            [agent_id],
+            params![session.id, saved],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// What the deleted session of review `id` was and said; `None` while
+    /// the session exists, or when nothing of it was kept.
+    pub fn auto_review_transcript(
+        &self,
+        id: i64,
+    ) -> Result<Option<(AgentSession, Vec<AgentEvent>)>> {
+        let conn = self.conn();
+        let saved: Option<String> = conn
+            .query_row(
+                "SELECT saved FROM auto_reviews WHERE id = ? AND agent_id IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(saved) = saved else {
+            return Ok(None);
+        };
+        // A copy saved before a field without a default was added to
+        // `AgentSession` reads as nothing kept, rather than failing the
+        // review's page.
+        let session = match serde_json::from_str(&saved) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!("review {id}'s saved session doesn't parse: {e}");
+                return Ok(None);
+            }
+        };
+        let mut stmt = conn.prepare(
+            "SELECT seq, event, at FROM auto_review_events WHERE review_id = ? ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, json, at) = row?;
+            // Likewise an event of a kind this build doesn't know, since
+            // a transcript with gaps could misstate what the review said.
+            let kind = match serde_json::from_str(&json) {
+                Ok(kind) => kind,
+                Err(e) => {
+                    tracing::warn!("review {id}'s saved event {seq} doesn't parse: {e}");
+                    return Ok(None);
+                }
+            };
+            events.push(AgentEvent {
+                seq: Some(seq),
+                at,
+                kind,
+            });
+        }
+        Ok(Some((session, events)))
     }
 
     /// Every review, newest first.
@@ -3247,6 +3335,8 @@ mod tests {
             ]
         );
         assert!(all.iter().all(|r| r.cost == 0.5));
+        // Their sessions went before transcripts were kept.
+        assert_eq!(db.auto_review_transcript(1).unwrap(), None);
         assert_eq!(db.queue_auto_review(&key, "a", "t", "u", 6).unwrap(), None);
         db.finish_auto_review(3, AutoReviewState::Posted, None, 7)
             .unwrap();
@@ -3269,6 +3359,92 @@ mod tests {
             created_at: 1,
             ..AgentSession::fixture(id, "o/n")
         }
+    }
+
+    /// A review's deleted session leaves what it was and said on the
+    /// review, until the review is pruned.
+    #[test]
+    fn a_deleted_review_session_keeps_its_transcript() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        let review = db
+            .start_auto_review(&key, "a", "t", "u", 1)
+            .unwrap()
+            .unwrap();
+        let session = AgentSession {
+            kind: SessionKind::AutoReview,
+            title: "Review #7: t".into(),
+            ..agent("r", AgentStatus::Idle)
+        };
+        db.create_agent(&session).unwrap();
+        db.set_auto_review_session(review, "r").unwrap();
+        db.append_agent_event("r", &AgentEventKind::Prompt("Review it".into()), 1_000)
+            .unwrap();
+        db.append_agent_event("r", &AgentEventKind::Error("e".into()), 2_000)
+            .unwrap();
+        // Nothing's kept while the session is there.
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+
+        db.auto_review_session_deleted(&session).unwrap();
+        db.delete_agent("r").unwrap();
+        let (saved, events) = db.auto_review_transcript(review).unwrap().unwrap();
+        assert_eq!(saved, session);
+        let kept: Vec<_> = events
+            .iter()
+            .map(|e| (e.seq, e.at, e.kind.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (
+                    Some(1),
+                    Some(1_000),
+                    AgentEventKind::Prompt("Review it".into())
+                ),
+                (Some(2), Some(2_000), AgentEventKind::Error("e".into())),
+            ]
+        );
+        assert_eq!(db.auto_review(review).unwrap().unwrap().session, None);
+
+        // A copy this build can't read, e.g. saved before a field without
+        // a default was added, reads as not kept.
+        db.conn()
+            .execute(
+                "UPDATE auto_reviews SET saved = '{\"id\": \"r\"}' WHERE id = ?",
+                [review],
+            )
+            .unwrap();
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+        // So does one with an event it can't read.
+        db.conn()
+            .execute(
+                "UPDATE auto_reviews SET saved = ? WHERE id = ?",
+                params![serde_json::to_string(&session).unwrap(), review],
+            )
+            .unwrap();
+        assert!(db.auto_review_transcript(review).unwrap().is_some());
+        db.conn()
+            .execute(
+                "UPDATE auto_review_events SET event = '{\"gone\": 1}'
+                 WHERE review_id = ? AND seq = 2",
+                [review],
+            )
+            .unwrap();
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+
+        // Pruning the review takes its transcript with it.
+        db.finish_auto_review(review, AutoReviewState::Posted, None, 2)
+            .unwrap();
+        assert!(db.prune_auto_reviews(3).unwrap());
+        let left: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM auto_review_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
     }
 
     /// A row whose backend or cost unit this build doesn't know fails to

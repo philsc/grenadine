@@ -23,7 +23,7 @@ pub fn tab_of(route: &Route) -> Tab {
     match route {
         Route::Inboxes | Route::Pr(_) => Tab::Inboxes,
         Route::Agents { .. } | Route::Draft(_) | Route::Agent(_) | Route::Cleanup => Tab::Agents,
-        Route::AutoReviews | Route::AutoReview(_) => Tab::AutoReviews,
+        Route::AutoReviews | Route::AutoReview(_) | Route::AutoReviewPage(_) => Tab::AutoReviews,
         Route::Debug => Tab::Debug,
     }
 }
@@ -46,6 +46,7 @@ fn hash_of(route: &Route) -> Option<String> {
         Route::Agent(id) => Some(crate::agents::session_hash(id, SessionKind::Interactive)),
         Route::Cleanup => Some("#/agents/cleanup".to_owned()),
         Route::AutoReview(id) => Some(crate::auto_reviews::hash(id)),
+        Route::AutoReviewPage(id) => Some(crate::auto_reviews::page_hash(*id)),
         Route::Inboxes | Route::Agents { .. } | Route::AutoReviews | Route::Debug => None,
     }
 }
@@ -184,6 +185,7 @@ mod tests {
         assert_eq!(tab_of(&Route::Cleanup), Tab::Agents);
         assert_eq!(tab_of(&Route::AutoReviews), Tab::AutoReviews);
         assert_eq!(tab_of(&Route::AutoReview("r".into())), Tab::AutoReviews);
+        assert_eq!(tab_of(&Route::AutoReviewPage(7)), Tab::AutoReviews);
         assert_eq!(tab_of(&Route::Debug), Tab::Debug);
     }
 
@@ -216,6 +218,16 @@ mod tests {
                 yes
             ),
             "#/auto-reviews/r"
+        );
+        // A review's page is there whatever became of its session.
+        assert_eq!(
+            href(
+                Tab::AutoReviews,
+                &on_pr,
+                Some(&Route::AutoReviewPage(7)),
+                no
+            ),
+            "#/auto-reviews/review/7"
         );
 
         // The active tab goes to its root, memory or not.
