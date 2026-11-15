@@ -737,6 +737,8 @@ class ServerTestCase(unittest.TestCase):
                 # The fake GitHub shows posted reviews at once, so a review
                 # that posts nothing needn't be looked for over 25s.
                 "--review-post-checks=0,1",
+                # The fake claude can't update itself.
+                "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
             ],

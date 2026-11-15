@@ -8,6 +8,7 @@ mod api;
 pub mod assets;
 mod auto_review;
 mod claude;
+mod claude_update;
 mod cleanup;
 mod db;
 mod devin;
@@ -115,6 +116,11 @@ struct Args {
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
+
+    /// Hours between runs of `claude update`, the first at startup. Claude
+    /// Code doesn't update itself under `claude -p`. 0 turns it off.
+    #[arg(long, default_value_t = 6)]
+    claude_update_hours: u64,
 
     /// The Devin executable that agent sessions run.
     #[arg(long, default_value = "devin")]
@@ -257,6 +263,7 @@ pub async fn run() -> Result<()> {
         let worktrees = worktrees.clone();
         move || agent::remove_orphaned_output_bases(&worktrees)
     });
+    let claude = args.claude.clone();
     let mut agents = agent::Agents::new(
         &db,
         args.claude,
@@ -322,6 +329,14 @@ pub async fn run() -> Result<()> {
     tokio::spawn(cleanup::prune_loop(state.clone()));
     // Counts the sessions' unstaged changes off the request path.
     tokio::spawn(unstaged::run(state.clone()));
+    // Shutting down doesn't wait for it; dropping it kills its claude.
+    if args.claude_update_hours > 0 {
+        tokio::spawn(claude_update::run(
+            claude,
+            Duration::from_secs(args.claude_update_hours.saturating_mul(3600)),
+            shutdown.clone(),
+        ));
+    }
     // Listing the backends' models can take a while, so it starts now
     // rather than with the first page or prompt.
     tokio::spawn({
