@@ -54,7 +54,8 @@ pub struct DevinConfig {
     pub exe: PathBuf,
     /// The model summaries and cleanup scans run on.
     pub job_model: String,
-    /// The model checks for stale cleanup items run on.
+    /// The model checks for stale cleanup items run on, and handoffs
+    /// written from a session's transcript.
     pub prune_model: String,
 }
 
@@ -77,7 +78,7 @@ impl Devin {
     fn job_model(&self, kind: JobKind) -> &str {
         match kind {
             JobKind::Summary | JobKind::Scan => &self.config.job_model,
-            JobKind::Prune => &self.config.prune_model,
+            JobKind::Prune | JobKind::Handoff => &self.config.prune_model,
         }
     }
 }

@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
-    AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CiStatus, CleanupState,
-    CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    RepoSettings, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    AgentSession, AgentStatus, AnswerHandoff, Approval, ApprovalKind, ApprovalOption, CiStatus,
+    CleanupState, CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk,
+    PermissionMode, PrKey, RepoSettings, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    WriteHandoff,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -1423,20 +1424,46 @@ fn repo_default_mode(settings: Option<&RepoSettings>, backend: AgentBackend) -> 
         .unwrap_or_else(PermissionMode::plan)
 }
 
-/// The agent's `handoff` request a `NewSession` form answers: the
-/// session `agent` asked, and the request's tool use id `tool`.
+/// The handoff proposal a `NewSession` form answers: the session
+/// `agent` it's in, and the id `tool` of the agent's `handoff` request
+/// or of the proposal written for the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffRequest {
     pub agent: String,
     pub tool: String,
+    /// Whether the user asked for the handoff, so no agent waits for the
+    /// answer.
+    pub by_user: bool,
+}
+
+impl HandoffRequest {
+    /// Starts `req`, or declines the proposal without one, telling a
+    /// waiting agent `reason`.
+    async fn answer(&self, req: Option<NewAgent>, reason: Option<String>) -> Result<(), String> {
+        if self.by_user {
+            return api::answer_handoff(&self.agent, &self.tool, &AnswerHandoff { start: req })
+                .await;
+        }
+        let approval = Approval {
+            id: self.tool.clone(),
+            allow: req.is_some(),
+            message: reason,
+            mode: None,
+            option: None,
+            answers: None,
+            handoff: req,
+        };
+        api::approve(&self.agent, &approval).await
+    }
 }
 
 /// The form that starts a session, filled in from the draft with id
 /// `draft` and kept in it as it changes. With `pr`, the session is
 /// locked to that PR: its repository and "Start from PR" aren't offered,
 /// and the draft takes them whatever it held. With `handoff`, the form
-/// is an agent's proposal, in its transcript: starting it allows the
-/// request with the session as the form has it, and it can be declined.
+/// is a handoff proposal in a session's transcript, the agent's or one
+/// written for the user: starting it answers the proposal with the
+/// session as the form has it, and it can be declined.
 #[component]
 pub fn NewSession(
     draft: String,
@@ -1652,16 +1679,7 @@ pub fn NewSession(
             // does for a start whose answer the page missed.
             if let Some(h) = handoff.get_value() {
                 save_start(&id, &req.permission_mode, &picked);
-                let approval = Approval {
-                    id: h.tool,
-                    allow: true,
-                    message: None,
-                    mode: None,
-                    option: None,
-                    answers: None,
-                    handoff: Some(req),
-                };
-                if let Err(e) = api::approve(&h.agent, &approval).await {
+                if let Err(e) = h.answer(Some(req), None).await {
                     forget_start(&id);
                     drafts.set_start_error(&id, Some(e));
                 }
@@ -1699,24 +1717,17 @@ pub fn NewSession(
     // behind a summary.
     let proposed = handoff.with_value(Option::is_some);
     let locked = pr.is_some() || proposed;
-    // Why the user declines a proposal, told to the agent.
+    // Why the user declines a proposal, told to the agent that made it.
     let reason = RwSignal::new(String::new());
+    let asks_why = handoff.with_value(|h| h.as_ref().is_some_and(|h| !h.by_user));
     let declining = RwSignal::new(false);
     let decline = move |_| {
         let Some(h) = handoff.get_value() else { return };
-        let approval = Approval {
-            id: h.tool,
-            allow: false,
-            message: Some(reason.get_untracked()).filter(|r| !r.trim().is_empty()),
-            mode: None,
-            option: None,
-            answers: None,
-            handoff: None,
-        };
+        let why = Some(reason.get_untracked()).filter(|r| !r.trim().is_empty());
         let id = id.get_value();
         declining.set(true);
         spawn_local(async move {
-            match api::approve(&h.agent, &approval).await {
+            match h.answer(None, why).await {
                 Ok(()) => drafts.remove(&id),
                 Err(e) => drafts.set_start_error(&id, Some(e)),
             }
@@ -1858,7 +1869,7 @@ pub fn NewSession(
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
                     <AttachButton attached=attached />
-                    {proposed.then(|| view! {
+                    {asks_why.then(|| view! {
                         <input
                             type="text"
                             class="handoff-reason"
@@ -1867,8 +1878,11 @@ pub fn NewSession(
                             prop:value=move || reason.get()
                             on:input=move |ev| reason.set(event_target_value(&ev))
                         />
+                    })}
+                    {proposed.then(|| view! {
                         <button
                             type="button"
+                            class:handoff-decline=!asks_why
                             disabled=move || busy() || declining.get()
                             on:click=decline
                         >"Decline"</button>
@@ -2516,6 +2530,7 @@ pub fn AgentView(
                                     session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
                                 });
                                 let active_model = reported;
+                                let writing_handoff = Memo::new(move |_| events.with(|e| writes_handoff(e)));
                                 view! {
                                     {if compact {
                                         view! {
@@ -2546,8 +2561,8 @@ pub fn AgentView(
                                             view! { <ReviewActions session=session /> }.into_any()
                                         } else {
                                             view! {
-                                                <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                                <AgentActions session=session mode=mode model=model show_thinking=show_thinking compact=compact />
+                                                <Composer session=session usage=usage active_model=active_model mode=mode model=model writing_handoff=writing_handoff.into() />
+                                                <AgentActions session=session mode=mode model=model show_thinking=show_thinking compact=compact writing_handoff=writing_handoff.into() />
                                             }.into_any()
                                         }}
                                     </div>
@@ -2842,6 +2857,8 @@ fn AgentActions(
     /// mustn't navigate that page away.
     #[prop(optional)]
     compact: bool,
+    /// Whether a handoff the user asked for is being written.
+    writing_handoff: Signal<bool>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     // A wrap-up asked for during a turn waits for the turn, so the buttons
@@ -2865,6 +2882,46 @@ fn AgentActions(
             wrapping.set(false);
         });
     };
+    // The box that asks what a handoff written from the transcript
+    // should have the new session do.
+    let handing_off = RwSignal::new(false);
+    let instruction = RwSignal::new(String::new());
+    let asking = RwSignal::new(false);
+    // A turn would change the transcript under the job that reads it,
+    // and the agent can hand off itself then. The server refuses a second
+    // handoff while one is being written too.
+    let working = move || {
+        writing_handoff.get()
+            || session.with(|s| {
+                matches!(
+                    s.status,
+                    AgentStatus::Creating
+                        | AgentStatus::Running
+                        | AgentStatus::AwaitingApproval
+                        | AgentStatus::Background
+                )
+            })
+    };
+    let write_handoff = move || {
+        let id = session.with_untracked(|s| s.id.clone());
+        let req = WriteHandoff {
+            instruction: instruction.get_untracked(),
+            permission_mode: mode.get_untracked(),
+            model: model_arg(model),
+        };
+        asking.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::write_handoff(&id, &req).await {
+                Ok(()) => {
+                    handing_off.set(false);
+                    instruction.set(String::new());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            asking.set(false);
+        });
+    };
     let delete = move |_| {
         session.with_untracked(|s| {
             if compact {
@@ -2876,7 +2933,40 @@ fn AgentActions(
     };
     view! {
         {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        <Show when=move || handing_off.get()>
+            <form
+                class="handoff-ask"
+                on:submit=move |ev| {
+                    ev.prevent_default();
+                    write_handoff();
+                }
+            >
+                <p class="hint">
+                    "Writes a new session's first prompt from this transcript, without a turn \
+                     in this session. You can change it before it starts."
+                </p>
+                <textarea
+                    rows="2"
+                    placeholder="What should the new session do? (optional)"
+                    aria-label="What the new session should do"
+                    prop:value=move || instruction.get()
+                    on:input=move |ev| instruction.set(event_target_value(&ev))
+                />
+                <div class="form-buttons">
+                    <button type="submit" class="primary" disabled=move || asking.get() || working()>
+                        "Write handoff"
+                    </button>
+                    <button type="button" on:click=move |_| handing_off.set(false)>"Cancel"</button>
+                </div>
+            </form>
+        </Show>
         <div class="agent-actions">
+            <button
+                class="link"
+                title="Have a new session take over from here: its first prompt is written from this transcript, without a turn in this session"
+                disabled=working
+                on:click=move |_| handing_off.update(|h| *h = !*h)
+            >"Hand off"</button>
             // A general session has nothing to land.
             <Show when=move || session.with(|s| s.repo != GENERAL)>
                 <button
@@ -3316,6 +3406,19 @@ fn Transcript(
             _ => true,
         },
     );
+    // The handoffs the user asked for that are written, or failed.
+    let handoffs_written = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::HandoffProposed { id, .. }
+                    | AgentEventKind::HandoffFailed { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>()
+        })
+    });
     let resolved = Memo::new(move |_| {
         events.with(|events| {
             events
@@ -3801,6 +3904,36 @@ fn Transcript(
                                 resolved=resolved
                                 waiting=waiting
                             />
+                        }.into_any(),
+                        AgentEventKind::HandoffRequested { id: request, instruction } => {
+                            let request = request.clone();
+                            let writing = Signal::derive(move || {
+                                !handoffs_written.with(|w| w.contains(&request))
+                            });
+                            let instruction = instruction.clone();
+                            view! {
+                                <p class="turn-end handoff-requested" class:writing=writing>
+                                    {move || if writing.get() { "Writing a handoff…" } else { "Asked for a handoff" }}
+                                    {(!instruction.is_empty()).then(|| view! {
+                                        ": " <span class="handoff-instruction">{instruction.clone()}</span>
+                                    })}
+                                </p>
+                            }.into_any()
+                        }
+                        AgentEventKind::HandoffProposed { id: proposal, input } => view! {
+                            <HandoffCard
+                                agent=id
+                                tool=proposal.clone()
+                                input=input.clone()
+                                resolved=resolved
+                                waiting=waiting
+                                by_user=true
+                            />
+                        }.into_any(),
+                        AgentEventKind::HandoffFailed { error, .. } => view! {
+                            <p class="turn-end error handoff-failed">
+                                {format!("Writing the handoff failed: {error}")}
+                            </p>
                         }.into_any(),
                         AgentEventKind::HandedOff { id: child, title } => view! {
                             <p class="turn-end handed-off">
@@ -4317,8 +4450,9 @@ fn QuestionCard(
     }
 }
 
-/// `handoff`: the session the agent proposes to start, in a `NewSession`
-/// form the user can change it in before starting it, or decline it.
+/// A handoff proposal, the agent's `handoff` request or one written for
+/// the user: the session it proposes to start, in a `NewSession` form
+/// the user can change it in before starting it, or decline it.
 #[component]
 fn HandoffCard(
     agent: String,
@@ -4327,8 +4461,12 @@ fn HandoffCard(
     input: String,
     resolved: Memo<HashMap<String, Answer>>,
     /// Whether the backend is running and so may wait for an answer;
-    /// requests from before a restart stay unanswered.
+    /// an agent's requests from before a restart stay unanswered.
     waiting: Signal<bool>,
+    /// Whether the user asked for the handoff: no agent waits for the
+    /// answer, so the proposal stays open until it's answered.
+    #[prop(optional)]
+    by_user: bool,
 ) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
     let draft = drafts::handoff_id(&tool);
@@ -4339,7 +4477,7 @@ fn HandoffCard(
     };
     // Only whether the form shows, so that it isn't rebuilt, losing what
     // the user typed, whenever something else changes.
-    let open = Memo::new(move |_| state.get().is_none() && waiting.get());
+    let open = Memo::new(move |_| state.get().is_none() && (by_user || waiting.get()));
     // A proposal that didn't start leaves nothing to keep. An allowed
     // one's draft goes once the sidebar moved its start mode onto the
     // new session.
@@ -4366,6 +4504,7 @@ fn HandoffCard(
                 let request = HandoffRequest {
                     agent: agent.clone(),
                     tool: tool.clone(),
+                    by_user,
                 };
                 return view! {
                     <div class="approval pending">
@@ -4502,6 +4641,26 @@ fn ApprovalCard(
     }
 }
 
+/// Whether the transcript `events` has a handoff the user asked for
+/// that's still being written: a turn would change the transcript the
+/// job reads.
+fn writes_handoff(events: &[Arc<AgentEvent>]) -> bool {
+    let mut writing = HashSet::new();
+    for e in events {
+        match &e.kind {
+            AgentEventKind::HandoffRequested { id, .. } => {
+                writing.insert(id.as_str());
+            }
+            AgentEventKind::HandoffProposed { id, .. }
+            | AgentEventKind::HandoffFailed { id, .. } => {
+                writing.remove(id.as_str());
+            }
+            _ => {}
+        }
+    }
+    !writing.is_empty()
+}
+
 #[component]
 fn Composer(
     session: Signal<AgentSession>,
@@ -4509,6 +4668,9 @@ fn Composer(
     active_model: Signal<Option<String>>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
+    /// Whether a handoff the user asked for is being written; follow-ups
+    /// wait until it is.
+    writing_handoff: Signal<bool>,
 ) -> impl IntoView {
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
     let backend = Signal::derive(move || session.with(|s| s.backend));
@@ -4534,7 +4696,7 @@ fn Composer(
     };
 
     let send = move || {
-        if blank() || files.pending_untracked() {
+        if blank() || files.pending_untracked() || writing_handoff.get_untracked() {
             return;
         }
         let text = prompt.get_untracked();
@@ -4585,7 +4747,7 @@ fn Composer(
             <textarea
                 rows="3"
                 aria-label="Follow-up"
-                placeholder=move || if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
+                placeholder=move || if writing_handoff.get() { "Writing a handoff… You can reply once it's written.".to_owned() } else if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
                 on:input=move |ev| prompt.set(event_target_value(&ev))
                 on:paste=move |ev| images::paste(ev, attached)
@@ -4602,7 +4764,7 @@ fn Composer(
             <div class="form-buttons">
                 <ModeSelect mode=mode backend=backend />
                 <ModelSelect model=model backend=backend session=SessionPick { id, reported: active_model } />
-                <button type="submit" class="primary" disabled=move || blank() || files.pending()>"Send"</button>
+                <button type="submit" class="primary" disabled=move || blank() || files.pending() || writing_handoff.get()>"Send"</button>
                 <AttachButton attached=attached />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
                 <div class="composer-status">
@@ -5272,6 +5434,37 @@ mod tests {
         assert_eq!(tool_duration(Some(1_000), Some(10_999)), None);
         assert_eq!(tool_duration(Some(1_000), Some(11_000)), Some(10_000));
         assert_eq!(tool_duration(Some(0), Some(125_000)), Some(125_000));
+    }
+
+    #[test]
+    fn a_handoff_is_written_until_proposed_or_failed() {
+        let event = |kind| {
+            Arc::new(AgentEvent {
+                seq: None,
+                at: None,
+                kind,
+            })
+        };
+        let requested = |id: &str| {
+            event(AgentEventKind::HandoffRequested {
+                id: id.into(),
+                instruction: String::new(),
+            })
+        };
+        let mut events = vec![requested("handoff-1")];
+        assert!(writes_handoff(&events));
+        events.push(event(AgentEventKind::HandoffProposed {
+            id: "handoff-1".into(),
+            input: "{}".into(),
+        }));
+        assert!(!writes_handoff(&events));
+        events.push(requested("handoff-2"));
+        assert!(writes_handoff(&events));
+        events.push(event(AgentEventKind::HandoffFailed {
+            id: "handoff-2".into(),
+            error: "no".into(),
+        }));
+        assert!(!writes_handoff(&events));
     }
 
     #[test]

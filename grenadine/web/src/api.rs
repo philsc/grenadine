@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewDetail,
-    AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue,
-    GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus,
-    SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
+    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval, AutoMerge,
+    AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState,
+    EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged,
+    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
+    PrMissing, PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview,
+    SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -484,6 +484,30 @@ pub async fn wrap_up_agent(id: &str, wrap_up: &WrapUp) -> Result<()> {
         .json(wrap_up)
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
+}
+
+/// Asks for a handoff to be written from the session's transcript; the
+/// proposal shows up in the transcript.
+pub async fn write_handoff(id: &str, req: &WriteHandoff) -> Result<()> {
+    let req = Request::post(&format!("/api/agents/{id}/handoff"))
+        .json(req)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Answers the handoff `proposal` written for the user in the session's
+/// transcript; the server has a 404 for one that was answered already.
+pub async fn answer_handoff(id: &str, proposal: &str, answer: &AnswerHandoff) -> Result<()> {
+    let resp = Request::post(&format!("/api/agents/{id}/handoff/{proposal}"))
+        .json(answer)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Err("This handoff isn't waiting anymore.".into());
+    }
+    check(Ok(resp)).await.map(|_| ())
 }
 
 /// Comments on the PR itself.

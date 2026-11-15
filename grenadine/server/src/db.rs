@@ -2250,6 +2250,25 @@ impl Db {
         .collect()
     }
 
+    /// The events of the handoffs the user asked for, in every session's
+    /// transcript, by session id and in order: requested, proposed and
+    /// failed.
+    pub fn handoff_events(&self) -> Result<Vec<(String, AgentEventKind)>> {
+        let conn = self.conn();
+        // As in `approval_events`. `handed_off` doesn't match.
+        let mut stmt = conn.prepare(
+            r#"SELECT agent_id, event FROM agent_events
+             WHERE event LIKE '{"handoff\_%' ESCAPE '\'
+             ORDER BY agent_id, seq"#,
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (id, json) = row?;
+            Ok((id, serde_json::from_str(&json)?))
+        })
+        .collect()
+    }
+
     /// The cleanup items, newest first.
     pub fn cleanup_items(&self) -> Result<Vec<CleanupItem>> {
         let conn = self.conn();

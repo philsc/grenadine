@@ -6,7 +6,7 @@
 //! its own, and the user answers on the page.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,7 +36,7 @@ use crate::reflow::reflow;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
-const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
+pub(crate) const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
 /// The ref a pull request's target branch is fetched into while a session's
 /// commits are pushed. One ref per repository is enough because pushing
 /// holds the repository's git lock.
@@ -193,6 +193,8 @@ pub enum JobKind {
     Scan,
     /// Which cleanup items are stale.
     Prune,
+    /// A handoff from a session's transcript, for the user.
+    Handoff,
 }
 
 impl JobKind {
@@ -202,6 +204,7 @@ impl JobKind {
             JobKind::Summary => "summary",
             JobKind::Scan => "scan",
             JobKind::Prune => "prune",
+            JobKind::Handoff => "handoff",
         }
     }
 }
@@ -579,6 +582,11 @@ struct Live {
     /// work. Devin sends a tool call again when it runs over 120 s, so a
     /// second call must not land the same work at the same time.
     landing: bool,
+    /// A background job is writing a handoff the user asked for.
+    writing_handoff: bool,
+    /// The user's handoff proposals being answered or answered since the
+    /// server started, so that one starts at most one session.
+    answered_handoffs: HashSet<String>,
 }
 
 /// A prompt with the names of its images and its attached files, and the
@@ -605,6 +613,8 @@ impl Live {
             turn: None,
             wrap_up: None,
             landing: false,
+            writing_handoff: false,
+            answered_handoffs: HashSet::new(),
         }
     }
 }
@@ -1039,6 +1049,12 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
+    /// Runs `f` on the session's live state if it has any, e.g. not once
+    /// the session is deleted.
+    fn with_existing_live<T>(&self, id: &str, f: impl FnOnce(&mut Live) -> T) -> Option<T> {
+        self.live.lock().unwrap().get_mut(id).map(f)
+    }
+
     /// Lets `interrupt` stop the current turn with `stopper`. An
     /// interrupt that came before the turn's process existed stops it now.
     pub fn set_stopper(&self, id: &str, stopper: Stopper) {
@@ -1440,7 +1456,8 @@ pub fn send(
 }
 
 /// Queues a prompt with the images `save_images` saved for it and the
-/// files `attachments::claim` claimed for it.
+/// files `attachments::claim` claimed for it. While a handoff is being
+/// written, it waits for the handoff.
 pub fn send_with_files(
     state: &Arc<State>,
     id: &str,
@@ -1458,7 +1475,11 @@ pub fn send_with_files(
             mode,
             model,
         });
-        !std::mem::replace(&mut l.running, true)
+        if l.running || l.writing_handoff {
+            return false;
+        }
+        l.running = true;
+        true
     });
     if start {
         tokio::spawn(run(state.clone(), id.to_owned()));
@@ -2193,6 +2214,50 @@ impl Drop for Landing {
 /// between turns.
 pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<String>)> {
     state.agents.with_live(id, |l| l.turn.clone())
+}
+
+/// Marks the session as having a handoff written for the user. False,
+/// without marking it, while a turn runs or is queued or a handoff is
+/// being written already.
+pub fn begin_handoff(state: &State, id: &str) -> bool {
+    state.agents.with_live(id, |l| {
+        if l.running || !l.queue.is_empty() || l.writing_handoff {
+            return false;
+        }
+        l.writing_handoff = true;
+        true
+    })
+}
+
+/// Takes back `begin_handoff`'s mark and starts the prompts queued
+/// meanwhile. A deleted session is left alone.
+pub fn end_handoff(state: &Arc<State>, id: &str) {
+    let start = state.agents.with_existing_live(id, |l| {
+        l.writing_handoff = false;
+        if l.running || l.queue.is_empty() {
+            return false;
+        }
+        l.running = true;
+        true
+    });
+    if start == Some(true) {
+        tokio::spawn(run(state.clone(), id.to_owned()));
+    }
+}
+
+/// Claims the answer to the session's handoff `proposal`; false when
+/// it's claimed already.
+pub fn claim_handoff(state: &State, id: &str, proposal: &str) -> bool {
+    state
+        .agents
+        .with_live(id, |l| l.answered_handoffs.insert(proposal.to_owned()))
+}
+
+/// Gives `claim_handoff`'s claim back, for an answer that failed.
+pub fn release_handoff(state: &State, id: &str, proposal: &str) {
+    state.agents.with_live(id, |l| {
+        l.answered_handoffs.remove(proposal);
+    });
 }
 
 /// Makes `turn_settings` say `turn`, as a running turn would.
@@ -8251,6 +8316,40 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 .unwrap_err();
             assert!(format!("{err:#}").contains("review"), "{err:#}");
         }
+    }
+
+    /// A prompt sent while a handoff is being written waits for it, and
+    /// starts once it's written.
+    #[tokio::test]
+    async fn prompts_wait_for_the_handoff_being_written() {
+        let state = crate::sync::test_state();
+        let id = uuid();
+        assert!(begin_handoff(&state, &id));
+        send(
+            &state,
+            &id,
+            "go on".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        let live = |state: &State| state.agents.with_live(&id, |l| (l.running, l.queue.len()));
+        assert_eq!(live(&state), (false, 1));
+        assert!(!begin_handoff(&state, &id));
+        // The turn's task doesn't get to run before the next await.
+        end_handoff(&state, &id);
+        assert_eq!(live(&state), (true, 1));
+    }
+
+    /// The end of a deleted session's handoff doesn't bring its entry
+    /// back.
+    #[test]
+    fn ending_a_deleted_sessions_handoff_leaves_no_entry() {
+        let state = crate::sync::test_state();
+        let id = uuid();
+        assert!(begin_handoff(&state, &id));
+        state.agents.live.lock().unwrap().remove(&id);
+        end_handoff(&state, &id);
+        assert!(!state.agents.live.lock().unwrap().contains_key(&id));
     }
 
     /// One landing at a time: a second call fails while a landing's guard

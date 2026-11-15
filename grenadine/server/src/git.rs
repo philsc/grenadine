@@ -279,6 +279,27 @@ impl Repo {
         Ok(found)
     }
 
+    /// The commits that those of `branches` that exist on the GitHub
+    /// repository are at, by branch.
+    pub fn remote_heads(&self, branches: &[String]) -> Result<BTreeMap<String, String>> {
+        let mut found = BTreeMap::new();
+        if branches.is_empty() {
+            return Ok(found);
+        }
+        let mut args = vec!["ls-remote".to_owned(), "--heads".into(), self.fetch_url()];
+        args.extend(branches.iter().map(|b| format!("refs/heads/{b}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        for line in self.git(&args)?.lines() {
+            if let Some((sha, branch)) = line
+                .split_once('\t')
+                .and_then(|(sha, r)| Some((sha, r.strip_prefix("refs/heads/")?)))
+            {
+                found.insert(branch.to_owned(), sha.to_owned());
+            }
+        }
+        Ok(found)
+    }
+
     /// Whether `name` is a valid git branch name.
     pub fn valid_branch_name(&self, name: &str) -> bool {
         self.git_ok(&["check-ref-format", "--branch", name])
@@ -455,6 +476,39 @@ impl Repo {
             .filter(|p| !p.is_empty())
             .collect();
         Ok(paths.len())
+    }
+
+    /// How many files in the worktree at `path` differ from its commit:
+    /// changed, staged or not, or untracked.
+    pub fn worktree_uncommitted_count(&self, path: &Path) -> Result<usize> {
+        let status = self.git_in(
+            path,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+        )?;
+        Ok(status.lines().filter(|l| !l.is_empty()).count())
+    }
+
+    /// How many commits the worktree at `path` has that none of `known`
+    /// has. Commits of `known` the clone doesn't have are left out.
+    pub fn worktree_commits_beyond(&self, path: &Path, known: &[String]) -> Result<usize> {
+        let mut args = vec!["rev-list", "--count", "HEAD", "--not"];
+        args.extend(
+            known
+                .iter()
+                .filter(|sha| self.has_commit(sha))
+                .map(String::as_str),
+        );
+        let count = self.git_in(path, &args)?;
+        count
+            .trim()
+            .parse()
+            .with_context(|| format!("git rev-list --count printed {count:?}"))
     }
 
     /// Rebases the commits after `upstream` in the worktree at `path` onto

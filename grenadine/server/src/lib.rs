@@ -15,6 +15,7 @@ mod db;
 mod devin;
 mod git;
 mod github;
+mod handoff;
 mod inbox_search;
 mod inboxes;
 mod mcp;
@@ -135,7 +136,8 @@ struct Args {
     )]
     devin_job_model: String,
 
-    /// The model the checks of Devin sessions' cleanup items run on.
+    /// The model the checks of Devin sessions' cleanup items run on, and
+    /// the handoffs written from Devin sessions' transcripts.
     #[arg(long, default_value = "claude-sonnet-5-5-medium")]
     devin_prune_model: String,
 
@@ -326,6 +328,10 @@ pub async fn run() -> Result<()> {
     // No request from before the restart is waiting anymore.
     if let Err(e) = agent::expire_orphaned_approvals(&state) {
         tracing::warn!("can't expire the permission requests left open: {e:#}");
+    }
+    // Nor is any handoff from before it still being written.
+    if let Err(e) = handoff::fail_orphaned(&state) {
+        tracing::warn!("can't fail the handoffs left being written: {e:#}");
     }
     let sync_task = tokio::spawn(sync::run(
         state.clone(),

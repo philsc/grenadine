@@ -14,12 +14,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, Approval, AutoMerge,
-    AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr,
-    Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged,
-    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview,
-    WorktreeChanges, WrapUp, submit_blocker,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
+    AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
+    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
+    ServerEvent, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -29,7 +29,7 @@ use crate::agent::{self, Decision};
 use crate::attachments;
 use crate::github::{MergeAsync, ReviewItem};
 use crate::sync::State;
-use crate::{assets, auto_review, cleanup, mcp, terminal};
+use crate::{assets, auto_review, cleanup, handoff, mcp, terminal};
 
 type St = AxState<Arc<State>>;
 
@@ -171,6 +171,11 @@ fn api_routes() -> Router<Arc<State>> {
             post(approve).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
+        .route("/api/agents/{id}/handoff", post(write_handoff))
+        .route(
+            "/api/agents/{id}/handoff/{proposal}",
+            post(answer_handoff).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
+        )
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/agents/{id}/prs", get(agent_prs))
@@ -1616,6 +1621,72 @@ async fn wrap_up_agent(
         return Ok((StatusCode::CONFLICT, "the session is already wrapping up").into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Has a background job write a handoff from the session's transcript,
+/// without a turn in the session; the proposal shows up in its
+/// transcript. 409 while the session runs a turn or a handoff is being
+/// written already.
+async fn write_handoff(
+    AxState(state): St,
+    Path(id): Path<String>,
+    Json(req): Json<WriteHandoff>,
+) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    if let Some(why) = handoff::refusal(&session) {
+        return Ok((StatusCode::BAD_REQUEST, why).into_response());
+    }
+    if let Some(r) = offers(
+        &state,
+        session.backend,
+        req.model.as_deref(),
+        &req.permission_mode,
+    )
+    .await
+    {
+        return Ok(r);
+    }
+    if !state.agents.offered(session.backend).await {
+        let message = format!("{} isn't installed on the server", session.backend.label());
+        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+    }
+    if !handoff::start(&state, &session, req)? {
+        return Ok((
+            StatusCode::CONFLICT,
+            "the session is busy: wait for its turn or the handoff being written",
+        )
+            .into_response());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Answers a handoff proposal written for the user: starts the session
+/// as the form has it and returns it, or declines the proposal. 404
+/// when it isn't waiting for an answer.
+async fn answer_handoff(
+    AxState(state): St,
+    Path((id, proposal)): Path<(String, String)>,
+    Json(answer): Json<AnswerHandoff>,
+) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    // Checked as the form's start would be, so a session that can't
+    // start doesn't use up the proposal.
+    if let Some(req) = &answer.start
+        && let Some(r) = check_new_agent(&state, req).await
+    {
+        return Ok(r);
+    }
+    Ok(
+        match handoff::answer(&state, &session, &proposal, answer).await? {
+            handoff::Answered::NotFound => StatusCode::NOT_FOUND.into_response(),
+            handoff::Answered::Declined => StatusCode::NO_CONTENT.into_response(),
+            handoff::Answered::Started(child) => Json(*child).into_response(),
+        },
+    )
 }
 
 /// Answers a permission request; 404 when it isn't waiting anymore.

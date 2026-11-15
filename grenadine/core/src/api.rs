@@ -1858,6 +1858,45 @@ pub struct WrapUp {
     pub model: Option<String>,
 }
 
+/// Asks for a handoff from an agent session to be written without
+/// running a turn in it: a background job reads the session's transcript
+/// and proposes a new session, which shows in the transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteHandoff {
+    /// What the new session should do; empty to go on with what the
+    /// session was working on.
+    #[serde(default)]
+    pub instruction: String,
+    /// The mode the proposed session starts in, one of the session's
+    /// backend's `AgentBackend::modes`.
+    pub permission_mode: PermissionMode,
+    /// The proposed session's model, an `AgentModelInfo::value` of the
+    /// backend; `None` keeps its default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// What the ids of the drafts that hold a handoff proposal start with.
+pub const HANDOFF_DRAFTS: &str = "handoff";
+
+/// The id of the draft that holds the proposal of the handoff request
+/// `tool`, and that the session started from it has. Draft ids are
+/// alphanumeric.
+pub fn handoff_id(tool: &str) -> String {
+    let tool: String = tool.chars().filter(char::is_ascii_alphanumeric).collect();
+    let tool = tool.strip_prefix(HANDOFF_DRAFTS).unwrap_or(&tool);
+    format!("{HANDOFF_DRAFTS}{tool}")
+}
+
+/// The user's answer to a `HandoffProposed` event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerHandoff {
+    /// The session to start, as the user has it in the proposal's form;
+    /// `None` declines the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<NewAgent>,
+}
+
 /// Where a session's work was landed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2055,6 +2094,24 @@ pub enum AgentEventKind {
         /// The new session's title.
         title: String,
     },
+    /// The user asked for a handoff to be written from the transcript,
+    /// which a background job is doing now. A `HandoffProposed` or
+    /// `HandoffFailed` with the same id follows.
+    HandoffRequested {
+        id: String,
+        /// What the user wants the new session to do; may be empty.
+        instruction: String,
+    },
+    /// The handoff the user asked for is written: the session it
+    /// proposes waits for the user's `AnswerHandoff`. An
+    /// `ApprovalResolved` with the same id follows once it's answered.
+    HandoffProposed {
+        id: String,
+        /// The proposed session, a `NewAgent` as JSON.
+        input: String,
+    },
+    /// Writing the handoff the user asked for failed; carries why.
+    HandoffFailed { id: String, error: String },
     /// The agent wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
         id: String,
