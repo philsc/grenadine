@@ -1,5 +1,11 @@
 """Repository rule unpacking the pinned Ubuntu .debs in packages.txt."""
 
+# Where each .deb is fetched from when its snapshot.ubuntu.com URL fails.
+# Launchpad keeps every package version it ever published, under the bare
+# file name. archive.ubuntu.com drops superseded versions from its pool.
+# The pinned sha256 still checks whatever the fallback serves.
+_FALLBACK = "https://launchpad.net/ubuntu/+archive/primary/+files/"
+
 def _chrome_deps_impl(rctx):
     entries = []
     for line in rctx.read(rctx.attr.packages).split("\n"):
@@ -11,7 +17,8 @@ def _chrome_deps_impl(rctx):
 
     for i, (sha256, url) in enumerate(entries):
         tmp = "deb{}".format(i)
-        rctx.download_and_extract(url = url, sha256 = sha256, type = "deb", output = tmp)
+        urls = [url, _FALLBACK + url.split("/")[-1]]
+        rctx.download_and_extract(url = urls, sha256 = sha256, type = "deb", output = tmp)
         for member in rctx.path(tmp).readdir():
             if member.basename.startswith("data.tar"):
                 rctx.extract(archive = member, output = ".")
