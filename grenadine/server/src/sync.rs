@@ -741,7 +741,7 @@ fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadS
 }
 
 /// Syncs one PR. Returns whether GitHub was still working out its merge
-/// state or checks, so that it's worth syncing again soon.
+/// state, checks or head, so that it's worth syncing again soon.
 async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
     let repo = state
         .repos
@@ -853,7 +853,8 @@ async fn sync_pr(state: &State, key: &PrKey) -> Result<bool> {
             .review_error
             .map(|e| format!("can't read the reviews and merge state: {e}")),
     };
-    let unsettled = meta.review.as_ref().is_some_and(settling);
+    // A stale head is left out of the versions until GitHub catches up.
+    let unsettled = computed.stale_head || meta.review.as_ref().is_some_and(settling);
     state.db.store_sync(
         &meta,
         &versions,
