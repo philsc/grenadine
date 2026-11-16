@@ -493,6 +493,37 @@ const MIGRATIONS: &[Migration] = &[
     );
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- Clears the drift that syncs reading GitHub's stale head right
+    -- after a force push reported: a trailing version re-adding an
+    -- earlier SHA that the next sync dropped. Each such drift_log row
+    -- has old = new || ', vN=SHA' with SHA already in new. A PR keeps
+    -- its drift if any of its rows is something else.
+    UPDATE prs SET drift = NULL
+    WHERE drift IS NOT NULL
+      AND EXISTS (SELECT 1 FROM drift_log d
+                  WHERE d.repo = prs.repo AND d.number = prs.number)
+      AND NOT EXISTS (
+        SELECT 1 FROM (
+            SELECT d.new AS new,
+                   substr(d.old, 1, length(d.new)) AS head,
+                   substr(d.old, length(d.new) + 1, 2) AS sep,
+                   substr(d.old, length(d.new) + 3) AS tail
+            FROM drift_log d
+            WHERE d.repo = prs.repo AND d.number = prs.number
+        )
+        WHERE NOT (
+            new != ''
+            AND head = new
+            AND sep = ', '
+            AND tail LIKE 'v%=%'
+            AND instr(tail, ',') = 0
+            AND instr(new || ',', substr(tail, instr(tail, '=')) || ',') > 0
+        )
+      );
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -2911,6 +2942,67 @@ mod tests {
         // A search that no longer reports the PR uncovers it again.
         db.set_inbox_results(1, Ok(&[]), None).unwrap();
         assert!(!db.in_background_inbox(&key).unwrap());
+    }
+
+    #[test]
+    fn clears_drift_from_stale_heads() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let last = MIGRATIONS.len() - 1;
+        migrate(&mut conn, last).unwrap();
+        for (number, old, new) in [
+            (1, "v1=aaa, v2=bbb, v3=aaa", "v1=aaa, v2=bbb"),
+            (2, "v1=aaa, v2=bbb", "v1=aaa, v2=ccc"),
+            (3, "v1=aaa, v2=bbb, v3=ccc", "v1=aaa, v2=bbb"),
+            // A recomputation that found no versions at all.
+            (5, "v1=aaa", ""),
+        ] {
+            conn.execute(
+                "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
+                                  created_at, updated_at, base_ref, head_ref, head_oid, drift)
+                 VALUES ('o/n', ?, 't', 'b', 'au', 'OPEN', 0, 'u', 'c', 'u', 'main', 'pr', 'h',
+                         'drifted')",
+                [number],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO drift_log (repo, number, at, old, new) VALUES ('o/n', ?, 'now', ?, ?)",
+                params![number, old, new],
+            )
+            .unwrap();
+        }
+        // A PR with a stale-head entry and a real one keeps its drift.
+        conn.execute(
+            "INSERT INTO drift_log (repo, number, at, old, new)
+             VALUES ('o/n', 2, 'then', 'v1=aaa, v2=bbb, v3=aaa', 'v1=aaa, v2=bbb')",
+            [],
+        )
+        .unwrap();
+        // A PR without drift_log rows keeps its drift.
+        conn.execute(
+            "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
+                              created_at, updated_at, base_ref, head_ref, head_oid, drift)
+             VALUES ('o/n', 4, 't', 'b', 'au', 'OPEN', 0, 'u', 'c', 'u', 'main', 'pr', 'h',
+                     'drifted')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        let drift = |number: u64| -> Option<String> {
+            conn.query_row("SELECT drift FROM prs WHERE number = ?", [number], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(drift(1), None);
+        assert!(drift(2).is_some());
+        assert!(drift(3).is_some());
+        assert!(drift(4).is_some());
+        assert!(drift(5).is_some());
+        // The log itself stays.
+        let logged: u64 = conn
+            .query_row("SELECT COUNT(*) FROM drift_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logged, 5);
     }
 
     #[test]
