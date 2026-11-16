@@ -454,7 +454,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pullRequest {
               number title headRefName state isDraft mergeable mergeStateStatus
               commits(last: 1) {
-                nodes { commit { statusCheckRollup { state } } }
+                nodes { commit { statusCheckRollup { ...Checks } } }
               }
             }
           }
@@ -885,7 +885,10 @@ fn stack_merge(pr: &Value) -> Option<StackMerge> {
                         _ => None,
                     },
                     state: merge_state(str_at(p, "/mergeStateStatus")),
-                    ci: ci_status(str_at(p, "/commits/nodes/0/commit/statusCheckRollup/state")),
+                    // The checks its own page shows, without superseded runs.
+                    ci: combined_ci(&head_checks(
+                        p.pointer("/commits/nodes/0/commit/statusCheckRollup"),
+                    )),
                 },
             ))
         })
@@ -3529,6 +3532,19 @@ mod tests {
 
     #[test]
     fn stack_merge_reads_the_open_prs_below() {
+        // PR 12's first `test` run was cancelled, which fails GitHub's own
+        // state, but the run that superseded it passed.
+        let rollup = |number: u64| {
+            let runs = match number {
+                12 => vec![
+                    check_run("test", "CANCELLED", "2026-01-01T00:00:00Z"),
+                    check_run("test", "SUCCESS", "2026-01-01T00:00:02Z"),
+                ],
+                _ => vec![check_run("test", "SUCCESS", "2026-01-01T00:00:00Z")],
+            };
+            let state = if number == 12 { "FAILURE" } else { "SUCCESS" };
+            json!({ "state": state, "contexts": { "nodes": runs } })
+        };
         let pr = |number: u64, position: u64| {
             json!({
                 "position": position,
@@ -3541,7 +3557,7 @@ mod tests {
                     "mergeable": if number == 12 { "CONFLICTING" } else { "MERGEABLE" },
                     "mergeStateStatus": if number == 12 { "DIRTY" } else { "CLEAN" },
                     "commits": {
-                        "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }]
+                        "nodes": [{ "commit": { "statusCheckRollup": rollup(number) } }]
                     },
                 },
             })
