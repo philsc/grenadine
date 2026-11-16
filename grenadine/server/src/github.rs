@@ -206,8 +206,8 @@ pub struct PrStatus {
     pub base_ref: String,
     /// The head branch's tip commit.
     pub head_oid: String,
-    /// The combined state of the checks on its head; `None` when it has
-    /// none.
+    /// The combined state of the checks on its head, as `combined_ci`
+    /// works it out; `None` when it has none.
     pub ci: Option<CiStatus>,
 }
 
@@ -222,7 +222,9 @@ impl From<&PrData> for PrStatus {
             title: data.title.clone(),
             base_ref: data.base_ref.clone(),
             head_oid: data.head_oid.clone(),
-            ci: data.ci,
+            // The checks the PR page shows, when the review fields could
+            // be read.
+            ci: data.review.as_ref().map_or(data.ci, |r| r.ci),
         }
     }
 }
@@ -662,6 +664,34 @@ fn combined_ci(checks: &[Check]) -> Option<CiStatus> {
         .into_iter()
         .find(|&s| checks.iter().any(|c| c.status == Some(s)))
         .or((!checks.is_empty()).then_some(CiStatus::Passing))
+}
+
+/// Where the PR node of a `pr_statuses` lookup stands; `None` when
+/// GitHub didn't find the PR.
+fn pr_status(pr: &Value) -> Option<PrStatus> {
+    let state = str_at(pr, "/state");
+    if state.is_empty() {
+        return None;
+    }
+    // GitHub says UNKNOWN until it has tried merging.
+    let conflicting = match str_at(pr, "/mergeable") {
+        "CONFLICTING" => Some(true),
+        "MERGEABLE" => Some(false),
+        _ => None,
+    };
+    Some(PrStatus {
+        state: state.to_owned(),
+        queued: pr["isInMergeQueue"].as_bool().unwrap_or_default(),
+        conflicting,
+        title: str_at(pr, "/title").to_owned(),
+        base_ref: str_at(pr, "/baseRefName").to_owned(),
+        head_oid: str_at(pr, "/headRefOid").to_owned(),
+        // Not GitHub's own combined state, which a superseded cancelled
+        // run fails: the same as the PR page's.
+        ci: combined_ci(&head_checks(
+            pr.pointer("/commits/nodes/0/commit/statusCheckRollup"),
+        )),
+    })
 }
 
 /// A search's PR node as a hit.
@@ -2673,7 +2703,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state isInMergeQueue mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state isInMergeQueue mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ ...Checks }} }} }} }} }} }}\n"
                     )
                 })
                 .collect();
@@ -2692,43 +2722,17 @@ impl GitHub {
                 .graphql(
                     "pr_statuses",
                     &repos,
-                    &format!("query({params}) {{\n{fields}}}"),
+                    &format!("query({params}) {{\n{fields}}}{CHECKS_FRAGMENT}"),
                     Value::Object(vars),
                 )
                 .await?;
             for (i, key) in chunk.iter().enumerate() {
-                let state = str_at(&data, &format!("/p{i}/pullRequest/state"));
-                if state.is_empty() {
-                    continue;
+                if let Some(status) = data
+                    .pointer(&format!("/p{i}/pullRequest"))
+                    .and_then(pr_status)
+                {
+                    out.insert(key.clone(), status);
                 }
-                // GitHub says UNKNOWN until it has tried merging.
-                let conflicting = match str_at(&data, &format!("/p{i}/pullRequest/mergeable")) {
-                    "CONFLICTING" => Some(true),
-                    "MERGEABLE" => Some(false),
-                    _ => None,
-                };
-                out.insert(
-                    key.clone(),
-                    PrStatus {
-                        state: state.to_owned(),
-                        queued: data
-                            .pointer(&format!("/p{i}/pullRequest/isInMergeQueue"))
-                            .and_then(Value::as_bool)
-                            .unwrap_or_default(),
-                        conflicting,
-                        title: str_at(&data, &format!("/p{i}/pullRequest/title")).to_owned(),
-                        base_ref: str_at(&data, &format!("/p{i}/pullRequest/baseRefName"))
-                            .to_owned(),
-                        head_oid: str_at(&data, &format!("/p{i}/pullRequest/headRefOid"))
-                            .to_owned(),
-                        ci: ci_status(str_at(
-                            &data,
-                            &format!(
-                                "/p{i}/pullRequest/commits/nodes/0/commit/statusCheckRollup/state"
-                            ),
-                        )),
-                    },
-                );
             }
         }
         Ok(out)
@@ -3387,7 +3391,8 @@ mod tests {
             head_repo: Some("o/r".into()),
             force_pushes: vec![],
             commits: vec![],
-            ci: Some(CiStatus::Passing),
+            // GitHub's own state, failed by a superseded run.
+            ci: Some(CiStatus::Failing),
             review: Some(ReviewInfo {
                 viewer: "me".into(),
                 decision: None,
@@ -3396,7 +3401,7 @@ mod tests {
                 can_edit_reviewers: false,
                 comments: vec![],
                 checks: vec![],
-                ci: None,
+                ci: Some(CiStatus::Passing),
                 merge: MergeInfo {
                     conflicting: Some(true),
                     state: MergeState::Dirty,
@@ -3431,7 +3436,76 @@ mod tests {
             review: None,
             ..data
         };
+        // Nor the checks the PR page reads, so GitHub's state stands in.
         assert_eq!(PrStatus::from(&data).conflicting, None);
+        assert_eq!(PrStatus::from(&data).ci, Some(CiStatus::Failing));
+    }
+
+    fn status_node(rollup: Value) -> Value {
+        json!({
+            "state": "OPEN",
+            "isInMergeQueue": false,
+            "mergeable": "MERGEABLE",
+            "title": "Fix it",
+            "baseRefName": "main",
+            "headRefOid": "abc",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": rollup } }] },
+        })
+    }
+
+    fn check_run(name: &str, conclusion: &str, started: &str) -> Value {
+        json!({
+            "name": name, "status": "COMPLETED", "conclusion": conclusion,
+            "detailsUrl": null, "startedAt": started,
+            "checkSuite": { "workflowRun": { "workflow": { "name": name } } },
+        })
+    }
+
+    #[test]
+    fn pr_status_reads_the_lookup() {
+        assert_eq!(
+            pr_status(&status_node(Value::Null)),
+            Some(PrStatus {
+                state: "OPEN".into(),
+                queued: false,
+                conflicting: Some(false),
+                title: "Fix it".into(),
+                base_ref: "main".into(),
+                head_oid: "abc".into(),
+                ci: None,
+            })
+        );
+        // A PR GitHub can't find.
+        assert_eq!(pr_status(&json!(null)), None);
+    }
+
+    #[test]
+    fn pr_status_ignores_superseded_runs() {
+        // A concurrency group cancelled the first run of `test`, which
+        // fails GitHub's own state, but the run that replaced it passed.
+        let rollup = json!({
+            "state": "FAILURE",
+            "contexts": { "nodes": [
+                check_run("test", "CANCELLED", "2026-01-01T00:00:00Z"),
+                check_run("test", "SUCCESS", "2026-01-01T00:00:02Z"),
+            ] },
+        });
+        assert_eq!(
+            pr_status(&status_node(rollup)).unwrap().ci,
+            Some(CiStatus::Passing)
+        );
+        // The latest run failing still fails it.
+        let rollup = json!({
+            "state": "FAILURE",
+            "contexts": { "nodes": [
+                check_run("test", "SUCCESS", "2026-01-01T00:00:00Z"),
+                check_run("test", "FAILURE", "2026-01-01T00:00:02Z"),
+            ] },
+        });
+        assert_eq!(
+            pr_status(&status_node(rollup)).unwrap().ci,
+            Some(CiStatus::Failing)
+        );
     }
     #[test]
     fn merge_async_status_maps_the_states() {
