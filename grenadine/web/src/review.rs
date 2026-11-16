@@ -7,7 +7,7 @@ use grenadine_core::api::{
     AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
     MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision,
     ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, ReviewerChange, StackMergePr,
-    SubmitReview, TeamRef, reviewer_change, submit_blocker,
+    SubmitReview, TeamRef, Version, reviewer_change, submit_blocker,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -18,7 +18,7 @@ use crate::composer::{
 };
 use crate::hash_for;
 use crate::inboxes::CiIcon;
-use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget};
+use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget, review_version, version_at};
 
 /// Each reviewer's verdict: their latest approval, change request or
 /// dismissal, or their latest comment when they gave no verdict. The PR's
@@ -987,14 +987,18 @@ fn entries(info: &ReviewInfo) -> Vec<Entry<'_>> {
 }
 
 /// The comments on the PR itself and the reviews' summaries.
-pub fn conversation(info: &ReviewInfo) -> impl IntoView + use<> {
+/// Each entry says which of `versions` it was written on.
+pub fn conversation(info: &ReviewInfo, versions: &[Version]) -> impl IntoView + use<> {
+    let latest = versions.iter().map(|v| v.number).max();
+    let on = |n: Option<u32>| n.zip(latest);
     let items = entries(info)
         .into_iter()
         .map(|e| match e {
             Entry::Comment(c) => {
                 let author = c.author.clone();
+                let version = on(version_at(versions, &c.created_at));
                 view! {
-                    <CommentFrame at=c.created_at.clone() url=c.url.clone() body=c.body.clone()>
+                    <CommentFrame at=c.created_at.clone() url=c.url.clone() body=c.body.clone() version=version>
                         <PersonChip person=author guess=false />
                     </CommentFrame>
                 }
@@ -1002,8 +1006,9 @@ pub fn conversation(info: &ReviewInfo) -> impl IntoView + use<> {
             }
             Entry::Review(r) => {
                 let (author, class, what) = (r.author.clone(), state_class(r.state), verb(r.state));
+                let version = on(review_version(versions, r));
                 view! {
-                    <CommentFrame at=r.submitted_at.clone() url=r.url.clone() body=r.body.clone()>
+                    <CommentFrame at=r.submitted_at.clone() url=r.url.clone() body=r.body.clone() version=version>
                         <PersonChip person=author guess=false />
                         " " <span class=class>{what}</span>
                     </CommentFrame>

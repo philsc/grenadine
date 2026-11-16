@@ -1243,6 +1243,16 @@ input[type="text"] {
 .comment-meta {
   font-size: 12px;
 }
+/* The version a comment was written on, dimmed once it's outdated. */
+.comment-version {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.comment-version.old {
+  color: var(--fg-muted);
+  border-style: dashed;
+}
 .comment .markdown p {
   margin: 4px 0;
 }

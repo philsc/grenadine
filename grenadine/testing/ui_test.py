@@ -42,6 +42,7 @@ from grenadine.testing.fake_github import (
     CheckRun,
     Comment,
     FakeGitHub,
+    IssueComment,
     PendingReview,
     PullRequest,
     Review,
@@ -3485,8 +3486,17 @@ class VersionsTest(ServerTestCase):
         grow.reviews.append(
             Review(scenarios.OTHER, APPROVED, commit=shas[-1], submitted_at=gh.tick())
         )
-        # A thread made on v1 shows on the left of diffs starting at v1.
         repo = gh.repo(scenarios.REPO)
+        # A comment on the PR written between the pushes of v2 and v3-v5.
+        pushes = repo.pushes[grow.head]
+        grow.issue_comments.append(
+            IssueComment(
+                author=scenarios.OTHER,
+                body="Written on v2.",
+                created_at=(pushes[1].at + pushes[2].at) // 2,
+            )
+        )
+        # A thread made on v1 shows on the left of diffs starting at v1.
         repo.comment(
             grow,
             author=scenarios.OTHER,
@@ -3598,6 +3608,24 @@ class VersionsTest(ServerTestCase):
         # Base can't be the latest version, and Head can't be the base.
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
+
+    def test_conversation_says_which_version_each_entry_was_written_on(
+        self,
+    ) -> None:
+        self.open(scenarios.GROW)
+        comments = self.page.locator("details.conversation .comment")
+        expect(comments).to_have_count(2)
+        # The comment by its time, after v2's push and before v3's.
+        old = comments.nth(0).locator(".comment-version")
+        expect(old).to_have_text("on v2")
+        expect(old).to_have_class(re.compile(r"\bold\b"))
+        expect(old).to_have_attribute("title", "Written on v2; the PR is now at v6")
+        # The approval by its commit, the head.
+        latest = comments.nth(1).locator(".comment-version")
+        expect(comments.nth(1).locator(".comment-meta")).to_contain_text("approved")
+        expect(latest).to_have_text("on v6")
+        expect(latest).not_to_have_class(re.compile(r"\bold\b"))
+        expect(latest).to_have_attribute("title", "Written on v6, the latest version")
 
     def test_marks_the_last_reviewed_version(self) -> None:
         self.open(scenarios.GROW)
