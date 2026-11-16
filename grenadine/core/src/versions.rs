@@ -93,6 +93,10 @@ pub struct Computed {
     pub versions: Vec<ComputedVersion>,
     /// The versions were reconstructed without the activity log.
     pub approximate: bool,
+    /// The head was left out because the push history says it was
+    /// already replaced: GitHub reports the old head for a few seconds
+    /// after a push. Worth computing again soon.
+    pub stale_head: bool,
 }
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
@@ -167,6 +171,8 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
             && !is_zero(&a.after)
     });
 
+    // The `before` of the latest push the history records.
+    let mut replaced: Option<&str> = None;
     let approximate = match initial_activity {
         Some(initial) => {
             b.push_one(
@@ -181,7 +187,11 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
                 .filter(|a| a.timestamp > history.created_at)
             {
                 let cur = b.cur().unwrap_or(ZERO_SHA).to_owned();
-                if a.kind == ActivityKind::BranchDeletion || is_zero(&a.after) || a.after == cur {
+                if a.kind == ActivityKind::BranchDeletion || is_zero(&a.after) {
+                    continue;
+                }
+                replaced = Some(a.before.as_str());
+                if a.after == cur {
                     continue;
                 }
                 let fast_forward =
@@ -208,6 +218,7 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
                 .unwrap_or(&history.head);
             b.push_one(initial, VersionKind::Initial, None, None);
             for f in &history.force_pushes {
+                replaced = f.before.as_deref();
                 let cur = b.cur().unwrap_or(ZERO_SHA).to_owned();
                 // Regular pushes between the last version and this force
                 // push each add their commits.
@@ -227,13 +238,28 @@ pub fn compute(history: &History, graph: &impl CommitGraph) -> Computed {
         }
     };
 
-    // Pushes the activity log hasn't caught up with yet.
+    // Pushes the activity log hasn't caught up with yet. Unless the head
+    // is what the latest recorded push replaced: then it's GitHub's stale
+    // view of the head, not a push back to it. A real push back to it
+    // that the history doesn't show yet looks the same; it's appended
+    // once the history shows it.
+    //
+    // The timeline only records force pushes, so it never shows a
+    // fast-forward back to the replaced head, e.g. after a force push
+    // rewound the branch. There a head that descends from the last
+    // version is taken for such a push.
     let cur = b.cur().unwrap_or(ZERO_SHA).to_owned();
-    b.push_range(&cur, &history.head, None, None);
+    let stale_head = cur != history.head
+        && replaced == Some(history.head.as_str())
+        && !(approximate && graph.first_parent_range(&cur, &history.head).is_some());
+    if !stale_head {
+        b.push_range(&cur, &history.head, None, None);
+    }
 
     Computed {
         versions: b.versions,
         approximate,
+        stale_head,
     }
 }
 
@@ -569,5 +595,131 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(compute(&history, &g), compute(&history, &g));
+    }
+
+    #[test]
+    fn a_stale_head_after_a_force_push_is_left_out() {
+        let mut g = Graph::default();
+        g.chain(&["M", "H"]);
+        g.chain(&["M", "X"]);
+        let history = History {
+            created_at: 100,
+            // GitHub still reports the head the force push replaced.
+            head: "H".into(),
+            activities: vec![
+                act(90, ActivityKind::BranchCreation, ZERO_SHA, "H"),
+                act(110, ActivityKind::ForcePush, "H", "X"),
+            ],
+            ..Default::default()
+        };
+        let stale = compute(&history, &g);
+        assert_eq!(shas(&stale), ["H", "X"]);
+        assert!(stale.stale_head);
+
+        // Once GitHub catches up, the versions are the same.
+        let caught_up = compute(
+            &History {
+                head: "X".into(),
+                ..history.clone()
+            },
+            &g,
+        );
+        assert_eq!(caught_up.versions, stale.versions);
+        assert!(!caught_up.stale_head);
+
+        // A real push back to H is appended once the log shows it.
+        let reverted = compute(
+            &History {
+                activities: [
+                    history.activities.clone(),
+                    vec![act(120, ActivityKind::ForcePush, "X", "H")],
+                ]
+                .concat(),
+                ..history
+            },
+            &g,
+        );
+        assert_eq!(shas(&reverted), ["H", "X", "H"]);
+        assert!(!reverted.stale_head);
+    }
+
+    #[test]
+    fn a_stale_head_after_a_force_push_event_is_left_out() {
+        let mut g = Graph::default();
+        g.chain(&["M", "H"]);
+        g.chain(&["M", "X"]);
+        let history = History {
+            created_at: 100,
+            head: "H".into(),
+            force_pushes: vec![ForcePush {
+                timestamp: 110,
+                before: Some("H".into()),
+                after: "X".into(),
+                actor: None,
+            }],
+            ..Default::default()
+        };
+        let c = compute(&history, &g);
+        assert_eq!(shas(&c), ["H", "X"]);
+        assert!(c.stale_head);
+    }
+
+    #[test]
+    fn a_fast_forward_back_after_a_rewinding_force_push_event_is_kept() {
+        let mut g = Graph::default();
+        g.chain(&["M", "X", "H"]);
+        // A force push rewound H to its parent X, and a regular push,
+        // which the timeline doesn't record, moved the branch back to H.
+        let history = History {
+            created_at: 100,
+            head: "H".into(),
+            force_pushes: vec![ForcePush {
+                timestamp: 110,
+                before: Some("H".into()),
+                after: "X".into(),
+                actor: None,
+            }],
+            ..Default::default()
+        };
+        let c = compute(&history, &g);
+        assert_eq!(shas(&c), ["H", "X", "H"]);
+        assert!(!c.stale_head);
+    }
+
+    #[test]
+    fn a_stale_head_after_a_push_is_left_out() {
+        let mut g = Graph::default();
+        g.chain(&["M", "A", "B"]);
+        let history = History {
+            created_at: 100,
+            // GitHub still reports the head the push replaced.
+            head: "A".into(),
+            activities: vec![
+                act(90, ActivityKind::BranchCreation, ZERO_SHA, "A"),
+                act(110, ActivityKind::Push, "A", "B"),
+            ],
+            ..Default::default()
+        };
+        let c = compute(&history, &g);
+        assert_eq!(shas(&c), ["A", "B"]);
+        assert!(c.stale_head);
+    }
+
+    #[test]
+    fn a_head_ahead_of_the_log_is_not_stale() {
+        let mut g = Graph::default();
+        g.chain(&["M", "A", "B", "C"]);
+        let history = History {
+            created_at: 100,
+            head: "C".into(),
+            activities: vec![
+                act(90, ActivityKind::BranchCreation, ZERO_SHA, "A"),
+                act(110, ActivityKind::Push, "A", "B"),
+            ],
+            ..Default::default()
+        };
+        let c = compute(&history, &g);
+        assert_eq!(shas(&c), ["A", "B", "C"]);
+        assert!(!c.stale_head);
     }
 }
