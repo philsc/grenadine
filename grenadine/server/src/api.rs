@@ -15,11 +15,11 @@ use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, Approval, AutoMerge,
-    AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL,
-    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges,
-    WrapUp, submit_blocker,
+    AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr,
+    Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged,
+    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
+    PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview,
+    WorktreeChanges, WrapUp, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -139,7 +139,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/auto-reviews", get(auto_reviews))
         .route(
             "/api/auto-reviews/{id}",
-            axum::routing::delete(cancel_auto_review),
+            get(auto_review).delete(cancel_auto_review),
         )
         .route(
             "/api/agents",
@@ -1056,6 +1056,23 @@ async fn set_repo_settings(
 
 async fn auto_reviews(AxState(state): St) -> ApiResult<Json<Vec<AutoReviewEntry>>> {
     Ok(Json(state.db.auto_reviews()?))
+}
+
+/// The review `id`, with what its session said once it's deleted.
+async fn auto_review(AxState(state): St, Path(id): Path<i64>) -> ApiResult<Response> {
+    let Some(review) = state.db.auto_review(id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let (saved, events) = match state.db.auto_review_transcript(id)? {
+        Some((saved, events)) => (Some(saved), events),
+        None => (None, Vec::new()),
+    };
+    Ok(Json(AutoReviewDetail {
+        review,
+        saved,
+        events,
+    })
+    .into_response())
 }
 
 /// The PR's auto-reviews, newest first.

@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewEntry,
-    Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GitHubUsage,
-    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession,
-    NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage,
-    RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus, SystemStats,
-    TerminalInfo, WorktreeChanges, WrapUp,
+    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewDetail,
+    AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue,
+    GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent,
+    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
+    PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus,
+    SystemStats, TerminalInfo, WorktreeChanges, WrapUp,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -91,6 +91,23 @@ pub async fn auto_reviews() -> Result<Vec<AutoReviewEntry>> {
         .await?
         .json()
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// The review `id`; `None` when there is no such review.
+pub async fn auto_review(id: i64) -> Result<Option<AutoReviewDetail>> {
+    let resp = Request::get(&format!("/api/auto-reviews/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    check(Ok(resp))
+        .await?
+        .json()
+        .await
+        .map(Some)
         .map_err(|e| e.to_string())
 }
 

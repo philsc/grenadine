@@ -1120,11 +1120,21 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","tot
         let session = state.db.agent(&id).unwrap().unwrap();
         assert_eq!(session.kind, SessionKind::AutoReview);
 
-        // Deleting it keeps the review and its cost.
+        // Deleting it keeps the review and its cost, and what the session
+        // was and said.
         assert!(agent::delete(&state, &id).await.unwrap());
         let review = state.db.auto_reviews().unwrap().remove(0);
         assert_eq!(review.state, AutoReviewState::Unposted);
         assert_eq!((review.session, review.cost), (None, 0.5));
+        let (saved, events) = state.db.auto_review_transcript(review.id).unwrap().unwrap();
+        assert_eq!(
+            (saved.id.as_str(), saved.title.as_str(), saved.status),
+            (id.as_str(), "Review #2: t", AgentStatus::Idle)
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.kind,
+            grenadine_core::api::AgentEventKind::Prompt(p) if p.contains("Review it")
+        )));
         // A review leaves nothing to clean up.
         let cleanup = crate::cleanup::cleanup_state(&state).unwrap();
         assert!(cleanup.scanning.is_empty() && cleanup.items.is_empty());
@@ -1156,6 +1166,9 @@ sleep 30
         let review = state.db.auto_reviews().unwrap().remove(0);
         assert_eq!(review.state, AutoReviewState::Cancelled);
         assert!(review.finished_at.is_some());
+        // Its page shows it stopped, not still working.
+        let (saved, _) = state.db.auto_review_transcript(review.id).unwrap().unwrap();
+        assert_eq!(saved.status, AgentStatus::Interrupted);
     }
 
     /// Nobody answers an unattended session's requests, so they're denied

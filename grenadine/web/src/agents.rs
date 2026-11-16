@@ -2777,6 +2777,40 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
     }
 }
 
+/// The transcript of a deleted session, as the server kept it: nothing
+/// streams in and nothing can be answered. It sits in a `.agent`, after
+/// the page's header.
+#[component]
+pub fn SavedTranscript(session: AgentSession, events: Vec<AgentEvent>) -> impl IntoView {
+    let session = Signal::stored(session);
+    let events = RwSignal::new(events.into_iter().map(Arc::new).collect::<Vec<_>>());
+    // Only answers use these, and nothing here can be answered.
+    let mode = RwSignal::new(offered_mode(session.with_untracked(|s| s.backend), None));
+    let model = RwSignal::new(String::new());
+    let turn = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+                .cloned()
+        })
+    });
+    view! {
+        <Transcript
+            session=session
+            events=events
+            streaming=RwSignal::new(String::new())
+            thinking_streaming=RwSignal::new(String::new())
+            show_thinking=Signal::stored(false)
+            mode=mode
+            model=model
+            turn=turn
+            now=RwSignal::new(js_sys::Date::now() as i64)
+        />
+    }
+}
+
 /// The events to show, without the repeated ends of a turn that older
 /// servers stored: one for each background task that finished after the
 /// answer.
