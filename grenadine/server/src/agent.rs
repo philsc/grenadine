@@ -5184,6 +5184,7 @@ sleep 3
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5332,6 +5333,7 @@ done
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
