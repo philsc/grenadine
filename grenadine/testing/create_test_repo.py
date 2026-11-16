@@ -1270,7 +1270,8 @@ def comments(fx: Fixture) -> None:
         "comment, a multi-line comment (lines 26-29), a comment on a removed "
         "line (left side, old line 10), a file-level comment on notes.md, and a "
         "comment with markdown. I reply to the single-line comment. There's also "
-        "a general PR comment, which grenadine doesn't show yet."
+        "a general PR comment, which the conversation shows as written on "
+        "version 2."
     )
     pr = fx.open_pr(
         case, "Collect review comments", notes, expected_inbox=RETURNED, notes=notes

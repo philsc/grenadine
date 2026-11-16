@@ -1172,7 +1172,10 @@ fn PrBody(
                     .into_any()
                 }
             }}
-            {move || pr.with(|p| p.review.clone()).map(|info| conversation(&info).into_any())}
+            {move || {
+                let (review, versions) = pr.with(|p| (p.review.clone(), p.versions.clone()));
+                review.map(|info| conversation(&info, &versions).into_any())
+            }}
             {move || (!sidebar.get()).then(|| view! {
                 {move || merge_section(&pr.get(), pinned.get(), false)}
                 {merge_warning()}
@@ -1464,10 +1467,57 @@ fn utc_prefix(t: &str) -> Option<&str> {
     t.get(..19)
 }
 
-/// The number of the latest version the viewer reviewed. The version
-/// whose SHA is the review's commit wins when it was pushed at or before
-/// the review. When the commit points at a version pushed after the
-/// review, the newest version pushed before the review wins instead.
+/// The number of the version that was the PR's head at `at`: the newest
+/// version pushed at or before it. `None` when no version was pushed by
+/// then, or when a version after that one has no push time, so it may
+/// have been pushed before `at` too. Versions are numbered in the order
+/// they were pushed. The version the PR was opened with counts as pushed
+/// before anything said on the PR, even without a push time.
+pub(crate) fn version_at(versions: &[Version], at: &str) -> Option<u32> {
+    let t = utc_prefix(at)?;
+    let mut head = None;
+    // An unknown push time since `head` leaves the head at `at` open.
+    let mut unsure = false;
+    for v in versions {
+        match v.pushed_at.as_deref().and_then(utc_prefix) {
+            Some(p) if p <= t => {
+                head = Some(v.number);
+                unsure = false;
+            }
+            Some(_) => break,
+            None if v.kind == VersionKind::Initial => head = Some(v.number),
+            None => unsure = true,
+        }
+    }
+    head.filter(|_| !unsure)
+}
+
+/// The number of the version `r` was submitted on, judged by its commit.
+/// The version whose SHA is the commit wins when it was pushed at or
+/// before the review. When it was pushed after the review, the version
+/// that was the head when the review was submitted wins instead. `None`
+/// when the commit isn't a version, or that head is unknown.
+fn reviewed_version(versions: &[Version], r: &Review) -> Option<u32> {
+    let commit = r.commit.as_deref()?;
+    let v = versions.iter().find(|v| v.sha == commit)?;
+    let submitted = utc_prefix(&r.submitted_at);
+    let pushed = v.pushed_at.as_deref().and_then(utc_prefix);
+    match (pushed, submitted) {
+        (Some(p), Some(s)) if p > s => version_at(versions, &r.submitted_at),
+        _ => Some(v.number),
+    }
+}
+
+/// The number of the version `r` was submitted on: the one its commit
+/// names (see `reviewed_version`), else the head when it was submitted.
+/// The fallback is for reviews without a commit or whose commit isn't a
+/// version.
+pub(crate) fn review_version(versions: &[Version], r: &Review) -> Option<u32> {
+    reviewed_version(versions, r).or_else(|| version_at(versions, &r.submitted_at))
+}
+
+/// The number of the latest version the viewer reviewed, from their
+/// newest review whose commit is a version (see `reviewed_version`).
 fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u32> {
     let info = review?;
     let mut mine: Vec<&Review> = info
@@ -1477,34 +1527,7 @@ fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u3
         .collect();
     // RFC 3339 strings sort chronologically.
     mine.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
-    for r in mine {
-        let Some(commit) = r.commit.as_deref() else {
-            continue;
-        };
-        let Some(v) = versions.iter().find(|v| v.sha == commit) else {
-            continue;
-        };
-        let submitted = utc_prefix(&r.submitted_at);
-        let pushed = v.pushed_at.as_deref().and_then(utc_prefix);
-        match (pushed, submitted) {
-            (Some(p), Some(s)) if p > s => {
-                let fallback = versions
-                    .iter()
-                    .filter(|v| {
-                        v.pushed_at
-                            .as_deref()
-                            .and_then(utc_prefix)
-                            .is_some_and(|p| p <= s)
-                    })
-                    .max_by_key(|v| v.number);
-                if let Some(v) = fallback {
-                    return Some(v.number);
-                }
-            }
-            _ => return Some(v.number),
-        }
-    }
-    None
+    mine.into_iter().find_map(|r| reviewed_version(versions, r))
 }
 
 #[component]
@@ -1681,9 +1704,22 @@ pub(crate) fn CommentFrame(
     #[prop(optional)] pending: bool,
     #[prop(optional)] actions: Option<AnyView>,
     #[prop(optional)] editor: Option<(Signal<bool>, ViewFn)>,
+    // The version it was written on and the PR's latest version.
+    #[prop(default = None)] version: Option<(u32, u32)>,
 ) -> impl IntoView {
     let links = expect_context::<PrLinks>();
     let time = rel(&at);
+    let version = version.map(|(n, latest)| {
+        let title = if n < latest {
+            format!("Written on v{n}; the PR is now at v{latest}")
+        } else {
+            format!("Written on v{n}, the latest version")
+        };
+        view! {
+            " "
+            <span class="comment-version" class:old=n < latest title=title>{format!("on v{n}")}</span>
+        }
+    });
     let html = (!body.trim().is_empty()).then(|| markdown::to_html(&body, &links.repo));
     let body = move || match editor.as_ref().filter(|(on, _)| on.get()) {
         Some((_, view)) => Some(view.run()),
@@ -1698,6 +1734,7 @@ pub(crate) fn CommentFrame(
         <div class="comment" class:pending=pending>
             <div class="comment-meta">
                 {children()}
+                {version}
                 " "
                 {time.map(|(text, title)| view! {
                     <a class="muted" href=url target="_blank" rel="noopener" title=title>{text}</a>
@@ -2604,10 +2641,116 @@ mod tests {
     }
 
     #[test]
+    fn last_reviewed_skips_a_review_whose_head_is_unsure() {
+        // The newest review's commit came after it, and v3's unknown push
+        // time leaves the head at the review open: v2 or v3. Rather than
+        // guess v2, the older review decides.
+        let versions = [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+            version(3, "c"),
+            version_pushed(4, "d", Some("2026-01-04T10:00:00+00:00")),
+        ];
+        let info = review_info(vec![
+            review("me", "2026-01-01T12:00:00Z", Some("a")),
+            review("me", "2026-01-03T12:00:00Z", Some("d")),
+        ]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn last_reviewed_falls_back_to_the_opening_version_without_a_push_time() {
+        let mut versions = [
+            version(1, "a"),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+        ];
+        versions[0].kind = VersionKind::Initial;
+        // The review's commit came after it; the PR was still at v1.
+        let info = review_info(vec![review("me", "2026-01-01T12:00:00Z", Some("b"))]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(1));
+    }
+
+    #[test]
     fn last_reviewed_trusts_the_commit_without_a_push_time() {
         let versions = [version(1, "a"), version(2, "b")];
         let info = review_info(vec![review("me", "2026-01-01T00:00:00Z", Some("b"))]);
         assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
+    }
+
+    fn pushed_versions() -> [Version; 3] {
+        [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+            version_pushed(3, "c", Some("2026-01-03T10:00:00+00:00")),
+        ]
+    }
+
+    #[test]
+    fn version_at_is_the_head_at_the_time() {
+        let versions = pushed_versions();
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), Some(2));
+        assert_eq!(version_at(&versions, "2026-01-05T00:00:00Z"), Some(3));
+        // A push in the same second counts.
+        assert_eq!(version_at(&versions, "2026-01-02T10:00:00Z"), Some(2));
+        // Before the first push, or with no time.
+        assert_eq!(version_at(&versions, "2025-12-31T00:00:00Z"), None);
+        assert_eq!(version_at(&versions, ""), None);
+    }
+
+    #[test]
+    fn version_at_is_none_when_an_unknown_push_may_come_first() {
+        let mut versions = pushed_versions();
+        versions[1].pushed_at = None;
+        // v2 may have been pushed before or after.
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), None);
+        // v3 came after v2, so v2 came before this.
+        assert_eq!(version_at(&versions, "2026-01-04T00:00:00Z"), Some(3));
+        // Before v1's push nothing was pushed yet.
+        assert_eq!(version_at(&versions, "2025-12-31T00:00:00Z"), None);
+        let unknown = [version(1, "a"), version(2, "b")];
+        assert_eq!(version_at(&unknown, "2026-01-02T12:00:00Z"), None);
+    }
+
+    #[test]
+    fn version_at_counts_the_opening_version_without_a_push_time() {
+        // Without the activity log, the version the PR was opened with
+        // has no push time, but it came before every comment.
+        let mut versions = pushed_versions();
+        versions[0].kind = VersionKind::Initial;
+        versions[0].pushed_at = None;
+        assert_eq!(version_at(&versions, "2026-01-01T12:00:00Z"), Some(1));
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), Some(2));
+        assert_eq!(version_at(&versions[..1], "2026-01-05T00:00:00Z"), Some(1));
+        // An unknown push time on a later version still leaves it open.
+        versions[1].pushed_at = None;
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), None);
+        // A pushed version doesn't count as the opening one.
+        let unknown = [version(1, "a")];
+        assert_eq!(version_at(&unknown, "2026-01-02T12:00:00Z"), None);
+    }
+
+    #[test]
+    fn review_version_trusts_a_commit_pushed_before_it() {
+        let versions = pushed_versions();
+        let r = review("other", "2026-01-03T12:00:00Z", Some("a"));
+        assert_eq!(review_version(&versions, &r), Some(1));
+        // Without push times the commit is all there is.
+        let unknown = [version(1, "a"), version(2, "b")];
+        let r = review("other", "2026-01-01T00:00:00Z", Some("b"));
+        assert_eq!(review_version(&unknown, &r), Some(2));
+    }
+
+    #[test]
+    fn review_version_falls_back_to_the_head_at_the_time() {
+        let versions = pushed_versions();
+        // The commit was pushed after the review.
+        let r = review("other", "2026-01-02T12:00:00Z", Some("c"));
+        assert_eq!(review_version(&versions, &r), Some(2));
+        // The commit isn't a version, or there is none.
+        let r = review("other", "2026-01-02T12:00:00Z", Some("x"));
+        assert_eq!(review_version(&versions, &r), Some(2));
+        let r = review("other", "2026-01-03T12:00:00Z", None);
+        assert_eq!(review_version(&versions, &r), Some(3));
     }
 
     #[test]
