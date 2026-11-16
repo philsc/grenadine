@@ -23,11 +23,13 @@ use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
 use crate::files::{self, FileChips, Files};
+use crate::global_settings::GlobalSettings;
 use crate::image_drafts;
 use crate::images::{self, AttachButton, Attached, Attachments};
 use crate::inboxes::{load_flag, save_flag, storage};
 use crate::settings::{Settings, SettingsButton};
 use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
+use crate::tool_summaries::{self, ToolSummaries};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
 fn agent_hash(id: &str) -> String {
@@ -3264,6 +3266,7 @@ fn Transcript(
     turn: Memo<Option<Arc<AgentEvent>>>,
     now: RwSignal<i64>,
 ) -> impl IntoView {
+    let summary_choice = expect_context::<GlobalSettings>().tool_summaries;
     // Tool results and approval answers are shown with the event they
     // belong to. The map compares by pointer rather than by content, so a
     // rebuild doesn't re-read every result's text.
@@ -3590,6 +3593,17 @@ fn Transcript(
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
                             let summary = tool_summary(name, &value, Some(&worktree));
                             let title = summary_title(&value, &summary);
+                            let description = tool_summaries::description(&value).map(str::to_owned);
+                            let summary_view = move || match description.clone() {
+                                Some(d) if summary_choice.get() == ToolSummaries::Description => {
+                                    // Task and Agent summaries already are the
+                                    // description, which needs no tooltip.
+                                    let title = (!summary.is_empty() && summary != d)
+                                        .then(|| summary.clone());
+                                    view! { <span class="tool-description" title=title>{d}</span> }.into_any()
+                                }
+                                _ => view! { <code title=title.clone()>{summary.clone()}</code> }.into_any(),
+                            };
                             let tool = tool.clone();
                             let approval_id = tool.clone();
                             let result = Memo::new_with_compare(
@@ -3655,7 +3669,7 @@ fn Transcript(
                                             }
                                         }}
                                         " " <span class="tool-name">{name.clone()}</span>
-                                        " " <code title=title>{summary}</code>
+                                        " " {summary_view}
                                         {move || {
                                             resolved.with(|r| r.get(&approval_id).copied()).map(|allow| {
                                                 let (class, label, mark) = match allow {

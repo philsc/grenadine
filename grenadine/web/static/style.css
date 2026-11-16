@@ -1895,7 +1895,8 @@ textarea {
 /* A long summary keeps to one line so the spinner and duration after it
    stay visible. */
 .approval p code,
-.tool summary code {
+.tool summary code,
+.tool-description {
   display: inline-block;
   max-width: 60%;
   overflow: hidden;
