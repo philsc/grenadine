@@ -73,4 +73,8 @@ web-sys = { workspace = true, features = [
   "IdbRequest",
   "IdbTransaction",
   "IdbTransactionMode",
+  "ProgressEvent",
+  "XmlHttpRequest",
+  "XmlHttpRequestEventTarget",
+  "XmlHttpRequestUpload",
 ] }

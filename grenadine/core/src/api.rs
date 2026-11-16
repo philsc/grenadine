@@ -1748,6 +1748,10 @@ pub struct NewAgent {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     /// The web draft the session starts from, if any. A second start with
     /// the same draft returns the session the first one started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1767,6 +1771,10 @@ pub struct AgentMessage {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// An image sent with a prompt.
@@ -1776,6 +1784,48 @@ pub struct PromptImage {
     pub media_type: String,
     /// The image's bytes, base64-encoded.
     pub data: String,
+}
+
+/// A file uploaded to go with a prompt, which `PUT /api/uploads` stored
+/// until a prompt claims it by `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    pub id: String,
+    /// The file's name, made safe to use as a path component.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+/// A file sent with a prompt, which the agent reads from disk and
+/// `/api/agents/{id}/attachments/{dir}/{name}` serves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub dir: String,
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+/// The most files one prompt may come with.
+pub const MAX_ATTACHMENTS: usize = 20;
+
+/// The largest file that may be uploaded, in bytes.
+pub const MAX_UPLOAD_BYTES: u64 = 1 << 30;
+
+/// `bytes` for people, e.g. `1.2 MB`.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 /// Where wrapping up a session puts its commits.
@@ -1952,6 +2002,8 @@ pub enum AgentEventKind {
     /// The images sent with the prompt before it, by their names under
     /// `/api/agents/{id}/images/`.
     Images(Vec<String>),
+    /// The files sent with the prompt before it.
+    Attachments(Vec<Attachment>),
     /// A piece of assistant text while it streams in. Never stored; the
     /// complete `Text` follows.
     TextDelta(String),
@@ -2087,6 +2139,16 @@ pub struct AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_sizes() {
+        use super::human_size;
+        assert_eq!(human_size(12), "12 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(1_258_291), "1.2 MB");
+        assert_eq!(human_size(3 << 30), "3.0 GB");
+    }
+
     use super::*;
 
     #[test]

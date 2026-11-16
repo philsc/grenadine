@@ -1180,8 +1180,8 @@ async fn run_turn(
         return Ok(Prompted::No);
     }
 
-    // The prompt's blocks: the notes first, then the images, then the
-    // text.
+    // The prompt's blocks: the notes first, then the images, then what
+    // it's told about the attached files, then the text.
     let mut blocks = Vec::new();
     if !t.notes.is_empty() {
         blocks.push(json!({"type": "text", "text": t.notes.join("\n\n")}));
@@ -1195,6 +1195,9 @@ async fn run_turn(
             "mimeType": crate::agent::media_type(name).unwrap_or("image/png"),
             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         }));
+    }
+    if let Some(attached) = t.attached {
+        blocks.push(json!({"type": "text", "text": attached}));
     }
     if !t.prompt.trim().is_empty() {
         blocks.push(json!({"type": "text", "text": t.prompt}));

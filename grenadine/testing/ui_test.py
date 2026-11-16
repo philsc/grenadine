@@ -355,7 +355,8 @@ def devin_scenario(tmp: Path) -> dict:
 # wrap-up's naming prompt makes it call update_prs too, naming each new
 # pull request's branch dev/test/<subject>. `hang up` has it ask to run
 # a Bash command and hang up before anyone answers. It says how many
-# images came with the prompt. `long transcript N` has it run N Bash
+# images came with the prompt, and the name and size of each attached
+# file. `long transcript N` has it run N Bash
 # calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
 # `hand off PROMPT` hands PROMPT off to a new session with the handoff MCP
@@ -398,7 +399,11 @@ import os
 import re
 content = json.loads(sys.stdin.read())["message"]["content"]
 images = sum(block["type"] == "image" for block in content)
-prompt = "".join(block["text"] for block in content if block["type"] == "text")
+ATTACHED = "The user attached these files"
+texts = [block["text"] for block in content if block["type"] == "text"]
+prompt = "".join(text for text in texts if not text.startswith(ATTACHED))
+# The paths of the attached files, one per line after the first: "- PATH (SIZE)".
+attached = [line[2:].rsplit(" (", 1)[0] for text in texts if text.startswith(ATTACHED) for line in text.splitlines()[1:]]
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
 mode = args[args.index("--permission-mode") + 1]
 model = args[args.index("--model") + 1] if "--model" in args else "claude-test"
@@ -446,6 +451,12 @@ usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_inp
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
 if images:
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"I see {images} images."}]}})
+for path in attached:
+    # Claude may read them without asking.
+    readable = f"Read(/{os.path.dirname(os.path.dirname(path))}/**)" in args
+    with open(path, "rb") as f:
+        size = len(f.read())
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"I read {os.path.basename(path)}: {size} bytes, readable: {readable}."}]}})
 # Grenadine asks it to commit before landing its work.
 if prompt.startswith("Wrap up: commit"):
     subprocess.run(["git", "add", "-A"], check=True)
@@ -4264,6 +4275,9 @@ self.onmessage = async (event) => {{
 # A new session's form; each is a draft of its own.
 DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"
 
+# A 1x1 PNG, base64-encoded.
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
 # Pastes a PNG screenshot into the text box it's evaluated on.
 PASTE_IMAGE = """async (box) => {
     const canvas = document.createElement("canvas");
@@ -5868,6 +5882,203 @@ class AgentTest(ServerTestCase):
         expect(thumbnails).to_have_count(0)
         self.page.reload()
         expect(thumbnails).to_have_count(0)
+
+    def test_attached_files_go_with_the_prompt(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # Picked files show as chips once they're uploaded; images Claude
+        # takes still go in the prompt as thumbnails.
+        picker = self.page.locator(".composer input[type=file]")
+        picker.set_input_files(
+            [
+                {"name": "notes.txt", "mimeType": "text/plain", "buffer": b"hello"},
+                {
+                    "name": "report.pdf",
+                    "mimeType": "application/pdf",
+                    "buffer": b"%PDF-1.4",
+                },
+                {
+                    "name": "dot.png",
+                    "mimeType": "image/png",
+                    "buffer": base64.b64decode(PNG),
+                },
+            ]
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(2)
+        expect(chips.filter(has_text="notes.txt")).to_contain_text("5 B")
+        expect(self.page.locator(".prompt-image img")).to_have_count(1)
+        self.page.get_by_role("button", name="Remove report.pdf").click()
+        expect(chips).to_have_count(1)
+
+        # A file alone can be the prompt. Claude gets its path, which it
+        # may read, and the transcript offers it for download.
+        self.page.get_by_role("button", name="Remove the image").click()
+        send = self.page.get_by_role("button", name="Send")
+        expect(send).to_be_enabled()
+        send.click()
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(transcript).to_contain_text("I read notes.txt: 5 bytes, readable: True.")
+        expect(chips).to_have_count(0)
+        sent = transcript.locator(".turn-files .file-chip")
+        expect(sent).to_have_count(1)
+        expect(sent).to_contain_text("notes.txt")
+        download = self.page.request.get(
+            self.url + sent.get_attribute("href").lstrip("/")
+        )
+        self.assertEqual(download.body(), b"hello")
+        self.page.reload()
+        expect(sent).to_have_count(1)
+
+    def test_text_pasted_with_a_picture_of_it_is_pasted_as_text(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        box = self.page.get_by_label("Prompt")
+        # Some apps put a picture of the text on the clipboard in a format
+        # that doesn't go inline; it's still the text that's pasted. A
+        # file of that format alone is attached.
+        paste = """async ([box, text]) => {
+            const data = new DataTransfer();
+            if (text) data.setData("text/plain", "a1\tb1");
+            data.items.add(new File(["II*"], "cells.tiff", {type: "image/tiff"}));
+            return box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+        }"""
+        handle = box.element_handle()
+        self.assertTrue(self.page.evaluate(paste, [handle, True]))
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(0)
+        self.assertFalse(self.page.evaluate(paste, [handle, False]))
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("cells.tiff")
+
+    def test_too_many_files_are_refused_right_away(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("say hi")
+        picker = self.page.locator(".agent-form input[type=file]")
+        picker.set_input_files(
+            [
+                {"name": f"{i}.log", "mimeType": "text/plain", "buffer": b"x"}
+                for i in range(21)
+            ]
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(21)
+        expect(chips.filter(has_text="1 B")).to_have_count(20)
+        # The one too many isn't uploaded, and can't be retried.
+        extra = chips.filter(has_text="20.log")
+        expect(extra).to_contain_text("Too many; a prompt can have at most 20 files")
+        expect(extra.get_by_role("button", name="Retry")).to_have_count(0)
+        start = self.page.get_by_role("button", name="Start")
+        expect(start).to_be_disabled()
+        self.page.get_by_role("button", name="Remove 20.log").click()
+        expect(start).to_be_enabled()
+
+    def test_files_attached_meanwhile_stay_with_the_draft(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        picker = self.page.locator(".composer input[type=file]")
+        chips = self.page.locator(".prompt-file")
+        send = self.page.get_by_role("button", name="Send")
+
+        # An upload still going when the session is left shows again when
+        # it's back, and lands in its draft.
+        held: list = []
+        uploads = re.compile(r"/api/uploads\?name=")
+        self.page.route(uploads, lambda route: held.append(route))
+        picker.set_input_files(
+            {"name": "a.log", "mimeType": "text/plain", "buffer": b"one"}
+        )
+        expect(chips.filter(has_text="a.log")).to_contain_text("Uploading")
+        expect(send).to_be_disabled()
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        expect(chips).to_have_count(0)
+        self.page.go_back()
+        expect(chips.filter(has_text="a.log")).to_contain_text("Uploading")
+        for route in held:
+            route.continue_()
+        self.page.unroute(uploads)
+        expect(chips.filter(has_text="a.log")).to_contain_text("3 B")
+        self.page.reload()
+        expect(chips.filter(has_text="a.log")).to_contain_text("3 B")
+
+        # A file attached while the prompt is on its way stays for the
+        # next one.
+        held.clear()
+        messages = re.compile(r"/api/agents/[^/]+/messages$")
+        self.page.route(messages, lambda route: held.append(route))
+        with self.page.expect_request(messages):
+            send.click()
+        picker.set_input_files(
+            {"name": "b.log", "mimeType": "text/plain", "buffer": b"two!"}
+        )
+        expect(chips.filter(has_text="b.log")).to_contain_text("4 B")
+        for route in held:
+            route.continue_()
+        self.page.unroute(messages)
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(transcript).to_contain_text("I read a.log: 3 bytes, readable: True.")
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("b.log")
+        self.page.reload()
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("b.log")
+
+    def test_new_session_files_survive_leaving_the_form(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("say hi")
+        picker = self.page.locator(".agent-form input[type=file]")
+        picker.set_input_files(
+            {"name": "a.log", "mimeType": "text/plain", "buffer": b"one"}
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_contain_text("3 B")
+
+        # A reload keeps the file.
+        self.page.reload()
+        expect(chips).to_contain_text("3 B")
+
+        # One that expired on the server holds the start until it's
+        # taken off.
+        picker.set_input_files(
+            {"name": "b.log", "mimeType": "text/plain", "buffer": b"two!"}
+        )
+        expect(chips.filter(has_text="b.log")).to_contain_text("4 B")
+        self.page.evaluate("""async () => {
+            const key = Object.keys(localStorage).find((k) => k.startsWith("prompt-files.new-session."));
+            const b = JSON.parse(localStorage.getItem(key)).find((u) => u.name === "b.log");
+            await fetch(`/api/uploads/${b.id}`, {method: "DELETE"});
+        }""")
+        self.page.reload()
+        expect(chips.filter(has_text="b.log")).to_contain_text("Expired")
+        start = self.page.get_by_role("button", name="Start")
+        expect(start).to_be_disabled()
+        self.page.get_by_role("button", name="Remove b.log").click()
+        expect(start).to_be_enabled()
+
+        # The file goes with the started session's prompt.
+        start.click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        expect(transcript).to_contain_text("I read a.log: 3 bytes, readable: True.")
+        expect(transcript.locator(".turn-files .file-chip")).to_have_count(1)
+
+        # A fresh form has no files.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(chips).to_have_count(0)
 
     def test_new_session_drafts_survive_switching(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
