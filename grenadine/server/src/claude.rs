@@ -520,7 +520,7 @@ fn bash_hook_settings() -> Result<Value> {
 fn job_model(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Summary | JobKind::Scan => "haiku",
-        JobKind::Prune => "sonnet",
+        JobKind::Prune | JobKind::Handoff => "sonnet",
     }
 }
 

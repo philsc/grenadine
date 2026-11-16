@@ -2014,6 +2014,29 @@ textarea {
   margin-left: auto;
   max-width: 24em;
 }
+.handoff .handoff-decline {
+  margin-left: auto;
+}
+/* What a handoff the user asked for should do, in its transcript row. */
+.handoff-instruction {
+  white-space: pre-wrap;
+}
+/* The box under the composer that asks for a handoff to be written. */
+.handoff-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+.handoff-ask .hint {
+  margin: 0;
+}
+.handoff-ask textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
 .handed-off-from {
   margin: 0 0 4px;
 }

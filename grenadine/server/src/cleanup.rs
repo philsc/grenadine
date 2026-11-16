@@ -53,10 +53,25 @@ const PRUNE_BUDGET: Budget = Budget { usd: 1.0, acu: 0.5 };
 /// and end are kept, and the full transcript is there to read.
 const DIGEST_LIMIT: usize = 200_000;
 
-/// How much of each prompt, text and tool call the digest keeps.
-const PROMPT_LIMIT: usize = 2_000;
-const TEXT_LIMIT: usize = 300;
-const RESULT_LIMIT: usize = 300;
+/// How much of a transcript a digest keeps, in bytes.
+pub(crate) struct DigestLimits {
+    /// Of each prompt.
+    pub prompt: usize,
+    /// Of each of the agent's texts, and of a tool call's input.
+    pub text: usize,
+    /// Of each tool call's result.
+    pub result: usize,
+    /// Of the digest; its beginning and end are kept.
+    pub total: usize,
+}
+
+/// What a scan's digest keeps.
+const SCAN_DIGEST: DigestLimits = DigestLimits {
+    prompt: 2_000,
+    text: 300,
+    result: 300,
+    total: DIGEST_LIMIT,
+};
 
 /// Read-only tools, so that a scan can only look, as Claude Code's
 /// allowed tools. Not `gh api` or bare `git branch`, which can change
@@ -123,7 +138,7 @@ it. If there's nothing, report no items."
 /// How to use the tools, for both scans and checks for stale items, and
 /// where the job runs, for `repo`: its clone, or a directory of its own
 /// when the server has none.
-fn tool_notes(repo: &str, clone: Option<&Path>) -> String {
+pub(crate) fn tool_notes(repo: &str, clone: Option<&Path>) -> String {
     let place = match clone {
         Some(clone) => format!(
             "The working directory is the clone of {repo} at {}, with `origin` on \
@@ -540,7 +555,7 @@ fn failed_scan(session: &AgentSession, e: &anyhow::Error) -> Vec<(String, String
 
 /// Where Claude Code keeps the session's full transcript: its config dir's
 /// `projects/`, in a directory named after the working directory.
-fn transcript_path(session: &AgentSession) -> PathBuf {
+pub(crate) fn transcript_path(session: &AgentSession) -> PathBuf {
     let config = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
@@ -586,7 +601,7 @@ async fn run(
         input += &format!("Its full transcript is {}.\n", transcript.display());
     }
     input += "\n# Transcript digest\n\n";
-    input += &digest(events, session.backend.agent_name());
+    input += &digest(events, session.backend.agent_name(), &SCAN_DIGEST);
 
     let schema = json!({
         "type": "object",
@@ -832,7 +847,7 @@ pub(crate) fn cut(s: &str, n: usize) -> String {
 /// A compact transcript: the prompts, Claude's text, and each tool call
 /// that could create something with the start of its result. Reads and
 /// searches are left out.
-fn digest(events: &[AgentEvent], agent: &str) -> String {
+pub(crate) fn digest(events: &[AgentEvent], agent: &str, limits: &DigestLimits) -> String {
     let results: HashMap<&str, (&str, bool)> = events
         .iter()
         .filter_map(|e| match &e.kind {
@@ -849,9 +864,9 @@ fn digest(events: &[AgentEvent], agent: &str) -> String {
     for event in events {
         match &event.kind {
             AgentEventKind::Prompt(p) => {
-                out += &format!("\n## Prompt\n\n{}\n\n", cut(p, PROMPT_LIMIT));
+                out += &format!("\n## Prompt\n\n{}\n\n", cut(p, limits.prompt));
             }
-            AgentEventKind::Text(t) => out += &format!("{agent}: {}\n", cut(t, TEXT_LIMIT)),
+            AgentEventKind::Text(t) => out += &format!("{agent}: {}\n", cut(t, limits.text)),
             AgentEventKind::ToolUse {
                 id,
                 name,
@@ -870,12 +885,12 @@ fn digest(events: &[AgentEvent], agent: &str) -> String {
                             .or(input["notebook_path"].as_str())
                             .unwrap_or_default()
                     ),
-                    _ => format!("{name} {}", cut(&input.to_string(), TEXT_LIMIT)),
+                    _ => format!("{name} {}", cut(&input.to_string(), limits.text)),
                 };
                 out += &format!("{sub}{call}");
                 out += "\n";
                 if let Some((content, is_error)) = results.get(id.as_str()) {
-                    let content = cut(content, RESULT_LIMIT);
+                    let content = cut(content, limits.result);
                     if *is_error {
                         out += &format!("  error: {content}\n");
                     } else if !content.is_empty() {
@@ -883,15 +898,15 @@ fn digest(events: &[AgentEvent], agent: &str) -> String {
                     }
                 }
             }
-            AgentEventKind::Error(e) => out += &format!("Error: {}\n", cut(e, TEXT_LIMIT)),
+            AgentEventKind::Error(e) => out += &format!("Error: {}\n", cut(e, limits.text)),
             AgentEventKind::Landed(landed) => out += &format!("Landed: {landed:?}\n"),
             _ => {}
         }
     }
-    if out.len() <= DIGEST_LIMIT {
+    if out.len() <= limits.total {
         return out;
     }
-    let half = DIGEST_LIMIT / 2;
+    let half = limits.total / 2;
     let head = (0..=half)
         .rev()
         .find(|&i| out.is_char_boundary(i))
@@ -1013,7 +1028,7 @@ mod tests {
             tool("5", "WebFetch", json!({"url": "https://example.com"})),
         ];
         assert_eq!(
-            digest(&events, "Claude"),
+            digest(&events, "Claude", &SCAN_DIGEST),
             "\n## Prompt\n\nRun the e2e tests\n\n\
              Claude: Starting a container.\n\
              $ docker run -d --name e2e pg\n  → abc123\n\
@@ -1028,7 +1043,7 @@ mod tests {
         let events: Vec<_> = (0..20_000)
             .map(|i| tool("x", "Bash", json!({"command": format!("touch /tmp/f{i}")})))
             .collect();
-        let d = digest(&events, "Claude");
+        let d = digest(&events, "Claude", &SCAN_DIGEST);
         assert!(d.len() < DIGEST_LIMIT + 200, "{}", d.len());
         assert!(d.starts_with("$ touch /tmp/f0\n"));
         assert!(d.ends_with("$ touch /tmp/f19999\n"));

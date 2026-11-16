@@ -794,6 +794,8 @@ session's to do with someone else's PR.
 An agent session can hand work off to a new session, with a fresh context,
 through the `handoff` MCP tool: the agent writes the new session's first
 prompt, and Grenadine starts it like a session started from the form.
+The user can also ask for a handoff from a session, which a background
+job writes from the session's transcript.
 
 **AGENT-HANDOFF-PROPOSE-1.** The proposed session must default to the
 asking session's repository, backend and model, the trunk, and the mode of
@@ -813,6 +815,38 @@ _Why:_ each session costs money and works on its own, so the user decides
 what starts.
 
 **AGENT-HANDOFF-ASK-2.** An unattended review must not hand off.
+
+**AGENT-HANDOFF-USER-1.** The user must be able to ask for a handoff from
+an interactive session's page, optionally saying what the new session
+should do. A background job on the session's backend must then write the
+new session's first prompt from the session's transcript, without a turn
+in the session. Without an instruction, the new session goes on with what
+the session was working on.
+_Why:_ a turn in a session with a long transcript is expensive, and the
+handoff tool takes one.
+
+**AGENT-HANDOFF-USER-2.** A handoff must not be written while the session
+runs a turn or while another one is being written for it.
+_Why:_ a turn changes the transcript under the job that reads it, and the
+agent can hand off itself then.
+
+**AGENT-HANDOFF-USER-3.** The written prompt must end with where the old
+session's worktree is, its branch and commit, how many files have
+uncommitted changes, and how many commits aren't on GitHub.
+_Why:_ a new session starts on the trunk or a pull request's head, so it
+can't see such work; told where it is, its agent can decide what to do
+with it.
+
+**AGENT-HANDOFF-USER-4.** The proposal must show in the session's
+transcript in the same new-session form as an agent's, defaulting to the
+session's repository and backend and to the mode and model picked in its
+composer. The job may propose one of the session's pull requests to start
+from. The proposal must stay open, across reloads and server restarts,
+until the user starts or declines it, and must start at most one session.
+
+**AGENT-HANDOFF-USER-5.** The transcript must show that a handoff is being
+written, and why writing it failed if it did, including when the server
+restarted meanwhile. The user must be able to ask again then.
 
 **AGENT-HANDOFF-LINK-1.** The asking session's transcript must link to
 the new session, and the new session's page must link back to the session

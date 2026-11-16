@@ -391,6 +391,13 @@ if "--json-schema" in args:
         output = {"summary": "Task: " + first}
     elif "stale" in schema["properties"]:
         output = {"stale": []}
+    elif "prompt" in schema["properties"]:
+        # A handoff written for the user from a session's transcript.
+        asked = request.split("# What the new session should do\n\n", 1)[1]
+        if asked.startswith("The user's own words:"):
+            output = {"prompt": "Carry on: " + asked.split("\n\n", 2)[1].strip()}
+        else:
+            output = {"prompt": "Carry on with it"}
     else:
         item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
         output = {"items": [item]}
@@ -5810,6 +5817,86 @@ class AgentTest(ServerTestCase):
             "The user declined the handoff: Not now"
         )
         expect(handed_off).to_have_count(1)
+
+    def test_user_handoff(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hello")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        parent = self.page.url
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
+
+        # The user asks for a handoff, which a job writes from the
+        # transcript without a turn in the session.
+        self.page.get_by_role("button", name="Hand off", exact=True).click()
+        self.page.get_by_label("What the new session should do").fill("write the docs")
+        self.page.get_by_role("button", name="Write handoff").click()
+        expect(self.page.get_by_role("button", name="Write handoff")).to_have_count(0)
+        expect(transcript.locator(".handoff-requested")).to_have_text(
+            "Asked for a handoff: write the docs"
+        )
+        card = transcript.locator(".approval.pending")
+        expect(card).to_contain_text("Hand off to a new session")
+        # Below what the job wrote is where the old session's work is.
+        written = re.compile(
+            r"^Carry on: write the docs\n\n# The session this was handed off from\n"
+            r"[\s\S]*\n- Worktree: `\S+`\n- Branch: `\S+`\n- Commit: `[0-9a-f]{40}`\n"
+            r"- Uncommitted changes: none\n- Commits that aren't on GitHub: none\n$"
+        )
+        expect(card.get_by_label("Prompt")).to_have_value(written)
+        expect(card.get_by_label("Repository")).to_have_value(scenarios.REPO)
+        expect(card.get_by_label("Permissions")).to_have_value("auto")
+        # No agent waits to hear why not.
+        expect(card.get_by_label("Why not")).to_have_count(0)
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
+
+        # Nobody waits for the answer, so the proposal stays open.
+        self.page.reload()
+        expect(card.get_by_label("Prompt")).to_have_value(written)
+
+        # The session starts as the user edits it.
+        card.get_by_label("Prompt").fill("say goodbye")
+        card.get_by_role("button", name="Start").click()
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        expect(transcript.locator(".approval")).to_contain_text(
+            "Handed off: Carry on: write the docs"
+        )
+        handed_off = transcript.locator(".handed-off")
+        expect(handed_off).to_have_text("Handed off to say goodbye")
+
+        # Each session links to the other.
+        handed_off.get_by_role("link").click()
+        expect(self.page).not_to_have_url(parent)
+        child = self.page.locator(".transcript")
+        expect(child.locator(".turn-prompt").first).to_have_text("say goodbye")
+        expect(self.page.locator(".composer .agent-mode")).to_have_value("auto")
+        origin = self.page.locator(".handed-off-from")
+        expect(origin).to_have_text("Handed off from say hello")
+        origin.get_by_role("link").click()
+        expect(self.page).to_have_url(parent)
+        expect(self.page.locator(".agent-header h1")).to_have_text("say hello")
+
+        # Without an instruction the new session goes on with the work,
+        # and a declined proposal starts nothing.
+        self.page.get_by_role("button", name="Hand off", exact=True).click()
+        self.page.get_by_role("button", name="Write handoff").click()
+        card = transcript.locator(".approval.pending")
+        expect(card.get_by_label("Prompt")).to_have_value(
+            re.compile(r"^Carry on with it\n")
+        )
+        expect(transcript.locator(".handoff-requested").last).to_have_text(
+            "Asked for a handoff"
+        )
+        card.get_by_role("button", name="Decline").click()
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        expect(transcript.locator(".approval").last).to_contain_text(
+            "Declined handoff: Carry on with it"
+        )
+        expect(handed_off).to_have_count(1)
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
 
     def test_images(self) -> None:
         self.page.goto(self.url + "#/agents")

@@ -3,7 +3,8 @@
 //! back, or a reload, until its session starts or it's discarded. The
 //! draft's images are kept in IndexedDB (see `image_drafts`).
 
-use grenadine_core::api::{AgentBackend, GENERAL, NewAgent, PermissionMode};
+pub use grenadine_core::api::handoff_id;
+use grenadine_core::api::{AgentBackend, GENERAL, HANDOFF_DRAFTS, NewAgent, PermissionMode};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -52,22 +53,10 @@ pub fn hash(id: &str) -> String {
     format!("#/agents/draft/{id}")
 }
 
-/// What the ids of the drafts that hold an agent's handoff proposal
-/// start with.
-const HANDOFF: &str = "handoff";
-
-/// The id of the draft that holds the proposal of the handoff request
-/// `tool`. Draft ids are alphanumeric.
-pub fn handoff_id(tool: &str) -> String {
-    let tool: String = tool.chars().filter(char::is_ascii_alphanumeric).collect();
-    let tool = tool.strip_prefix(HANDOFF).unwrap_or(&tool);
-    format!("{HANDOFF}{tool}")
-}
-
 /// Whether the draft `id` holds a handoff proposal, which shows in its
 /// request's card rather than as a draft of its own.
 fn is_handoff(id: &str) -> bool {
-    id.starts_with(HANDOFF)
+    id.starts_with(HANDOFF_DRAFTS)
 }
 
 /// The drafts worth keeping when the page loads: the blank ones were left
