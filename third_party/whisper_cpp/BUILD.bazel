@@ -1,0 +1,3 @@
+# The BUILD file for @whisper_cpp; see MODULE.bazel.
+
+exports_files(["whisper_cpp.BUILD.bazel"])

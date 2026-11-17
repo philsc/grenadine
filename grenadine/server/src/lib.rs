@@ -13,6 +13,7 @@ mod claude_update;
 mod cleanup;
 mod db;
 mod devin;
+mod dictation;
 mod git;
 mod github;
 mod handoff;
@@ -150,6 +151,22 @@ struct Args {
     /// directory next to the database.
     #[arg(long)]
     worktrees: Option<PathBuf>,
+
+    /// A ggml Whisper model, e.g. ggml-small.en-q5_1.bin, for dictating
+    /// into text boxes. Without it, dictation is off.
+    #[arg(long)]
+    whisper_model: Option<PathBuf>,
+
+    /// A smaller, faster ggml Whisper model, e.g. ggml-base.en-q5_1.bin,
+    /// for the preview of the phrase being spoken. Defaults to
+    /// --whisper-model, which then transcribes one thing at a time:
+    /// previews pause while a finished phrase is transcribed.
+    #[arg(long, requires = "whisper_model")]
+    whisper_preview_model: Option<PathBuf>,
+
+    /// Transcribes dictation with a fake that needs no model; for tests.
+    #[arg(long, hide = true, conflicts_with = "whisper_model")]
+    fake_dictation: bool,
 }
 
 fn default_db() -> Result<PathBuf> {
@@ -297,6 +314,14 @@ pub async fn run() -> Result<()> {
         tracing::warn!("can't set up reviewing PRs: {e:#}");
     }
 
+    let dictation = match args.whisper_model {
+        Some(path) => dictation::Dictation::from_models(path, args.whisper_preview_model)?,
+        None if args.fake_dictation => {
+            dictation::Dictation::with(Arc::new(dictation::FakeTranscriber::default()))
+        }
+        None => dictation::Dictation::off(),
+    };
+
     let mut signals = Signals::new()?;
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(sync::State {
@@ -324,6 +349,7 @@ pub async fn run() -> Result<()> {
         started_at: agent::now(),
         system: system::Sampler::default(),
         shutdown: shutdown.clone(),
+        dictation,
     });
     // No request from before the restart is waiting anymore.
     if let Err(e) = agent::expire_orphaned_approvals(&state) {
