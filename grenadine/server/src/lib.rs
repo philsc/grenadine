@@ -164,7 +164,8 @@ struct Args {
 
     /// A smaller, faster ggml Whisper model, e.g. ggml-base.en-q5_1.bin,
     /// for the preview of the phrase being spoken. Defaults to
-    /// --whisper-model.
+    /// --whisper-model, which then transcribes one thing at a time:
+    /// previews pause while a finished phrase is transcribed.
     #[arg(long, requires = "whisper_model")]
     whisper_preview_model: Option<PathBuf>,
 

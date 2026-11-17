@@ -35,6 +35,10 @@ const PAUSE_FRAMES: usize = 25;
 /// stays quick to compute and Whisper's 30 s window isn't exceeded.
 const MAX_PHRASE: usize = 20 * SAMPLE_RATE;
 
+/// A phrase cut for being too long is cut at the quietest of its last
+/// this many frames, so the cut falls between words where it can.
+const CUT_FRAMES: usize = 50;
+
 /// The audio kept from before speech starts, so the first sound of a
 /// phrase isn't clipped.
 const PREROLL_FRAMES: usize = 10;
@@ -74,10 +78,14 @@ pub struct Segmenter {
     recent: VecDeque<f32>,
 }
 
+#[derive(Default)]
 struct Phrase {
     audio: Vec<f32>,
     speech_frames: usize,
     silent_frames: usize,
+    /// The RMS of its last `CUT_FRAMES` frames, and whether each was
+    /// speech.
+    tail: VecDeque<(f32, bool)>,
 }
 
 impl Segmenter {
@@ -110,7 +118,8 @@ impl Segmenter {
                 self.phrase = Some(Phrase {
                     audio,
                     speech_frames: 1,
-                    silent_frames: 0,
+                    tail: VecDeque::from([(rms, true)]),
+                    ..Phrase::default()
                 });
             } else {
                 self.preroll.push_back(frame.to_vec());
@@ -127,20 +136,18 @@ impl Segmenter {
         } else {
             p.silent_frames += 1;
         }
+        p.tail.push_back((rms, speech));
+        if p.tail.len() > CUT_FRAMES {
+            p.tail.pop_front();
+        }
         if p.silent_frames >= PAUSE_FRAMES {
             return self.phrase.take().and_then(Phrase::words);
         }
         if p.audio.len() >= MAX_PHRASE {
-            // Speech goes on, so the next frames start a phrase right away.
-            let words = std::mem::replace(
-                p,
-                Phrase {
-                    audio: Vec::new(),
-                    speech_frames: 0,
-                    silent_frames: 0,
-                },
-            );
-            return words.words();
+            // Speech goes on, so what follows the cut starts the next
+            // phrase right away.
+            let rest = p.cut();
+            return std::mem::replace(p, rest).words();
         }
         None
     }
@@ -162,6 +169,28 @@ impl Segmenter {
 }
 
 impl Phrase {
+    /// Cuts the phrase after the quietest frame of its tail and returns
+    /// the frames after that as the start of the next phrase.
+    fn cut(&mut self) -> Phrase {
+        // The latest of the quietest, so less goes to the next phrase.
+        let quietest = self
+            .tail
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| a.0.total_cmp(&b.0).then(j.cmp(i)))
+            .map_or(0, |(i, _)| i);
+        let tail = self.tail.split_off(quietest + 1);
+        let audio = self.audio.split_off(self.audio.len() - tail.len() * FRAME);
+        let speech_frames = tail.iter().filter(|f| f.1).count();
+        self.speech_frames -= speech_frames;
+        Phrase {
+            audio,
+            speech_frames,
+            silent_frames: tail.iter().rev().take_while(|f| !f.1).count(),
+            tail,
+        }
+    }
+
     fn words(self) -> Option<Vec<f32>> {
         (self.speech_frames >= MIN_SPEECH_FRAMES).then_some(self.audio)
     }
@@ -453,6 +482,12 @@ where
     O::Error: std::error::Error + Send + Sync + 'static,
 {
     let transcribers = dictation.transcribers().await?;
+    // Without a preview model the previews use the finals' model, which
+    // transcribes one thing at a time: a preview would hold up the finals.
+    let shared = std::ptr::addr_eq(
+        Arc::as_ptr(&transcribers.finals),
+        Arc::as_ptr(&transcribers.previews),
+    );
     let mut segmenter = Segmenter::default();
     // Finished phrases waiting for their transcription, in order, with
     // their numbers.
@@ -467,7 +502,8 @@ where
     let mut shown = None;
     let mut preview_due = false;
     let mut stopping = false;
-    // A phrase's final transcription and a preview run side by side.
+    // A phrase's final transcription and a preview run side by side,
+    // given two models.
     let mut final_job: Option<Job> = None;
     let mut preview_job: Option<Job> = None;
     let mut ticker = tokio::time::interval(INTERIM_EVERY);
@@ -489,6 +525,7 @@ where
         }
         if preview_job.is_none()
             && !stopping
+            && !(shared && final_job.is_some())
             && let Some(audio) = segmenter
                 .pending()
                 .filter(|a| preview_due && a.len() >= previewed + INTERIM_GROWTH)
@@ -632,10 +669,16 @@ mod tests {
         let mut s = Segmenter::default();
         let done = s.push(&speech(25_000));
         assert_eq!(done.len(), 1);
-        assert_eq!(done[0].len(), MAX_PHRASE);
+        // At the last dip between syllables before 20 s.
+        let at = done[0].len();
+        assert!(
+            at <= MAX_PHRASE && at > MAX_PHRASE - CUT_FRAMES * FRAME,
+            "{at}"
+        );
+        assert!((at - FRAME) % (SAMPLE_RATE / 4) < SAMPLE_RATE / 25, "{at}");
         // The rest goes on as the next phrase.
         let rest = s.finish().unwrap();
-        assert_eq!(ms(rest.len()), 5_000);
+        assert_eq!(at + rest.len(), 25 * SAMPLE_RATE);
     }
 
     #[test]
