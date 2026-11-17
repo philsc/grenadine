@@ -31,6 +31,7 @@ use crate::inboxes::{load_flag, save_flag, storage};
 use crate::markdown::SessionRef;
 use crate::settings::{Settings, SettingsButton};
 use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
+use crate::slash::{self, SlashList, Suggest};
 use crate::tool_summaries::{self, ToolSummaries};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
@@ -1748,6 +1749,14 @@ pub fn NewSession(
             let _ = t.set_selection_range(end, end);
         }
     });
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Repo {
+            repo: repo.get(),
+            backend: backend.get(),
+        }),
+    );
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
@@ -1985,22 +1994,34 @@ pub fn NewSession(
                     </label>
                     <label>"Model" <ModelSelect model=model backend=backend.into() /></label>
                 </div>
-                <textarea
-                    node_ref=textarea
-                    class="agent-prompt"
-                    rows="5"
-                    placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
-                    aria-label="Prompt"
-                    prop:value=move || prompt.get()
-                    on:input=move |ev| prompt.set(event_target_value(&ev))
-                    on:paste=move |ev| images::paste(ev, attached)
-                    on:keydown=move |ev| {
-                        if submits(&ev) {
-                            ev.prevent_default();
-                            start();
+                <div class="slash-anchor">
+                    <textarea
+                        node_ref=textarea
+                        class="agent-prompt"
+                        rows="5"
+                        placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
+                        aria-label="Prompt"
+                        prop:value=move || prompt.get()
+                        on:input=move |ev| {
+                            prompt.set(event_target_value(&ev));
+                            suggest.input();
                         }
-                    }
-                ></textarea>
+                        on:paste=move |ev| images::paste(ev, attached)
+                        on:keydown=move |ev| {
+                            if suggest.keydown(&ev) {
+                                return;
+                            }
+                            if submits(&ev) {
+                                ev.prevent_default();
+                                start();
+                            }
+                        }
+                        on:keyup=move |_| suggest.caret_moved()
+                        on:click=move |_| suggest.caret_moved()
+                        on:blur=move |_| suggest.blur()
+                    ></textarea>
+                    <SlashList suggest=suggest />
+                </div>
                 <Attachments images=images />
                 <FileChips files=files />
                 {move || {
@@ -5143,6 +5164,12 @@ fn Composer(
     let backend = Signal::derive(move || session.with(|s| s.backend));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
+    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Session(id.get_value())),
+    );
     // The images pasted so far, kept with the draft in IndexedDB, and the
     // other files, kept in localStorage.
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
@@ -5211,20 +5238,33 @@ fn Composer(
             on:dragover=images::drag_over
             on:drop=move |ev| images::drop(ev, attached)
         >
+            <div class="slash-anchor">
             <textarea
+                node_ref=textarea
                 rows="3"
                 aria-label="Follow-up"
                 placeholder=move || if writing_handoff.get() { "Writing a handoff… You can reply once it's written.".to_owned() } else if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
-                on:input=move |ev| prompt.set(event_target_value(&ev))
+                on:input=move |ev| {
+                    prompt.set(event_target_value(&ev));
+                    suggest.input();
+                }
                 on:paste=move |ev| images::paste(ev, attached)
                 on:keydown=move |ev| {
+                    if suggest.keydown(&ev) {
+                        return;
+                    }
                     if submits(&ev) {
                         ev.prevent_default();
                         send();
                     }
                 }
+                on:keyup=move |_| suggest.caret_moved()
+                on:click=move |_| suggest.caret_moved()
+                on:blur=move |_| suggest.blur()
             ></textarea>
+            <SlashList suggest=suggest above=true />
+            </div>
             <Attachments images=images />
             <FileChips files=files />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
