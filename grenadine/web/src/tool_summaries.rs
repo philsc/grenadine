@@ -1,6 +1,7 @@
 //! What a transcript's tool rows show: the call's input, like the command
 //! or the path, or the description the agent wrote for the call, where it
-//! wrote one.
+//! wrote one. Any built-in tool's `description` counts, but not an MCP
+//! tool's: those often use the field for content, like an issue's body.
 
 use leptos::prelude::*;
 
@@ -47,8 +48,11 @@ pub fn signal() -> RwSignal<ToolSummaries> {
 }
 
 /// The first line of a tool call's `description`, trimmed, or `None` when it
-/// has no description to show.
-pub fn description(input: &serde_json::Value) -> Option<&str> {
+/// has no description to show or is an MCP tool's.
+pub fn description<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    if name.starts_with("mcp__") {
+        return None;
+    }
     let line = input["description"].as_str()?.lines().next()?.trim();
     (!line.is_empty()).then_some(line)
 }
@@ -72,7 +76,7 @@ mod tests {
 
     #[test]
     fn descriptions() {
-        let d = |v: serde_json::Value| description(&v).map(str::to_owned);
+        let d = |v: serde_json::Value| description("Bash", &v).map(str::to_owned);
         assert_eq!(
             d(serde_json::json!({"command": "ls", "description": "List files"})),
             Some("List files".to_owned())
@@ -86,5 +90,8 @@ mod tests {
         assert_eq!(d(serde_json::json!({"description": "  \n x"})), None);
         assert_eq!(d(serde_json::json!({"description": 3})), None);
         assert_eq!(d(serde_json::json!(null)), None);
+        let input = serde_json::json!({"description": "This change fixes"});
+        assert_eq!(description("mcp__tracker__create_issue", &input), None);
+        assert_eq!(description("Agent", &input), Some("This change fixes"));
     }
 }

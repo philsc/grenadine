@@ -3593,7 +3593,7 @@ fn Transcript(
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
                             let summary = tool_summary(name, &value, Some(&worktree));
                             let title = summary_title(&value, &summary);
-                            let description = tool_summaries::description(&value).map(str::to_owned);
+                            let description = tool_summaries::description(name, &value).map(str::to_owned);
                             let summary_view = move || match description.clone() {
                                 Some(d) if summary_choice.get() == ToolSummaries::Description => {
                                     // Task and Agent summaries already are the
