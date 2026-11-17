@@ -4197,7 +4197,7 @@ fn PlanCard(
             {move || pending().then(|| {
                 // The recording goes with the box, or it would go on with
                 // no Stop when the plan is answered elsewhere.
-                on_cleanup(move || dictation.cancel());
+                dictation.end_with_box();
                 view! {
                 <textarea
                     node_ref=feedback_box
