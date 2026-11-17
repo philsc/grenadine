@@ -732,6 +732,10 @@ AUTO_DELETE = "Leave the branch to GitHub"
 SETTLE = "Wait for GitHub to decide"
 STACK_PARENT = "Carry another PR"
 STACK_CHILD = "Sit on another PR"
+RANGE_DRAG = "Comment on a range of lines"
+RANGE_SHIFT = "Stretch a comment over lines"
+RANGE_SIDES = "Comment across the sides"
+RANGE_SPLIT = "Comment on lines side by side"
 REVIEW_CASES = [
     REPLY,
     RESOLVE,
@@ -757,10 +761,18 @@ REVIEW_CASES = [
     SETTLE,
     STACK_PARENT,
     STACK_CHILD,
+    RANGE_DRAG,
+    RANGE_SHIFT,
+    RANGE_SIDES,
+    RANGE_SPLIT,
 ]
 # A file on main, which LEFT_LINE removes the third line of.
 OLD_PATH = "review/old.md"
 OLD_LINES = [f"Old line {i}" for i in range(1, 6)]
+# A file on main, whose lines 3 and 25 RANGE_SIDES and RANGE_SPLIT change,
+# so that their diffs hide the lines between.
+LONG_PATH = "review/long.md"
+LONG_LINES = [f"Long line {i}" for i in range(1, 31)]
 
 
 def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
@@ -772,7 +784,11 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     repo.checkout("main")
     repo.commit(
         "Seed the repo",
-        {"README.md": "# test\n", OLD_PATH: "\n".join(OLD_LINES) + "\n"},
+        {
+            "README.md": "# test\n",
+            OLD_PATH: "\n".join(OLD_LINES) + "\n",
+            LONG_PATH: "\n".join(LONG_LINES) + "\n",
+        },
     )
     repo.push("main")
     prs = {}
@@ -788,6 +804,12 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
         if title == LEFT_LINE:
             kept = OLD_LINES[:2] + OLD_LINES[3:]
             files[OLD_PATH] = "\n".join(kept) + "\n"
+        if title in (RANGE_SIDES, RANGE_SPLIT):
+            changed = [
+                f"New line {i + 1}" if i in (2, 24) else line
+                for i, line in enumerate(LONG_LINES)
+            ]
+            files[LONG_PATH] = "\n".join(changed) + "\n"
         repo.commit(title, files, author=author)
         repo.push(branch, actor=author)
         pr = repo.open_pr(title, head=branch, base=base, author=author)

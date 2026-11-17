@@ -1277,6 +1277,11 @@ class FakeGitHub:
             on_file = input.get("subjectType") == "FILE"
             if not on_file and not input.get("line"):
                 raise ValueError("line is required unless subjectType is FILE")
+            side = input.get("side") or "RIGHT"
+            start_line = None if on_file else input.get("startLine")
+            start_side = (input.get("startSide") or side) if start_line else None
+            if start_line and start_side == side and start_line >= input["line"]:
+                raise ValueError("startLine must precede the end line.")
             return Comment(
                 id=self.next_comment_id(),
                 author=VIEWER,
@@ -1285,7 +1290,9 @@ class FakeGitHub:
                 commit=pr.head_oid,
                 line=0 if on_file else input["line"],
                 created_at=self.tick(),
-                side=input.get("side") or "RIGHT",
+                side=side,
+                start_line=start_line,
+                start_side=start_side if start_side != side else None,
                 on_file=on_file,
             )
 
@@ -1852,6 +1859,9 @@ class FakeGitHub:
                     {
                         "id": f"PRRT_{c.id}",
                         "diffSide": c.side,
+                        "startDiffSide": (
+                            (c.start_side or c.side) if c.start_line else None
+                        ),
                         "isResolved": c.resolved,
                         "viewerCanResolve": c.can_resolve and not c.resolved,
                         "viewerCanUnresolve": c.can_resolve and c.resolved,

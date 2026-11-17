@@ -132,6 +132,8 @@ pub struct ThreadState {
     /// The viewer may resolve the thread, or unresolve it if it's resolved.
     pub can_resolve: bool,
     pub side: Side,
+    /// The side a multi-line thread starts on.
+    pub start_side: Option<Side>,
 }
 
 /// The viewer's pending review on a PR, as `GitHub::pending_review`
@@ -519,7 +521,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id diffSide
+          id diffSide startDiffSide
           isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -1420,6 +1422,8 @@ impl GitHub {
                 "body": t.body,
                 "line": t.line,
                 "side": t.side.as_github(),
+                "startLine": t.start_line,
+                "startSide": t.start_line.map(|_| t.start_side.unwrap_or(t.side).as_github()),
             })]
         });
         let data = self
@@ -1477,10 +1481,11 @@ impl GitHub {
         self.mutate(
             std::slice::from_ref(&repo.to_owned()),
             "mutation($review: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide,
+                      $startLine: Int, $startSide: DiffSide,
                       $subject: PullRequestReviewThreadSubjectType) {
                addPullRequestReviewThread(input: {
                  pullRequestReviewId: $review, path: $path, body: $body, line: $line, side: $side,
-                 subjectType: $subject
+                 startLine: $startLine, startSide: $startSide, subjectType: $subject
                }) {
                  clientMutationId
                }
@@ -1491,6 +1496,8 @@ impl GitHub {
                 "body": t.body,
                 "line": t.line,
                 "side": t.line.map(|_| t.side.as_github()),
+                "startLine": t.start_line,
+                "startSide": t.start_line.map(|_| t.start_side.unwrap_or(t.side).as_github()),
                 "subject": if t.line.is_some() { "LINE" } else { "FILE" },
             }),
         )
@@ -2644,6 +2651,7 @@ impl GitHub {
                         resolved_by: resolved.then(|| person_at(&t["resolvedBy"])).flatten(),
                         can_resolve: t[can].as_bool() == Some(true),
                         side: Side::from_github(str_at(t, "/diffSide")),
+                        start_side: t["startDiffSide"].as_str().map(Side::from_github),
                     },
                 ))
             }));
