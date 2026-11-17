@@ -26,6 +26,7 @@ mod sidebar;
 mod tabs;
 mod terminal;
 mod theme;
+mod tool_summaries;
 mod topbar;
 
 use grenadine_core::api::{GENERAL, PrKey, ServerEvent, SyncStatus};

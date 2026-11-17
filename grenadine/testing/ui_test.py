@@ -500,6 +500,16 @@ if prompt.startswith("commit "):
         f.write(name)
     subprocess.run(["git", "add", "-A"], check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "Add " + name], check=True)
+# `describe` runs a Bash command that Claude described, asking first when
+# it must, and then one without a description.
+if prompt == "describe":
+    tool_input = {"command": "ls -la", "description": "List the files"}
+    tool_use = use("Bash", tool_input)
+    if mode == "manual":
+        approve("Bash", tool_input, tool_use)
+    result(tool_use, "notes.txt\n")
+    tool_use = use("Bash", {"command": "pwd"})
+    result(tool_use, "/\n")
 # `open pr URL` has it open a PR with gh, which prints the PR's URL.
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
@@ -3187,13 +3197,14 @@ class ReviewTest(ServerTestCase):
         # The box closes once the comment is sent.
         expect(conversation.get_by_role("textbox")).to_have_count(0)
 
-    def test_settings_dialog_only_has_the_theme(self) -> None:
+    def test_settings_dialog_only_has_global_settings(self) -> None:
         self.open(scenarios.CONVERSE)
         expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
         self.page.get_by_role("button", name="Settings", exact=True).click()
         dialog = self.page.get_by_role("dialog", name="Settings")
         expect(dialog.get_by_label("Theme")).to_have_count(1)
+        expect(dialog.get_by_label("Tool summaries")).to_have_count(1)
         expect(dialog.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
 
@@ -5542,6 +5553,49 @@ class AgentTest(ServerTestCase):
         finished_name_box = tool.locator(".tool-name").bounding_box()
         assert finished_name_box
         self.assertAlmostEqual(finished_name_box["x"], name_box["x"], delta=0.5)
+        self.delete_session()
+
+    def test_tool_rows_can_show_descriptions(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        picker = self.page.get_by_label("Tool summaries")
+        expect(picker).to_have_value("input")
+        picker.select_option("description")
+        self.page.keyboard.press("Escape")
+
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("describe")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        # The approval card shows what runs.
+        transcript = self.page.locator(".transcript")
+        approval = transcript.locator(".approval")
+        expect(approval.locator("code")).to_have_text("ls -la")
+
+        # The row shows the description, with the command as its tooltip.
+        tools = transcript.locator("details.tool")
+        described = tools.nth(0).locator("summary")
+        expect(described.locator(".tool-description")).to_have_text("List the files")
+        expect(described.locator(".tool-description")).to_have_attribute(
+            "title", "ls -la"
+        )
+        expect(described.locator("code")).to_have_count(0)
+        approval.get_by_role("button", name="Allow").click()
+
+        # A call without a description shows its input.
+        expect(tools).to_have_count(2)
+        expect(tools.nth(1).locator("summary code")).to_have_text("pwd")
+        expect(tools.nth(1).locator(".tool-description")).to_have_count(0)
+
+        # The choice survives a reload, and switching back shows the input.
+        self.page.reload()
+        expect(described.locator(".tool-description")).to_have_text("List the files")
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        picker.select_option("input")
+        expect(described.locator("code")).to_have_text("ls -la")
+        expect(described.locator(".tool-description")).to_have_count(0)
+        self.page.keyboard.press("Escape")
         self.delete_session()
 
     def test_a_request_nobody_waits_for_expires(self) -> None:
