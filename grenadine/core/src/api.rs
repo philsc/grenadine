@@ -1791,6 +1791,30 @@ pub struct AgentModelInfo {
     pub description: String,
 }
 
+/// A command a prompt can start with, as `/name`: a skill or one of the
+/// backend's own commands, and how many of the repository's prompts have
+/// started with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub name: String,
+    pub uses: u64,
+}
+
+/// Whether `c` can be part of a command's name, e.g. `code-review` or
+/// `plugin:skill`.
+pub fn command_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')
+}
+
+/// The command `prompt` starts with, without its `/`: `/foo bar` runs
+/// `foo`. A path such as `/tmp/x` runs none.
+pub fn leading_command(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty() && name.chars().all(command_char)).then_some(name)
+}
+
 /// The `repo` of the sessions that aren't in any repository, which work in
 /// a plain directory of their own, with no git. Repositories are
 /// `owner/name`, so it can't name one.
@@ -2311,6 +2335,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn leading_commands() {
+        assert_eq!(leading_command("/foo bar"), Some("foo"));
+        assert_eq!(leading_command("/foo"), Some("foo"));
+        assert_eq!(leading_command("/foo\nbar"), Some("foo"));
+        assert_eq!(leading_command("/plug:a-b_c.d x"), Some("plug:a-b_c.d"));
+        assert_eq!(leading_command("/tmp/x is full"), None);
+        assert_eq!(leading_command("/ foo"), None);
+        assert_eq!(leading_command("/"), None);
+        assert_eq!(leading_command(" /foo"), None);
+        assert_eq!(leading_command("foo"), None);
+    }
 
     #[test]
     fn what_a_review_needs() {

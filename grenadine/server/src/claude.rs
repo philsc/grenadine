@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
-    AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk, TaskStatus,
+    AgentBackend, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk, TaskStatus,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -305,7 +305,12 @@ async fn turn(
             break;
         };
         match parse_line(&line) {
-            Parsed::Started { model } => sink.started(id, model)?,
+            Parsed::Started { model, commands } => {
+                sink.started(id, model)?;
+                if let Some(commands) = commands {
+                    sink.commands(AgentBackend::Claude, &commands)?;
+                }
+            }
             Parsed::Events(events) => {
                 // A task starting or ending isn't the agent working, so
                 // it leaves the deadline alone.
@@ -330,12 +335,48 @@ async fn turn(
     })
 }
 
+/// Claude Code's config directory: `$CLAUDE_CONFIG_DIR`, or `~/.claude`.
+pub(crate) fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
+        })
+}
+
+/// The commands that an init line says a prompt can start with: its
+/// skills and slash commands, sorted, without the ones bound to the
+/// terminal, which don't work under `-p`.
+fn init_commands(init: &Value) -> Option<Vec<String>> {
+    let names = |key: &str| {
+        init[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+    };
+    let (skills, commands) = (names("skills"), names("slash_commands"));
+    if skills.is_none() && commands.is_none() {
+        return None;
+    }
+    let terminal = names("terminal_slash_commands").unwrap_or_default();
+    let all: std::collections::BTreeSet<&str> = skills
+        .into_iter()
+        .chain(commands)
+        .flatten()
+        .filter(|n| !terminal.contains(n))
+        .collect();
+    Some(all.into_iter().map(str::to_owned).collect())
+}
+
 /// What one line of `--output-format stream-json` means for the transcript.
 #[derive(Debug, PartialEq)]
 enum Parsed {
     /// Claude Code created (or resumed) its session with `model`.
     Started {
         model: Option<String>,
+        /// The commands a prompt can start with; `None` when the line
+        /// doesn't list them.
+        commands: Option<Vec<String>>,
     },
     Events(Vec<AgentEventKind>),
 }
@@ -446,6 +487,7 @@ fn parse_line(line: &str) -> Parsed {
             let model = v["model"].as_str().unwrap_or_default();
             return Parsed::Started {
                 model: (!model.is_empty()).then(|| model.to_owned()),
+                commands: init_commands(&v),
             };
         }
         // A task of the session's own agent, by the tool call that
@@ -667,7 +709,22 @@ pub(crate) mod tests {
                 r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
             ),
             Parsed::Started {
-                model: Some("claude-opus-4-6".into())
+                model: Some("claude-opus-4-6".into()),
+                commands: None,
+            }
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"m","slash_commands":["foo","doctor","compact","baz"],"terminal_slash_commands":["doctor"],"skills":["foo","bar"]}"#
+            ),
+            Parsed::Started {
+                model: Some("m".into()),
+                commands: Some(vec![
+                    "bar".into(),
+                    "baz".into(),
+                    "compact".into(),
+                    "foo".into()
+                ]),
             }
         );
         assert_eq!(
@@ -675,7 +732,8 @@ pub(crate) mod tests {
                 r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
             ),
             Parsed::Started {
-                model: Some("claude-opus-4-6[1m]".into())
+                model: Some("claude-opus-4-6[1m]".into()),
+                commands: None,
             }
         );
         assert_eq!(
