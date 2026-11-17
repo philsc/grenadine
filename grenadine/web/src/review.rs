@@ -1439,13 +1439,31 @@ pub struct MergeChoice {
     warning: RwSignal<Option<String>>,
     /// The direct-merge controls are revealed on a merge-queue branch.
     bypass: RwSignal<bool>,
+    /// Dictation into the squash commit's message. It lives with the
+    /// page, since the merge box is rebuilt each time the PR refreshes.
+    dictation: Dictation,
 }
 
 impl MergeChoice {
     pub fn new() -> MergeChoice {
+        let message = RwSignal::new(None::<(String, String)>);
+        let dictation = Dictation::with_text(
+            Signal::derive(move || {
+                message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
+            }),
+            SignalSetter::map(move |body| {
+                message.update(|m| {
+                    if let Some(m) = m {
+                        m.1 = body;
+                    }
+                })
+            }),
+            NodeRef::new(),
+        );
         MergeChoice {
             method: RwSignal::new(None),
-            message: RwSignal::new(None),
+            message,
+            dictation,
             delete_branch: RwSignal::new(None),
             merged: RwSignal::new(false),
             warning: RwSignal::new(None),
@@ -1504,6 +1522,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         delete_branch,
         merged,
         warning,
+        dictation,
         ..
     } = expect_context::<MergeChoice>();
     let name = StoredValue::new(merge_name(&key));
@@ -1574,20 +1593,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         why.join("\n")
     });
     let merge_base = stack_base.clone();
-    let message_box = NodeRef::<leptos::html::Textarea>::new();
-    let dictation = Dictation::with_text(
-        Signal::derive(move || {
-            message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
-        }),
-        SignalSetter::map(move |body| {
-            message.update(|m| {
-                if let Some(m) = m {
-                    m.1 = body;
-                }
-            })
-        }),
-        message_box,
-    );
+    let message_box = dictation.textarea();
     let merge = move |_| {
         let (Some(m), Some(head)) = (chosen(), head.clone()) else {
             return;
@@ -1690,7 +1696,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
             {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| {
                 // The recording goes with the box, or it would go on with
                 // no Stop when the method changes.
-                on_cleanup(move || dictation.cancel());
+                dictation.end_with_box();
                 view! {
                 <div class="merge-message">
                     <input type="text" aria-label="Commit title"

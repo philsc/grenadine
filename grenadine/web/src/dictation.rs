@@ -272,7 +272,8 @@ impl Dictation {
         match self.phase.get_untracked() {
             Phase::Idle => self.start(),
             Phase::Starting | Phase::Recording => self.stop(),
-            Phase::Finishing => {}
+            // The last phrases are taking a while: drop them.
+            Phase::Finishing => self.cancel(),
         }
     }
 
@@ -301,12 +302,21 @@ impl Dictation {
         let prompt = text[..at].to_owned();
         let attempt = self.attempt.get_value() + 1;
         self.attempt.set_value(attempt);
+        // Made in the click, since browsers keep an audio context made
+        // outside a user gesture suspended: it would record silence.
+        let context = match AudioContext::new() {
+            Ok(c) => c,
+            Err(e) => return self.fail(js_error(e)),
+        };
+        let _ = context.resume();
         spawn_local(async move {
-            // Stopping while starting makes the start fail; that's no error.
-            if let Err(e) = self.open(prompt, attempt).await
-                && self.current(attempt)
-            {
-                self.fail(e);
+            if let Err(e) = self.open(prompt, attempt, context.clone()).await {
+                let _ = context.close();
+                // Stopping while starting makes the start fail; that's no
+                // error.
+                if self.current(attempt) {
+                    self.fail(e);
+                }
             }
         });
     }
@@ -321,7 +331,7 @@ impl Dictation {
     }
 
     /// Connects to the server, then starts the microphone.
-    async fn open(self, prompt: String, attempt: u64) -> Result<(), String> {
+    async fn open(self, prompt: String, attempt: u64, context: AudioContext) -> Result<(), String> {
         let socket = WebSocket::new(&socket_url()).map_err(js_error)?;
         socket.set_binary_type(BinaryType::Arraybuffer);
         let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
@@ -364,7 +374,7 @@ impl Dictation {
         socket.set_onopen(None);
         socket.set_onerror(None);
         if !self.current(attempt) {
-            return Ok(());
+            return Err("stopped".to_owned());
         }
         let start = serde_json::to_string(&DictationCommand::Start { prompt }).unwrap_or_default();
         socket.send_with_str(&start).map_err(js_error)?;
@@ -389,7 +399,6 @@ impl Dictation {
         .await
         .map_err(|e| format!("can't use the microphone: {}", js_error(e)))?
         .unchecked_into();
-        let context = AudioContext::new().map_err(js_error)?;
         let options = BlobPropertyBag::new();
         options.set_type("text/javascript");
         let parts = js_sys::Array::of1(&WORKLET.into());
@@ -473,9 +482,29 @@ impl Dictation {
         }
     }
 
-    /// Drops the recording, and the phrases still being transcribed, for
-    /// when its box goes away but the `Dictation` stays.
-    pub fn cancel(self) {
+    /// Ends the recording when the box goes away and no box takes its
+    /// place by the next task, as when the box is rebuilt. Call it in the
+    /// scope that renders the box, when the `Dictation` outlives that.
+    pub fn end_with_box(self) {
+        on_cleanup(move || {
+            set_timeout(
+                move || {
+                    let mounted = self
+                        .textarea
+                        .try_get_untracked()
+                        .flatten()
+                        .is_some_and(|t| t.is_connected());
+                    if !mounted {
+                        self.cancel();
+                    }
+                },
+                Duration::ZERO,
+            );
+        });
+    }
+
+    /// Drops the recording, and the phrases still being transcribed.
+    fn cancel(self) {
         RECORDERS.with_borrow_mut(|r| r.remove(&self.id));
         self.phase.try_set(Phase::Idle);
         self.interim.try_set(String::new());
@@ -543,15 +572,14 @@ pub fn RecordButton(dictation: Dictation) -> impl IntoView {
                     let s = d.seconds.get();
                     format!("■ Stop · {}:{:02}", s / 60, s % 60)
                 }
-                Phase::Finishing => "Finishing…".to_owned(),
+                Phase::Finishing => "Finishing… · Cancel".to_owned(),
             };
             view! {
                 <button
                     type="button"
                     class="record"
                     class:recording=move || d.phase.get() == Phase::Recording
-                    title="Dictate at the cursor"
-                    disabled=move || d.phase.get() == Phase::Finishing
+                    title=move || if d.phase.get() == Phase::Finishing { "Drop the phrases still being transcribed" } else { "Dictate at the cursor" }
                     on:click=move |_| d.toggle()
                 >{label}</button>
             }
