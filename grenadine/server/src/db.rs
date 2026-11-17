@@ -10,7 +10,7 @@ use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
     AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed,
     Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo,
-    SessionKind, Stack, ThreadCounts, Version, VersionKind,
+    SessionKind, SlashCommand, Stack, ThreadCounts, Version, VersionKind, leading_command,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -26,6 +26,9 @@ enum Migration {
     /// edited default keeps it off. Reads DEFAULT_INBOXES so the names
     /// and filters aren't duplicated here.
     BackgroundDefaults,
+    /// Counts the commands that the stored prompts started with into
+    /// `skill_uses`.
+    BackfillSkillUses,
 }
 
 /// Each entry upgrades the schema by one version.
@@ -524,6 +527,33 @@ const MIGRATIONS: &[Migration] = &[
       );
 "#,
     ),
+    Migration::Sql(
+        r#"
+    -- The commands a prompt can start with, as the backend's latest
+    -- session in the repository listed them: names is a JSON array.
+    CREATE TABLE slash_commands (
+        repo TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        names TEXT NOT NULL,
+        -- Unix seconds.
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, backend)
+    );
+    -- The commands the session's backend listed, as a JSON array; NULL
+    -- until it has.
+    ALTER TABLE agents ADD COLUMN slash_commands TEXT;
+    -- How many of the repository's prompts started with each command.
+    CREATE TABLE skill_uses (
+        repo TEXT NOT NULL,
+        name TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        -- Unix seconds; NULL for uses whose time isn't known.
+        last_used INTEGER,
+        PRIMARY KEY (repo, name)
+    );
+"#,
+    ),
+    Migration::BackfillSkillUses,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -574,6 +604,7 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
                 }
             }
             Migration::BackfillAgentPrs => backfill_agent_prs(&tx)?,
+            Migration::BackfillSkillUses => backfill_skill_uses(&tx)?,
             Migration::BackgroundDefaults => {
                 tx.execute_batch(
                     "ALTER TABLE inboxes ADD COLUMN sync_in_background INTEGER NOT NULL DEFAULT 0;",
@@ -620,6 +651,36 @@ fn backfill_agent_prs(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    Ok(())
+}
+
+fn backfill_skill_uses(conn: &Connection) -> Result<()> {
+    let prompts: Vec<(String, String, Option<i64>)> = conn
+        .prepare(
+            "SELECT a.repo, e.event, e.at FROM agent_events e
+             JOIN agents a ON a.id = e.agent_id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (repo, json, at) in prompts {
+        if let Ok(AgentEventKind::Prompt(prompt)) = serde_json::from_str(&json)
+            && let Some(name) = leading_command(&prompt)
+        {
+            count_skill_use(conn, &repo, name, at)?;
+        }
+    }
+    Ok(())
+}
+
+/// Adds a use of the command `name` in `repo` at `at`.
+fn count_skill_use(conn: &Connection, repo: &str, name: &str, at: Option<i64>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO skill_uses (repo, name, count, last_used) VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT (repo, name) DO UPDATE SET
+             count = count + 1,
+             last_used = MAX(COALESCE(last_used, excluded.last_used), COALESCE(excluded.last_used, last_used))",
+        params![repo, name, at],
+    )?;
     Ok(())
 }
 
@@ -1687,6 +1748,88 @@ impl Db {
             params![model, id],
         )?;
         Ok(())
+    }
+
+    /// Records the commands the session's backend listed, as the session's
+    /// own and as the latest for its repository and backend.
+    pub fn set_slash_commands(
+        &self,
+        id: &str,
+        repo: &str,
+        backend: AgentBackend,
+        names: &[String],
+        at: i64,
+    ) -> Result<()> {
+        let names = serde_json::to_string(names)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE agents SET slash_commands = ? WHERE id = ?",
+            params![names, id],
+        )?;
+        tx.execute(
+            "INSERT INTO slash_commands (repo, backend, names, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT (repo, backend) DO UPDATE SET
+                 names = excluded.names, updated_at = excluded.updated_at",
+            params![repo, backend.as_str(), names, at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The commands the session's backend listed; `None` until it has.
+    pub fn agent_slash_commands(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let names: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT slash_commands FROM agents WHERE id = ?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(names.and_then(|n| serde_json::from_str(&n).ok()))
+    }
+
+    /// The commands the latest `backend` session in `repo` listed; `None`
+    /// when none has.
+    pub fn repo_slash_commands(
+        &self,
+        repo: &str,
+        backend: AgentBackend,
+    ) -> Result<Option<Vec<String>>> {
+        let names: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT names FROM slash_commands WHERE repo = ? AND backend = ?",
+                params![repo, backend.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(names.and_then(|n| serde_json::from_str(&n).ok()))
+    }
+
+    /// Adds a use of the command `name` by a prompt in `repo` at `at`.
+    pub fn add_skill_use(&self, repo: &str, name: &str, at: i64) -> Result<()> {
+        count_skill_use(&self.conn(), repo, name, Some(at))
+    }
+
+    /// `names` with how many of `repo`'s prompts started with each.
+    pub fn with_uses(&self, repo: &str, names: Vec<String>) -> Result<Vec<SlashCommand>> {
+        let conn = self.conn();
+        let mut uses = conn.prepare("SELECT count FROM skill_uses WHERE repo = ? AND name = ?")?;
+        names
+            .into_iter()
+            .map(|name| {
+                let count: Option<u64> = uses
+                    .query_row(params![repo, name], |r| r.get(0))
+                    .optional()?;
+                Ok(SlashCommand {
+                    name,
+                    uses: count.unwrap_or(0),
+                })
+            })
+            .collect()
     }
 
     /// Records where wrapping up landed the session's work.
@@ -2966,8 +3109,13 @@ mod tests {
     #[test]
     fn clears_drift_from_stale_heads() {
         let mut conn = Connection::open_in_memory().unwrap();
-        let last = MIGRATIONS.len() - 1;
-        migrate(&mut conn, last).unwrap();
+        let clear = MIGRATIONS
+            .iter()
+            .position(
+                |m| matches!(m, Migration::Sql(sql) if sql.contains("UPDATE prs SET drift = NULL")),
+            )
+            .unwrap();
+        migrate(&mut conn, clear).unwrap();
         for (number, old, new) in [
             (1, "v1=aaa, v2=bbb, v3=aaa", "v1=aaa, v2=bbb"),
             (2, "v1=aaa, v2=bbb", "v1=aaa, v2=ccc"),
@@ -4078,6 +4226,111 @@ mod tests {
         assert!(db.pr(&key).unwrap().unwrap().summary.queued);
         assert!(db.inbox_prs(1).unwrap()[0].queued);
         assert_eq!(db.sync_mark(&key).unwrap().unwrap().queued, Some(true));
+    }
+
+    #[test]
+    fn backfills_skill_uses() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let backfill = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::BackfillSkillUses))
+            .unwrap();
+        migrate(&mut conn, backfill).unwrap();
+        for (id, repo) in [("a", "o/n"), ("b", "o/n"), ("c", "o/other")] {
+            conn.execute(
+                "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status, created_at)
+                 VALUES (?, ?, 't', 'b', '/w', 's', 'idle', 0)",
+                [id, repo],
+            )
+            .unwrap();
+        }
+        let prompts = [
+            ("a", "/foo do it", Some(10)),
+            ("a", "/foo again", None),
+            ("b", "/foo", Some(5)),
+            ("b", "/bar x", Some(7)),
+            ("b", "/tmp/x is full", Some(8)),
+            ("b", "no command", Some(9)),
+            ("c", "/foo", Some(20)),
+        ];
+        for (id, prompt, at) in prompts {
+            conn.execute(
+                "INSERT INTO agent_events (agent_id, seq, event, at)
+                 SELECT ?1, COALESCE(MAX(seq) + 1, 1), ?2, ?3 FROM agent_events WHERE agent_id = ?1",
+                params![
+                    id,
+                    serde_json::to_string(&AgentEventKind::Prompt(prompt.into())).unwrap(),
+                    at
+                ],
+            )
+            .unwrap();
+        }
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        let uses: Vec<(String, String, u64, Option<i64>)> = conn
+            .prepare("SELECT repo, name, count, last_used FROM skill_uses ORDER BY repo, name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            uses,
+            [
+                ("o/n".into(), "bar".into(), 1, Some(7)),
+                ("o/n".into(), "foo".into(), 3, Some(10)),
+                ("o/other".into(), "foo".into(), 1, Some(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_slash_commands_and_their_uses() {
+        let db = Db::in_memory();
+        for id in ["a", "b"] {
+            db.create_agent(&AgentSession::fixture(id, "o/n")).unwrap();
+        }
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(db.agent_slash_commands("a").unwrap(), None);
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Claude).unwrap(),
+            None
+        );
+
+        db.set_slash_commands("a", "o/n", AgentBackend::Claude, &names(&["bar", "foo"]), 1)
+            .unwrap();
+        db.set_slash_commands("b", "o/n", AgentBackend::Claude, &names(&["foo"]), 2)
+            .unwrap();
+        assert_eq!(
+            db.agent_slash_commands("a").unwrap(),
+            Some(names(&["bar", "foo"]))
+        );
+        // The repository keeps the latest session's.
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Claude).unwrap(),
+            Some(names(&["foo"]))
+        );
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Devin).unwrap(),
+            None
+        );
+
+        db.add_skill_use("o/n", "foo", 3).unwrap();
+        db.add_skill_use("o/n", "foo", 4).unwrap();
+        db.add_skill_use("o/other", "bar", 4).unwrap();
+        assert_eq!(
+            db.with_uses("o/n", names(&["bar", "foo"])).unwrap(),
+            [
+                SlashCommand {
+                    name: "bar".into(),
+                    uses: 0
+                },
+                SlashCommand {
+                    name: "foo".into(),
+                    uses: 2
+                },
+            ]
+        );
     }
 
     #[test]
