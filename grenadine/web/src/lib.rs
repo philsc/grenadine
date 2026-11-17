@@ -23,6 +23,7 @@ mod pr_threads;
 mod review;
 mod settings;
 mod sidebar;
+mod slash;
 mod tabs;
 mod terminal;
 mod theme;
