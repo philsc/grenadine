@@ -2733,6 +2733,29 @@ class ReviewTest(ServerTestCase):
         thread = file.locator(".thread", has_text="Both sides.")
         expect(thread.locator(".thread-lines")).to_have_text("Lines -3 to +5")
 
+    def test_a_range_cant_go_from_new_lines_back_to_old_ones(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # GitHub refuses a range from the new side to the old one, so a drag
+        # from the new line 2 passes the removed line 3...
+        self.drag(self.ln(file, "R", 2), self.ln(file, "L", 3))
+        expect(file.locator("tr.dragging")).to_have_count(1)
+        # ...and takes a context line's new side when pointed at its old one.
+        self.ln(file, "L", 4).hover()
+        expect(file.locator("tr.dragging")).to_have_count(4)
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines +2 to +4")
+        composer = file.locator(".comment-composer")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # A shift-click onto the removed line comments on it alone.
+        self.ln(file, "R", 2).click()
+        self.ln(file, "L", 3).click(modifiers=["Shift"])
+        expect(composer).to_have_count(2)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
     def test_ranges_keep_to_a_side_and_stop_at_hidden_lines(self) -> None:
         self.open(scenarios.RANGE_SPLIT)
         self.side_by_side(True)

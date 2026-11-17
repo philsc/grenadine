@@ -1280,6 +1280,10 @@ class FakeGitHub:
             side = input.get("side") or "RIGHT"
             start_line = None if on_file else input.get("startLine")
             start_side = (input.get("startSide") or side) if start_line else None
+            if start_line and (start_side, side) == ("RIGHT", "LEFT"):
+                raise ValueError(
+                    "A range can't start on the RIGHT side and end on the LEFT."
+                )
             if start_line and start_side == side and start_line >= input["line"]:
                 raise ValueError("startLine must precede the end line.")
             return Comment(

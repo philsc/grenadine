@@ -1937,10 +1937,20 @@ fn row_under(target: Option<web_sys::EventTarget>) -> Option<usize> {
         .ok()
 }
 
+/// Whether a range between `a` and `b`, in either order, goes from the
+/// new side back to the old one, which GitHub refuses: a range may only
+/// cross from the old side to the new.
+fn crosses_back(a: RowLine, b: RowLine) -> bool {
+    let (first, last) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    first.0 != last.0 && first.1.0 == Side::Right && last.1.0 == Side::Left
+}
+
 /// Where a range that starts at `from` reaches toward row `to`: the last
 /// line it can take on the way. It stops before a row of hidden lines,
 /// and keeps to `from`'s side in the side-by-side view (`split`). In the
-/// unified view it takes `from`'s side's line of a row that has both.
+/// unified view it takes `from`'s side's line of a row that has both, and
+/// passes a row whose only line would make the range cross back from the
+/// new side to the old one.
 fn range_reach(rows: &[Row], from: RowLine, to: usize, split: bool) -> RowLine {
     let mut reach = from;
     let mut i = from.0;
@@ -1950,11 +1960,11 @@ fn range_reach(rows: &[Row], from: RowLine, to: usize, split: bool) -> RowLine {
         if r.class.split(' ').any(|c| c == "skip") {
             break;
         }
-        let line = r
-            .lines
-            .iter()
-            .find(|l| l.0 == from.1.0)
-            .or_else(|| r.lines.first().filter(|_| !split));
+        let line = r.lines.iter().find(|l| l.0 == from.1.0).or_else(|| {
+            r.lines
+                .first()
+                .filter(|&&l| !split && !crosses_back(from, (i, l)))
+        });
         if let Some(&l) = line {
             reach = (i, l);
         }
@@ -2078,6 +2088,7 @@ fn diff_table(
                     if let Some(c) = cell
                         && c.0 == d.to.0
                         && (!split || c.1.0 == d.from.1.0)
+                        && !crosses_back(d.from, c)
                     {
                         d.to = c;
                     }
@@ -2139,8 +2150,8 @@ fn diff_table(
 
 /// The range a shift-click on `clicked` makes from the line last clicked,
 /// `anchor`: `None` when there's no such line in `rows`, it's on the same
-/// row, or the range would cross hidden lines or, side by side (`split`),
-/// the sides.
+/// row, or the range would cross hidden lines, cross back from the new
+/// side to the old one or, side by side (`split`), cross the sides at all.
 fn shift_range(
     rows: &[Row],
     anchor: Option<(Side, u32)>,
@@ -2151,8 +2162,11 @@ fn shift_range(
     let row = rows.iter().position(|r| r.lines.contains(&anchor))?;
     let from = (row, anchor);
     let reach = range_reach(rows, from, clicked.0, split);
-    (row != clicked.0 && reach.0 == clicked.0 && (!split || clicked.1.0 == anchor.0))
-        .then(|| range_target(from, clicked))
+    (row != clicked.0
+        && reach.0 == clicked.0
+        && (!split || clicked.1.0 == anchor.0)
+        && !crosses_back(from, clicked))
+    .then(|| range_target(from, clicked))
 }
 
 /// Marks the rows each unresolved multi-line thread spans with a
@@ -2526,11 +2540,18 @@ mod tests {
     #[test]
     fn a_range_reaches_up_to_hidden_lines() {
         let rows = unified_rows();
-        let from = (0, (Side::Right, 1));
         // In the unified view, a row without the start's side gives its
-        // other line.
-        assert_eq!(range_reach(&rows, from, 1, false), (1, (Side::Left, 2)));
+        // other line when the range goes from the old side to the new.
+        let old = (0, (Side::Left, 1));
+        assert_eq!(range_reach(&rows, old, 2, false), (2, (Side::Right, 2)));
+        let up = range_reach(&rows, (3, (Side::Right, 3)), 1, false);
+        assert_eq!(up, (1, (Side::Left, 2)));
+        // But not the other way: the removed line is passed.
+        let from = (0, (Side::Right, 1));
+        assert_eq!(range_reach(&rows, from, 1, false), from);
         assert_eq!(range_reach(&rows, from, 3, false), (3, (Side::Right, 3)));
+        let up = range_reach(&rows, (3, (Side::Left, 3)), 2, false);
+        assert_eq!(up, (3, (Side::Left, 3)));
         // It stops before the hidden lines.
         assert_eq!(range_reach(&rows, from, 5, false), (3, (Side::Right, 3)));
         // Upward too.
@@ -2539,11 +2560,10 @@ mod tests {
         // Side by side, a row with nothing on the start's side is passed.
         let split = [
             row(&[(Side::Left, 1), (Side::Right, 1)], 0),
-            row(&[(Side::Left, 2)], 0),
+            row(&[(Side::Right, 2)], 0),
         ];
-        let from = (0, (Side::Right, 1));
-        assert_eq!(range_reach(&split, from, 1, true), from);
-        assert_eq!(range_reach(&split, from, 1, false), (1, (Side::Left, 2)));
+        assert_eq!(range_reach(&split, old, 1, true), old);
+        assert_eq!(range_reach(&split, old, 1, false), (1, (Side::Right, 2)));
     }
 
     #[test]
@@ -2590,6 +2610,17 @@ mod tests {
         );
         assert_eq!(
             shift_range(&rows, anchor, (5, (Side::Right, 10)), false),
+            None
+        );
+        // From the new side down to a removed line, or up from the old
+        // side to an added one: GitHub refuses a range that ends on the old
+        // side after starting on the new.
+        assert_eq!(
+            shift_range(&rows, anchor, (1, (Side::Left, 2)), false),
+            None
+        );
+        assert_eq!(
+            shift_range(&rows, Some((Side::Left, 3)), (2, (Side::Right, 2)), false),
             None
         );
         let gone = Some((Side::Right, 40));
