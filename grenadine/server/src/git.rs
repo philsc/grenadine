@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, WorktreeFile};
+use grenadine_core::file_order;
 use grenadine_core::versions::CommitGraph;
 
 /// Refs that grenadine writes into the clone live under this prefix.
@@ -399,7 +400,8 @@ impl Repo {
 
     /// The unstaged changes in the worktree at `path`: the files whose
     /// working copy differs from the index, and the untracked files that
-    /// aren't ignored, as additions. Symlinks and submodules are left out.
+    /// aren't ignored, as additions, in the order diffs list them. Symlinks
+    /// and submodules are left out.
     pub fn worktree_changes(&self, path: &Path) -> Result<Vec<WorktreeFile>> {
         // Without optional locks, git doesn't take the index's lock to
         // refresh it, which could make the agent's own git commands fail.
@@ -427,6 +429,7 @@ impl Repo {
                     new_blob: None,
                 }),
         );
+        changes.sort_by(|a, b| file_order::cmp(a.path(), b.path()));
         let ids: Vec<String> = changes.iter().filter_map(|c| c.old_blob.clone()).collect();
         let mut olds = self.blobs(&ids)?;
         let mut files = Vec::new();
@@ -635,8 +638,9 @@ impl Repo {
         Ok(())
     }
 
-    /// The files that differ between the trees of two commits. Only trees
-    /// are compared here; the page diffs the contents.
+    /// The files that differ between the trees of two commits, in the
+    /// order diffs list them. Only trees are compared here; the page diffs
+    /// the contents.
     pub fn changed_files(&self, from: &str, to: &str) -> Result<Vec<FileChange>> {
         let out = self.git(&[
             "diff-tree",
@@ -648,7 +652,9 @@ impl Repo {
             from,
             to,
         ])?;
-        parse_raw_diff(&out)
+        let mut files = parse_raw_diff(&out)?;
+        files.sort_by(|a, b| file_order::cmp(a.path(), b.path()));
+        Ok(files)
     }
 
     /// The contents of blobs.
@@ -1111,7 +1117,14 @@ pub(crate) mod tests {
         let s = |t: &str| Some(Some(t.to_owned()));
         assert_eq!(
             summary,
+            // Untracked files are listed among the others, in path order.
             [
+                (
+                    ChangeStatus::Added,
+                    ".gitignore".to_owned(),
+                    None,
+                    s("ignored\n")
+                ),
                 (
                     ChangeStatus::Modified,
                     "a".to_owned(),
@@ -1119,19 +1132,13 @@ pub(crate) mod tests {
                     s("1\n2\n")
                 ),
                 (ChangeStatus::Deleted, "b".to_owned(), s("b\n"), None),
+                (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
                 (
                     ChangeStatus::Modified,
                     "c".to_owned(),
                     s("c\nstaged\n"),
                     s("c\nstaged\nunstaged\n")
                 ),
-                (
-                    ChangeStatus::Added,
-                    ".gitignore".to_owned(),
-                    None,
-                    s("ignored\n")
-                ),
-                (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
                 (ChangeStatus::Added, "new".to_owned(), None, s("new\n")),
             ]
         );
@@ -1140,5 +1147,38 @@ pub(crate) mod tests {
                 .iter()
                 .all(|w| w.change.old_blob.is_none() && w.change.new_blob.is_none())
         );
+    }
+
+    #[test]
+    fn worktree_changes_list_headers_before_their_sources() {
+        let f = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt");
+        f.clone.worktree_add(&path, "x", "HEAD").unwrap();
+        commit(&path, "foo.cpp", "int x;\n");
+        std::fs::write(path.join("foo.cpp"), "int y;\n").unwrap();
+        // Untracked, so git lists it after the tracked foo.cpp.
+        std::fs::write(path.join("foo.h"), "int y;\n").unwrap();
+
+        let files = f.clone.worktree_changes(&path).unwrap();
+        let paths: Vec<_> = files.iter().map(|w| w.change.path()).collect();
+        assert_eq!(paths, ["foo.h", "foo.cpp"]);
+    }
+
+    #[test]
+    fn changed_files_list_headers_before_their_sources() {
+        let f = fixture();
+        let base = run(&f.upstream, &["rev-parse", "HEAD"]);
+        for name in ["foo.cpp", "foo.h", "foo_test.cpp", "main.cpp"] {
+            std::fs::write(f.upstream.join(name), "x\n").unwrap();
+        }
+        run(&f.upstream, &["add", "."]);
+        run(&f.upstream, &["commit", "-q", "-m", "x"]);
+        let head = run(&f.upstream, &["rev-parse", "HEAD"]);
+        f.clone.fetch_commits(std::slice::from_ref(&head));
+
+        let files = f.clone.changed_files(&base, &head).unwrap();
+        let paths: Vec<_> = files.iter().map(FileChange::path).collect();
+        assert_eq!(paths, ["foo.h", "foo.cpp", "foo_test.cpp", "main.cpp"]);
     }
 }

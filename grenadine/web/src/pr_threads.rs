@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use grenadine_core::api::{PrDetail, PrKey, ReviewComment};
+use grenadine_core::file_order;
 use leptos::prelude::*;
 
 use crate::inboxes::{load_flag, save_flag};
@@ -80,7 +81,8 @@ pub fn counts(comments: &[ReviewComment]) -> [usize; 3] {
     out
 }
 
-/// The threads of the kinds in `shown`, grouped by file in path order.
+/// The threads of the kinds in `shown`, grouped by file in the order the
+/// diff lists them.
 /// In a file, threads on the whole file come first, then the others by
 /// line: on the PR's head where GitHub has one, else where they were
 /// made.
@@ -89,10 +91,10 @@ pub fn listed(comments: &[ReviewComment], shown: &[Kind]) -> Vec<(String, Vec<Th
         .into_iter()
         .filter(|t| shown.contains(&kind(t)))
         .collect();
-    list.sort_by_key(|t| {
+    list.sort_by_cached_key(|t| {
         let c = &t.root;
         (
-            c.path.clone(),
+            file_order::key(&c.path).into_owned(),
             !c.on_file,
             c.line.or(c.original_line).unwrap_or(0),
             c.id,
@@ -367,6 +369,15 @@ mod tests {
             [("f.rs", vec![1, 2, 3])]
         );
         assert!(listed(&comments, &[]).is_empty());
+    }
+
+    #[test]
+    fn listed_puts_headers_before_their_sources() {
+        let comments = [comment(1, "foo.cpp", Some(1)), comment(2, "foo.h", Some(1))];
+        assert_eq!(
+            ids(&listed(&comments, &Kind::ALL)),
+            [("foo.h", vec![2]), ("foo.cpp", vec![1])]
+        );
     }
 
     #[test]
