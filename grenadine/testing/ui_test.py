@@ -2417,6 +2417,30 @@ class EditPrTest(ServerTestCase):
         self.assertEqual(pr.body, "")
 
 
+class FileOrderTest(ServerTestCase):
+    """Lists a C++ header before the source files that share its stem."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.checkout("main")
+        repo.commit("Seed the repo", {"README.md": "# test\n"})
+        repo.push("main")
+        repo.checkout("order", "main")
+        repo.commit(
+            "Add foo",
+            {path: "int x;\n" for path in ("src/foo.cpp", "src/foo.h", "src/main.cpp")},
+        )
+        repo.push("order")
+        cls.pr = repo.open_pr("Add foo", head="order")
+
+    def test_headers_come_before_their_sources(self) -> None:
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{self.pr.number}")
+        expect(self.page.locator("section.file .file-header .path")).to_have_text(
+            ["src/foo.h", "src/foo.cpp", "src/main.cpp"]
+        )
+
+
 class ReviewTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
