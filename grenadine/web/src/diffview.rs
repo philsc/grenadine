@@ -1830,7 +1830,27 @@ fn thread_lines(p: &Placed) -> Option<String> {
     }
 }
 
-fn group_view(rows: &Arc<Vec<Row>>, group: Group, fc: Option<&FileCommenting>) -> AnyView {
+/// A diff table's open comment boxes and the rows their ranges cover,
+/// worked out once per change for all its rows.
+#[derive(Clone, Copy)]
+struct OpenBoxRows {
+    targets: Memo<Vec<Target>>,
+    selected: Memo<HashSet<usize>>,
+}
+
+impl OpenBoxRows {
+    fn new(rows: Arc<Vec<Row>>, fc: FileCommenting) -> Self {
+        let targets = Memo::new(move |_| fc.open_targets());
+        let selected = Memo::new(move |_| targets.with(|t| selected_rows(&rows, t)));
+        OpenBoxRows { targets, selected }
+    }
+}
+
+fn group_view(
+    rows: &Arc<Vec<Row>>,
+    group: Group,
+    fc: Option<(&FileCommenting, OpenBoxRows)>,
+) -> AnyView {
     match group {
         Group::Plain(start, end) => {
             let mut html = String::new();
@@ -1857,21 +1877,23 @@ fn group_view(rows: &Arc<Vec<Row>>, group: Group, fc: Option<&FileCommenting>) -
                 }
             });
             let class = {
-                let (rows, fc, class) = (rows.clone(), fc.cloned(), r.class.clone());
-                move || match &fc {
-                    Some(fc) if selected_rows(&rows, &fc.open_targets()).contains(&i) => {
+                let (open, class) = (fc.map(|(_, o)| o), r.class.clone());
+                move || match open {
+                    Some(o) if o.selected.with(|s| s.contains(&i)) => {
                         format!("{class} selecting-range")
                     }
                     _ => class.clone(),
                 }
             };
-            let boxes = fc.map(|fc| {
-                let (lines, open, fc) = (r.lines.clone(), fc.clone(), fc.clone());
+            let boxes = fc.map(|(fc, open)| {
+                let (lines, fc) = (r.lines.clone(), fc.clone());
                 let each = move || {
-                    open.open_targets()
-                        .into_iter()
-                        .filter(|t| lines.contains(&t.end))
-                        .collect::<Vec<_>>()
+                    open.targets.with(|t| {
+                        t.iter()
+                            .copied()
+                            .filter(|t| lines.contains(&t.end))
+                            .collect::<Vec<_>>()
+                    })
                 };
                 view! { <For each=each key=|t| *t children=move |t| fc.box_row(t, 4) /> }
             });
@@ -2025,14 +2047,12 @@ fn diff_table(
     expand: Option<RwSignal<Vec<diff::Expand>>>,
 ) -> impl IntoView + use<> {
     let rows = Arc::new(rows);
+    let open = fc.clone().map(|fc| OpenBoxRows::new(rows.clone(), fc));
     let each = {
-        let (rows, fc) = (rows.clone(), fc.clone());
-        move || {
-            let open = fc
-                .as_ref()
-                .map(FileCommenting::open_targets)
-                .unwrap_or_default();
-            groups(&rows, &open)
+        let rows = rows.clone();
+        move || match open {
+            Some(o) => o.targets.with(|t| groups(&rows, t)),
+            None => groups(&rows, &[]),
         }
     };
     let on_mousedown = {
@@ -2126,14 +2146,19 @@ fn diff_table(
                 ev.stop_propagation();
                 return;
             }
-            // Plain clicks and drags are handled when the mouse button
-            // goes up.
-            let (Some(fc), true) = (&fc, ev.shift_key()) else {
-                return;
-            };
+            let Some(fc) = &fc else { return };
             let Some(clicked) = line_cell(ev.target()) else {
                 return;
             };
+            // Plain clicks and drags are handled when the mouse button
+            // goes up, but a click without a mouse, e.g. from assistive
+            // technology, comes without a press.
+            if !ev.shift_key() {
+                if ev.detail() == 0 && fc.drag.with_value(Option::is_none) {
+                    fc.open(Target::line(clicked.1), clicked.1);
+                }
+                return;
+            }
             match shift_range(&rows, fc.anchor.get_value().map(|(a, _)| a), clicked, split) {
                 Some(at) => fc.extend(at),
                 None => fc.open(Target::line(clicked.1), clicked.1),
@@ -2143,7 +2168,7 @@ fn diff_table(
     view! {
         <table class=class class:inline-changes=move || inline_changes.get()
             on:mousedown=on_mousedown on:mouseover=on_mouseover on:click=on_click>
-            <For each=each key=|g| *g children=move |g| group_view(&rows, g, fc.as_ref()) />
+            <For each=each key=|g| *g children=move |g| group_view(&rows, g, fc.as_ref().zip(open)) />
         </table>
     }
 }

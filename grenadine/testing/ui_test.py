@@ -2733,6 +2733,16 @@ class ReviewTest(ServerTestCase):
         thread = file.locator(".thread", has_text="Both sides.")
         expect(thread.locator(".thread-lines")).to_have_text("Lines -3 to +5")
 
+    def test_a_click_without_a_mouse_opens_a_box(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # A click event with no press before it, as assistive technology
+        # sends.
+        self.ln(file, "R", 2).dispatch_event("click")
+        expect(file.locator(".comment-composer")).to_have_count(1)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
     def test_a_range_cant_go_from_new_lines_back_to_old_ones(self) -> None:
         self.open(scenarios.RANGE_SIDES)
         self.side_by_side(False)
