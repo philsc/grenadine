@@ -32,6 +32,8 @@
   --error-bg: #ffebe9;
   --upstream-stripe: rgba(128, 128, 128, 0.12);
   --mixed-stripe: rgba(212, 167, 44, 0.25);
+  --select-bg: rgba(212, 167, 44, 0.2);
+  --select-ln: rgba(212, 167, 44, 0.4);
 }
 
 :root[data-theme="dark"] {
@@ -59,6 +61,8 @@
   --error-bg: rgba(248, 81, 73, 0.1);
   --upstream-stripe: rgba(200, 200, 200, 0.08);
   --mixed-stripe: rgba(210, 153, 34, 0.18);
+  --select-bg: rgba(187, 128, 9, 0.2);
+  --select-ln: rgba(187, 128, 9, 0.45);
 }
 
 * {
@@ -1122,6 +1126,16 @@ input[type="text"] {
 /* The lines a multi-line comment covers. */
 .diff tr.commented-range td.ln {
   box-shadow: inset 3px 0 0 var(--accent);
+}
+/* The lines being picked for a comment, or that an open comment box on
+   a range covers. */
+.diff tr.dragging td.code,
+.diff tr.selecting-range td.code {
+  background: var(--select-bg);
+}
+.diff tr.dragging td.ln,
+.diff tr.selecting-range td.ln {
+  background: var(--select-ln);
 }
 .diff td.blank {
   background: var(--bg-subtle);
@@ -3100,6 +3114,10 @@ textarea.markdown-editor {
 }
 td.ln.commentable {
   cursor: pointer;
+}
+.composer-lines {
+  margin: 0 0 6px;
+  font-size: 12px;
 }
 td.ln.commentable:hover {
   color: var(--accent);

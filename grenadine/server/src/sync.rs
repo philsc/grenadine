@@ -724,8 +724,8 @@ fn merge_pending(comments: &mut Vec<ReviewComment>, pending: &[ReviewComment]) {
 }
 
 /// Marks each review comment that starts a thread with the thread's ID
-/// and whether it's resolved. GitHub keeps the side of a pending comment
-/// only on its thread, so pending comments also get the thread's side.
+/// and whether it's resolved. GitHub keeps the sides of a pending comment
+/// only on its thread, so pending comments also get the thread's sides.
 fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadState>) {
     for c in comments {
         if let Some(t) = threads.get(&c.id) {
@@ -735,6 +735,7 @@ fn apply_threads(comments: &mut [ReviewComment], threads: &BTreeMap<u64, ThreadS
             c.can_resolve = t.can_resolve;
             if c.pending {
                 c.side = t.side;
+                c.start_side = c.start_line.and(t.start_side);
             }
         }
     }
@@ -1575,6 +1576,7 @@ mod tests {
                     resolved_by: None,
                     can_resolve: true,
                     side: Side::Left,
+                    start_side: None,
                 },
             ),
             (
@@ -1588,6 +1590,7 @@ mod tests {
                     }),
                     can_resolve: false,
                     side: Side::Left,
+                    start_side: None,
                 },
             ),
         ]);
@@ -1653,6 +1656,7 @@ mod tests {
                     resolved_by: None,
                     can_resolve: true,
                     side: Side::Left,
+                    start_side: None,
                 },
             ),
             (
@@ -1663,6 +1667,7 @@ mod tests {
                     resolved_by: None,
                     can_resolve: false,
                     side: Side::Left,
+                    start_side: None,
                 },
             ),
         ]);

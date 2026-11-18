@@ -466,8 +466,16 @@ pub struct NewReply {
 pub struct NewThread {
     pub path: String,
     pub side: Side,
-    /// The 1-based line on `side`; `None` comments on the whole file.
+    /// The 1-based line on `side`; `None` comments on the whole file. A
+    /// multi-line thread's last line.
     pub line: Option<u32>,
+    /// A multi-line thread's first line (1-based) on `start_side`; `None`
+    /// for a single line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    /// The side of `start_line`; `None` means `side`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<Side>,
     pub body: String,
 }
 

@@ -19,7 +19,7 @@ use grenadine_core::api::{
     CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
     MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
     PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
-    ServerEvent, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
+    ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -458,13 +458,35 @@ fn require_thread_place(t: &NewThread) -> ApiResult<()> {
     if t.path.is_empty() {
         return Err(refuse(StatusCode::BAD_REQUEST, "the path is empty".into()));
     }
-    if t.line == Some(0) {
+    if t.line == Some(0) || t.start_line == Some(0) {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
             "lines are numbered from 1".into(),
         ));
     }
-    Ok(())
+    match (t.start_line, t.line) {
+        (None, _) if t.start_side.is_some() => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "a start side needs a start line".into(),
+        )),
+        (Some(_), None) => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "a comment on the whole file has no start line".into(),
+        )),
+        (Some(_), Some(_)) if t.start_side == Some(Side::Right) && t.side == Side::Left => {
+            Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "a range can't go from the new side to the old one".into(),
+            ))
+        }
+        (Some(start), Some(end)) if t.start_side.unwrap_or(t.side) == t.side && start >= end => {
+            Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "the start line must come before the line".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Refuses `comment` unless it's the GraphQL ID of one of the viewer's
@@ -1779,6 +1801,37 @@ async fn image(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grenadine_core::api::Side;
+
+    #[test]
+    fn thread_places_github_would_refuse_are_refused() {
+        let thread = |start_side, start_line, line| NewThread {
+            path: "src/lib.rs".into(),
+            side: Side::Right,
+            line,
+            start_line,
+            start_side,
+            body: "Comment".into(),
+        };
+        let ok = |t: NewThread| require_thread_place(&t).is_ok();
+        assert!(ok(thread(None, None, Some(4))));
+        assert!(ok(thread(None, None, None)));
+        assert!(ok(thread(None, Some(2), Some(4))));
+        assert!(ok(thread(Some(Side::Right), Some(2), Some(4))));
+        // Across the sides, the old line may have any number.
+        assert!(ok(thread(Some(Side::Left), Some(9), Some(4))));
+        assert!(!ok(thread(None, Some(0), Some(4))));
+        assert!(!ok(thread(None, Some(4), Some(4))));
+        assert!(!ok(thread(None, Some(5), Some(4))));
+        assert!(!ok(thread(None, Some(2), None)));
+        assert!(!ok(thread(Some(Side::Left), None, Some(4))));
+        // GitHub only takes ranges that cross from the old side to the new.
+        let back = NewThread {
+            side: Side::Left,
+            ..thread(Some(Side::Right), Some(2), Some(4))
+        };
+        assert!(!ok(back));
+    }
 
     #[test]
     fn terminals_only_open_from_the_servers_pages() {
