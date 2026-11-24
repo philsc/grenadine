@@ -331,7 +331,6 @@ pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
         .map_err(|e| e.to_string())
 }
 
-/// The session's open terminals, oldest first.
 /// What runs in the session, for its Processes tab.
 pub async fn processes(id: &str) -> Result<SessionProcesses> {
     check(
@@ -345,6 +344,7 @@ pub async fn processes(id: &str) -> Result<SessionProcesses> {
     .map_err(|e| e.to_string())
 }
 
+/// The session's open terminals, oldest first.
 pub async fn terminals(id: &str) -> Result<Vec<TerminalInfo>> {
     check(
         Request::get(&format!("/api/agents/{id}/terminals"))

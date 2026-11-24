@@ -14,6 +14,10 @@ use crate::debug::bytes;
 /// How often the processes are listed while they show.
 const POLL_EVERY: Duration = Duration::from_secs(2);
 
+/// Snapshots closer together than this, e.g. because the tab was reopened
+/// right away, are too coarse to compare: their times are in 10 ms steps.
+const MIN_CPU_WINDOW_MS: u64 = 500;
+
 /// Snapshots further apart than this, e.g. because the tab was hidden,
 /// don't say how much CPU a process uses now.
 const MAX_CPU_WINDOW_MS: u64 = 10_000;
@@ -80,11 +84,18 @@ fn rows(processes: &[ProcessInfo], collapsed: &HashSet<Key>) -> Vec<Row> {
 }
 
 /// How much of one core each process used between the snapshots, in
-/// percent, for the ones in both.
-fn cpu_percents(before: &SessionProcesses, after: &SessionProcesses) -> HashMap<Key, f64> {
-    let elapsed = after.now_ms.saturating_sub(before.now_ms);
-    if elapsed == 0 || elapsed > MAX_CPU_WINDOW_MS {
-        return HashMap::new();
+/// percent, for the ones in both. `None` if they're too close together to
+/// tell.
+fn cpu_percents(before: &SessionProcesses, after: &SessionProcesses) -> Option<HashMap<Key, f64>> {
+    // The clock starts over when the server's machine reboots.
+    let Some(elapsed) = after.now_ms.checked_sub(before.now_ms) else {
+        return Some(HashMap::new());
+    };
+    if elapsed < MIN_CPU_WINDOW_MS {
+        return None;
+    }
+    if elapsed > MAX_CPU_WINDOW_MS {
+        return Some(HashMap::new());
     }
     let used: HashMap<Key, u64> = before
         .processes
@@ -92,7 +103,7 @@ fn cpu_percents(before: &SessionProcesses, after: &SessionProcesses) -> HashMap<
         .flatten()
         .map(|p| (key(p), p.cpu_ms))
         .collect();
-    after
+    let percents = after
         .processes
         .iter()
         .flatten()
@@ -100,7 +111,8 @@ fn cpu_percents(before: &SessionProcesses, after: &SessionProcesses) -> HashMap<
             let used = p.cpu_ms.saturating_sub(*used.get(&key(p))?);
             Some((key(p), used as f64 / elapsed as f64 * 100.0))
         })
-        .collect()
+        .collect();
+    Some(percents)
 }
 
 /// How long something takes or took, e.g. "0:07", "1:02:03" or "2d 03:04".
@@ -119,6 +131,8 @@ fn elapsed(ms: u64) -> String {
 pub fn ProcessesView(session: String, active: Signal<bool>) -> impl IntoView {
     let snapshot = RwSignal::new(None::<SessionProcesses>);
     let cpu = RwSignal::new(HashMap::<Key, f64>::new());
+    // The snapshot the next one's CPU use is worked out from.
+    let baseline = StoredValue::new(None::<SessionProcesses>);
     let error = RwSignal::new(None::<String>);
     let collapsed = RwSignal::new(HashSet::<Key>::new());
     let loading = StoredValue::new(false);
@@ -140,11 +154,14 @@ pub fn ProcessesView(session: String, active: Signal<bool>) -> impl IntoView {
             }
             match result {
                 Ok(new) => {
-                    cpu.set(snapshot.with_untracked(|old| {
-                        old.as_ref()
-                            .map(|old| cpu_percents(old, &new))
-                            .unwrap_or_default()
-                    }));
+                    let percents = baseline.with_value(|old| match old {
+                        Some(old) => cpu_percents(old, &new),
+                        None => Some(HashMap::new()),
+                    });
+                    if let Some(percents) = percents {
+                        cpu.set(percents);
+                        baseline.set_value(Some(new.clone()));
+                    }
                     if let Some(listed) = &new.processes {
                         let live: HashSet<Key> = listed.iter().map(key).collect();
                         if collapsed.with_untracked(|c| !c.is_subset(&live)) {
@@ -348,11 +365,21 @@ mod tests {
         let after = snapshot(3000, &[(1, 10, 4500), (2, 2000, 100), (3, 2500, 7)]);
         assert_eq!(
             cpu_percents(&before, &after),
-            HashMap::from([((1, 10), 200.0)])
+            Some(HashMap::from([((1, 10), 200.0)]))
         );
-        assert!(cpu_percents(&before, &before).is_empty());
+        // Too close together to tell.
+        assert_eq!(cpu_percents(&before, &before), None);
+        let soon = snapshot(1499, &[(1, 10, 510)]);
+        assert_eq!(cpu_percents(&before, &soon), None);
+        let enough = snapshot(1500, &[(1, 10, 510)]);
+        assert_eq!(
+            cpu_percents(&before, &enough),
+            Some(HashMap::from([((1, 10), 2.0)]))
+        );
+        // The machine rebooted.
+        assert_eq!(cpu_percents(&after, &before), Some(HashMap::new()));
         let late = snapshot(60_000, &[(1, 10, 4500)]);
-        assert!(cpu_percents(&before, &late).is_empty());
+        assert_eq!(cpu_percents(&before, &late), Some(HashMap::new()));
     }
 
     #[test]
