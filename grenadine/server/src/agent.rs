@@ -18,8 +18,9 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, Attachment, BusySession, GENERAL, Landed, LandedPr, NewAgent,
-    PermissionMode, PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, Attachment, AutoReviewState, BusySession, GENERAL, Landed,
+    LandedPr, NewAgent, PermissionMode, PrDetail, PrKey, PromptImage, ServerEvent, SessionKind,
+    WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -584,6 +585,8 @@ struct Live {
     landing: bool,
     /// A background job is writing a handoff the user asked for.
     writing_handoff: bool,
+    /// The automatic review that the session did is being finished.
+    finishing_review: bool,
     /// The user's handoff proposals being answered or answered since the
     /// server started, so that one starts at most one session.
     answered_handoffs: HashSet<String>,
@@ -614,6 +617,7 @@ impl Live {
             wrap_up: None,
             landing: false,
             writing_handoff: false,
+            finishing_review: false,
             answered_handoffs: HashSet::new(),
         }
     }
@@ -2222,9 +2226,11 @@ pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<
 
 /// The sessions a restart of the server would interrupt: those running a
 /// turn, also one that waits for the user's approval, with prompts queued,
-/// landing their work or having a handoff written.
+/// landing their work, having a handoff written, doing an automatic review
+/// that isn't finished, or with a command running in a terminal.
 pub fn busy_sessions(state: &State) -> Vec<BusySession> {
-    let mut ids: Vec<String> = {
+    let terminals = state.agents.terminals.busy();
+    let mut ids: std::collections::BTreeSet<String> = {
         let live = state.agents.live.lock().unwrap();
         live.iter()
             .filter(|(_, l)| {
@@ -2233,20 +2239,55 @@ pub fn busy_sessions(state: &State) -> Vec<BusySession> {
                     || l.wrap_up.is_some()
                     || l.landing
                     || l.writing_handoff
+                    || l.finishing_review
             })
             .map(|(id, _)| id.clone())
             .collect()
     };
-    ids.sort();
+    ids.extend(terminals.keys().cloned());
+    let mut starting = Vec::new();
+    match state.db.auto_reviews() {
+        Ok(reviews) => {
+            for r in reviews {
+                if r.state != AutoReviewState::Running {
+                    continue;
+                }
+                match r.session {
+                    Some(id) => {
+                        ids.insert(id);
+                    }
+                    None => starting.push(BusySession {
+                        id: String::new(),
+                        title: format!("Review #{}: {}", r.key.number, r.title),
+                        terminals: 0,
+                    }),
+                }
+            }
+        }
+        Err(e) => tracing::warn!("can't list the auto-reviews: {e:#}"),
+    }
     ids.into_iter()
         .map(|id| {
             let title = match state.db.agent(&id) {
                 Ok(Some(s)) => s.summary.unwrap_or(s.title),
                 _ => String::new(),
             };
-            BusySession { id, title }
+            let terminals = terminals.get(&id).copied().unwrap_or(0);
+            BusySession {
+                id,
+                title,
+                terminals,
+            }
         })
+        .chain(starting)
         .collect()
+}
+
+/// Has the session count as busy while its automatic review is finished.
+pub fn set_finishing_review(state: &State, id: &str, finishing: bool) {
+    state
+        .agents
+        .with_existing_live(id, |l| l.finishing_review = finishing);
 }
 
 /// Has the session count as busy until the guard is dropped.
@@ -5814,7 +5855,9 @@ esac
         // Each Bash command goes through the hook, which checks its
         // options.
         assert!(args.contains("--settings {\"hooks\""), "{args}");
-        assert!(args.contains(crate::cleanup::BASH_HOOK_ARG), "{args}");
+        // It blocks the command when the hook can't run.
+        let hook = format!("{} || exit 2", crate::cleanup::BASH_HOOK_ARG);
+        assert!(args.contains(&hook), "{args}");
         let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
         assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
 
@@ -6036,7 +6079,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     }
 
     /// A session row with its worktree at `worktree`, never started.
-    fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
+    pub(crate) fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
         AgentSession {
             title: "t".into(),
             branch: session_branch(id),
@@ -9905,6 +9948,75 @@ esac
                 asked: false,
             })
         });
-        assert_eq!(ids(), ["a", "b", "c", "d", "e"]);
+        with("f", |l| l.finishing_review = true);
+        assert_eq!(ids(), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_review_is_busy() {
+        let state = crate::sync::test_state();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 2,
+        };
+        let review = state
+            .db
+            .start_auto_review(&key, "abc", "t", "u", now())
+            .unwrap()
+            .unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1, "its session is being created");
+        assert_eq!(busy[0].title, "Review #2: t");
+
+        // No turn runs anymore, but the review isn't posted yet.
+        let dir = tempfile::tempdir().unwrap();
+        let session = tests::session_row(&uuid(), "o/n", dir.path());
+        state.db.create_agent(&session).unwrap();
+        state
+            .db
+            .set_auto_review_session(review, &session.id)
+            .unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].id, session.id);
+
+        state
+            .db
+            .finish_auto_review(review, AutoReviewState::Posted, None, now())
+            .unwrap();
+        assert!(busy_sessions(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_is_busy_while_it_runs_a_command() {
+        let mut state = crate::sync::test_state();
+        Arc::get_mut(&mut state).unwrap().agents.terminals =
+            crate::terminal::Terminals::new("/bin/sh".into());
+        let dir = tempfile::tempdir().unwrap();
+        let session = tests::session_row(&uuid(), "o/n", dir.path());
+        let id = crate::terminal::open(&state, &session).unwrap().id;
+        let terminal = state.agents.terminals.get(&session.id, id).unwrap();
+        let until = async |done: &dyn Fn() -> bool| {
+            for _ in 0..1500 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the terminal got stuck");
+        };
+        until(&|| terminal.waiting_at_prompt()).await;
+        assert!(busy_sessions(&state).is_empty());
+        assert_eq!(state.agents.terminals.count(), 1);
+
+        terminal.write(b"sleep 600\n").await.unwrap();
+        until(&|| !busy_sessions(&state).is_empty()).await;
+        let busy = busy_sessions(&state);
+        assert_eq!((busy[0].id.as_str(), busy[0].terminals), (&*session.id, 1));
+
+        terminal.write(b"\x03").await.unwrap();
+        until(&|| busy_sessions(&state).is_empty()).await;
+        state.agents.terminals.close_all(&session.id).await;
+        assert_eq!(state.agents.terminals.count(), 0);
     }
 }

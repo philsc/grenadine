@@ -9687,6 +9687,36 @@ chmod 755 "$script"
         self.end_session()
         expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
 
+    def test_waits_for_a_terminal(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        session = self.page.url
+        self.push("After the terminal")
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        tab = self.page.get_by_role("tab", name=re.compile("^Terminal"))
+        expect(tab).to_have_attribute("aria-busy", "false")
+        screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+        expect(screen).to_contain_text(re.compile(r"[$#]"))
+        self.page.keyboard.type("echo in-$((6 * 7)); sleep 600\n")
+        expect(screen).to_contain_text("in-42")
+
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text(
+            "waiting for 1 session; the restart closes 1 terminal"
+        )
+        # At its prompt again, it doesn't hold up the restart.
+        self.page.goto(session)
+        expect(tab).to_have_attribute("aria-busy", "false")
+        self.page.locator(".terminal-host:not([hidden])").click()
+        self.page.keyboard.press("Control+c")
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.page.reload()
+        self.end_session()
+
     def test_failed_build(self) -> None:
         self.broken.touch()
         self.addCleanup(self.broken.unlink)

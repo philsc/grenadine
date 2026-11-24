@@ -876,9 +876,12 @@ build must leave it running, show why the build failed, and put the clone
 back unless someone has changed it meanwhile.
 
 **UPDATE-4.** The restart must wait until no session runs a turn, has
-prompts queued, is landing its work or is having a handoff written. The
-user must be able to cancel it, or to restart at once after being told
-which sessions that stops.
+prompts queued, is landing its work, is having a handoff written or is
+finishing an automatic review, and no terminal runs a command in the
+foreground. A terminal whose shell is at its prompt must not hold it up.
+The user must be able to cancel it, or to restart at once after being told
+which sessions that stops. While it waits, the page must show how many
+open terminals the restart closes.
 
 **UPDATE-5.** The restart must keep the server's process ID, terminal and
 arguments. SIGINT and SIGTERM must still stop the server.
@@ -887,3 +890,9 @@ arguments. SIGINT and SIGTERM must still stop the server.
 loaded from another commit than the server runs must offer a reload and
 must not reload by itself.
 _Why:_ the user may be in the middle of something.
+
+**UPDATE-7.** The restart must run the build that the update made, also
+when the clone or Bazel's output changed during the wait. If that build is
+gone, the server must keep running and show that the update failed. A clone
+that changes during the build must fail the update.
+_Why:_ the wait can take hours, and work in the clone goes on meanwhile.

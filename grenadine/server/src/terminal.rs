@@ -148,6 +148,26 @@ impl Terminals {
         }
     }
 
+    /// How many terminals are open.
+    pub fn count(&self) -> usize {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.values().map(|s| s.open.len()).sum()
+    }
+
+    /// How many terminals run a command in the foreground, for each
+    /// session with any.
+    pub fn busy(&self) -> BTreeMap<String, usize> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .map(|(id, s)| {
+                let busy = s.open.values().filter(|t| !t.at_prompt()).count();
+                (id.clone(), busy)
+            })
+            .filter(|(_, busy)| *busy > 0)
+            .collect()
+    }
+
     fn remove(&self, session: &str, id: u64) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(s) = sessions.get_mut(session) {

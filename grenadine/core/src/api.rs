@@ -1277,8 +1277,11 @@ pub struct CommitInfo {
 /// A session that a restart would interrupt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusySession {
+    /// Empty while an automatic review's session is being created.
     pub id: String,
     pub title: String,
+    /// How many of its terminals run a command.
+    pub terminals: usize,
 }
 
 /// Where the server's update to a newer version stands.
@@ -1294,6 +1297,8 @@ pub enum UpdatePhase {
         /// The commit that was built.
         target: String,
         sessions: Vec<BusySession>,
+        /// How many terminals are open, which the restart closes.
+        terminals: usize,
     },
     Restarting,
     Failed {

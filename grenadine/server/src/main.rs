@@ -69,10 +69,10 @@ fn main() -> Result<()> {
         .build()?;
     match runtime.block_on(grenadine_server::run())? {
         Exit::Stop => Ok(()),
-        Exit::Restart(script) => {
+        Exit::Restart(binary) => {
             runtime.shutdown_timeout(RESTART_GRACE);
             reap_children();
-            exec(&script)
+            exec(&binary)
         }
     }
 }
@@ -91,10 +91,10 @@ fn reap_children() {
     }
 }
 
-/// Replaces this process with `script`, run with the same arguments.
-fn exec(script: &Path) -> Result<()> {
-    let error = std::process::Command::new(script)
+/// Replaces this process with `binary`, run with the same arguments.
+fn exec(binary: &Path) -> Result<()> {
+    let error = std::process::Command::new(binary)
         .args(std::env::args_os().skip(1))
         .exec();
-    Err(error).with_context(|| format!("can't run {}", script.display()))
+    Err(error).with_context(|| format!("can't run {}", binary.display()))
 }

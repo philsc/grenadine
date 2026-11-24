@@ -645,36 +645,44 @@ pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus) {
             return;
         }
     }
+    // Until it's finished and its session deleted, also once the database
+    // has it as posted.
+    agent::set_finishing_review(state, id, true);
     // Its own task, since deleting the session stops the task that runs
     // its turns, which calls this.
     let (state, id) = (state.clone(), id.to_owned());
     tokio::spawn(async move {
-        // A turn that's over quickly can end before `start` recorded
-        // which review the session is doing.
-        let mut review = None;
-        for _ in 0..50 {
-            match state.db.auto_review_of(&id) {
-                Ok(Some(r)) => {
-                    review = Some(r);
-                    break;
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
-                Err(e) => {
-                    tracing::warn!("agent {id}: {e:#}");
-                    return;
-                }
+        finish_session(&state, &id, last).await;
+        agent::set_finishing_review(&state, &id, false);
+    });
+}
+
+async fn finish_session(state: &Arc<State>, id: &str, last: AgentStatus) {
+    // A turn that's over quickly can end before `start` recorded
+    // which review the session is doing.
+    let mut review = None;
+    for _ in 0..50 {
+        match state.db.auto_review_of(id) {
+            Ok(Some(r)) => {
+                review = Some(r);
+                break;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => {
+                tracing::warn!("agent {id}: {e:#}");
+                return;
             }
         }
-        let Some(review) = review.filter(|r| r.state == AutoReviewState::Running) else {
-            return;
-        };
-        if let Err(e) = finish(&state, &id, &review, last).await {
-            tracing::warn!("agent {id}: can't finish the review: {e:#}");
-        }
-        state.send(ServerEvent::AutoReviewsChanged);
-        // Its slot is free for a queued review.
-        start_queued(&state).await;
-    });
+    }
+    let Some(review) = review.filter(|r| r.state == AutoReviewState::Running) else {
+        return;
+    };
+    if let Err(e) = finish(state, id, &review, last).await {
+        tracing::warn!("agent {id}: can't finish the review: {e:#}");
+    }
+    state.send(ServerEvent::AutoReviewsChanged);
+    // Its slot is free for a queued review.
+    start_queued(state).await;
 }
 
 async fn finish(

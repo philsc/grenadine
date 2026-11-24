@@ -224,8 +224,7 @@ impl Signals {
 /// What to do once the server has shut down.
 pub enum Exit {
     Stop,
-    /// Exec this script, which launches the new version, with this
-    /// process's arguments.
+    /// Exec this binary, the new version, with this process's arguments.
     Restart(PathBuf),
 }
 
@@ -235,6 +234,9 @@ pub async fn run() -> Result<Exit> {
     // Claude Code runs the server's binary as the cleanup jobs' hook.
     if std::env::args().nth(1).as_deref() == Some(cleanup::BASH_HOOK_ARG) {
         std::process::exit(cleanup::bash_hook());
+    }
+    if std::env::args().nth(1).as_deref() == Some(update::INSTALL_ARG) {
+        std::process::exit(update::install());
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -251,10 +253,11 @@ pub async fn run() -> Result<Exit> {
         Some(p) => p,
         None => default_db()?,
     };
-    let update = update::Updater::new(update::Build::detect(
-        &token,
-        db_path.with_file_name("restart.sh"),
-    ));
+    // Bazel runs in another directory.
+    let db_path = std::path::absolute(db_path)?;
+    let mut update_dir = db_path.clone().into_os_string();
+    update_dir.push("-update");
+    let update = update::Updater::new(update::Build::detect(&token, update_dir.into()));
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
     let github = github::GitHub::new(&token, &args.github_api)?;
@@ -388,7 +391,7 @@ pub async fn run() -> Result<Exit> {
     let mut exit = Exit::Stop;
     tokio::select! {
         _ = signals.wait() => {}
-        script = updating.update.restart_requested() => exit = Exit::Restart(script),
+        binary = updating.update.restart_requested() => exit = Exit::Restart(binary),
         r = &mut server_task => return r.context("server task panicked")?.context("can't serve").map(|()| Exit::Stop),
     }
     drop(updating);

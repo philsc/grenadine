@@ -58,20 +58,39 @@ fn busy(phase: &UpdatePhase) -> bool {
     !matches!(phase, UpdatePhase::Idle | UpdatePhase::Failed { .. })
 }
 
-fn waiting_label(n: usize) -> String {
+fn count(n: usize, what: &str) -> String {
     match n {
-        1 => "Update ready, waiting for 1 session".into(),
-        n => format!("Update ready, waiting for {n} sessions"),
+        1 => format!("1 {what}"),
+        n => format!("{n} {what}s"),
     }
 }
 
-fn confirm_text(sessions: &[BusySession]) -> String {
+fn waiting_label(sessions: usize, terminals: usize) -> String {
+    let mut text = format!("Update ready, waiting for {}", count(sessions, "session"));
+    if terminals > 0 {
+        text.push_str(&format!(
+            "; the restart closes {}",
+            count(terminals, "terminal")
+        ));
+    }
+    text
+}
+
+fn confirm_text(sessions: &[BusySession], terminals: usize) -> String {
     let mut text = "Restart now? This stops these sessions:\n".to_owned();
     for s in sessions {
         let title = if s.title.is_empty() { &s.id } else { &s.title };
         text.push_str(&format!("\n• {title}"));
+        if s.terminals > 0 {
+            let running = count(s.terminals, "terminal");
+            text.push_str(&format!(" (a command runs in {running})"));
+        }
     }
     text.push_str("\n\nPrompts queued in them are lost.");
+    if terminals > 0 {
+        let closed = count(terminals, "open terminal");
+        text.push_str(&format!(" {closed} will close."));
+    }
     text
 }
 
@@ -96,11 +115,15 @@ pub fn UpdateBar() -> impl IntoView {
             UpdatePhase::CheckingOut => view! { <span>"Updating…"</span> }.into_any(),
             UpdatePhase::Building => view! { <span>"Building the update…"</span> }.into_any(),
             UpdatePhase::Restarting => view! { <span>"Restarting…"</span> }.into_any(),
-            UpdatePhase::Waiting { sessions, .. } => {
-                let label = waiting_label(sessions.len());
+            UpdatePhase::Waiting {
+                sessions,
+                terminals,
+                ..
+            } => {
+                let label = waiting_label(sessions.len(), terminals);
                 let force = move |_| {
                     if !window()
-                        .confirm_with_message(&confirm_text(&sessions))
+                        .confirm_with_message(&confirm_text(&sessions, terminals))
                         .unwrap_or(false)
                     {
                         return;
@@ -243,13 +266,23 @@ mod tests {
 
     #[test]
     fn confirmation_names_the_sessions() {
-        let session = |id: &str, title: &str| BusySession {
+        let session = |id: &str, title: &str, terminals| BusySession {
             id: id.into(),
             title: title.into(),
+            terminals,
         };
-        let text = confirm_text(&[session("1", "Fix it"), session("2", "")]);
-        assert!(text.contains("• Fix it\n• 2\n"), "{text}");
-        assert_eq!(waiting_label(1), "Update ready, waiting for 1 session");
-        assert_eq!(waiting_label(2), "Update ready, waiting for 2 sessions");
+        let busy = [session("1", "Fix it", 0), session("2", "", 2)];
+        let text = confirm_text(&busy, 3);
+        assert!(
+            text.contains("• Fix it\n• 2 (a command runs in 2 terminals)\n"),
+            "{text}"
+        );
+        assert!(text.ends_with(" 3 open terminals will close."), "{text}");
+        assert!(!confirm_text(&busy, 0).contains("open terminal"));
+        assert_eq!(waiting_label(1, 0), "Update ready, waiting for 1 session");
+        assert_eq!(
+            waiting_label(2, 1),
+            "Update ready, waiting for 2 sessions; the restart closes 1 terminal"
+        );
     }
 }
