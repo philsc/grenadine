@@ -724,6 +724,11 @@ class ServerTestCase(unittest.TestCase):
         gh.repo(scenarios.REPO)
 
     @classmethod
+    def prepare(cls, tmp: Path, bin_dir: Path, env: dict[str, str]) -> None:
+        """Changes what the server is started with: the directory first on
+        its PATH, and its environment."""
+
+    @classmethod
     def setUpClass(cls) -> None:
         tmp = Path(tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR")))
 
@@ -774,6 +779,8 @@ class ServerTestCase(unittest.TestCase):
                 check=True,
             )
             repo_flags.append(f"--repo={clone}")
+
+        cls.prepare(tmp, bin_dir, env)
 
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
@@ -9533,6 +9540,166 @@ class CleanupTest(ServerTestCase):
             ).click()
             expect(items).to_have_count(n)
         expect(select_all).to_have_count(0)
+
+
+class UpdateTest(ServerTestCase):
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.commit("Seed", {"README": "hello\n"})
+        repo.push("main")
+
+    @classmethod
+    def prepare(cls, tmp: Path, bin_dir: Path, env: dict[str, str]) -> None:
+        # The clone that the server was "built" in.
+        cls.workspace = tmp / "workspace"
+        for args in (
+            ["clone", "--quiet", f"https://github.com/{scenarios.REPO}"],
+            ["-C", cls.workspace, "checkout", "--quiet", "--detach"],
+        ):
+            target = [cls.workspace] if args[0] == "clone" else []
+            subprocess.run(["git", *args, *target], env=env, check=True)
+        # Fails while the file is there.
+        cls.broken = tmp / "broken"
+        server = Path(os.environ["GRENADINE_SERVER"]).absolute()
+        bazel = bin_dir / "bazel"
+        bazel.write_text(
+            f"""#!/bin/sh
+if [ -e {cls.broken} ]; then
+    echo "ERROR: it does not compile" >&2
+    exit 1
+fi
+for arg; do
+    case "$arg" in --script_path=*) script="${{arg#--script_path=}}" ;; esac
+done
+printf '#!/bin/sh\\nexec {server} "$@"\\n' > "$script"
+chmod 755 "$script"
+"""
+        )
+        bazel.chmod(0o755)
+        env["BUILD_WORKSPACE_DIRECTORY"] = str(cls.workspace)
+
+    def push(self, title: str) -> str:
+        """Pushes a commit to main and returns it."""
+        repo = self.gh.repo(scenarios.REPO)
+        repo.commit(title, {"README": f"{title}\n"})
+        repo.push("main")
+        return repo.tip("main")
+
+    def head(self) -> str:
+        return self.gh.git("-C", str(self.workspace), "rev-parse", "HEAD").strip()
+
+    def section(self) -> Locator:
+        return self.page.locator(".update-server")
+
+    def bar(self) -> Locator:
+        return self.page.locator(".update-bar")
+
+    def start_session(self) -> None:
+        """Starts a session that stays busy for a while."""
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("sleep 600")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+    def end_session(self) -> None:
+        """Deletes the session, which the page shows."""
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.locator(".agent-actions").get_by_role("button", name="Delete").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
+    def test_updates_in_place(self) -> None:
+        pushed = self.push("Shiny feature")
+        pid = self.server.pid
+        self.page.goto(self.url + "#/debug")
+        # Another test's commits may be there too.
+        expect(self.section()).to_contain_text("behind origin/main:")
+        expect(self.section().locator("li").first).to_have_text("Shiny feature")
+        self.section().get_by_role("button", name="Update and restart").click()
+
+        # The page stays on the version it loaded until it's reloaded.
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.assertEqual(self.head(), pushed)
+        self.assertIsNone(self.server.poll())
+        self.assertEqual(self.server.pid, pid)
+        self.bar().get_by_role("button", name="Reload").click()
+        expect(self.section()).to_contain_text(f"Running {pushed[:8]}")
+        expect(self.section()).to_contain_text("Up to date with origin/main.")
+        expect(
+            self.section().get_by_role("button", name="Rebuild and restart")
+        ).to_be_enabled()
+        expect(self.bar()).to_have_count(0)
+
+    def test_waits_for_sessions(self) -> None:
+        self.start_session()
+        session = self.page.url
+        pushed = self.push("Waited for")
+        self.page.goto(self.url + "#/debug")
+        button = self.section().get_by_role("button", name="Update and restart")
+        button.click()
+        waiting = "Update ready, waiting for 1 session"
+        expect(self.bar()).to_contain_text(waiting)
+        expect(button).to_be_disabled()
+        # Every page shows it.
+        self.page.goto(session)
+        expect(self.bar()).to_contain_text(waiting)
+
+        # Cancelled, the server keeps running what it ran.
+        self.bar().get_by_role("button", name="Cancel").click()
+        expect(self.bar()).to_have_count(0)
+        self.page.goto(self.url + "#/debug")
+        expect(self.section()).to_contain_text("Waited for")
+        button.click()
+
+        # Forcing it names what it stops, and can be declined.
+        messages: list[str] = []
+
+        def answer(accept: bool) -> None:
+            def handle(dialog: Dialog) -> None:
+                messages.append(dialog.message)
+                if accept:
+                    dialog.accept()
+                else:
+                    dialog.dismiss()
+
+            self.page.once("dialog", handle)
+            self.bar().get_by_role("button", name="Restart now").click()
+
+        answer(False)
+        self.assertIn("• Task: sleep 600", messages[0])
+        expect(self.bar()).to_contain_text(waiting)
+        answer(True)
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.page.goto(session)
+        self.page.reload()
+        expect(self.page.locator(".agent-header")).to_contain_text("interrupted")
+        self.assertEqual(self.head(), pushed)
+        self.end_session()
+
+    def test_restarts_when_the_session_is_done(self) -> None:
+        self.start_session()
+        session = self.page.url
+        self.push("After the session")
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text("waiting for 1 session")
+        self.page.goto(session)
+        self.end_session()
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+
+    def test_failed_build(self) -> None:
+        self.broken.touch()
+        self.addCleanup(self.broken.unlink)
+        before = self.head()
+        self.push("Broken")
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text("The update failed")
+        self.bar().locator("summary").click()
+        expect(self.bar().locator("pre")).to_contain_text("ERROR: it does not compile")
+        self.assertEqual(self.head(), before)
+        self.bar().get_by_role("button", name="Dismiss").click()
+        expect(self.bar()).to_have_count(0)
 
 
 if __name__ == "__main__":

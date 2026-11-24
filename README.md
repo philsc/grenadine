@@ -10,9 +10,20 @@ bazel run //grenadine/server -- --repo=PATH[:REMOTE]
 
 See [AGENTS.md](AGENTS.md) for building, testing and linting.
 
+- [Updating](#updating)
 - [Inbox filters](#inbox-filters)
 - [Default inboxes](#default-inboxes)
 - [Auto-reviews](#auto-reviews)
+
+## Updating
+
+The Debug tab's "Update and restart" button checks out the newest `origin/main` in the clone that `bazel run` started the server from, builds it, and restarts the server in place once no agent session is busy. The clone must have a detached HEAD without local changes:
+
+```sh
+git fetch origin && git checkout --detach origin/main
+```
+
+The build uses the running server's compilation mode, e.g. `-c opt`. Put any other Bazel flags it needs in `.bazelrc.user`. If a new version fails at startup, start the server again by hand.
 
 ## Inbox filters
 

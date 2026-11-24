@@ -159,6 +159,8 @@ pub struct State {
     pub started_at: i64,
     /// What /api/debug/system samples through.
     pub system: crate::system::Sampler,
+    /// Updates the server to a newer version.
+    pub update: crate::update::Updater,
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -1126,6 +1128,7 @@ pub fn test_state_with_agents(
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
+        update: crate::update::Updater::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }

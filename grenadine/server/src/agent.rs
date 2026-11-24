@@ -18,8 +18,8 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, Attachment, GENERAL, Landed, LandedPr, NewAgent, PermissionMode,
-    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, Attachment, BusySession, GENERAL, Landed, LandedPr, NewAgent,
+    PermissionMode, PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -2218,6 +2218,48 @@ impl Drop for Landing {
 /// between turns.
 pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<String>)> {
     state.agents.with_live(id, |l| l.turn.clone())
+}
+
+/// The sessions a restart of the server would interrupt: those running a
+/// turn, also one that waits for the user's approval, with prompts queued,
+/// landing their work or having a handoff written.
+pub fn busy_sessions(state: &State) -> Vec<BusySession> {
+    let mut ids: Vec<String> = {
+        let live = state.agents.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, l)| {
+                l.running
+                    || !l.queue.is_empty()
+                    || l.wrap_up.is_some()
+                    || l.landing
+                    || l.writing_handoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            let title = match state.db.agent(&id) {
+                Ok(Some(s)) => s.summary.unwrap_or(s.title),
+                _ => String::new(),
+            };
+            BusySession { id, title }
+        })
+        .collect()
+}
+
+/// Has the session count as busy until the guard is dropped.
+#[cfg(test)]
+pub(crate) fn busy_for_test(state: &Arc<State>, id: &str) -> impl Drop + use<> {
+    struct Busy(Arc<State>, String);
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            self.0.agents.with_live(&self.1, |l| l.running = false);
+        }
+    }
+    state.agents.with_live(id, |l| l.running = true);
+    Busy(state.clone(), id.to_owned())
 }
 
 /// Marks the session as having a handoff written for the user. False,
@@ -9834,5 +9876,35 @@ esac
             "{}",
             found[0].detail
         );
+    }
+
+    #[tokio::test]
+    async fn busy_sessions_are_those_a_restart_interrupts() {
+        let state = crate::sync::test_state();
+        let ids = || -> Vec<String> { busy_sessions(&state).into_iter().map(|s| s.id).collect() };
+        let with = |id: &str, f: fn(&mut Live)| state.agents.with_live(id, f);
+        with("idle", |_| {});
+        assert!(ids().is_empty());
+        with("a", |l| l.running = true);
+        with("b", |l| {
+            l.queue.push_back(Queued {
+                prompt: String::new(),
+                images: Vec::new(),
+                attachments: Vec::new(),
+                mode: PermissionMode::from("auto"),
+                model: None,
+            })
+        });
+        with("c", |l| l.landing = true);
+        with("d", |l| l.writing_handoff = true);
+        with("e", |l| {
+            l.wrap_up = Some(Pending {
+                target: WrapUpTarget::Checkout,
+                mode: PermissionMode::from("auto"),
+                model: None,
+                asked: false,
+            })
+        });
+        assert_eq!(ids(), ["a", "b", "c", "d", "e"]);
     }
 }

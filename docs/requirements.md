@@ -9,6 +9,7 @@ reviews can refer to it.
 - [Reviews and merge state](#reviews-and-merge-state)
 - [Agent stacks](#agent-stacks)
 - [Agent handoffs](#agent-handoffs)
+- [Server updates](#server-updates)
 
 # Stacked PRs
 
@@ -854,3 +855,35 @@ that handed it off.
 
 **AGENT-HANDOFF-LINK-2.** The tool must return once the new session has
 started, without waiting for its work.
+
+# Server updates
+
+These requirements cover updating the running server to the newest
+`origin/main` from the UI.
+
+**UPDATE-1.** The Debug tab must show the commit the server runs, the
+commits of `origin/main` it doesn't have, and a button to update. A server
+that wasn't started with `bazel run` must not offer to update.
+
+**UPDATE-2.** An update must build in the clone that `bazel run` started
+the server from. It must refuse to touch a clone that has a branch checked
+out, uncommitted changes to tracked files, or commits that aren't in
+`origin/main`.
+_Why:_ the clone may hold someone's work.
+
+**UPDATE-3.** The server must go on serving during the build. A failed
+build must leave it running, show why the build failed, and put the clone
+back unless someone has changed it meanwhile.
+
+**UPDATE-4.** The restart must wait until no session runs a turn, has
+prompts queued, is landing its work or is having a handoff written. The
+user must be able to cancel it, or to restart at once after being told
+which sessions that stops.
+
+**UPDATE-5.** The restart must keep the server's process ID, terminal and
+arguments. SIGINT and SIGTERM must still stop the server.
+
+**UPDATE-6.** Every page must show the update's progress. A page that was
+loaded from another commit than the server runs must offer a reload and
+must not reload by itself.
+_Why:_ the user may be in the middle of something.

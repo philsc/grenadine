@@ -132,6 +132,10 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/debug/github", get(github_usage))
         .route("/api/debug/system", get(system_stats))
         .route("/api/events", get(events))
+        .route("/api/update", get(update_status).post(start_update))
+        .route("/api/update/check", get(check_update))
+        .route("/api/update/force", post(force_update))
+        .route("/api/update/cancel", post(cancel_update))
         .route("/api/repos", get(repos))
         .route(
             "/api/repos/{owner}/{name}/settings",
@@ -975,6 +979,37 @@ async fn system_stats(AxState(state): St) -> ApiResult<Json<grenadine_core::api:
     })
     .await?;
     Ok(Json(stats))
+}
+
+/// Where the server's update to a newer version stands.
+async fn update_status(AxState(state): St) -> Json<grenadine_core::api::UpdateStatus> {
+    Json(state.update.status())
+}
+
+/// What an update would bring.
+async fn check_update(AxState(state): St) -> ApiResult<Json<grenadine_core::api::UpdateCheck>> {
+    Ok(Json(crate::update::check(&state).await?))
+}
+
+async fn start_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(crate::update::start(&state), "can't start an update now")
+}
+
+/// Restarts into the waiting update without waiting any longer.
+async fn force_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(state.update.force(), "no update is waiting")
+}
+
+/// Drops the waiting update, or dismisses a failed one.
+async fn cancel_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(crate::update::cancel(&state), "no update is waiting")
+}
+
+fn accepted(ok: bool, otherwise: &str) -> ApiResult<StatusCode> {
+    if !ok {
+        return Err(refuse(StatusCode::CONFLICT, otherwise.into()));
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Keep-alives as a named "ping" event rather than a comment, so that the

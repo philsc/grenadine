@@ -1,7 +1,16 @@
 //! The grenadine binary: the server with the web UI's files embedded.
 
-use anyhow::Result;
+use std::os::unix::process::CommandExt as _;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use grenadine_server::Exit;
 use grenadine_server::assets::{self, Asset};
+
+/// How long a restart waits for blocking work, and then for killed child
+/// processes, to end.
+const RESTART_GRACE: Duration = Duration::from_secs(2);
 
 const ASSETS: &[Asset] = &[
     Asset {
@@ -51,8 +60,41 @@ const ASSETS: &[Asset] = &[
     },
 ];
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     assets::set(ASSETS);
-    grenadine_server::run().await
+    // Not #[tokio::main]: a restart may only exec once the runtime is gone,
+    // since dropping its tasks kills the processes they run.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    match runtime.block_on(grenadine_server::run())? {
+        Exit::Stop => Ok(()),
+        Exit::Restart(script) => {
+            runtime.shutdown_timeout(RESTART_GRACE);
+            reap_children();
+            exec(&script)
+        }
+    }
+}
+
+/// Collects the child processes that have ended: the new version keeps
+/// this process's PID, and would keep them as zombies.
+fn reap_children() {
+    let deadline = Instant::now() + RESTART_GRACE;
+    while Instant::now() < deadline {
+        // SAFETY: waitpid accepts a null status pointer.
+        match unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } {
+            -1 => return,
+            0 => std::thread::sleep(Duration::from_millis(20)),
+            _ => {}
+        }
+    }
+}
+
+/// Replaces this process with `script`, run with the same arguments.
+fn exec(script: &Path) -> Result<()> {
+    let error = std::process::Command::new(script)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error).with_context(|| format!("can't run {}", script.display()))
 }

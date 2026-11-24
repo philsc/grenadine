@@ -545,11 +545,9 @@ fn parse_line(line: &str) -> Parsed {
 /// The settings that have this binary check each of a job's Bash commands
 /// as its PreToolUse hook, `cleanup::bash_hook`.
 fn bash_hook_settings() -> Result<Value> {
-    let exe = std::env::current_exe().context("can't find the server's executable")?;
-    let exe = exe
-        .to_str()
-        .and_then(|e| shlex::try_quote(e).ok())
-        .ok_or_else(|| anyhow!("can't quote {}", exe.display()))?;
+    // Not the executable's path: once a build has replaced the file, the
+    // path has another version's binary, or none, at it.
+    let exe = format!("/proc/{}/exe", std::process::id());
     let hook = format!("{exe} {}", crate::cleanup::BASH_HOOK_ARG);
     Ok(json!({"hooks": {"PreToolUse": [{
         "matcher": "Bash",
