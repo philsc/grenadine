@@ -8093,6 +8093,9 @@ class AgentTest(ServerTestCase):
         plans.get_by_role("button", name="Keep planning").click()
         expect(plans).to_have_count(2)
         expect(plans.first).to_contain_text("Plan sent back")
+        expect(plans.first.locator(".ask-times")).to_have_text(
+            re.compile(r"^Asked \d{2}:\d{2} · Sent back \d{2}:\d{2}$")
+        )
         # The feedback stays in the transcript, between the two plans.
         feedback = transcript.locator(".approval.plan ~ .turn-msg .turn-prompt")
         expect(feedback).to_have_text("Add a title")
@@ -8109,6 +8112,9 @@ class AgentTest(ServerTestCase):
         after.select_option(label="Accept edits")
         revised.get_by_role("button", name="Approve plan").click()
         expect(revised).to_contain_text("Plan approved")
+        expect(revised.locator(".ask-times")).to_have_text(
+            re.compile(r"^Asked \d{2}:\d{2} · Approved \d{2}:\d{2}$")
+        )
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
@@ -8146,6 +8152,47 @@ class AgentTest(ServerTestCase):
         # Reloaded, the stored events still hold the answer.
         self.page.reload()
         expect(transcript.locator(".question-answer")).to_have_text("Go ahead")
+
+    def test_question_times(self) -> None:
+        asked = r"Asked \d{2}:\d{2}"
+        title = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d{2}:\d{2}$")
+        question = self.page.locator(".transcript .approval.questions")
+        times = question.locator(".ask-times")
+
+        def ask() -> None:
+            self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+            self.page.get_by_label("Permissions").select_option(
+                label="Ask for everything"
+            )
+            self.page.get_by_label("Prompt").fill("question the plan")
+            self.page.get_by_role("button", name="Start").click()
+            expect(question).to_contain_text("Claude asks")
+
+        # A question that waits only has the time it was asked.
+        ask()
+        expect(times).to_have_text(re.compile(f"^{asked}$"))
+        question.get_by_label("Go ahead").check()
+        question.get_by_role("button", name="Answer").click()
+        answered = re.compile(rf"^{asked} · Answered \d{{2}}:\d{{2}}$")
+        expect(times).to_have_text(answered)
+        for i in range(2):
+            expect(times.locator("time").nth(i)).to_have_attribute("title", title)
+        self.page.reload()
+        expect(times).to_have_text(answered)
+
+        # Without an answer, the time it was skipped shows.
+        ask()
+        question.get_by_role("button", name="Skip").click()
+        expect(question).to_contain_text("Not answered")
+        expect(times).to_have_text(re.compile(rf"^{asked} · Closed \d{{2}}:\d{{2}}$"))
+
+        # A question that expired with the server doesn't say when.
+        ask()
+        self.stop_server()
+        self.start_server()
+        self.page.reload()
+        expect(question).to_contain_text("Not answered")
+        expect(times).to_have_text(re.compile(f"^{asked}$"))
 
     def test_half_answered_question_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
