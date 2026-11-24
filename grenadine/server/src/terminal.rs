@@ -110,6 +110,16 @@ impl Terminals {
             .cloned()
     }
 
+    /// The session's open terminals by their shells' PIDs.
+    pub fn shells(&self, session: &str) -> HashMap<u32, u64> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .map(|s| s.open.iter().map(|(&id, t)| (t.pid, id)).collect())
+            .unwrap_or_default()
+    }
+
     /// Hangs up on the terminal. Returns false when there is no such
     /// terminal.
     pub fn close(&self, session: &str, id: u64) -> bool {

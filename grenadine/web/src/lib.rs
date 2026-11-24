@@ -20,6 +20,7 @@ mod markdown;
 mod pr;
 mod pr_agents;
 mod pr_threads;
+mod processes;
 mod review;
 mod settings;
 mod sidebar;

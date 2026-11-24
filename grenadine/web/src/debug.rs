@@ -32,7 +32,7 @@ fn thousands(n: u32) -> String {
 
 /// `n` bytes in binary units, e.g. "512 MiB"; GiB and up get one
 /// decimal, e.g. "11.3 GiB".
-fn bytes(n: u64) -> String {
+pub fn bytes(n: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;

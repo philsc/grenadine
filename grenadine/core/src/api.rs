@@ -1269,6 +1269,35 @@ pub struct TerminalInfo {
     pub id: u64,
 }
 
+/// What runs in an agent session, for its Processes tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProcesses {
+    /// Milliseconds since boot when the snapshot was taken.
+    pub now_ms: u64,
+    /// `None` when there is no systemd user manager, whose slices tell
+    /// which processes are the session's.
+    pub processes: Option<Vec<ProcessInfo>>,
+}
+
+/// One process of an agent session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    /// The parent, which may be outside the session.
+    pub ppid: u32,
+    /// Milliseconds since boot when it started. Tells it from another
+    /// process that reuses its PID.
+    pub started_ms: u64,
+    /// The CPU time it used so far, in all its threads.
+    pub cpu_ms: u64,
+    pub rss_bytes: u64,
+    /// Its arguments on one line, possibly cut off, or its name in
+    /// brackets if it has none.
+    pub command: String,
+    /// The terminal whose shell it is.
+    pub terminal: Option<u64>,
+}
+
 /// The size a page fits a terminal to, sent as a WebSocket text message.
 /// Binary messages carry the terminal's input and output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

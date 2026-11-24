@@ -11,8 +11,8 @@ use grenadine_core::api::{
     AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState,
     EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged,
     NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview,
-    SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
+    PrMissing, PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SessionProcesses,
+    SubmitReview, SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -332,6 +332,19 @@ pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
 }
 
 /// The session's open terminals, oldest first.
+/// What runs in the session, for its Processes tab.
+pub async fn processes(id: &str) -> Result<SessionProcesses> {
+    check(
+        Request::get(&format!("/api/agents/{id}/processes"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
 pub async fn terminals(id: &str) -> Result<Vec<TerminalInfo>> {
     check(
         Request::get(&format!("/api/agents/{id}/terminals"))

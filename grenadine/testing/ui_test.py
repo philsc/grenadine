@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest_bazel
-from playwright.sync_api import Dialog, Locator, expect, sync_playwright
+from playwright.sync_api import Dialog, Locator, Route, expect, sync_playwright
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import (
@@ -5322,7 +5322,9 @@ class AgentTest(ServerTestCase):
         # bottom of the transcript in view.
         scroll_to(0)
         toggle_to("true")
-        expect(self.page.get_by_role("tab")).to_have_text(["Terminal 1"])
+        expect(self.page.get_by_role("tab", name=re.compile("^Terminal"))).to_have_text(
+            ["Terminal 1"]
+        )
         self.assertAlmostEqual(below(), 0, delta=1)
 
         # Scrolled up, the pane keeps its distance from the bottom as the
@@ -7032,7 +7034,7 @@ class AgentTest(ServerTestCase):
         self.page.get_by_role("button", name="Start").click()
         expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
         session = Path(self.page.locator(".agent-worktree").inner_text()).name
-        tabs = self.page.get_by_role("tab")
+        tabs = self.page.get_by_role("tab", name=re.compile("^Terminal"))
         screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
 
         def wait_for_shell(tab: Locator) -> None:
@@ -7146,6 +7148,159 @@ class AgentTest(ServerTestCase):
         self.assertEqual(handshake("http://evil.example"), 403)
         self.assertEqual(handshake(f"http://127.0.0.1:{port}"), 101)
 
+    def test_processes(self) -> None:
+        self.session_page(1200)
+        toggle = self.page.get_by_role("button", name="Terminal", exact=True)
+        tab = self.page.get_by_role("tab", name="Processes")
+        terminals = self.page.get_by_role("tab", name=re.compile("^Terminal"))
+        pane = self.page.locator(".processes")
+        rows = pane.locator("tbody tr")
+        no_systemd = pane.get_by_text("needs a systemd user manager")
+
+        # The tab opens the panel without starting a shell, and so does the
+        # toggle while the tab is selected. A reload comes back to it.
+        tab.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(
+            no_systemd.or_(pane.get_by_text("No processes are running.")).or_(
+                rows.first
+            )
+        ).to_be_visible()
+        toggle.click()
+        expect(pane).to_be_hidden()
+        toggle.click()
+        expect(pane).to_be_visible()
+        self.page.reload()
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(pane).to_be_visible()
+        expect(terminals).to_have_count(0)
+
+        # What a terminal runs is below its shell until it ends. Slices
+        # need a systemd user manager; without one a note stands in.
+        self.page.get_by_role("button", name="New terminal").click()
+        expect(terminals).to_have_attribute("aria-busy", "false")
+        screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+        expect(screen).to_contain_text(re.compile(r"[$#]"))
+        self.page.keyboard.type("sleep 98765\n")
+        tab.click()
+        shell = rows.filter(has_text="Terminal 1: ")
+        sleep = rows.filter(has_text=re.compile(r"sleep 98765$"))
+        expect(no_systemd.or_(sleep)).to_be_visible()
+        if no_systemd.count() == 0:
+            expect(shell).to_have_count(1)
+            shell.get_by_role("button").click()
+            expect(shell).to_contain_text("(1 hidden)")
+            expect(sleep).to_have_count(0)
+            shell.get_by_role("button").click()
+            expect(sleep).to_have_count(1)
+            terminals.click()
+            # The click on the tab doesn't reach the shell.
+            self.page.locator(".terminal-host:not([hidden])").click()
+            self.page.keyboard.press("Control+C")
+            tab.click()
+            expect(sleep).to_have_count(0)
+
+        # The panel stays open on the tab as the last shell closes.
+        self.page.get_by_role("button", name="Close terminal 1").click()
+        expect(terminals).to_have_count(0)
+        expect(pane).to_be_visible()
+
+    def test_processes_tree(self) -> None:
+        self.session_page(1200)
+        now_ms = 10_000_000
+
+        def process(pid: int, ppid: int, command: str, **kwargs: object) -> dict:
+            return {
+                "pid": pid,
+                "ppid": ppid,
+                "started_ms": 9_000_000 + pid,
+                "cpu_ms": 0,
+                "rss_bytes": 5 << 20,
+                "command": command,
+                "terminal": None,
+                **kwargs,
+            }
+
+        snapshot: dict = {
+            "now_ms": now_ms,
+            "processes": [
+                process(300, 1, "bazel(made-up)"),
+                process(301, 300, "linux-sandbox test"),
+                process(100, 2, "claude " + "x" * 4000),
+                process(101, 100, "bash -c build"),
+                process(102, 101, "bazel build"),
+                process(200, 2, "/bin/sh -l", terminal=1),
+            ],
+        }
+        status = 200
+        polls = 0
+
+        def answer(route: Route) -> None:
+            nonlocal polls
+            polls += 1
+            if status != 200:
+                route.fulfill(status=status, body="made-up failure")
+                return
+            route.fulfill(json=snapshot)
+
+        self.page.route("**/api/agents/*/processes", answer)
+        self.page.get_by_role("tab", name="Processes").click()
+        pane = self.page.locator(".processes")
+        pids = pane.locator("tbody tr td:first-child")
+        expect(pids).to_have_text(["100", "101", "102", "200", "300", "301"])
+        indents = pane.locator(".process-command").evaluate_all(
+            "es => es.map(e => parseFloat(e.style.paddingLeft) / 1.4)"
+        )
+        self.assertEqual([round(i) for i in indents], [0, 1, 2, 0, 0, 1])
+        row = pane.locator("tr[data-pid='300']")
+        expect(row.locator("td")).to_have_text(
+            ["300", "", "5 MiB", "16:39", re.compile(r"bazel\(made-up\)")]
+        )
+        expect(pane.locator("tr[data-pid='200']")).to_contain_text(
+            "Terminal 1: /bin/sh -l"
+        )
+        # A long command doesn't widen the table past the panel.
+        self.assertTrue(pane.evaluate("e => e.scrollWidth <= e.clientWidth"))
+
+        # A collapsed process stays so across updates, which show the CPU
+        # used since the last one.
+        toggle = pane.locator("tr[data-pid='100']").get_by_role("button")
+        toggle.click()
+        expect(pids).to_have_text(["100", "200", "300", "301"])
+        expect(pane.locator("tr[data-pid='100']")).to_contain_text("(2 hidden)")
+        snapshot = {
+            "now_ms": now_ms + 2000,
+            "processes": [
+                {**p, "cpu_ms": 3000 if p["pid"] == 300 else 0}
+                for p in snapshot["processes"]
+                if p["pid"] != 301
+            ],
+        }
+        expect(row.locator("td").nth(1)).to_have_text("150%")
+        expect(pids).to_have_text(["100", "200", "300"])
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        # A failed update keeps the tree.
+        status = 500
+        expect(pane.locator(".error")).to_contain_text("made-up failure")
+        expect(pids).to_have_text(["100", "200", "300"])
+        status = 200
+        expect(pane.locator(".error")).to_have_count(0)
+
+        # Collapsing the panel stops the polls.
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        self.page.wait_for_timeout(500)
+        before = polls
+        self.page.wait_for_timeout(3000)
+        self.assertEqual(polls, before)
+
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        snapshot = {"now_ms": now_ms, "processes": []}
+        expect(pane).to_contain_text("No processes are running.")
+        snapshot = {"now_ms": now_ms, "processes": None}
+        expect(pane).to_contain_text("needs a systemd user manager")
+
     def pr_page(self) -> Locator:
         """The PR page's agents panel, in a window wide enough for the sidebar."""
         self.page.set_viewport_size({"width": 1800, "height": 900})
@@ -7201,7 +7356,7 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(
             re.compile(f"#/{scenarios.REPO}/{self.panel_pr.number}$")
         )
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(1)
         expect(tabs.first).to_have_attribute("aria-selected", "true")
         transcript = panel.locator(".transcript")
@@ -7220,7 +7375,7 @@ class AgentTest(ServerTestCase):
 
         panel = self.pr_page()
         panel.locator(".pr-agents-toggle").click()
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(2)
         # Oldest first, and the oldest is the one opened.
         expect(tabs.first).to_contain_text("say one")
@@ -7273,7 +7428,7 @@ class AgentTest(ServerTestCase):
         # The expansion and the selected tab survive a reload.
         self.page.reload()
         expect(toggle).to_have_attribute("aria-expanded", "true")
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(1)
         expect(tabs.first).to_have_attribute("aria-selected", "true")
         expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
@@ -7288,7 +7443,7 @@ class AgentTest(ServerTestCase):
         expect(panel.locator(".transcript .turn-end")).to_have_count(1)
         terminals = panel.locator(".terminal-panel")
         toggle = terminals.get_by_role("button", name="Terminal", exact=True)
-        tabs = terminals.get_by_role("tab")
+        tabs = terminals.get_by_role("tab", name=re.compile("^Terminal"))
         screen = terminals.locator(".terminal-host:not([hidden]) .xterm-rows")
 
         # The session's terminal panel starts collapsed under its chat;
@@ -7318,7 +7473,9 @@ class AgentTest(ServerTestCase):
 
         # It's the same shell the session's own page shows.
         self.page.get_by_role("link", name="Open in Agents tab").click()
-        page_tabs = self.page.locator(".terminal-panel").get_by_role("tab")
+        page_tabs = self.page.locator(".terminal-panel").get_by_role(
+            "tab", name=re.compile("^Terminal")
+        )
         expect(page_tabs).to_have_text(["Terminal 1"])
         expect(
             self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
