@@ -723,6 +723,9 @@ class ServerTestCase(unittest.TestCase):
         """Adds the PRs the tests expect; there are none by default."""
         gh.repo(scenarios.REPO)
 
+    # Whether the database may go on tmpfs, which can be mounted noexec.
+    DB_ON_TMPFS: ClassVar[bool] = True
+
     @classmethod
     def prepare(cls, tmp: Path, bin_dir: Path, env: dict[str, str]) -> None:
         """Changes what the server is started with: the directory first on
@@ -790,7 +793,7 @@ class ServerTestCase(unittest.TestCase):
         # is busy with other actions' inputs held the server's startup for
         # 30s. The worktrees stay where the server would put them.
         db_dir = tmp
-        if os.access("/dev/shm", os.W_OK):
+        if cls.DB_ON_TMPFS and os.access("/dev/shm", os.W_OK):
             db_dir = Path(tempfile.mkdtemp(dir="/dev/shm"))
             cls.addClassCleanup(shutil.rmtree, db_dir, ignore_errors=True)
         cls.server_args = (
@@ -9543,6 +9546,9 @@ class CleanupTest(ServerTestCase):
 
 
 class UpdateTest(ServerTestCase):
+    # The server runs its new build from next to the database.
+    DB_ON_TMPFS = False
+
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
         repo = gh.repo(scenarios.REPO)
