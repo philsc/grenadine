@@ -1212,8 +1212,9 @@ pub struct ServerStats {
 pub struct SessionResources {
     pub id: String,
     pub title: String,
-    /// A short summary of the first prompt, written in the background;
-    /// `None` until it's written, or if writing it failed.
+    /// A short summary of the first prompt and, if needed, the PR the
+    /// session started from, written in the background; `None` until it's
+    /// written, or if writing it failed.
     #[serde(default)]
     pub summary: Option<String>,
     pub status: AgentStatus,
@@ -1363,8 +1364,9 @@ pub struct AgentSession {
     pub pr: Option<u64>,
     /// The first line of the first prompt.
     pub title: String,
-    /// A short summary of the first prompt, written in the background;
-    /// `None` until it's written, or if writing it failed.
+    /// A short summary of the first prompt and, if needed, the PR the
+    /// session started from, written in the background; `None` until it's
+    /// written, or if writing it failed.
     #[serde(default)]
     pub summary: Option<String>,
     /// The local branch checked out in the worktree.
