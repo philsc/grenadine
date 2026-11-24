@@ -607,6 +607,20 @@ if prompt == "question the plan":
     tool_use = use("AskUserQuestion", tool_input)
     name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
     result(tool_use, f'"{question}"="{name}"')
+# `refer to ID` mentions the session ID and asks a question about it.
+if prompt.startswith("refer to "):
+    short = prompt.split()[-1][:8]
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"Session {short} took over, see `{short}`."}]}})
+    question = f"Session {short} has it. Go on?\n\nAsk {short} first."
+    tool_input = {"questions": [{
+        "question": question,
+        "header": "Session",
+        "options": [{"label": "Take it back", "description": f"From {short}"}, {"label": f"Leave it with {short}", "description": ""}],
+        "multiSelect": False,
+    }]}
+    tool_use = use("AskUserQuestion", tool_input)
+    name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
+    result(tool_use, f'"{question}"="{name}"')
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -8271,6 +8285,60 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(question).to_contain_text("Not answered")
         expect(times).to_have_text(re.compile(f"^{asked}$"))
+
+    def test_session_references_are_links(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("the other one")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        other = self.page.url.split("/")[-1]
+        short = other[:8]
+
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill(f"refer to {other}")
+        self.page.get_by_role("button", name="Start").click()
+        question = transcript.locator(".approval.questions")
+        expect(question).to_contain_text("Claude asks")
+        session = self.page.url
+
+        # What the agent says links to the session, named in the tooltip.
+        link = f'a.session-link[href="#/agents/{other}"]'
+        mentions = transcript.locator(".turn-text").last.locator(link)
+        expect(mentions).to_have_text([short, short])
+        expect(mentions.first).to_have_attribute("title", re.compile(r"\S"))
+        # The prompt doesn't.
+        expect(transcript.locator(f".turn-prompt {link}")).to_have_count(0)
+
+        # So does the question: its title, body and options.
+        expect(question.locator(f"legend {link}")).to_have_count(1)
+        expect(question.locator(f".question-body {link}")).to_have_count(1)
+        options = question.locator(f".question-option {link}")
+        expect(options).to_have_count(2)
+
+        # Following an option's link doesn't pick the option.
+        options.last.click()
+        expect(self.page).to_have_url(re.compile(f"#/agents/{other}$"))
+        expect(transcript).to_contain_text("the other one")
+        self.page.goto(session)
+        expect(question.get_by_role("radio")).to_have_count(2)
+        for radio in question.get_by_role("radio").all():
+            expect(radio).not_to_be_checked()
+
+        question.get_by_role("radio").last.check()
+        question.get_by_role("button", name="Answer").click()
+        expect(question).to_contain_text("Answered")
+        expect(question.locator(f"p.muted {link}")).to_have_count(1)
+        expect(question.locator(f".question-answer {link}")).to_have_count(1)
+
+        # Once the session is gone, its ID isn't a link to it any more.
+        self.delete_session_via_api(other)
+        expect(transcript.locator(link)).to_have_count(0)
+        expect(question.locator(".question-answer")).to_have_text(
+            f"Leave it with {short}"
+        )
 
     def test_half_answered_question_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

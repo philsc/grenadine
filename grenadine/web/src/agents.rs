@@ -28,6 +28,7 @@ use crate::global_settings::GlobalSettings;
 use crate::image_drafts;
 use crate::images::{self, AttachButton, Attached, Attachments};
 use crate::inboxes::{load_flag, save_flag, storage};
+use crate::markdown::SessionRef;
 use crate::settings::{Settings, SettingsButton};
 use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
 use crate::tool_summaries::{self, ToolSummaries};
@@ -90,6 +91,53 @@ pub(crate) fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
 /// The sessions, refetched when they change.
 pub(crate) fn sessions() -> LocalResource<api::Result<Vec<AgentSession>>> {
     expect_context()
+}
+
+/// The sessions that text in the transcript of session `own` may refer to.
+/// Doesn't change with what only the sessions' pages show, like a status.
+fn session_refs(own: String) -> Memo<Vec<SessionRef>> {
+    let sessions = sessions();
+    Memo::new(move |prev: Option<&Vec<SessionRef>>| match sessions.get() {
+        Some(Ok(list)) => list
+            .into_iter()
+            .map(|s| SessionRef {
+                hash: session_hash(&s.id, s.kind),
+                own: s.id == own,
+                title: s.summary.unwrap_or(s.title),
+                id: s.id,
+            })
+            .collect(),
+        _ => prev.cloned().unwrap_or_default(),
+    })
+}
+
+/// The ones of `known` that `text` may refer to, so that only text that
+/// does is rendered again when they change.
+fn refs_in(text: &str, known: Memo<Vec<SessionRef>>) -> Memo<Vec<SessionRef>> {
+    let text = text.to_owned();
+    Memo::new(move |_| known.with(|k| k.iter().filter(|s| s.may_be_in(&text)).cloned().collect()))
+}
+
+/// Markdown of a transcript as HTML, with the sessions it refers to linked.
+fn linked_markdown(
+    text: &str,
+    repo: &str,
+    known: Memo<Vec<SessionRef>>,
+) -> impl Fn() -> String + Clone + Send + Sync + 'static + use<> {
+    let refs = refs_in(text, known);
+    let (text, repo) = (text.to_owned(), repo.to_owned());
+    move || refs.with(|r| markdown::to_html_with_sessions(&text, &repo, r))
+}
+
+/// Plain text of a transcript as HTML, with the sessions it refers to
+/// linked.
+fn linked_text(
+    text: &str,
+    known: Memo<Vec<SessionRef>>,
+) -> impl Fn() -> String + Clone + Send + Sync + 'static + use<> {
+    let refs = refs_in(text, known);
+    let text = text.to_owned();
+    move || refs.with(|r| markdown::text_to_html(&text, r))
 }
 
 /// The models `backend` offers: `None` until the backends are in, an
@@ -3548,6 +3596,7 @@ fn Transcript(
             s.worktree.clone(),
         )
     });
+    let known = session_refs(id.clone());
 
     // Keeps the newest output in view, starting with the bottom of the
     // transcript, until the user scrolls up. Scrolling back down follows
@@ -3741,12 +3790,12 @@ fn Transcript(
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
                             <div class="turn-msg turn-msg-agent">
-                                <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
+                                <div class="turn-text markdown" inner_html=linked_markdown(t, &repo, known)></div>
                                 {turn_time(at)}
                             </div>
                         }.into_any(),
                         AgentEventKind::Thinking(t) => {
-                            let html = markdown::to_html(t, &repo);
+                            let html = linked_markdown(t, &repo, known);
                             view! {
                                 {move || show_thinking.get().then(|| view! {
                                     <div class="turn-thinking">
@@ -3921,7 +3970,7 @@ fn Transcript(
                                 <PlanCard
                                     agent=id
                                     tool=tool.clone()
-                                    plan=markdown::to_html(plan, &repo)
+                                    plan=Signal::derive(linked_markdown(plan, &repo, known))
                                     backend=backend
                                     asked=at
                                     resolved=resolved
@@ -3943,6 +3992,7 @@ fn Transcript(
                                     tool=tool.clone()
                                     backend=backend
                                     repo=repo.clone()
+                                    known=known
                                     questions=questions
                                     asked=at
                                     resolved=resolved
@@ -4157,7 +4207,7 @@ fn PlanCard(
     agent: String,
     tool: String,
     /// The plan as HTML.
-    plan: String,
+    plan: Signal<String>,
     /// The session's backend, for the modes the turn can go on in.
     backend: AgentBackend,
     /// When the agent asked, in Unix milliseconds.
@@ -4255,7 +4305,7 @@ fn PlanCard(
                     None => "The turn ended before the plan was answered. Answering it continues the session.".to_owned(),
                 }}
             </p>
-            <div class="plan-text markdown" inner_html=plan></div>
+            <div class="plan-text markdown" inner_html=move || plan.get()></div>
             {move || pending().then(|| view! {
                 <textarea
                     class="plan-feedback"
@@ -4331,6 +4381,8 @@ fn QuestionCard(
     backend: AgentBackend,
     /// The session's repository, for links in a question's Markdown.
     repo: String,
+    /// The sessions a question may refer to.
+    known: Memo<Vec<SessionRef>>,
     questions: Vec<Question>,
     /// When the agent asked, in Unix milliseconds.
     asked: Option<i64>,
@@ -4464,20 +4516,20 @@ fn QuestionCard(
                                     prop:checked=checked
                                     on:change=toggle
                                 />
-                                " " <span>{o.label}</span>
+                                " " <span inner_html=linked_text(&o.label, known)></span>
                                 {(!o.description.is_empty()).then(|| view! {
-                                    <span class="muted">{format!(" – {}", o.description)}</span>
+                                    <span class="muted" inner_html=linked_text(&format!(" – {}", o.description), known)></span>
                                 })}
                             </label>
                         }
                     }).collect_view();
                     let (title, body) = question_parts(&q.question);
-                    let body = body.map(|b| markdown::to_html(b, &repo));
+                    let body = body.map(|b| linked_markdown(b, &repo, known));
                     view! {
                         <fieldset class="question">
                             <legend>
                                 {(!q.header.is_empty()).then(|| view! { <span class="badge">{q.header}</span> " " })}
-                                {title.to_owned()}
+                                <span inner_html=linked_text(title, known)></span>
                             </legend>
                             {body.map(|html| view! {
                                 <div class="question-body markdown" inner_html=html></div>
@@ -4516,19 +4568,19 @@ fn QuestionCard(
             } else {
                 questions.with_value(|qs| qs.iter().map(|q| {
                     let (title, body) = question_parts(&q.question);
-                    let body = body.map(|b| markdown::to_html(b, &repo));
+                    let body = body.map(|b| linked_markdown(b, &repo, known));
                     let given = answers.with(|a| {
                         a.get(&name.get_value())
                             .and_then(|m| m.get(&q.question))
                             .cloned()
                     });
                     view! {
-                        <p class="muted">{title.to_owned()}</p>
+                        <p class="muted" inner_html=linked_text(title, known)></p>
                         {body.map(|html| view! {
                             <div class="question-body markdown" inner_html=html></div>
                         })}
                         {given.filter(|v| !v.is_empty()).map(|v| view! {
-                            <p class="question-answer"><strong>{v.join(", ")}</strong></p>
+                            <p class="question-answer"><strong inner_html=linked_text(&v.join(", "), known)></strong></p>
                         })}
                     }
                 }).collect_view()).into_any()
