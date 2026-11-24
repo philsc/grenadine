@@ -127,24 +127,26 @@ fn session_link(s: &SessionRef, id: &str) -> String {
 }
 
 /// The ID of one of `sessions` at the start of `rest`, which comes after
-/// `prev`. Never a part of a path, a branch name or a longer token.
+/// `prev` and is followed by `after`. Never a part of a path, a branch name
+/// or a longer token.
 fn session_at<'a>(
     prev: Option<char>,
     rest: &str,
+    after: &str,
     sessions: &'a [SessionRef],
 ) -> Option<(usize, &'a SessionRef)> {
-    if prev.is_some_and(|c| c.is_alphanumeric() || "_/\\-.#@".contains(c)) {
+    if prev.is_some_and(|c| c.is_alphanumeric() || "_/\\-.#@~".contains(c)) {
         return None;
     }
     let len = rest
         .bytes()
         .take_while(|b| b.is_ascii_hexdigit() || *b == b'-')
         .count();
-    let mut after = rest[len..].chars();
-    let next = after.next();
+    let mut following = rest[len..].chars().chain(after.chars());
+    let next = following.next();
     // A `.` or `:` may end the sentence or the clause.
-    if next.is_some_and(|c| c.is_alphanumeric() || "_/\\@".contains(c))
-        || (next == Some('.') && after.next().is_some_and(char::is_alphanumeric))
+    if next.is_some_and(|c| c.is_alphanumeric() || "_/\\-@~".contains(c))
+        || (next == Some('.') && following.next().is_some_and(char::is_alphanumeric))
     {
         return None;
     }
@@ -157,7 +159,7 @@ pub fn text_to_html(text: &str, sessions: &[SessionRef]) -> String {
     let mut prev = None;
     let mut i = 0;
     while let Some(c) = text[i..].chars().next() {
-        match session_at(prev, &text[i..], sessions) {
+        match session_at(prev, &text[i..], "", sessions) {
             Some((len, s)) => {
                 out += &session_link(s, &text[i..i + len]);
                 i += len;
@@ -344,10 +346,30 @@ fn emojify(text: &str) -> String {
     out
 }
 
+/// The text an event adds to its line: none for inline markup, which text
+/// continues across, and `None` for what separates the texts around it.
+fn adjoining<'a>(event: &'a Event) -> Option<&'a str> {
+    match event {
+        Event::Text(t) | Event::Code(t) => Some(t),
+        Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. })
+        | Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link) => {
+            Some("")
+        }
+        _ => None,
+    }
+}
+
 /// Splits plain text into Text events and generated links for URLs,
 /// emails, mentions, issue references, commit SHAs and the IDs of
-/// `sessions`.
-fn autolink(text: &str, repo: &str, sessions: &[SessionRef]) -> Vec<Event<'static>> {
+/// `sessions`. `before` and `after` are what's rendered right next to the
+/// text, see `adjoining`.
+fn autolink(
+    text: &str,
+    repo: &str,
+    sessions: &[SessionRef],
+    before: Option<char>,
+    after: &str,
+) -> Vec<Event<'static>> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
     let mut links = finder.links(text).peekable();
@@ -383,7 +405,7 @@ fn autolink(text: &str, repo: &str, sessions: &[SessionRef]) -> Vec<Event<'stati
         }
         // `@` can't be part of a `owner/repo#n` token, and `#` needs no
         // leading token; SHAs and repo refs both start on a word char.
-        let found = if let Some((end, s)) = session_at(prev, rest, sessions) {
+        let found = if let Some((end, s)) = session_at(prev.or(before), rest, after, sessions) {
             let link = session_link(s, &rest[..end]);
             Some((end, Event::InlineHtml(link.into())))
         } else if c == '@' && word_boundary(prev) {
@@ -498,7 +520,9 @@ pub fn to_html_with_sessions(markdown: &str, repo: &str, sessions: &[SessionRef]
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_GFM;
-    let mut parser = Parser::new_ext(markdown, options);
+    let mut parser = Parser::new_ext(markdown, options)
+        .collect::<Vec<_>>()
+        .into_iter();
     let mut events: Vec<Event> = Vec::new();
     // Text inside a link or image is only emoji-expanded; link text the
     // parser produced is never autolinked.
@@ -507,7 +531,11 @@ pub fn to_html_with_sessions(markdown: &str, repo: &str, sessions: &[SessionRef]
     // replaced too. For a PR link the GitHub URL is kept so the icon
     // after the link can point at it.
     let mut own_link: Option<(Option<String>, String)> = None;
+    // The last character on the line before the current event.
+    let mut last = None;
     while let Some(event) = parser.next() {
+        let before = last;
+        last = adjoining(&event).and_then(|t| t.chars().next_back().or(before));
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
                 let lang = match &kind {
@@ -579,7 +607,17 @@ pub fn to_html_with_sessions(markdown: &str, repo: &str, sessions: &[SessionRef]
             }
             Event::SoftBreak => events.push(Event::HardBreak),
             Event::Text(t) if in_link => events.push(Event::Text(emojify(&t).into())),
-            Event::Text(t) => events.extend(autolink(&t, repo, sessions)),
+            Event::Text(t) => {
+                // Two characters tell `.txt` from the end of a sentence.
+                let after: String = parser
+                    .as_slice()
+                    .iter()
+                    .map_while(adjoining)
+                    .flat_map(str::chars)
+                    .take(2)
+                    .collect();
+                events.extend(autolink(&t, repo, sessions, before, &after));
+            }
             Event::Code(t) if !in_link => match find_session(&t, sessions) {
                 Some(s) => events.push(Event::InlineHtml(session_link(s, &t).into())),
                 None => events.push(Event::Code(t)),
@@ -671,6 +709,10 @@ mod tests {
                 ("**", "**"),
                 ("`", "`"),
                 ("session:", ", "),
+                ("agent/\n", "\n/file"),
+                ("a/ *", "* b"),
+                ("", "**.** b"),
+                ("`x` ", " `x`"),
             ] {
                 let h = linked(&format!("{before}{id}{after}"));
                 assert!(h.contains(&format!("href=\"#/agents/{ID}\"")), "{h}");
@@ -697,6 +739,19 @@ mod tests {
             "```\n47f34647\n```",
             "https://example.com/47f34647",
             "[47f34647](https://example.com)",
+            "feature~47f34647",
+            "47f34647~1",
+            // Across inline markup, entities and escapes.
+            "`agent/`47f34647",
+            "47f34647`/file`",
+            "a/*47f34647*",
+            "a/***47f34647***",
+            "**47f34647**/file",
+            "**47f34647**.txt",
+            "a&#47;47f34647",
+            "47f34647\\_x",
+            "47f34647\\-1253",
+            "47f34647\\.txt",
         ] {
             let h = linked(text);
             assert!(!h.contains("session-link"), "{text}: {h}");
