@@ -4064,7 +4064,10 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
-    if let Some(name) = leading_command(&prompt) {
+    // Reviews' prompts are written by the server, not the user.
+    if session.kind != SessionKind::AutoReview
+        && let Some(name) = leading_command(&prompt)
+    {
         state.db.add_skill_use(&session.repo, name, now())?;
     }
     if !images.is_empty() {
@@ -5273,7 +5276,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
     }
 
     /// A turn keeps the commands claude lists, for the session and its
-    /// repository, and counts the one its prompt starts with.
+    /// repository, and counts the one its prompt starts with, unless
+    /// it's an automatic review's.
     #[tokio::test]
     async fn keeps_the_commands_claude_lists() {
         let fx = crate::git::tests::fixture();
@@ -5285,23 +5289,29 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.2
 "#;
         let state = state_with_claude(&fx, dir.path(), script);
 
-        let session = create(
+        let req = |prompt: &str| NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: None,
+            prompt: prompt.into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            draft: None,
+        };
+        let session = create(&state, req("/foo go")).await.unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let review = create_session(
             &state,
-            NewAgent {
-                backend: AgentBackend::Claude,
-                repo: "owner/name".into(),
-                pr: None,
-                prompt: "/foo go".into(),
-                permission_mode: PermissionMode::from("auto"),
-                model: None,
-                images: Vec::new(),
-                attachments: Vec::new(),
-                draft: None,
-            },
+            req("/foo Review pull request"),
+            SessionKind::AutoReview,
+            None,
+            None,
         )
         .await
         .unwrap();
-        wait_for_turns(&state, &session.id, 1).await;
+        wait_for_turns(&state, &review.id, 1).await;
 
         let expected = vec!["bar".to_owned(), "foo".to_owned()];
         assert_eq!(

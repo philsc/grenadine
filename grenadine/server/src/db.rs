@@ -26,8 +26,8 @@ enum Migration {
     /// edited default keeps it off. Reads DEFAULT_INBOXES so the names
     /// and filters aren't duplicated here.
     BackgroundDefaults,
-    /// Counts the commands that the stored prompts started with into
-    /// `skill_uses`.
+    /// Counts the commands that the stored prompts, other than automatic
+    /// reviews', started with into `skill_uses`.
     BackfillSkillUses,
 }
 
@@ -655,10 +655,13 @@ fn backfill_agent_prs(conn: &Connection) -> Result<()> {
 }
 
 fn backfill_skill_uses(conn: &Connection) -> Result<()> {
+    // Events are stored with their kind as the only key, so the prefix
+    // finds these prompts without loading the other events.
     let prompts: Vec<(String, String, Option<i64>)> = conn
         .prepare(
-            "SELECT a.repo, e.event, e.at FROM agent_events e
-             JOIN agents a ON a.id = e.agent_id",
+            r#"SELECT a.repo, e.event, e.at FROM agent_events e
+             JOIN agents a ON a.id = e.agent_id
+             WHERE a.kind != 'auto_review' AND e.event LIKE '{"prompt":"/%'"#,
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -4238,15 +4241,21 @@ mod tests {
             .position(|m| matches!(m, Migration::BackfillSkillUses))
             .unwrap();
         migrate(&mut conn, backfill).unwrap();
-        for (id, repo) in [("a", "o/n"), ("b", "o/n"), ("c", "o/other")] {
+        for (id, repo, kind) in [
+            ("a", "o/n", "interactive"),
+            ("b", "o/n", "interactive"),
+            ("c", "o/other", "interactive"),
+            ("review", "o/n", "auto_review"),
+        ] {
             conn.execute(
-                "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status, created_at)
-                 VALUES (?, ?, 't', 'b', '/w', 's', 'idle', 0)",
-                [id, repo],
+                "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status, created_at, kind)
+                 VALUES (?, ?, 't', 'b', '/w', 's', 'idle', 0, ?)",
+                [id, repo, kind],
             )
             .unwrap();
         }
         let prompts = [
+            ("review", "/foo Review pull request", Some(30)),
             ("a", "/foo do it", Some(10)),
             ("a", "/foo again", None),
             ("b", "/foo", Some(5)),
