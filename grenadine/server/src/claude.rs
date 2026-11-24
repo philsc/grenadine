@@ -35,6 +35,12 @@ const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
 /// exits right after the answer.
 const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What every turn is told beyond the session's own notes. The Bash tool's
+/// `description` is optional, and Claude tends to leave it out of a whole
+/// session once it left it out of the first call.
+pub(crate) const DESCRIPTION_NOTE: &str = "Give every Bash call a `description`, even a simple \
+    one. The user may see it in the transcript in place of the command.";
+
 /// The `initialize` control request the Agent SDK starts with. Claude Code
 /// answers it without calling a model.
 const INITIALIZE: &str =
@@ -181,6 +187,13 @@ async fn user_message(
     Ok(format!("{message}\n"))
 }
 
+/// What a turn with `notes` appends to Claude Code's system prompt.
+fn system_prompt(notes: &[String]) -> String {
+    let mut parts: Vec<&str> = notes.iter().map(String::as_str).collect();
+    parts.push(DESCRIPTION_NOTE);
+    parts.join("\n\n")
+}
+
 /// Runs `t` as a `claude -p` turn of `session` and returns the status the
 /// session ends up in; `sink` gets what the turn's output means for the
 /// transcript.
@@ -233,12 +246,8 @@ async fn turn(
     .args(crate::mcp::ALLOWED_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
-    .args(
-        (!notes.is_empty())
-            .then(|| notes.join("\n\n"))
-            .into_iter()
-            .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
-    )
+    .arg("--append-system-prompt")
+    .arg(system_prompt(notes))
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
     .env(
         "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
