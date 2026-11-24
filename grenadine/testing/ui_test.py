@@ -2664,6 +2664,158 @@ class ReviewTest(ServerTestCase):
         expect(after.locator(".pending-badge")).to_have_count(1)
         expect(after).to_contain_text("Why remove this?")
 
+    def file_at(self, path: str) -> Locator:
+        return self.page.locator("section.file").filter(
+            has=self.page.locator(".file-header .path", has_text=exactly(path))
+        )
+
+    @staticmethod
+    def ln(file: Locator, side: str, line: int) -> Locator:
+        """The line number cell of `line` on `side`, "L" or "R"."""
+        return file.locator(
+            f'td.ln.commentable[data-side="{side}"][data-line="{line}"]'
+        )
+
+    def drag(self, start: Locator, end: Locator) -> None:
+        """Presses the mouse on `start` and moves it to `end`, holding it."""
+        start.hover()
+        self.page.mouse.down()
+        end.hover()
+
+    def side_by_side(self, on: bool) -> None:
+        self.page.get_by_label("Side by side").set_checked(on)
+
+    def test_drag_across_lines_comments_on_a_range(self) -> None:
+        pr = self.prs[scenarios.RANGE_DRAG]
+        self.open(scenarios.RANGE_DRAG)
+        self.side_by_side(False)
+        file = self.file()
+        self.drag(self.ln(file, "R", 3), self.ln(file, "R", 5))
+        expect(file.locator("tr.dragging")).to_have_count(3)
+        self.page.mouse.up()
+        expect(file.locator("tr.dragging")).to_have_count(0)
+        expect(file.locator("tr.selecting-range")).to_have_count(3)
+        expect(file.locator(".composer-lines")).to_have_text("Lines +3 to +5")
+        box = file.get_by_role("textbox", name="Add to review")
+        expect(box).to_be_focused()
+        expect(box).to_have_attribute("placeholder", "Comment on these lines…")
+        box.fill("These three.")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual(
+            (c.path, c.start_line, c.start_side, c.line, c.side),
+            (scenarios.REVIEW_PATH, 3, None, 5, "RIGHT"),
+        )
+        thread = file.locator(".thread", has_text="These three.")
+        expect(thread.locator(".thread-lines")).to_have_text("Lines +3 to +5")
+        expect(file.locator("tr.commented-range")).to_have_count(3)
+        expect(file.locator("tr.selecting-range")).to_have_count(0)
+
+    def test_shift_click_stretches_a_box_over_lines(self) -> None:
+        pr = self.prs[scenarios.RANGE_SHIFT]
+        self.open(scenarios.RANGE_SHIFT)
+        self.side_by_side(False)
+        file = self.file()
+        self.ln(file, "R", 4).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Stretch me.")
+        expect(file.locator(".composer-lines")).to_have_count(0)
+        self.ln(file, "R", 7).click(modifiers=["Shift"])
+        # The box moved under line 7 with what was written in it.
+        expect(file.locator(".comment-composer")).to_have_count(1)
+        expect(file.locator(".composer-lines")).to_have_text("Lines +4 to +7")
+        expect(box).to_have_value("Stretch me.")
+        expect(file.locator("tr.selecting-range")).to_have_count(4)
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.start_line, c.line, c.side), (4, 7, "RIGHT"))
+
+    def test_a_range_can_go_from_old_lines_to_new_ones(self) -> None:
+        pr = self.prs[scenarios.RANGE_SIDES]
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # From the removed line 3 to the new side of the context line 5.
+        self.drag(self.ln(file, "L", 3), self.ln(file, "R", 5))
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines -3 to +5")
+        expect(file.locator("tr.selecting-range")).to_have_count(4)
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Both sides.")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual(
+            (c.path, c.start_line, c.start_side, c.line, c.side),
+            (scenarios.LONG_PATH, 3, "LEFT", 5, "RIGHT"),
+        )
+        thread = file.locator(".thread", has_text="Both sides.")
+        expect(thread.locator(".thread-lines")).to_have_text("Lines -3 to +5")
+
+    def test_a_click_without_a_mouse_opens_a_box(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # A click event with no press before it, as assistive technology
+        # sends.
+        self.ln(file, "R", 2).dispatch_event("click")
+        expect(file.locator(".comment-composer")).to_have_count(1)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
+    def test_a_range_cant_go_from_new_lines_back_to_old_ones(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # GitHub refuses a range from the new side to the old one, so a drag
+        # from the new line 2 passes the removed line 3...
+        self.drag(self.ln(file, "R", 2), self.ln(file, "L", 3))
+        expect(file.locator("tr.dragging")).to_have_count(1)
+        # ...and takes a context line's new side when pointed at its old one.
+        self.ln(file, "L", 4).hover()
+        expect(file.locator("tr.dragging")).to_have_count(4)
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines +2 to +4")
+        composer = file.locator(".comment-composer")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # A shift-click onto the removed line comments on it alone.
+        self.ln(file, "R", 2).click()
+        self.ln(file, "L", 3).click(modifiers=["Shift"])
+        expect(composer).to_have_count(2)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
+    def test_ranges_keep_to_a_side_and_stop_at_hidden_lines(self) -> None:
+        self.open(scenarios.RANGE_SPLIT)
+        self.side_by_side(True)
+        file = self.file_at(scenarios.LONG_PATH)
+        composer = file.locator(".comment-composer")
+        # Side by side, a drag stays in the column it started in.
+        self.drag(self.ln(file, "L", 2), self.ln(file, "R", 5))
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines -2 to -5")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # Lines 7 to 21 are hidden: the drag stops at line 6.
+        self.drag(self.ln(file, "R", 5), self.ln(file, "R", 22))
+        expect(file.locator("tr.dragging")).to_have_count(2)
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines +5 to +6")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # A shift-click across them comments on its own line only.
+        self.ln(file, "R", 6).click()
+        self.ln(file, "R", 22).click(modifiers=["Shift"])
+        expect(composer).to_have_count(2)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
     def test_boxes_survive_a_refetch(self) -> None:
         pr = self.prs[scenarios.KEEP]
         self.open(scenarios.KEEP)
