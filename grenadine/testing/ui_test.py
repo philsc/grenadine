@@ -5068,6 +5068,22 @@ class AgentTest(ServerTestCase):
         follow_up.press_sequentially("/baz again")
         follow_up.press("Enter")
         expect(transcript.locator(".turn-end")).to_have_count(2)
+
+        # Sending a bare command closes its list, even when the server only
+        # answers after the key is released.
+        held: list = []
+        self.page.route("**/api/agents/*/messages", lambda route: held.append(route))
+        follow_up.press_sequentially("/baz")
+        expect(suggestions).to_have_text(["/baz"])
+        follow_up.press("Enter")
+        expect(suggestions).to_have_text(["/baz"])
+        self.wait_held(held)
+        held.pop().continue_()
+        self.page.unroute("**/api/agents/*/messages")
+        expect(follow_up).to_have_value("")
+        expect(suggestions).to_have_count(0)
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+
         follow_up.press_sequentially("/")
         expect(suggestions).to_have_text(["/baz", "/bar", "/foo"])
         follow_up.press("Tab")
@@ -5085,6 +5101,24 @@ class AgentTest(ServerTestCase):
         follow_up.fill("")
         follow_up.press_sequentially("/")
         expect(suggestions).to_have_text(["/baz", "/bar", "/clear"])
+
+        # A long list scrolls to the highlighted command.
+        self.page.route(
+            "**/api/agents/*/slash-commands",
+            lambda route: route.fulfill(
+                json=[{"name": f"c{i:02}", "uses": 0} for i in range(30)]
+            ),
+        )
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_count(30)
+        follow_up.press("Shift+Tab")
+        expect(selected).to_have_text("/c29")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+        follow_up.press("Tab")
+        expect(selected).to_have_text("/c00")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+        self.page.unroute("**/api/agents/*/slash-commands")
 
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:
         self.page.goto(self.url + "#/agents")

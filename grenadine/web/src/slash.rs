@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use grenadine_core::api::{AgentBackend, SlashCommand, command_char};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::global_settings::GlobalSettings;
@@ -120,6 +121,8 @@ pub struct Suggest {
     source: Signal<Source>,
     /// The commands last fetched, and for which source.
     commands: RwSignal<Option<(Source, Vec<SlashCommand>)>>,
+    /// The box's text that `word` and `cycle` are about.
+    read: StoredValue<String>,
     /// What `typed` says of the box: the command being typed.
     word: RwSignal<Option<String>>,
     /// The matches Tab cycles through, and which one the box holds.
@@ -141,6 +144,7 @@ impl Suggest {
             text,
             source,
             commands: RwSignal::new(None),
+            read: StoredValue::new(String::new()),
             word: RwSignal::new(None),
             cycle: RwSignal::new(None),
             dismissed: RwSignal::new(false),
@@ -166,6 +170,14 @@ impl Suggest {
                 });
             }
             (open, current)
+        });
+        // Text set by other means than the box, e.g. cleared once it's
+        // sent, closes the list.
+        Effect::new(move |_| {
+            let changed = s.text.with(|t| s.read.with_value(|r| t != r));
+            if changed {
+                s.close();
+            }
         });
         s
     }
@@ -210,6 +222,7 @@ impl Suggest {
             .take_while(|u| *u <= caret)
             .count();
         let word = typed(&text, caret).map(str::to_owned);
+        self.read.set_value(text);
         if self.word.get_untracked() != word {
             self.word.set(word);
         }
@@ -223,6 +236,10 @@ impl Suggest {
     }
 
     pub fn blur(self) {
+        self.close();
+    }
+
+    fn close(self) {
         self.cycle.set(None);
         self.word.set(None);
     }
@@ -274,6 +291,7 @@ impl Suggest {
             t.set_value(&text);
             let _ = t.set_selection_range(units as u32, units as u32);
         }
+        self.read.set_value(text.clone());
         self.text.set(text);
         self.word.set(None);
         self.cycle.set(Some((names, at)));
@@ -284,6 +302,26 @@ impl Suggest {
 /// bottom of the page, `above` it; nothing without any.
 #[component]
 pub fn SlashList(suggest: Suggest, #[prop(optional)] above: bool) -> impl IntoView {
+    let list = NodeRef::<leptos::html::Ul>::new();
+    // Keeps the highlighted command in sight, once it's rendered.
+    Effect::new(move |_| {
+        suggest.shown();
+        request_animation_frame(move || {
+            let Some(list) = list.try_get_untracked().flatten() else {
+                return;
+            };
+            let Ok(Some(item)) = list.query_selector("li.selected") else {
+                return;
+            };
+            let item: web_sys::HtmlElement = item.unchecked_into();
+            let (top, bottom) = (item.offset_top(), item.offset_top() + item.offset_height());
+            if top < list.scroll_top() {
+                list.set_scroll_top(top);
+            } else if bottom > list.scroll_top() + list.client_height() {
+                list.set_scroll_top(bottom - list.client_height());
+            }
+        });
+    });
     move || {
         let (names, at) = suggest.shown();
         (!names.is_empty()).then(|| {
@@ -309,7 +347,7 @@ pub fn SlashList(suggest: Suggest, #[prop(optional)] above: bool) -> impl IntoVi
                 })
                 .collect_view();
             view! {
-                <ul class="slash-suggest" class:above=above role="listbox" aria-label="Commands">
+                <ul node_ref=list class="slash-suggest" class:above=above role="listbox" aria-label="Commands">
                     {items}
                 </ul>
             }
