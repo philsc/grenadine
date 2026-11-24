@@ -8019,6 +8019,84 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
+    def test_links_navigate_without_hash_navigations(self) -> None:
+        """WebKit on iOS reloads the page after a hash navigation, so the
+        app's links mustn't cause any. Only the browser's own hashchange
+        events are trusted."""
+        self.page.add_init_script(
+            """
+            window.hashNavigations = 0;
+            addEventListener("hashchange", (e) => {
+              if (e.isTrusted) window.hashNavigations++;
+            });
+            """
+        )
+        new = self.page.get_by_role("link", name="+ New session")
+        header = self.page.locator(".agent-header h1")
+        session_url = re.compile(r"#/agents/[0-9a-f-]{36}$")
+
+        def start(prompt: str) -> str:
+            self.page.get_by_label("Repository").select_option(self.OTHER_REPO)
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(session_url)
+            expect(header).to_have_text(prompt)
+            return self.page.url
+
+        self.page.goto(self.url)
+        self.page.get_by_role("link", name="Agents", exact=True).click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        first = start("first look")
+        new.click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        pr_url = f"https://github.com/{self.OTHER_REPO}/pull/1"
+        second = start(f"look at {pr_url}")
+
+        def entry(url: str) -> Locator:
+            return self.page.locator(f'a.agent-item[href="#{url.split("#")[1]}"]')
+
+        entry(first).click()
+        expect(header).to_have_text("first look")
+        self.assertEqual(self.page.url, first)
+        entry(second).click()
+        expect(header).to_contain_text("look at")
+        link = self.page.locator(".transcript .turn-text a").filter(has_text=pr_url)
+        link.click()
+        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/1$"))
+        expect(self.page.locator(".agents-page")).to_have_count(0)
+        self.assertEqual(self.page.evaluate("window.hashNavigations"), 0)
+
+        # Each page is one step in the history; a link to the page that
+        # shows adds none.
+        self.page.go_back()
+        expect(self.page).to_have_url(second)
+        expect(header).to_contain_text("look at")
+        self.page.go_back()
+        expect(self.page).to_have_url(first)
+        expect(header).to_have_text("first look")
+        length = self.page.evaluate("history.length")
+        entry(first).click()
+        self.assertEqual(self.page.evaluate("history.length"), length)
+        self.page.go_forward()
+        expect(self.page).to_have_url(second)
+        expect(header).to_contain_text("look at")
+
+        # The browser still opens other tabs.
+        with self.page.context.expect_page() as opened:
+            entry(first).click(modifiers=["ControlOrMeta"])
+        expect(opened.value).to_have_url(first)
+        opened.value.close()
+        self.assertEqual(self.page.url, second)
+
+        # Deleting the open session goes to a new draft.
+        navigations = self.page.evaluate("window.hashNavigations")
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.locator(".agent-entry").filter(has=entry(second)).get_by_role(
+            "button", name="Delete session"
+        ).click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        self.assertEqual(self.page.evaluate("window.hashNavigations"), navigations)
+
     def test_transcript_pr_links_open_in_grenadine(self) -> None:
         self.page.context.route(
             "https://github.com/**",

@@ -17,6 +17,7 @@ mod image_drafts;
 mod images;
 mod inboxes;
 mod markdown;
+mod navigate;
 mod pr;
 mod pr_agents;
 mod pr_threads;
@@ -165,7 +166,7 @@ fn open_draft(route: Route, drafts: drafts::Drafts) -> Route {
         return route;
     };
     let id = drafts.create(repo, pr);
-    let _ = window().location().replace(&drafts::hash(&id));
+    navigate::replace_quietly(&drafts::hash(&id));
     Route::Draft(id)
 }
 
@@ -312,6 +313,7 @@ fn App() -> impl IntoView {
         route.set(r);
     });
     on_cleanup(move || handle.remove());
+    navigate::follow_links();
     let on_inboxes = Memo::new(move |_| route.with(|r| *r == Route::Inboxes));
     let selected = Memo::new(move |_| route.with(pr_of));
     let agents = Memo::new(move |_| {
