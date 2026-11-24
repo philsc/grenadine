@@ -78,6 +78,101 @@ fn anchor(href: &str, hash: Option<&str>, inner: &str) -> Event<'static> {
     Event::InlineHtml(html.into())
 }
 
+/// A session that text may refer to by its ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRef {
+    /// A UUID.
+    pub id: String,
+    /// The session's page.
+    pub hash: String,
+    /// Names the session in the link's tooltip.
+    pub title: String,
+    /// Whether the text is in the session's own transcript, where its ID
+    /// isn't linked.
+    pub own: bool,
+}
+
+/// How long the short form of a session's ID is, e.g. `47f34647`.
+const SHORT_ID: usize = 8;
+
+impl SessionRef {
+    fn short_id(&self) -> &str {
+        self.id.get(..SHORT_ID).unwrap_or(&self.id)
+    }
+
+    /// Whether `text` may refer to the session.
+    pub fn may_be_in(&self, text: &str) -> bool {
+        text.contains(self.short_id())
+    }
+}
+
+/// The session with the full or short ID `id`, `None` if several have it.
+fn find_session<'a>(id: &str, sessions: &'a [SessionRef]) -> Option<&'a SessionRef> {
+    let mut found = sessions.iter().filter(|s| s.id == id || s.short_id() == id);
+    found.next().filter(|_| found.next().is_none())
+}
+
+/// `<a>` to the session `s` for its `id`, as the text wrote it; just the
+/// `id` in the session's own transcript.
+fn session_link(s: &SessionRef, id: &str) -> String {
+    if s.own {
+        return format!("<code>{}</code>", escape(id));
+    }
+    format!(
+        "<a class=\"session-link\" href=\"{}\" title=\"{}\"><code>{}</code></a>",
+        escape_attr(&s.hash),
+        escape_attr(&s.title),
+        escape(id)
+    )
+}
+
+/// The ID of one of `sessions` at the start of `rest`, which comes after
+/// `prev`. Never a part of a path, a branch name or a longer token.
+fn session_at<'a>(
+    prev: Option<char>,
+    rest: &str,
+    sessions: &'a [SessionRef],
+) -> Option<(usize, &'a SessionRef)> {
+    if prev.is_some_and(|c| c.is_alphanumeric() || "_/\\-.#@".contains(c)) {
+        return None;
+    }
+    let len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_hexdigit() || *b == b'-')
+        .count();
+    let mut after = rest[len..].chars();
+    let next = after.next();
+    // A `.` or `:` may end the sentence or the clause.
+    if next.is_some_and(|c| c.is_alphanumeric() || "_/\\@".contains(c))
+        || (next == Some('.') && after.next().is_some_and(char::is_alphanumeric))
+    {
+        return None;
+    }
+    find_session(&rest[..len], sessions).map(|s| (len, s))
+}
+
+/// Plain text as HTML, with the IDs of `sessions` linked.
+pub fn text_to_html(text: &str, sessions: &[SessionRef]) -> String {
+    let mut out = String::new();
+    let mut prev = None;
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        match session_at(prev, &text[i..], sessions) {
+            Some((len, s)) => {
+                out += &session_link(s, &text[i..i + len]);
+                i += len;
+                prev = text[..i].chars().next_back();
+            }
+            None => {
+                out += &escape(c.encode_utf8(&mut [0; 4]));
+                i += c.len_utf8();
+                prev = Some(c);
+            }
+        }
+    }
+    out
+}
+
 fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -250,8 +345,9 @@ fn emojify(text: &str) -> String {
 }
 
 /// Splits plain text into Text events and generated links for URLs,
-/// emails, mentions, issue references and commit SHAs.
-fn autolink(text: &str, repo: &str) -> Vec<Event<'static>> {
+/// emails, mentions, issue references, commit SHAs and the IDs of
+/// `sessions`.
+fn autolink(text: &str, repo: &str, sessions: &[SessionRef]) -> Vec<Event<'static>> {
     let mut finder = LinkFinder::new();
     finder.url_must_have_scheme(false);
     let mut links = finder.links(text).peekable();
@@ -287,7 +383,10 @@ fn autolink(text: &str, repo: &str) -> Vec<Event<'static>> {
         }
         // `@` can't be part of a `owner/repo#n` token, and `#` needs no
         // leading token; SHAs and repo refs both start on a word char.
-        let found = if c == '@' && word_boundary(prev) {
+        let found = if let Some((end, s)) = session_at(prev, rest, sessions) {
+            let link = session_link(s, &rest[..end]);
+            Some((end, Event::InlineHtml(link.into())))
+        } else if c == '@' && word_boundary(prev) {
             mention_at(rest)
         } else if c == '#' && word_boundary(prev) {
             issue_ref_at(rest, repo)
@@ -389,6 +488,11 @@ fn code_block_html(lang: &str, code: &str) -> String {
 /// Markdown to sanitized HTML. `repo` is the `owner/name` the text belongs
 /// to, for `#123` and commit links, or `GENERAL` for none.
 pub fn to_html(markdown: &str, repo: &str) -> String {
+    to_html_with_sessions(markdown, repo, &[])
+}
+
+/// Like `to_html`, with the IDs of `sessions` linked.
+pub fn to_html_with_sessions(markdown: &str, repo: &str, sessions: &[SessionRef]) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -475,12 +579,17 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             }
             Event::SoftBreak => events.push(Event::HardBreak),
             Event::Text(t) if in_link => events.push(Event::Text(emojify(&t).into())),
-            Event::Text(t) => events.extend(autolink(&t, repo)),
+            Event::Text(t) => events.extend(autolink(&t, repo, sessions)),
+            Event::Code(t) if !in_link => match find_session(&t, sessions) {
+                Some(s) => events.push(Event::InlineHtml(session_link(s, &t).into())),
+                None => events.push(Event::Code(t)),
+            },
             _ => events.push(event),
         }
     }
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
+    let pages: Vec<String> = sessions.iter().map(|s| s.hash.clone()).collect();
     ammonia::Builder::default()
         .add_generic_attributes(["align"])
         .add_tag_attributes("input", ["type", "checked", "disabled"])
@@ -489,7 +598,7 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
         .add_tag_attributes("code", ["class", "data-hl"])
         .add_tags(["input", "details", "summary"])
         .link_rel(Some("noopener noreferrer"))
-        .attribute_filter(|tag, attr, value| match (tag, attr) {
+        .attribute_filter(move |tag, attr, value| match (tag, attr) {
             ("span" | "code", "class")
                 if !value.is_empty()
                     && value
@@ -498,9 +607,15 @@ pub fn to_html(markdown: &str, repo: &str) -> String {
             {
                 Some(Cow::Borrowed(value))
             }
-            ("a", "class") if value == "gh-link" => Some(Cow::Borrowed(value)),
-            // In-app hashes only ever have `#/owner/name/number`.
-            ("a", "href") if value.starts_with("#/") && valid_grenadine_hash(value) => {
+            ("a", "class") if value == "gh-link" || value == "session-link" => {
+                Some(Cow::Borrowed(value))
+            }
+            // In-app hashes only ever have `#/owner/name/number` or are
+            // the page of one of the sessions.
+            ("a", "href")
+                if value.starts_with("#/")
+                    && (valid_grenadine_hash(value) || pages.iter().any(|p| p == value)) =>
+            {
                 Some(Cow::Borrowed(value))
             }
             ("a", "target") if value == "_blank" => Some(Cow::Borrowed(value)),
@@ -528,6 +643,118 @@ mod tests {
 
     fn html(markdown: &str) -> String {
         to_html(markdown, "o/r")
+    }
+
+    const ID: &str = "47f34647-1253-44e8-85f8-f092b077192b";
+
+    fn session(id: &str, title: &str) -> SessionRef {
+        SessionRef {
+            id: id.to_owned(),
+            hash: format!("#/agents/{id}"),
+            title: title.to_owned(),
+            own: false,
+        }
+    }
+
+    fn linked(markdown: &str) -> String {
+        to_html_with_sessions(markdown, "o/r", &[session(ID, "Fix it")])
+    }
+
+    #[test]
+    fn links_session_ids() {
+        for id in ["47f34647", ID] {
+            for (before, after) in [
+                ("Session ", " took over"),
+                ("", "."),
+                ("(", "…)"),
+                ("", "'s"),
+                ("**", "**"),
+                ("`", "`"),
+                ("session:", ", "),
+            ] {
+                let h = linked(&format!("{before}{id}{after}"));
+                assert!(h.contains(&format!("href=\"#/agents/{ID}\"")), "{h}");
+                assert!(h.contains("class=\"session-link\""), "{h}");
+                assert!(h.contains("title=\"Fix it\""), "{h}");
+                assert!(h.contains(&format!("<code>{id}</code></a>")), "{h}");
+                assert!(!h.contains("/commit/"), "{h}");
+                assert!(!h.contains("target="), "{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_links_whole_session_ids() {
+        for text in [
+            "grenadine/agent/47f34647",
+            "47f34647/file",
+            "47f34647.txt",
+            "47f34647-1253",
+            "47f346471",
+            "x47f34647",
+            "#47f34647",
+            "`git log 47f34647`",
+            "```\n47f34647\n```",
+            "https://example.com/47f34647",
+            "[47f34647](https://example.com)",
+        ] {
+            let h = linked(text);
+            assert!(!h.contains("session-link"), "{text}: {h}");
+        }
+        assert!(html("47f34647").contains("/commit/47f34647"));
+        // Two sessions share the short ID, so only the full ones link.
+        let other = "47f34647-0000-44e8-85f8-f092b077192b";
+        let both = [session(ID, "a"), session(other, "b")];
+        assert!(!to_html_with_sessions("47f34647", "o/r", &both).contains("session-link"));
+        let h = to_html_with_sessions(other, "o/r", &both);
+        assert!(h.contains(&format!("#/agents/{other}")), "{h}");
+    }
+
+    #[test]
+    fn own_session_id_is_not_linked() {
+        let own = SessionRef {
+            own: true,
+            ..session(ID, "Fix it")
+        };
+        for text in ["see 47f34647", "see `47f34647`"] {
+            let h = to_html_with_sessions(text, "o/r", std::slice::from_ref(&own));
+            assert_eq!(h, "<p>see <code>47f34647</code></p>\n");
+        }
+    }
+
+    #[test]
+    fn session_titles_are_escaped() {
+        let s = [session(ID, "\"><b>&")];
+        for h in [
+            to_html_with_sessions("47f34647", "o/r", &s),
+            text_to_html("47f34647", &s),
+        ] {
+            assert!(!h.contains("<b>"), "{h}");
+            assert!(h.contains("title=\"&quot;&gt;&lt;b&gt;&amp;\""), "{h}");
+        }
+    }
+
+    #[test]
+    fn only_known_session_pages_pass() {
+        let h = linked("[x](#/agents/cleanup)");
+        assert!(!h.contains("href"), "{h}");
+    }
+
+    #[test]
+    fn links_session_ids_in_plain_text() {
+        let s = [session(ID, "Fix it")];
+        assert_eq!(
+            text_to_html("é <b> **x** & #1", &s),
+            "é &lt;b&gt; **x** &amp; #1"
+        );
+        assert_eq!(
+            text_to_html("Leave it with 47f34647?", &s),
+            format!(
+                "Leave it with <a class=\"session-link\" href=\"#/agents/{ID}\" \
+                 title=\"Fix it\"><code>47f34647</code></a>?"
+            )
+        );
+        assert_eq!(text_to_html("agent/47f34647", &s), "agent/47f34647");
     }
 
     #[test]
