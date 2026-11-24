@@ -46,7 +46,7 @@ pub fn session_hash(id: &str, kind: SessionKind) -> String {
 }
 
 pub fn go(hash: &str) {
-    let _ = window().location().set_hash(hash);
+    crate::navigate::push(hash);
 }
 
 pub fn status_label(s: AgentStatus) -> &'static str {
@@ -2507,7 +2507,7 @@ pub fn AgentView(
         if let Some(s) = current.get() {
             let review = s.kind == SessionKind::AutoReview;
             if review != read_only {
-                let _ = window().location().replace(&session_hash(&s.id, s.kind));
+                crate::navigate::replace(&session_hash(&s.id, s.kind));
             }
         }
     });
