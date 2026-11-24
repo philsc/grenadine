@@ -547,6 +547,32 @@ fn turn_time(at: Option<i64>) -> Option<impl IntoView> {
     })
 }
 
+/// The last line of a question's or a plan's card: when the agent asked,
+/// and when and how that ended. `outcome` words the ending; it is `None`
+/// when its time shouldn't show.
+#[component]
+fn AskTimes(
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
+    /// When it ended, in Unix milliseconds.
+    #[prop(into)]
+    ended: Signal<Option<i64>>,
+    #[prop(into)] outcome: Signal<Option<&'static str>>,
+) -> impl IntoView {
+    move || {
+        let end = outcome.get().zip(ended.get());
+        (asked.is_some() || end.is_some()).then(|| {
+            view! {
+                <p class="ask-times">
+                    {asked.map(|at| view! { "Asked " {turn_time(Some(at))} })}
+                    {(asked.is_some() && end.is_some()).then_some(" · ")}
+                    {end.map(|(outcome, at)| view! { {outcome} " " {turn_time(Some(at))} })}
+                </p>
+            }
+        })
+    }
+}
+
 /// A day, as the browser writes dates.
 fn date(unix_seconds: i64) -> String {
     js_sys::Date::new(&JsValue::from_f64(unix_seconds as f64 * 1000.0))
@@ -3435,6 +3461,18 @@ fn Transcript(
                 .collect::<HashMap<_, _>>()
         })
     });
+    // When each request was resolved, in Unix milliseconds.
+    let resolved_at = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::ApprovalResolved { id, .. } => Some((id.clone(), e.at?)),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+    });
     // A prompt with images gets its time under the images, the last
     // piece of the message.
     let more_follows = Memo::new(move |_| events.with(|e| pieces_followed_by_more(e)));
@@ -3885,7 +3923,9 @@ fn Transcript(
                                     tool=tool.clone()
                                     plan=markdown::to_html(plan, &repo)
                                     backend=backend
+                                    asked=at
                                     resolved=resolved
+                                    resolved_at=resolved_at
                                     open=open
                                     waiting=waiting
                                     mode=mode
@@ -3904,7 +3944,9 @@ fn Transcript(
                                     backend=backend
                                     repo=repo.clone()
                                     questions=questions
+                                    asked=at
                                     resolved=resolved
+                                    resolved_at=resolved_at
                                     answers=given_answers
                                     waiting=waiting
                                 />
@@ -4118,7 +4160,11 @@ fn PlanCard(
     plan: String,
     /// The session's backend, for the modes the turn can go on in.
     backend: AgentBackend,
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
     resolved: Memo<HashMap<String, Answer>>,
+    /// When each request was resolved, in Unix milliseconds.
+    resolved_at: Memo<HashMap<String, i64>>,
     /// Whether this is the plan the last turn ended on, still unanswered.
     open: Signal<bool>,
     waiting: Signal<bool>,
@@ -4132,6 +4178,7 @@ fn PlanCard(
     let feedback = RwSignal::new(String::new());
     // The mode the backend prefers the turn to go on in.
     let then = RwSignal::new(PermissionMode::new(backend.plan_default_mode()));
+    let name = StoredValue::new(tool.clone());
     let state = {
         let tool = tool.clone();
         Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)))
@@ -4185,6 +4232,17 @@ fn PlanCard(
         });
     };
     let answer = StoredValue::new(answer);
+    let ended =
+        Signal::derive(move || resolved_at.with(|r| name.with_value(|n| r.get(n).copied())));
+    // An expired request's time can be the server's restart, long after
+    // the agent stopped waiting.
+    let outcome = Signal::derive(move || {
+        match resolved.with(|r| name.with_value(|n| r.get(n).copied()))? {
+            Answer::Allowed => Some("Approved"),
+            Answer::Denied => Some("Sent back"),
+            Answer::Expired => None,
+        }
+    });
     let pending = move || state.get().is_none() && open.get();
     view! {
         <div class="approval plan" class:pending=pending>
@@ -4214,6 +4272,7 @@ fn PlanCard(
                 </div>
             })}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <AskTimes asked=asked ended=ended outcome=outcome />
         </div>
     }
 }
@@ -4273,7 +4332,11 @@ fn QuestionCard(
     /// The session's repository, for links in a question's Markdown.
     repo: String,
     questions: Vec<Question>,
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
     resolved: Memo<HashMap<String, Answer>>,
+    /// When each request was resolved, in Unix milliseconds.
+    resolved_at: Memo<HashMap<String, i64>>,
     /// The answers the user gave, by tool use id.
     answers: Memo<HashMap<String, BTreeMap<String, Vec<String>>>>,
     waiting: Signal<bool>,
@@ -4323,6 +4386,17 @@ fn QuestionCard(
     let name = StoredValue::new(tool.clone());
     let state =
         Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)));
+    let ended =
+        Signal::derive(move || resolved_at.with(|r| name.with_value(|n| r.get(n).copied())));
+    // An expired request's time can be the server's restart, long after
+    // the agent stopped waiting.
+    let outcome = Signal::derive(move || {
+        match resolved.with(|r| name.with_value(|n| r.get(n).copied()))? {
+            Answer::Allowed => Some("Answered"),
+            Answer::Denied => Some("Closed"),
+            Answer::Expired => None,
+        }
+    });
     let pending = move || state.get().is_none() && waiting.get();
     // Keeps what's picked and written while the form is shown, and drops
     // it otherwise: once the question is answered or skipped, here or
@@ -4460,6 +4534,7 @@ fn QuestionCard(
                 }).collect_view()).into_any()
             }}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <AskTimes asked=asked ended=ended outcome=outcome />
         </div>
     }
 }

@@ -2006,6 +2006,11 @@ textarea {
 .approval p {
   margin: 0;
 }
+.approval .ask-times {
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 4px;
+}
 .approval.pending {
   border-color: var(--warn-border);
   background: var(--warn-bg);
