@@ -323,7 +323,6 @@ pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     .map_err(|e| e.to_string())
 }
 
-/// The PRs a session opened, as of the last poll.
 /// The commands a new session's prompt in `repo` can start with.
 pub async fn slash_commands(repo: &str, backend: AgentBackend) -> Result<Vec<SlashCommand>> {
     check(
@@ -351,6 +350,7 @@ pub async fn agent_slash_commands(id: &str) -> Result<Vec<SlashCommand>> {
     .map_err(|e| e.to_string())
 }
 
+/// The PRs a session opened, as of the last poll.
 pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
     check(Request::get(&format!("/api/agents/{id}/prs")).send().await)
         .await?

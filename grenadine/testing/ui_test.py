@@ -5076,7 +5076,11 @@ class AgentTest(ServerTestCase):
         # Hiding nothing shows the commands hidden by default too.
         self.page.locator(".global-settings-button").click()
         dialog = self.page.get_by_role("dialog", name="Settings")
+        # Only a changed setting is stored, so that new defaults show.
+        stored = "() => localStorage.getItem('hidden-commands')"
+        self.assertIsNone(self.page.evaluate(stored))
         dialog.get_by_label("Hidden commands").fill("foo")
+        self.page.wait_for_function(f"({stored})() === 'foo'")
         dialog.get_by_role("button", name="Close").click()
         follow_up.fill("")
         follow_up.press_sequentially("/")

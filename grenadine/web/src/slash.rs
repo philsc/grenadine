@@ -20,7 +20,9 @@ const KEY: &str = "hidden-commands";
 pub const DEFAULT_HIDDEN: &str = "clear exit login logout config resume vim terminal-setup ide \
     doctor help status theme memory permissions agents mcp hooks model add-dir";
 
-/// The "Hidden commands" setting as typed, persisted in localStorage.
+/// The "Hidden commands" setting as typed, persisted in localStorage
+/// while it differs from the default, so that a later default reaches
+/// those who never changed it.
 pub fn hidden_signal() -> RwSignal<String> {
     let hidden = RwSignal::new(
         storage()
@@ -30,7 +32,11 @@ pub fn hidden_signal() -> RwSignal<String> {
     Effect::new(move |_| {
         if let Some(s) = storage() {
             hidden.with(|h| {
-                let _ = s.set_item(KEY, h);
+                let _ = if h == DEFAULT_HIDDEN {
+                    s.remove_item(KEY)
+                } else {
+                    s.set_item(KEY, h)
+                };
             });
         }
     });
@@ -38,13 +44,13 @@ pub fn hidden_signal() -> RwSignal<String> {
 }
 
 /// The names in the "Hidden commands" setting: separated by spaces or
-/// commas, with or without their `/`.
+/// commas, with or without their `/`; lowercased.
 pub fn parse_hidden(setting: &str) -> HashSet<String> {
     setting
         .split(|c: char| c.is_whitespace() || c == ',')
         .map(|n| n.trim_start_matches('/'))
         .filter(|n| !n.is_empty())
-        .map(str::to_owned)
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -69,12 +75,15 @@ pub fn typed(text: &str, caret: usize) -> Option<&str> {
 }
 
 /// The names of `commands` that start with `prefix`, ignoring case, and
-/// aren't hidden: the most used first, then alphabetically.
+/// aren't in `hidden`, which is lowercase: the most used first, then alphabetically.
 pub fn matches(commands: &[SlashCommand], prefix: &str, hidden: &HashSet<String>) -> Vec<String> {
     let prefix = prefix.to_lowercase();
     let mut found: Vec<&SlashCommand> = commands
         .iter()
-        .filter(|c| c.name.to_lowercase().starts_with(&prefix) && !hidden.contains(&c.name))
+        .filter(|c| {
+            let name = c.name.to_lowercase();
+            name.starts_with(&prefix) && !hidden.contains(&name)
+        })
         .collect();
     found.sort_by(|a, b| b.uses.cmp(&a.uses).then_with(|| a.name.cmp(&b.name)));
     found.into_iter().map(|c| c.name.clone()).collect()
@@ -108,6 +117,7 @@ pub enum Source {
 pub struct Suggest {
     textarea: NodeRef<leptos::html::Textarea>,
     text: RwSignal<String>,
+    source: Signal<Source>,
     /// The commands last fetched, and for which source.
     commands: RwSignal<Option<(Source, Vec<SlashCommand>)>>,
     /// What `typed` says of the box: the command being typed.
@@ -129,6 +139,7 @@ impl Suggest {
         let s = Suggest {
             textarea,
             text,
+            source,
             commands: RwSignal::new(None),
             word: RwSignal::new(None),
             cycle: RwSignal::new(None),
@@ -170,9 +181,14 @@ impl Suggest {
         let Some(word) = self.word.get() else {
             return (Vec::new(), 0);
         };
+        // Another source's commands, e.g. the repository picked before,
+        // aren't shown while the current one's are fetched.
+        let source = self.source.get();
         let names = self.commands.with(|c| match c {
-            Some((_, commands)) => self.hidden.with(|h| matches(commands, &word, h)),
-            None => Vec::new(),
+            Some((from, commands)) if *from == source => {
+                self.hidden.with(|h| matches(commands, &word, h))
+            }
+            _ => Vec::new(),
         });
         (names, 0)
     }
@@ -339,6 +355,9 @@ mod tests {
         assert!(matches(&commands, "x", &none).is_empty());
         let hidden = parse_hidden("/bat, baz");
         assert_eq!(matches(&commands, "b", &hidden), ["bar"]);
+        let hidden = parse_hidden("BAT");
+        assert_eq!(matches(&commands, "b", &hidden), ["bar", "baz"]);
+        assert!(matches(&[cmd("Foo", 0)], "f", &parse_hidden("foo")).is_empty());
     }
 
     #[test]
