@@ -1273,7 +1273,11 @@ pub async fn create_session(
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
     if kind == SessionKind::Interactive {
-        crate::summary::start(state, &id, session.backend, &req.prompt);
+        let pr = session.pr.map(|number| PrKey {
+            repo: session.repo.clone(),
+            number,
+        });
+        crate::summary::start(state, &id, session.backend, &req.prompt, pr.as_ref());
     }
     send_with_files(
         state,
@@ -5585,6 +5589,62 @@ esac
             "{input}"
         );
         wait_for_turns(&state, &session.id, 1).await;
+    }
+
+    /// The summary job is also told the title of the PR the session
+    /// started from.
+    #[tokio::test]
+    async fn summarizes_with_the_starting_prs_title() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in
+*" --json-schema "*)
+  cat > {dir}/summary_input
+  echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
+  ;;
+*" --no-session-persistence "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
+  ;;
+*)
+  cat > /dev/null
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+  ;;
+esac
+"#,
+            dir = dir.path().display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        state
+            .agents
+            .summaries
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let head = run(&fx.upstream, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(&fx.upstream, &["branch", "pr-branch", &head]);
+        store_pr(&state, &fx, 5, "pr-branch", &head);
+
+        let session = start_from_pr(&state, "/fix-it", 5).await;
+        for _ in 0..300 {
+            if state
+                .db
+                .agent(&session.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let input = std::fs::read_to_string(dir.path().join("summary_input")).unwrap();
+        assert!(
+            input.ends_with("\n\n# Pull request\n\nt\n\n# Request\n\n/fix-it\n"),
+            "{input}"
+        );
     }
 
     /// A session whose fake claude starts a container, and answers scans
