@@ -1754,7 +1754,9 @@ impl Db {
     }
 
     /// Records the commands the session's backend listed, as the session's
-    /// own and as the latest for its repository and backend.
+    /// own and as the latest for its repository and backend. Automatic
+    /// reviews only set their own: they run at their PRs' heads, whose
+    /// skills needn't be the ones a new session gets.
     pub fn set_slash_commands(
         &self,
         id: &str,
@@ -1771,10 +1773,12 @@ impl Db {
             params![names, id],
         )?;
         tx.execute(
-            "INSERT INTO slash_commands (repo, backend, names, updated_at) VALUES (?, ?, ?, ?)
+            "INSERT INTO slash_commands (repo, backend, names, updated_at)
+             SELECT ?, ?, ?, ?
+             WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ? AND kind = 'auto_review')
              ON CONFLICT (repo, backend) DO UPDATE SET
                  names = excluded.names, updated_at = excluded.updated_at",
-            params![repo, backend.as_str(), names, at],
+            params![repo, backend.as_str(), names, at, id],
         )?;
         tx.commit()?;
         Ok(())
@@ -4315,7 +4319,19 @@ mod tests {
             db.agent_slash_commands("a").unwrap(),
             Some(names(&["bar", "foo"]))
         );
-        // The repository keeps the latest session's.
+        // An automatic review only keeps its own.
+        db.create_agent(&AgentSession {
+            kind: SessionKind::AutoReview,
+            ..AgentSession::fixture("review", "o/n")
+        })
+        .unwrap();
+        db.set_slash_commands("review", "o/n", AgentBackend::Claude, &names(&["old"]), 3)
+            .unwrap();
+        assert_eq!(
+            db.agent_slash_commands("review").unwrap(),
+            Some(names(&["old"]))
+        );
+        // The repository keeps the latest interactive session's.
         assert_eq!(
             db.repo_slash_commands("o/n", AgentBackend::Claude).unwrap(),
             Some(names(&["foo"]))

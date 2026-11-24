@@ -42,6 +42,8 @@ pub fn list(
 
 /// The skills and commands in the Claude Code config directory `config`
 /// and in the repository checked out at `checkout`, sorted.
+/// It doesn't read the skills' frontmatter, so ones that aren't
+/// user-invocable are included until a session lists its commands.
 fn scan(config: &Path, checkout: Option<&Path>) -> Vec<String> {
     let mut names = Vec::new();
     let dirs = std::iter::once(config.to_owned()).chain(checkout.map(|c| c.join(".claude")));
