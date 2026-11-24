@@ -5118,6 +5118,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             "{log}"
         );
         assert!(second.trim_end().ends_with(" | second | 1"), "{log}");
+        for call in [first, second.as_str()] {
+            assert!(call.contains(&images_note()), "{log}");
+            assert!(call.contains(crate::claude::DESCRIPTION_NOTE), "{log}");
+        }
 
         // Pages get the stored events and the streamed text.
         let mut live = Vec::new();
