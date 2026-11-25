@@ -4380,9 +4380,21 @@ self.onmessage = async (event) => {{
         file.locator(".file-header").click()
         expect(file.locator("table.diff")).to_have_count(0)
 
-    def toolbar_bottom(self) -> float:
-        box = self.page.locator(".toolbar").bounding_box()
-        return box["y"] + box["height"]
+    def expect_header_at_toolbar(self, file: Locator) -> None:
+        """Expects `file`'s header to stick to the pinned toolbar's bottom
+        edge."""
+        # Pinning adds the title row a moment after the scroll, and a
+        # ResizeObserver moves the header below it just before the next
+        # frame is painted.
+        expect(self.page.locator(".toolbar-title")).to_be_visible()
+        expect(file.locator(".file-header")).to_be_visible()
+        self.page.wait_for_function(
+            "(file) => Math.abs("
+            "file.querySelector('.file-header').getBoundingClientRect().top"
+            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
+            ") <= 1",
+            arg=file.element_handle(),
+        )
 
     def test_file_headers_stick_below_the_toolbar(self) -> None:
         self.open(scenarios.BIG_DIFF)
@@ -4392,11 +4404,7 @@ self.onmessage = async (event) => {{
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         # Mid-file the header sticks to the toolbar's bottom edge.
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
-        header = file.locator(".file-header")
-        expect(header).to_be_visible()
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
     def test_toolbar_shows_the_title_only_while_pinned(self) -> None:
         pr = self.cases.prs[scenarios.BIG_DIFF]
@@ -4417,10 +4425,7 @@ self.onmessage = async (event) => {{
         expect(title).to_contain_text(pr.title)
         expect(title.locator(".pr-number")).to_have_text(f"#{pr.number}")
         # The row grew the toolbar; the stuck file header follows it.
-        header = file.locator(".file-header")
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
         main = self.page.locator(".pr-page .main")
         main.evaluate("el => el.scrollTop = 0")
@@ -4462,10 +4467,7 @@ self.onmessage = async (event) => {{
         self.open(scenarios.BIG_DIFF)
         path = scenarios.BIG_FILES[4]
         self.page.locator(".file-index a", has_text=path).click()
-        header = self.file(path).locator(".file-header")
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(self.file(path))
 
     def test_collapsing_a_stuck_file_keeps_its_header_in_view(self) -> None:
         self.open(scenarios.BIG_DIFF)
@@ -4485,9 +4487,7 @@ self.onmessage = async (event) => {{
             ") <= 1",
             arg=file.element_handle(),
         )
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
     def test_collapsing_a_stuck_file_lets_the_user_scroll(self) -> None:
         self.open(scenarios.BIG_DIFF)
