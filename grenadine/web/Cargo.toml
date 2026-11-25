@@ -39,7 +39,6 @@ web-sys = { workspace = true, features = [
   "Worker",
   "WorkerOptions",
   "WorkerType",
-  "EventSource",
   "MessageEvent",
   "MouseEvent",
   "Location",

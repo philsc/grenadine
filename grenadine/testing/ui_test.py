@@ -4955,6 +4955,33 @@ class AgentTest(ServerTestCase):
         backend.select_option(label="Devin")
         expect(model).to_have_value("swe-2-high")
 
+    def test_more_tabs_than_http_connections_all_load(self) -> None:
+        # A browser keeps six HTTP connections to a server, shared by the
+        # tabs of a context. Every tab follows two event streams; over
+        # HTTP, three tabs' streams left no connection for a fourth tab.
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        self.page = context.new_page()
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("Count the tabs")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        for _ in range(4):
+            tab = context.new_page()
+            tab.goto(self.page.url)
+            expect(tab.locator(".transcript .turn-prompt").first).to_have_text(
+                "Count the tabs"
+            )
+            expect(tab.locator(".transcript .turn-end")).to_have_count(1)
+        # The first tab still gets what happens next.
+        self.page.get_by_label("Follow-up").fill("And again")
+        self.page.get_by_label("Follow-up").press("Enter")
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(2)
+        expect(tab.locator(".transcript .turn-end")).to_have_count(2)
+
     def test_sessions_keep_their_own_models(self) -> None:
         def start(model: str, prompt: str) -> str:
             self.page.goto(self.url + "#/agents")
