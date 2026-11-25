@@ -656,10 +656,11 @@ fn backfill_agent_prs(conn: &Connection) -> Result<()> {
 
 fn backfill_skill_uses(conn: &Connection) -> Result<()> {
     // Events are stored with their kind as the only key, so the prefix
-    // finds these prompts without loading the other events.
+    // finds these prompts without loading the other events. Their times
+    // are in milliseconds.
     let prompts: Vec<(String, String, Option<i64>)> = conn
         .prepare(
-            r#"SELECT a.repo, e.event, e.at FROM agent_events e
+            r#"SELECT a.repo, e.event, e.at / 1000 FROM agent_events e
              JOIN agents a ON a.id = e.agent_id
              WHERE a.kind != 'auto_review' AND e.event LIKE '{"prompt":"/%'"#,
         )?
@@ -4259,14 +4260,14 @@ mod tests {
             .unwrap();
         }
         let prompts = [
-            ("review", "/foo Review pull request", Some(30)),
-            ("a", "/foo do it", Some(10)),
+            ("review", "/foo Review pull request", Some(30_000)),
+            ("a", "/foo do it", Some(10_000)),
             ("a", "/foo again", None),
-            ("b", "/foo", Some(5)),
-            ("b", "/bar x", Some(7)),
-            ("b", "/tmp/x is full", Some(8)),
-            ("b", "no command", Some(9)),
-            ("c", "/foo", Some(20)),
+            ("b", "/foo", Some(5_000)),
+            ("b", "/bar x", Some(7_000)),
+            ("b", "/tmp/x is full", Some(8_000)),
+            ("b", "no command", Some(9_000)),
+            ("c", "/foo", Some(20_000)),
         ];
         for (id, prompt, at) in prompts {
             conn.execute(
