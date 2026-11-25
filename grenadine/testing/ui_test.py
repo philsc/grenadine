@@ -9567,6 +9567,8 @@ class UpdateTest(ServerTestCase):
             subprocess.run(["git", *args, *target], env=env, check=True)
         # Fails while the file is there.
         cls.broken = tmp / "broken"
+        # Hangs while the file is there.
+        cls.hung = tmp / "hung"
         server = Path(os.environ["GRENADINE_SERVER"]).absolute()
         bazel = bin_dir / "bazel"
         bazel.write_text(
@@ -9574,6 +9576,9 @@ class UpdateTest(ServerTestCase):
 if [ -e {cls.broken} ]; then
     echo "ERROR: it does not compile" >&2
     exit 1
+fi
+if [ -e {cls.hung} ]; then
+    sleep 600
 fi
 for arg; do
     case "$arg" in --script_path=*) script="${{arg#--script_path=}}" ;; esac
@@ -9722,6 +9727,20 @@ chmod 755 "$script"
         expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
         self.page.reload()
         self.end_session()
+
+    def test_cancels_a_hung_build(self) -> None:
+        self.hung.touch()
+        self.addCleanup(self.hung.unlink)
+        before = self.head()
+        self.push("Hung")
+        self.page.goto(self.url + "#/debug")
+        button = self.section().get_by_role("button", name="Update and restart")
+        button.click()
+        expect(self.bar()).to_contain_text("Building the update…")
+        self.bar().get_by_role("button", name="Cancel").click()
+        expect(self.bar()).to_have_count(0)
+        expect(button).to_be_enabled()
+        self.assertEqual(self.head(), before)
 
     def test_failed_build(self) -> None:
         self.broken.touch()

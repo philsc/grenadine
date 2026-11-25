@@ -457,17 +457,14 @@ impl Scans {
     }
 }
 
+/// The titles of the deleted sessions being scanned, by session ID.
+pub fn scanning(state: &State) -> BTreeMap<String, String> {
+    state.agents.scans.running.lock().unwrap().clone()
+}
+
 /// The cleanup items, and the sessions still being scanned.
 pub fn cleanup_state(state: &State) -> Result<CleanupState> {
-    let scanning = state
-        .agents
-        .scans
-        .running
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
+    let scanning = scanning(state).into_values().collect();
     Ok(CleanupState {
         items: state.db.cleanup_items()?,
         scanning,

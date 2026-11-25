@@ -399,9 +399,18 @@ pub async fn run() -> Result<Exit> {
     shutdown.cancel();
     tokio::select! {
         r = async {
-            server_task.await.context("server task panicked")??;
-            sync_task.await.context("sync task panicked")
-        } => r?,
+            let served = server_task.await.context("server task panicked");
+            let synced = sync_task.await.context("sync task panicked");
+            served??;
+            synced
+        } => match r {
+            // The new version gets to serve whatever became of the tasks,
+            // which may have panicked long ago.
+            Err(e) if matches!(exit, Exit::Restart(_)) => {
+                tracing::error!("restarting anyway: {e:#}");
+            }
+            r => r?,
+        },
         // Dropping the runtime would wait forever on spawn_blocking git
         // work, so timeouts and repeated signals exit the process directly.
         _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {

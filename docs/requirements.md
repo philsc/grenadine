@@ -873,18 +873,21 @@ _Why:_ the clone may hold someone's work.
 
 **UPDATE-3.** The server must go on serving during the build. A failed
 build must leave it running, show why the build failed, and put the clone
-back unless someone has changed it meanwhile.
+back unless someone has changed it meanwhile. The user must be able to
+cancel the build, which must put the clone back likewise.
 
 **UPDATE-4.** The restart must wait until no session runs a turn, has
 prompts queued, is landing its work, is having a handoff written or is
-finishing an automatic review, and no terminal runs a command in the
+finishing an automatic review, no session is being deleted or scanned for
+what it left behind, and no terminal runs a command in the
 foreground. A terminal whose shell is at its prompt must not hold it up.
 The user must be able to cancel it, or to restart at once after being told
 which sessions that stops. While it waits, the page must show how many
 open terminals the restart closes.
 
 **UPDATE-5.** The restart must keep the server's process ID, terminal and
-arguments. SIGINT and SIGTERM must still stop the server.
+arguments. SIGINT and SIGTERM must still stop the server, also while it
+restarts.
 
 **UPDATE-6.** Every page must show the update's progress. A page that was
 loaded from another commit than the server runs must offer a reload and

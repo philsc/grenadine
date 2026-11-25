@@ -537,6 +537,8 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// How many deletions of each session are under way.
+    deleting: std::sync::Mutex<HashMap<String, usize>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether each new session's first prompt is summarized.
@@ -999,6 +1001,7 @@ impl Agents {
             worktrees,
             base_url,
             slices,
+            deleting: std::sync::Mutex::default(),
             live: std::sync::Mutex::default(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
@@ -1898,6 +1901,29 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
     Ok(true)
 }
 
+/// Has the session count as busy while it's being deleted.
+struct Deleting(Arc<State>, String);
+
+impl Deleting {
+    fn new(state: &Arc<State>, id: &str) -> Deleting {
+        let mut deleting = state.agents.deleting.lock().unwrap();
+        *deleting.entry(id.to_owned()).or_default() += 1;
+        Deleting(state.clone(), id.to_owned())
+    }
+}
+
+impl Drop for Deleting {
+    fn drop(&mut self) {
+        let mut deleting = self.0.agents.deleting.lock().unwrap();
+        if let Some(n) = deleting.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                deleting.remove(&self.1);
+            }
+        }
+    }
+}
+
 /// Stops the session and removes it along with its worktree and branch, or
 /// a general session's directory. Returns false when there is no such
 /// session. A session whose backend this build doesn't know goes too, but
@@ -1916,6 +1942,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             repo = session.repo
         );
     }
+    // Before the interrupt, so that the session is busy throughout. It ends
+    // once the scan counts.
+    let _deleting = Deleting::new(state, id);
     // The transcript goes with the session; the scan reads it after.
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
@@ -2227,7 +2256,8 @@ pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<
 /// The sessions a restart of the server would interrupt: those running a
 /// turn, also one that waits for the user's approval, with prompts queued,
 /// landing their work, having a handoff written, doing an automatic review
-/// that isn't finished, or with a command running in a terminal.
+/// that isn't finished, being deleted or scanned for what they left behind,
+/// or with a command running in a terminal.
 pub fn busy_sessions(state: &State) -> Vec<BusySession> {
     let terminals = state.agents.terminals.busy();
     let mut ids: std::collections::BTreeSet<String> = {
@@ -2245,6 +2275,10 @@ pub fn busy_sessions(state: &State) -> Vec<BusySession> {
             .collect()
     };
     ids.extend(terminals.keys().cloned());
+    // The deletions first: one ends when its scan has started.
+    ids.extend(state.agents.deleting.lock().unwrap().keys().cloned());
+    let scanning = crate::cleanup::scanning(state);
+    ids.extend(scanning.keys().cloned());
     let mut starting = Vec::new();
     match state.db.auto_reviews() {
         Ok(reviews) => {
@@ -2270,7 +2304,10 @@ pub fn busy_sessions(state: &State) -> Vec<BusySession> {
         .map(|id| {
             let title = match state.db.agent(&id) {
                 Ok(Some(s)) => s.summary.unwrap_or(s.title),
-                _ => String::new(),
+                _ => match scanning.get(&id) {
+                    Some(title) => format!("Cleanup scan: {title}"),
+                    None => String::new(),
+                },
             };
             let terminals = terminals.get(&id).copied().unwrap_or(0);
             BusySession {
@@ -5756,7 +5793,7 @@ esac
 
     /// A session whose fake claude starts a container, and answers scans
     /// with `scan` after logging their arguments and input to `dir`.
-    async fn scanned_session(
+    pub(crate) async fn scanned_session(
         dir: &Path,
         scan: &str,
     ) -> (crate::git::tests::Fixture, Arc<State>, AgentSession) {
@@ -9950,6 +9987,46 @@ esac
         });
         with("f", |l| l.finishing_review = true);
         assert_eq!(ids(), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[tokio::test]
+    async fn deletions_and_scans_are_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let scan = format!(
+            r#"while [ ! -e {} ]; do sleep 0.05; done
+  echo '{{"type":"result","is_error":false,"structured_output":{{"items":[]}}}}'"#,
+            gate.display()
+        );
+        let (_fx, state, session) = tests::scanned_session(dir.path(), &scan).await;
+        let cloned = state.repos["owner/name"].clone();
+        let until = async |done: &dyn Fn() -> bool| {
+            for _ in 0..1500 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("stuck: {:?}", busy_sessions(&state));
+        };
+        until(&|| busy_sessions(&state).is_empty()).await;
+
+        // The deletion waits for the lock to remove the worktree.
+        let held = cloned.git_lock.lock().await;
+        let deleting = tokio::spawn({
+            let (state, id) = (state.clone(), session.id.clone());
+            async move { delete(&state, &id).await }
+        });
+        until(&|| !busy_sessions(&state).is_empty()).await;
+        assert_eq!(busy_sessions(&state)[0].id, session.id);
+        drop(held);
+        assert!(deleting.await.unwrap().unwrap());
+
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].title, "Cleanup scan: Run the e2e tests");
+        std::fs::write(gate, "").unwrap();
+        until(&|| busy_sessions(&state).is_empty()).await;
     }
 
     #[tokio::test]

@@ -191,8 +191,11 @@ async fn run_step(mut cmd: tokio::process::Command, what: &str) -> Result<()> {
         let program = Path::new(cmd.as_std().get_program());
         format!("can't run {}", program.display())
     })?;
+    let mut group = KillGroup(child.id());
     let stderr = agent::stderr_tail(child.stderr.take().expect("stderr is piped"));
     let status = child.wait().await?;
+    // Its PID may be another process's now.
+    group.0 = None;
     if !status.success() {
         bail!(
             "{what} failed ({status})\n{}",
@@ -200,6 +203,18 @@ async fn run_step(mut cmd: tokio::process::Command, what: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Kills the process group on drop: `bazel` may be a wrapper that runs the
+/// real one as a child.
+struct KillGroup(Option<u32>);
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::terminal::signal_group(pid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Copies this binary to the path in the second argument and returns the
@@ -276,7 +291,7 @@ enum Decision {
 #[derive(Default)]
 struct Inner {
     phase: UpdatePhase,
-    /// What the user decided about the waiting update.
+    /// What the user decided about the update being built or waiting.
     decision: Option<Decision>,
     /// The binary to restart into, once the restart is due.
     restart_into: Option<PathBuf>,
@@ -317,11 +332,14 @@ impl Updater {
         inner.restart_into.clone().expect("the restart is due")
     }
 
-    /// Takes the waiting update's decision; false if none is waiting.
+    /// Takes the decision about the update; false if it can't be followed
+    /// now. A build can only be cancelled.
     fn decide(&self, decision: Decision) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if !matches!(inner.phase, UpdatePhase::Waiting { .. }) {
-            return false;
+        match (&inner.phase, &decision) {
+            (UpdatePhase::Waiting { .. }, _) => {}
+            (UpdatePhase::Building, Decision::Cancel) => {}
+            _ => return false,
         }
         inner.decision = Some(decision);
         drop(inner);
@@ -345,7 +363,7 @@ fn set_phase(state: &State, phase: UpdatePhase) {
     state.send(ServerEvent::UpdateChanged);
 }
 
-/// Stops waiting to restart, or dismisses a failure.
+/// Stops building or waiting to restart, or dismisses a failure.
 pub fn cancel(state: &State) -> bool {
     let failed = matches!(
         state.update.inner.lock().unwrap().phase,
@@ -426,7 +444,8 @@ pub fn start(state: &Arc<State>) -> bool {
             _ = state.shutdown.cancelled() => return,
         };
         match result {
-            Ok((target, binary)) => wait(&state, target, binary).await,
+            Ok(Some((target, binary))) => wait(&state, target, binary).await,
+            Ok(None) => set_phase(&state, UpdatePhase::Idle),
             Err(e) => {
                 tracing::warn!("can't update: {e:#}");
                 let error = format!("{e:#}");
@@ -437,8 +456,9 @@ pub fn start(state: &Arc<State>) -> bool {
     true
 }
 
-/// Checks out the branch's tip and builds it. Returns it and the binary.
-async fn prepare(state: &Arc<State>) -> Result<(String, PathBuf)> {
+/// Checks out the branch's tip and builds it. Returns it and the binary, or
+/// `None` if the user cancelled the build.
+async fn prepare(state: &Arc<State>) -> Result<Option<(String, PathBuf)>> {
     let (old, target) = with_clone(state, Build::check_out).await?;
     tracing::info!("building {target}");
     set_phase(state, UpdatePhase::Building);
@@ -457,15 +477,29 @@ async fn prepare(state: &Arc<State>) -> Result<(String, PathBuf)> {
         .await?;
         Ok(binary)
     };
-    match built.await {
-        Ok(binary) => Ok((target, binary)),
-        Err(e) => {
-            let restored = with_clone(state, move |b| b.restore(&old, &target)).await;
-            if let Err(e) = restored {
-                tracing::warn!("can't move the clone back: {e:#}");
-            }
-            Err(e)
+    // Dropping the build stops Bazel.
+    let built = tokio::select! {
+        r = built => r.map(Some),
+        _ = build_cancelled(state) => Ok(None),
+    };
+    if let Ok(Some(binary)) = built {
+        return Ok(Some((target, binary)));
+    }
+    let restored = with_clone(state, move |b| b.restore(&old, &target)).await;
+    if let Err(e) = restored {
+        tracing::warn!("can't move the clone back: {e:#}");
+    }
+    built.map(|_| None)
+}
+
+/// Waits until the user cancels the build.
+async fn build_cancelled(state: &State) {
+    loop {
+        // Before waiting: a notification can be left from an earlier one.
+        if state.update.inner.lock().unwrap().decision.is_some() {
+            return;
         }
+        state.update.decided.notified().await;
     }
 }
 
@@ -770,6 +804,36 @@ chmod 755 "$script"
         // It can be dismissed, and tried again.
         assert!(cancel(&state));
         assert_eq!(state.update.status().phase, UpdatePhase::Idle);
+        assert!(start(&state));
+    }
+
+    #[tokio::test]
+    async fn a_hung_build_can_be_cancelled() {
+        let f = fixture();
+        let b = build(
+            &f,
+            "#!/bin/sh\nsleep 600 &\necho $! > pid.tmp && mv pid.tmp pid\nwait\n",
+        );
+        let old = b.running.sha.clone();
+        let state = state(Some(b));
+        add_commit(&f.upstream, "b", "1\n");
+        assert!(start(&state));
+        until(&state, |p| *p == UpdatePhase::Building).await;
+        let file = f.clone.path.join("pid");
+        until(&state, |_| file.exists()).await;
+        assert!(!state.update.force(), "there's nothing to restart into");
+        assert!(cancel(&state));
+        until(&state, |p| *p == UpdatePhase::Idle).await;
+        assert_eq!(head(&f), old);
+        // What the build started is gone too, or a zombie until whatever
+        // adopted it reaps it.
+        let pid = std::fs::read_to_string(file).unwrap();
+        let stat = format!("/proc/{}/stat", pid.trim());
+        until(&state, |_| match std::fs::read_to_string(&stat) {
+            Ok(s) => s.contains(") Z "),
+            Err(_) => true,
+        })
+        .await;
         assert!(start(&state));
     }
 

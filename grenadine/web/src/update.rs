@@ -113,7 +113,11 @@ pub fn UpdateBar() -> impl IntoView {
         Some(match phase {
             UpdatePhase::Idle => return None,
             UpdatePhase::CheckingOut => view! { <span>"Updating…"</span> }.into_any(),
-            UpdatePhase::Building => view! { <span>"Building the update…"</span> }.into_any(),
+            UpdatePhase::Building => view! {
+                <span>"Building the update…"</span>
+                <button class="link" on:click=cancel>"Cancel"</button>
+            }
+            .into_any(),
             UpdatePhase::Restarting => view! { <span>"Restarting…"</span> }.into_any(),
             UpdatePhase::Waiting {
                 sessions,

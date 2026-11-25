@@ -70,10 +70,20 @@ fn main() -> Result<()> {
     match runtime.block_on(grenadine_server::run())? {
         Exit::Stop => Ok(()),
         Exit::Restart(binary) => {
+            // Nothing reads tokio's signal handlers anymore.
+            reset_signals();
             runtime.shutdown_timeout(RESTART_GRACE);
             reap_children();
             exec(&binary)
         }
+    }
+}
+
+/// Has SIGINT and SIGTERM end the process.
+fn reset_signals() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: the default action is no handler that could be unsafe.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
     }
 }
 

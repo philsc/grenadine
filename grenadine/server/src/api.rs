@@ -1000,9 +1000,9 @@ async fn force_update(AxState(state): St) -> ApiResult<StatusCode> {
     accepted(state.update.force(), "no update is waiting")
 }
 
-/// Drops the waiting update, or dismisses a failed one.
+/// Drops the update being built or waiting, or dismisses a failed one.
 async fn cancel_update(AxState(state): St) -> ApiResult<StatusCode> {
-    accepted(crate::update::cancel(&state), "no update is waiting")
+    accepted(crate::update::cancel(&state), "no update can be cancelled")
 }
 
 fn accepted(ok: bool, otherwise: &str) -> ApiResult<StatusCode> {

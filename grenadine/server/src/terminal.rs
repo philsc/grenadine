@@ -465,8 +465,8 @@ fn waiting_for_input(syscall: &str) -> bool {
     }
 }
 
-/// Sends `signal` to the shell's process group; the shell leads it.
-fn signal_group(pid: u32, signal: libc::c_int) {
+/// Sends `signal` to the process group that `pid` leads, e.g. a shell's.
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
     // SAFETY: kill has no memory-safety preconditions.
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);
