@@ -1717,6 +1717,8 @@ pub fn NewSession(
         let images = images.get_untracked();
         let attachments = files.ids();
         let id = id.get_value();
+        // Read here because the task outlives the form, which owns it.
+        let handoff = handoff.get_value();
         drafts.set_starting(&id, true);
         // The last attempt's error doesn't carry into this one.
         drafts.set_start_error(&id, None);
@@ -1753,7 +1755,7 @@ pub fn NewSession(
             // draft stays until the session shows up, when the sidebar
             // moves the start mode onto it and removes the draft, as it
             // does for a start whose answer the page missed.
-            if let Some(h) = handoff.get_value() {
+            if let Some(h) = handoff {
                 save_start(&id, &req.permission_mode, &picked);
                 if let Err(e) = h.answer(Some(req), None).await {
                     forget_start(&id);

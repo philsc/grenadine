@@ -6746,6 +6746,40 @@ class AgentTest(ServerTestCase):
         expect(entries.filter(has_text="say held")).to_have_count(1)
         expect(draft).to_have_count(0)
 
+    def test_leaving_a_form_while_its_start_fetches_the_settings(self) -> None:
+        # A start asked for before the repository's settings arrived
+        # fetches them itself; leaving the form meanwhile doesn't stop it.
+        held: list[Route] = []
+        arriving = threading.Event()
+
+        def hold(route: Route) -> None:
+            if arriving.is_set():
+                route.continue_()
+            else:
+                held.append(route)
+
+        self.page.route(f"**/api/repos/{scenarios.REPO}/settings", hold)
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say held")
+        self.page.get_by_role("button", name="Start").click()
+        draft = self.page.locator(".agent-draft", has_text="say held")
+        expect(draft.locator(".agent-status")).to_have_text("Starting…")
+        self.wait_held(held)
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(self.page.get_by_label("Prompt")).to_have_value("")
+
+        arriving.set()
+        for route in held:
+            route.continue_()
+        entries = self.section(scenarios.REPO).locator(".agent-entry")
+        expect(
+            entries.filter(has=self.page.locator("a.agent-item")).filter(
+                has_text="say held"
+            )
+        ).to_have_count(1)
+        expect(draft).to_have_count(0)
+
     def test_a_session_opened_before_its_start_answers_keeps_its_mode(self) -> None:
         held = self.hold_agent_answers()
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
