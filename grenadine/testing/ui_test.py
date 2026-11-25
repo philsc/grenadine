@@ -6681,7 +6681,7 @@ class AgentTest(ServerTestCase):
             if held:
                 return
             self.page.wait_for_timeout(50)
-        self.fail("no session start reached the server")
+        self.fail("the page didn't make the request to hold")
 
     def test_starting_a_draft_leaves_you_where_you_went(self) -> None:
         # A session to go to while the draft's start is in flight.
@@ -7401,10 +7401,9 @@ class AgentTest(ServerTestCase):
         tabs.nth(1).click()
         expect(transcript.locator(".turn-prompt")).to_have_text(["say two"])
 
-    def test_pr_agents_panel_expanded_before_its_sessions_load(self) -> None:
-        self.start_pr_session("say one")
-
-        # The session list arrives only after the panel is expanded.
+    def hold_pr_sessions(self) -> tuple[list[Route], Callable[[], None]]:
+        """Stashes the routes of the requests for the PR's sessions; calling
+        the second value lets them and any later ones through."""
         held: list[Route] = []
         arriving = threading.Event()
 
@@ -7414,9 +7413,21 @@ class AgentTest(ServerTestCase):
             else:
                 held.append(route)
 
+        def release() -> None:
+            arriving.set()
+            for route in held:
+                route.continue_()
+
         self.page.route(
             f"**/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents", hold
         )
+        return held, release
+
+    def test_pr_agents_panel_expanded_before_its_sessions_load(self) -> None:
+        self.start_pr_session("say one")
+
+        # The session list arrives only after the panel is expanded.
+        held, release = self.hold_pr_sessions()
         panel = self.pr_page()
         toggle = panel.locator(".pr-agents-toggle")
         toggle.click()
@@ -7426,14 +7437,92 @@ class AgentTest(ServerTestCase):
         expect(panel.locator(".pr-agents-tabs").get_by_role("tab")).to_have_count(0)
         expect(panel.locator(".agent-form")).to_have_count(0)
 
-        arriving.set()
-        for route in held:
-            route.continue_()
+        release()
         tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(1)
         expect(tabs.first).to_contain_text("say one")
         expect(tabs.first).to_have_attribute("aria-selected", "true")
         expect(panel.locator(".transcript .turn-prompt")).to_have_text(["say one"])
+
+    def test_pr_agents_panel_expanded_before_an_empty_list_loads(self) -> None:
+        held, release = self.hold_pr_sessions()
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        self.wait_held(held)
+        expect(panel.locator(".agent-form")).to_have_count(0)
+
+        # Once it's known that there are no sessions, the form opens.
+        release()
+        expect(panel.locator(".agent-form")).to_be_visible()
+
+    def fail_pr_sessions(self) -> threading.Event:
+        """Fails the requests for the PR's sessions while the event is set."""
+        failing = threading.Event()
+
+        def answer(route: Route) -> None:
+            if failing.is_set():
+                route.fulfill(status=500, body="made-up failure")
+            else:
+                route.continue_()
+
+        self.page.route(
+            f"**/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents", answer
+        )
+        return failing
+
+    def change_sessions(self) -> None:
+        """Starts a session in another repository, so the page refetches its
+        sessions."""
+        resp = self.page.request.post(
+            f"{self.url}api/agents",
+            headers={"Origin": self.url.rstrip("/")},
+            data={
+                "backend": "claude",
+                "repo": self.OTHER_REPO,
+                "prompt": "say elsewhere",
+                "permission_mode": "auto",
+            },
+        )
+        self.assertTrue(resp.ok, resp.text())
+
+    def test_pr_agents_panel_whose_sessions_fail_to_load(self) -> None:
+        failing = self.fail_pr_sessions()
+        failing.set()
+        panel = self.pr_page()
+        error = panel.locator(".pr-agents-bar .error")
+        expect(error).to_contain_text("made-up failure")
+        # Not knowing the sessions isn't having none, but a new one can
+        # still be asked for.
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(panel.locator(".agent-form")).to_have_count(0)
+        panel.locator(".pr-agents-new").click()
+        expect(panel.locator(".agent-form")).to_be_visible()
+
+        # The error goes once the sessions arrive.
+        failing.clear()
+        self.change_sessions()
+        expect(error).to_have_count(0)
+
+    def test_pr_agents_panel_whose_sessions_fail_to_refetch(self) -> None:
+        failing = self.fail_pr_sessions()
+        with self.page.expect_response(
+            lambda r: r.url.endswith(f"/{self.panel_pr.number}/agents")
+        ) as first:
+            panel = self.pr_page()
+        first.value.finished()
+        failing.set()
+        self.change_sessions()
+        expect(panel.locator(".pr-agents-bar .error")).to_contain_text(
+            "made-up failure"
+        )
+
+        # There were no sessions, as far as is known.
+        panel.locator(".pr-agents-toggle").click()
+        expect(panel.locator(".agent-form")).to_be_visible()
 
     def test_pr_agents_panel_survives_reload_and_sync(self) -> None:
         self.start_pr_session("say one")

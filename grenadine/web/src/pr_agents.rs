@@ -89,6 +89,8 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
         })
     };
     let sessions = RwSignal::new(Vec::<AgentSession>::new());
+    // Whether `sessions` has arrived; a later fetch may still fail.
+    let loaded = RwSignal::new(false);
     // The new-session draft the "+" tab shows, if it's open.
     let draft = RwSignal::new(None::<String>);
     let selected = RwSignal::new(None::<String>);
@@ -158,6 +160,8 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
     let open_draft_fx = open_draft.clone();
     Effect::new(move |_| match listed.get() {
         Some(Ok(list)) => {
+            error.set(None);
+            loaded.set(true);
             // A session that started from the draft's tab takes its
             // place.
             if let Some(d) = draft.get_untracked()
@@ -196,7 +200,7 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
             open.update(|o| *o = !*o);
             // Until the sessions arrive it isn't known that there are none;
             // once they do, the effect above opens the form if it has to.
-            let none = matches!(listed.get_untracked(), Some(Ok(l)) if l.is_empty());
+            let none = loaded.get_untracked() && sessions.with_untracked(Vec::is_empty);
             if open.get_untracked() && none && draft.get_untracked().is_none() {
                 open_draft();
             }
