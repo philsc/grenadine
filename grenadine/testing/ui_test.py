@@ -8478,6 +8478,17 @@ class AgentTest(ServerTestCase):
         self.page.evaluate("window.scrollTo(0, 0)")
         activity.get_by_role("button", name="Waiting on Bash sleep 8").click()
         expect(row).to_be_in_viewport()
+        # Nothing that sticks to an edge of the page covers its summary.
+        self.assertTrue(
+            row.locator("summary").evaluate(
+                """el => {
+                    const box = el.getBoundingClientRect();
+                    const top = document.elementFromPoint(
+                        box.left + 4, box.top + box.height / 2);
+                    return el.contains(top);
+                }"""
+            )
+        )
         expect(count).to_have_text(str(base + 1))
         follow_up = self.page.get_by_label("Follow-up")
         expect(follow_up).to_have_attribute(
