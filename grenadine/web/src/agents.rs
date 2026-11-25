@@ -495,8 +495,14 @@ pub fn Sidebar(
                 .map(|r| r.as_ref().map(|_| ()).map_err(String::clone))
         })
     });
-    let groups = Signal::derive(move || loaded.get().and_then(Result::ok).unwrap_or_default());
-    let names = move || groups.with(|g| g.iter().map(|g| g.repo.clone()).collect::<Vec<_>>());
+    let groups = Memo::new(move |_| {
+        loaded.with(|l| match l {
+            Some(Ok(groups)) => groups.clone(),
+            _ => Vec::new(),
+        })
+    });
+    let names =
+        Memo::new(move |_| groups.with(|g| g.iter().map(|g| g.repo.clone()).collect::<Vec<_>>()));
     // Deleting from the sidebar failed.
     let error = RwSignal::new(None::<String>);
     // The repository whose settings are open.
@@ -530,7 +536,7 @@ pub fn Sidebar(
                 Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),
                 Some(Ok(())) => view! {
                     <For
-                        each=names
+                        each=move || names.get()
                         key=|r| r.clone()
                         let:repo
                     >
@@ -830,7 +836,7 @@ pub fn CleanupView() -> impl IntoView {
 #[component]
 fn RepoSessions(
     repo: String,
-    groups: Signal<Vec<RepoGroup>>,
+    groups: Memo<Vec<RepoGroup>>,
     route: Signal<Route>,
     error: RwSignal<Option<String>>,
     settings: RwSignal<Option<String>>,
@@ -903,7 +909,9 @@ fn RepoSessions(
 }
 
 /// A session's entry in the sidebar. It changes in place, so that what the
-/// pointer or the focus is on stays.
+/// pointer or the focus is on stays. If one update lists several sessions
+/// above it, though, `For` takes the entry out of the page and puts it back,
+/// which loses the focus.
 #[component]
 fn SessionEntry(
     session: Memo<AgentSession>,
