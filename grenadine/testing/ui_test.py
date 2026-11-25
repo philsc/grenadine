@@ -5817,7 +5817,9 @@ class AgentTest(ServerTestCase):
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
         self.page.get_by_label("Prompt").fill("say one")
-        # From here on, the list stays as it was before the start.
+        # The sections only show once the list has arrived. From here on, it
+        # stays as it was before the start.
+        expect(self.section(self.OTHER_REPO)).to_be_visible()
         self.page.route(
             "**/api/agents",
             lambda route: route.continue_() if route.request.method == "POST" else None,
