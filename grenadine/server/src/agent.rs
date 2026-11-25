@@ -2028,6 +2028,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
 /// then goes on with a wrap-up that waited for them.
 async fn run(state: Arc<State>, id: String) {
     let mut last = AgentStatus::Idle;
+    let mut last_turn = None;
     loop {
         // Only a wrap-up that waited for this task is the task's to go on
         // with; one that comes once it stops running is wrap_up's.
@@ -2041,7 +2042,7 @@ async fn run(state: Arc<State>, id: String) {
         });
         let Some(queued) = prompt else {
             if !waiting {
-                crate::auto_review::session_done(&state, &id, last);
+                crate::auto_review::session_done(&state, &id, last, last_turn);
                 return;
             }
             if last == AgentStatus::Idle {
@@ -2059,6 +2060,7 @@ async fn run(state: Arc<State>, id: String) {
             }
             return;
         };
+        last_turn = Some((queued.mode.clone(), queued.model.clone()));
         let status = match turn(&state, &id, queued).await {
             Ok(status) => status,
             Err(e) => {

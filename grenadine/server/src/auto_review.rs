@@ -3,7 +3,8 @@
 //! ask for reviews. Each PR that is due gets an unattended agent session
 //! that reviews it and posts the review on GitHub. Once the review is on
 //! the PR, the session is deleted; the `auto_reviews` table keeps a row
-//! for each review.
+//! for each review. A session that ends without posting is asked again a
+//! few times, since posting can fail for reasons that pass.
 //!
 //! A review can also be asked for from the PR's page, whatever the
 //! repository's settings say. It's queued, and starts as soon as fewer
@@ -16,8 +17,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use grenadine_core::api::{
-    AgentBackend, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState, NewAgent,
-    PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
+    AgentBackend, AgentEventKind, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState,
+    NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
 };
 
 use crate::agent;
@@ -49,6 +50,12 @@ pub const NOTE: &str = "This is an unattended pull request review. Nobody reads 
     or request changes. If the skill you were asked to run posts the review itself, don't post \
     it a second time. If you find nothing worth raising, post a short comment that says so. \
     Don't commit, push, or change the pull request's branch, title or description.";
+
+/// What a review's session is asked when its review isn't on the PR
+/// after its turn.
+const RETRY: &str = "Your review isn't on the pull request. If posting it failed, the cause may \
+    have passed by now. Check on GitHub whether the review is there, and post it only if it's \
+    missing. If part of it is there, post only the rest. Don't redo the review.";
 
 /// The mode a review on `backend` runs in. An unattended review denies
 /// every approval request, so the mode itself has to let routine
@@ -634,9 +641,13 @@ fn posted_since(detail: &PrDetail, since: i64) -> bool {
             .any(|c| c.author == viewer && !c.pending && after(&c.created_at))
 }
 
+/// The permission mode and the model a turn ran with.
+type TurnSettings = (PermissionMode, Option<String>);
+
 /// Goes on with the review of session `id` once its turns are done and it
-/// ended up `last`.
-pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus) {
+/// ended up `last`. `turn` is what the last turn ran with, `None` if it
+/// was stopped before one ran.
+pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus, turn: Option<TurnSettings>) {
     match state.db.agent(id) {
         Ok(Some(s)) if s.kind == SessionKind::AutoReview => {}
         Ok(_) => return,
@@ -668,7 +679,7 @@ pub fn session_done(state: &Arc<State>, id: &str, last: AgentStatus) {
         let Some(review) = review.filter(|r| r.state == AutoReviewState::Running) else {
             return;
         };
-        if let Err(e) = finish(&state, &id, &review, last).await {
+        if let Err(e) = finish(&state, &id, &review, last, turn).await {
             tracing::warn!("agent {id}: can't finish the review: {e:#}");
         }
         state.send(ServerEvent::AutoReviewsChanged);
@@ -682,54 +693,94 @@ async fn finish(
     id: &str,
     review: &AutoReviewEntry,
     last: AgentStatus,
+    turn: Option<TurnSettings>,
 ) -> Result<()> {
     let failed = |why: &str| {
         state
             .db
             .finish_auto_review(review.id, AutoReviewState::Failed, Some(why), agent::now())
     };
-    // A session stopped before its turn ran is idle too.
-    let answered = state.db.agent_events(id)?.iter().any(|e| {
-        matches!(
-            e.kind,
-            grenadine_core::api::AgentEventKind::TurnEnded { error: None, .. }
-        )
-    });
-    match last {
-        AgentStatus::Idle if answered => {}
-        AgentStatus::Idle | AgentStatus::Interrupted => {
+    let events = state.db.agent_events(id)?;
+    let answered = events
+        .iter()
+        .any(|e| matches!(e.kind, AgentEventKind::TurnEnded { error: None, .. }));
+    let (mode, model) = match (last, turn) {
+        (AgentStatus::Idle, Some(turn)) if answered => turn,
+        // A session stopped before its turn ran is idle too.
+        (AgentStatus::Idle | AgentStatus::Interrupted, _) => {
             return failed("The review was interrupted.");
         }
         _ => return failed("The review's session failed."),
-    }
+    };
     for &delay in &state.posted_checks {
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = state.shutdown.cancelled() => return Ok(()),
+        if !wait(state, delay).await {
+            return Ok(());
         }
-        if !state.resync_now(&review.key).await {
-            continue;
-        }
-        if state
-            .db
-            .pr(&review.key)?
-            .is_some_and(|d| posted_since(&d, review.started_at))
-        {
-            state
-                .db
-                .finish_auto_review(review.id, AutoReviewState::Posted, None, agent::now())?;
-            tracing::info!(
-                "{}#{}: the review is posted",
-                review.key.repo,
-                review.key.number
-            );
-            agent::delete(state, id).await?;
+        if finish_if_posted(state, id, review).await? {
             return Ok(());
         }
     }
-    state
+    // Every prompt after the first asked to post again.
+    let retries = events
+        .iter()
+        .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+        .count()
+        .saturating_sub(1);
+    let Some(&delay) = state.post_retries.get(retries) else {
+        return state.db.finish_auto_review(
+            review.id,
+            AutoReviewState::Unposted,
+            None,
+            agent::now(),
+        );
+    };
+    if !wait(state, delay).await || finish_if_posted(state, id, review).await? {
+        return Ok(());
+    }
+    // It may have been cancelled meanwhile.
+    let running = state
         .db
-        .finish_auto_review(review.id, AutoReviewState::Unposted, None, agent::now())
+        .auto_review(review.id)?
+        .is_some_and(|r| r.state == AutoReviewState::Running);
+    if running {
+        tracing::info!(
+            "{}#{}: the review isn't posted; asking its session again",
+            review.key.repo,
+            review.key.number
+        );
+        agent::send(state, id, RETRY.to_owned(), mode, model);
+    }
+    Ok(())
+}
+
+/// Waits for `delay`. Returns false if the server is stopping.
+async fn wait(state: &State, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        _ = state.shutdown.cancelled() => false,
+    }
+}
+
+/// Looks for the review on GitHub. If it's there, records it as posted,
+/// deletes its session `id` and returns true.
+async fn finish_if_posted(state: &Arc<State>, id: &str, review: &AutoReviewEntry) -> Result<bool> {
+    let posted = state.resync_now(&review.key).await
+        && state
+            .db
+            .pr(&review.key)?
+            .is_some_and(|d| posted_since(&d, review.started_at));
+    if posted {
+        state
+            .db
+            .finish_auto_review(review.id, AutoReviewState::Posted, None, agent::now())?;
+        tracing::info!(
+            "{}#{}: the review is posted",
+            review.key.repo,
+            review.key.number
+        );
+        agent::delete(state, id).await?;
+    }
+    Ok(posted)
 }
 
 #[cfg(test)]
@@ -1051,9 +1102,25 @@ mod tests {
         Arc<State>,
         String,
     ) {
+        review_session_with(script, Vec::new(), None).await
+    }
+
+    /// Like `review_session`, asking again after `retries` and running on
+    /// `model`.
+    async fn review_session_with(
+        script: &str,
+        retries: Vec<Duration>,
+        model: Option<&str>,
+    ) -> (
+        crate::git::tests::Fixture,
+        tempfile::TempDir,
+        Arc<State>,
+        String,
+    ) {
         let fx = crate::git::tests::fixture();
         let dir = tempfile::tempdir().unwrap();
-        let state = crate::agent::tests::state_with_claude(&fx, dir.path(), script);
+        let mut state = crate::agent::tests::state_with_claude(&fx, dir.path(), script);
+        Arc::get_mut(&mut state).unwrap().post_retries = retries;
         let key = PrKey {
             repo: fx.clone.slug.clone(),
             number: 2,
@@ -1069,7 +1136,7 @@ mod tests {
             pr: None,
             prompt: "Review it".into(),
             permission_mode: PermissionMode::new("auto"),
-            model: None,
+            model: model.map(str::to_owned),
             images: Vec::new(),
             attachments: Vec::new(),
             draft: None,
@@ -1135,7 +1202,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","tot
         );
         assert!(events.iter().any(|e| matches!(
             &e.kind,
-            grenadine_core::api::AgentEventKind::Prompt(p) if p.contains("Review it")
+            AgentEventKind::Prompt(p) if p.contains("Review it")
         )));
         // A review leaves nothing to clean up.
         let cleanup = crate::cleanup::cleanup_state(&state).unwrap();
@@ -1155,6 +1222,85 @@ echo '{"type":"result","subtype":"error_during_execution","is_error":true,"resul
             Some("The review's session failed.")
         );
         assert!(state.db.agent(&id).unwrap().is_some());
+    }
+
+    /// The prompts session `id` got.
+    fn prompts_of(state: &State, id: &str) -> Vec<String> {
+        state
+            .db
+            .agent_events(id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::Prompt(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A session that posts nothing is asked again once per retry, as its
+    /// first turn ran, before the review ends.
+    #[tokio::test]
+    async fn a_review_that_posted_nothing_is_asked_again() {
+        let script = r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/args"
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","total_cost_usd":0.5}'
+"#;
+        let retries = vec![Duration::from_millis(10); 2];
+        let (_fx, dir, state, id) = review_session_with(script, retries, Some("sonnet")).await;
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Unposted);
+        assert_eq!(review.session.as_deref(), Some(id.as_str()));
+        assert_eq!(prompts_of(&state, &id), ["Review it", RETRY, RETRY]);
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert_eq!(args.matches("--permission-mode auto").count(), 3, "{args}");
+        assert_eq!(args.matches("--model sonnet").count(), 3, "{args}");
+    }
+
+    /// A review whose session fails when it's asked again ends as failed.
+    #[tokio::test]
+    async fn a_failed_retry_fails_the_review() {
+        let script = r#"#!/bin/sh
+if [ -e "$(dirname "$0")/ran" ]; then
+    echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}'
+    exit
+fi
+touch "$(dirname "$0")/ran"
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","total_cost_usd":0.5}'
+"#;
+        let retries = vec![Duration::from_millis(10); 2];
+        let (_fx, _dir, state, id) = review_session_with(script, retries, None).await;
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Failed);
+        assert_eq!(prompts_of(&state, &id), ["Review it", RETRY]);
+    }
+
+    /// A review that's cancelled while it waits to ask again doesn't ask.
+    #[tokio::test]
+    async fn a_review_cancelled_before_a_retry_isnt_asked_again() {
+        let retries = vec![Duration::from_secs(1)];
+        let (_fx, _dir, state, id) = review_session_with(SUCCEED, retries, None).await;
+        for _ in 0..300 {
+            if state.db.agent(&id).unwrap().unwrap().status == AgentStatus::Idle {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let review = state.db.auto_reviews().unwrap().remove(0);
+        assert_eq!(review.state, AutoReviewState::Running);
+        assert!(cancel(&state, review.id).await.unwrap());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let review = state.db.auto_reviews().unwrap().remove(0);
+        assert_eq!(review.state, AutoReviewState::Cancelled);
+        let (_, events) = state.db.auto_review_transcript(review.id).unwrap().unwrap();
+        let prompts = events
+            .iter()
+            .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+            .count();
+        assert_eq!(prompts, 1);
+        assert!(state.db.agent(&id).unwrap().is_none());
     }
 
     /// Deleting a running review cancels it.
