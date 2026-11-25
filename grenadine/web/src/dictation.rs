@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use grenadine_core::api::{DictationCommand, DictationEvent};
-use leptos::html::Textarea;
+use leptos::html::{Button, Textarea};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::prelude::*;
@@ -80,6 +80,8 @@ pub struct Dictation {
     text: Signal<String>,
     set_text: SignalSetter<String>,
     textarea: NodeRef<Textarea>,
+    /// The Record button.
+    button: NodeRef<Button>,
     phase: RwSignal<Phase>,
     interim: RwSignal<String>,
     error: RwSignal<Option<String>>,
@@ -242,6 +244,7 @@ impl Dictation {
             text,
             set_text,
             textarea,
+            button: NodeRef::new(),
             phase: RwSignal::new(Phase::Idle),
             interim: RwSignal::new(String::new()),
             error: RwSignal::new(None),
@@ -535,7 +538,8 @@ impl Dictation {
         self.error.set(Some(message));
     }
 
-    /// Ends the recording and puts the cursor after the inserted text.
+    /// Ends the recording and puts the cursor after the inserted text. The
+    /// box gets the focus unless the user has moved on to something else.
     fn finish(self) {
         RECORDERS.with_borrow_mut(|r| r.remove(&self.id));
         if self.phase.get_untracked() == Phase::Idle {
@@ -549,8 +553,17 @@ impl Dictation {
                 .text
                 .with_untracked(|text| utf16_offset(text, at.min(text.len())));
             // After the box is editable again.
+            let button = self.button;
             request_animation_frame(move || {
-                let _ = t.focus();
+                let moved_on = document().active_element().is_some_and(|focused| {
+                    let button = button.try_get_untracked().flatten();
+                    focused.tag_name() != "BODY"
+                        && !t.is_same_node(Some(&focused))
+                        && !button.is_some_and(|b| b.is_same_node(Some(&focused)))
+                });
+                if !moved_on {
+                    let _ = t.focus();
+                }
                 let _ = t.set_selection_range(pos, pos);
             });
         }
@@ -576,6 +589,7 @@ pub fn RecordButton(dictation: Dictation) -> impl IntoView {
             };
             view! {
                 <button
+                    node_ref=d.button
                     type="button"
                     class="record"
                     class:recording=move || d.phase.get() == Phase::Recording

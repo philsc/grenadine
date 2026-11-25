@@ -9689,6 +9689,29 @@ class DictationTest(ServerTestCase):
         self.assertEqual(
             prompt.evaluate("t => t.selectionStart"), len(value) - len(" after")
         )
+        expect(prompt).to_be_focused()
+
+    def test_finishing_leaves_the_focus_where_the_user_went(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        prompt = self.page.get_by_label("Prompt")
+        self.page.get_by_role("button", name="Record").click()
+        expect(prompt).to_have_value(re.compile("phrase 1"))
+        # Stopping without a press leaves the focus in the other field, as
+        # when the user went there while the last phrases were transcribed.
+        other = self.page.get_by_label("Start from PR")
+        other.focus()
+        self.page.get_by_role("button", name="Stop").dispatch_event("click")
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # The cursor moved, so finishing is over.
+        self.page.wait_for_function(
+            "t => !t.readOnly && t.selectionStart === t.value.length",
+            arg=prompt.element_handle(),
+        )
+        # Past the animation frame that would focus the box.
+        self.page.evaluate(
+            "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+        )
+        expect(other).to_be_focused()
 
 
 if __name__ == "__main__":
