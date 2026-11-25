@@ -1,5 +1,5 @@
-//! The terminal panel under a session's transcript: tabs of login shells in
-//! the session's worktree, shown with xterm.js. The server keeps the shells
+//! The terminal panel under a session's transcript: a tab with the session's
+//! processes, and tabs of login shells in its worktree, shown with xterm.js. The server keeps the shells
 //! running, so they outlive the page; a tab that connects gets their recent
 //! output first.
 
@@ -143,6 +143,30 @@ fn open_key(id: &str) -> String {
 /// to another session and back shows the same terminal.
 fn selected_key(id: &str) -> String {
     format!("grenadine.terminal-selected.{id}")
+}
+
+/// A tab of the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Processes,
+    Terminal(u64),
+}
+
+impl Tab {
+    /// What's kept under `selected_key`.
+    fn store(self) -> String {
+        match self {
+            Tab::Processes => "processes".to_owned(),
+            Tab::Terminal(t) => t.to_string(),
+        }
+    }
+
+    fn load(s: &str) -> Option<Tab> {
+        match s {
+            "processes" => Some(Tab::Processes),
+            s => s.parse().ok().map(Tab::Terminal),
+        }
+    }
 }
 
 /// Drops what's kept for session `id`'s panel, once the session is deleted.
@@ -553,7 +577,7 @@ fn TerminalView(
     }
 }
 
-/// The session's terminals as tabs in a panel that can be collapsed to its
+/// The session's processes and terminals as tabs in a panel that can be collapsed to its
 /// tab bar and dragged taller.
 /// `compact` is for a session embedded in a PR's sidebar, where the panel
 /// keeps its own height and shares the Agents panel with the transcript.
@@ -619,27 +643,32 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
     };
     let terminals = RwSignal::new(Vec::<u64>::new());
     let loading = RwSignal::new(BTreeSet::<u64>::new());
-    let selected = RwSignal::new(None::<u64>);
     let selected_key = selected_key(&id);
     let stored = storage()
         .and_then(|s| s.get_item(&selected_key).ok().flatten())
-        .and_then(|t| t.parse::<u64>().ok());
+        .and_then(|t| Tab::load(&t));
+    // A terminal is only selected once it's known to still be open.
+    let selected = RwSignal::new(stored.filter(|&t| t == Tab::Processes));
     Effect::new(move |_| {
         if let (Some(t), Some(s)) = (selected.get(), storage()) {
-            let _ = s.set_item(&selected_key, &t.to_string());
+            let _ = s.set_item(&selected_key, &t.store());
         }
     });
     let error = RwSignal::new(None::<String>);
     Effect::new(move |_| match listed.get() {
         Some(Ok(list)) => {
             let ids: Vec<u64> = list.iter().map(|t| t.id).collect();
-            if !selected.get_untracked().is_some_and(|s| ids.contains(&s)) {
-                let kept = stored.filter(|s| ids.contains(s));
-                selected.set(kept.or_else(|| ids.last().copied()));
+            let is_there = |tab: &Tab| match tab {
+                Tab::Processes => true,
+                Tab::Terminal(t) => ids.contains(t),
+            };
+            if !selected.get_untracked().as_ref().is_some_and(is_there) {
+                let kept = stored.filter(|t| *t != Tab::Processes && is_there(t));
+                selected.set(kept.or_else(|| ids.last().copied().map(Tab::Terminal)));
             }
-            // Without terminals there's nothing to show, so the panel
-            // doesn't come back open on an empty body.
-            if ids.is_empty() {
+            // Without a tab there's nothing to show, so the panel doesn't
+            // come back open on an empty body.
+            if selected.get_untracked().is_none() {
                 open.set(false);
             }
             terminals.set(ids);
@@ -661,7 +690,7 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
                                 ts.push(t.id);
                             }
                         });
-                        selected.set(Some(t.id));
+                        selected.set(Some(Tab::Terminal(t.id)));
                         open.set(true);
                     }
                     Err(e) => error.set(Some(e)),
@@ -673,7 +702,10 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
         let create = create.clone();
         move |_| {
             open.update(|o| *o = !*o);
-            if open.get_untracked() && terminals.with_untracked(Vec::is_empty) {
+            if open.get_untracked()
+                && terminals.with_untracked(Vec::is_empty)
+                && selected.get_untracked() != Some(Tab::Processes)
+            {
                 create();
             }
         }
@@ -730,13 +762,28 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
                 <button
                     class="terminal-toggle"
                     aria-expanded=move || open.get().to_string()
-                    title="Shells in the session's worktree"
+                    title="The session's processes and shells in its worktree"
                     on:click=toggle
                 >
                     <span class="terminal-chevron" aria-hidden="true">{move || if open.get() { "▾" } else { "▸" }}</span>
                     "Terminal"
                 </button>
                 <div class="terminal-tabs" role="tablist">
+                    <span
+                        class="terminal-tab"
+                        class:selected=move || selected.get() == Some(Tab::Processes)
+                    >
+                        <button
+                            class="terminal-tab-name"
+                            role="tab"
+                            aria-selected=move || (selected.get() == Some(Tab::Processes)).to_string()
+                            title="What runs in the session"
+                            on:click=move |_| {
+                                selected.set(Some(Tab::Processes));
+                                open.set(true);
+                            }
+                        >"Processes"</button>
+                    </span>
                     <For
                         each=move || terminals.get()
                         key=|t| *t
@@ -745,15 +792,15 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
                             view! {
                                 <span
                                     class="terminal-tab"
-                                    class:selected=move || selected.get() == Some(t)
+                                    class:selected=move || selected.get() == Some(Tab::Terminal(t))
                                 >
                                     <button
                                         class="terminal-tab-name"
                                         role="tab"
-                                        aria-selected=move || (selected.get() == Some(t)).to_string()
+                                        aria-selected=move || (selected.get() == Some(Tab::Terminal(t))).to_string()
                                         aria-busy=move || loading.get().contains(&t).to_string()
                                         on:click=move |_| {
-                                            selected.set(Some(t));
+                                            selected.set(Some(Tab::Terminal(t)));
                                             open.set(true);
                                         }
                                     >{format!("Terminal {t}")}
@@ -797,11 +844,15 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
                 hidden=move || !open.get()
                 style:height=move || format!("{}px", height.get())
             >
+                <crate::processes::ProcessesView
+                    session=session.clone()
+                    active=Signal::derive(move || open.get() && selected.get() == Some(Tab::Processes))
+                />
                 <For
                     each=move || terminals.get()
                     key=|t| *t
                     children=move |t| {
-                        let active = Signal::derive(move || open.get() && selected.get() == Some(t));
+                        let active = Signal::derive(move || open.get() && selected.get() == Some(Tab::Terminal(t)));
                         view! { <TerminalView session=session.clone() terminal=t active=active loading=loading /> }
                     }
                 />
@@ -813,6 +864,16 @@ pub fn TerminalPanel(id: String, #[prop(optional)] compact: bool) -> impl IntoVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tabs_are_kept() {
+        for tab in [Tab::Processes, Tab::Terminal(3)] {
+            assert_eq!(Tab::load(&tab.store()), Some(tab));
+        }
+        // What was kept before there was a Processes tab.
+        assert_eq!(Tab::load("2"), Some(Tab::Terminal(2)));
+        assert_eq!(Tab::load("x"), None);
+    }
 
     #[test]
     fn height_stays_usable() {

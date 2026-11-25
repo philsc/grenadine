@@ -180,6 +180,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/agents/{id}/prs", get(agent_prs))
         .route("/api/images/{id}", get(image))
+        .route("/api/agents/{id}/processes", get(processes))
         .route(
             "/api/agents/{id}/terminals",
             get(terminals).post(open_terminal),
@@ -1345,6 +1346,19 @@ async fn agent_prs(AxState(state): St, Path(id): Path<String>) -> ApiResult<Resp
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
     Ok(Json(state.db.agent_pr_list(&id)?).into_response())
+}
+
+/// What runs in the session, for its Processes tab.
+async fn processes(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let cgroup = crate::system::agent_cgroup(&state).await;
+    let processes = tokio::task::spawn_blocking(move || {
+        crate::system::session_processes(&state, &id, cgroup.as_deref())
+    })
+    .await?;
+    Ok(Json(processes).into_response())
 }
 
 async fn terminals(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {

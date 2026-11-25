@@ -2325,6 +2325,64 @@ textarea {
   position: absolute;
   inset: 4px 0 0 8px;
 }
+.processes {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.processes table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+}
+.processes th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.processes th,
+.processes td {
+  padding: 1px 12px 1px 0;
+  white-space: nowrap;
+}
+.processes .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.processes tbody tr:hover {
+  background: var(--bg-hover);
+}
+/* Takes the width the numbers leave, and no more, however long the
+   command. */
+.processes .process-command {
+  width: 100%;
+  max-width: 0;
+  min-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.processes .process-toggle {
+  display: inline-block;
+  width: 1.4em;
+  padding: 0;
+  font: inherit;
+  color: var(--fg-muted);
+  text-align: left;
+  background: none;
+  border: none;
+}
+.processes button.process-toggle {
+  cursor: pointer;
+}
+.processes .process-terminal {
+  font-weight: 600;
+}
+.processes .process-hidden {
+  color: var(--fg-muted);
+}
+.processes[hidden],
 .terminal-body[hidden],
 .terminal-host[hidden] {
   display: none;
