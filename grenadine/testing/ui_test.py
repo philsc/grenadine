@@ -8348,6 +8348,24 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
+    def close_tab(self, url: str) -> None:
+        """Waits for the browser to show `url` in a tab and closes it.
+
+        It asks the browser because Playwright sometimes loses a
+        background tab's navigation, or the tab itself."""
+        cdp = self.browser.new_browser_cdp_session()
+        self.addCleanup(cdp.detach)
+        deadline = time.monotonic() + 15
+        while True:
+            pages = cdp.send("Target.getTargets")["targetInfos"]
+            ids = [t["targetId"] for t in pages if t["url"] == url]
+            if ids:
+                break
+            self.assertLess(time.monotonic(), deadline, f"no tab shows {url}: {pages}")
+            self.page.wait_for_timeout(50)
+        for id in ids:
+            cdp.send("Target.closeTarget", {"targetId": id})
+
     def test_links_navigate_without_hash_navigations(self) -> None:
         """WebKit on iOS reloads the page after a hash navigation, so the
         app's links mustn't cause any. Only the browser's own hashchange
@@ -8411,10 +8429,8 @@ class AgentTest(ServerTestCase):
         expect(header).to_contain_text("look at")
 
         # The browser still opens other tabs.
-        with self.page.context.expect_page() as opened:
-            entry(first).click(modifiers=["ControlOrMeta"])
-        expect(opened.value).to_have_url(first)
-        opened.value.close()
+        entry(first).click(modifiers=["ControlOrMeta"])
+        self.close_tab(first)
         self.assertEqual(self.page.url, second)
 
         # Deleting the open session goes to a new draft.
