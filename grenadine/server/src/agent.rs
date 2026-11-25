@@ -698,6 +698,33 @@ pub fn systemd_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// The slice above every session's slice; see [`slice`].
+const AGENTS_SLICE: &str = "grenadine.slice";
+
+/// The sessions' share of a busy CPU, against systemd's default of 100
+/// for the server and everything else the user runs. A few sessions
+/// building and testing at once otherwise make the server slow to answer
+/// the page.
+const AGENTS_CPU_WEIGHT: u32 = 20;
+
+/// Makes the sessions' processes yield the CPU to everything else when
+/// it is busy, until the next boot; with idle cores they run as fast as
+/// before. The weight is on the slice above them all because a weight
+/// only ranks a slice among its siblings: one on each session's slice or
+/// scope would rank the sessions among themselves.
+pub fn lower_agents_cpu_weight() -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
+        .arg(format!("CPUWeight={AGENTS_CPU_WEIGHT}"))
+        .stdin(Stdio::null())
+        .output()
+        .context("can't run systemctl")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// The systemd user slice the session's processes run in. A cgroup holds on
 /// to daemons that leave claude's process group, like Bazel's server, so
 /// stopping the slice stops them too. Dashes nest slices, so the ID loses
