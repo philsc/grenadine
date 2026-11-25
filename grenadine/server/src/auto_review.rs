@@ -1603,9 +1603,12 @@ sleep 30
             .unwrap();
     }
 
-    const STALL: &str = "#!/bin/sh
+    /// A Claude whose turns stall. Listing its models fails right away
+    /// instead, as the tests would wait for that.
+    const STALL: &str = r#"#!/bin/sh
+case " $* " in *" --no-session-persistence "*) exit 1 ;; esac
 sleep 30
-";
+"#;
 
     /// A review asked for from the PR's page starts right away when
     /// there's room, and the PR gets no other until it ends.
