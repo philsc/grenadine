@@ -4476,17 +4476,8 @@ self.onmessage = async (event) => {{
         # out at their real height.
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
-        header = file.locator(".file-header")
-        header.click()
-        expect(header).to_be_visible()
+        file.locator(".file-header").click()
         # Collapsing scrolls the file back below the toolbar.
-        self.page.wait_for_function(
-            "(file) => Math.abs("
-            "file.querySelector('.file-header').getBoundingClientRect().top"
-            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
-            ") <= 1",
-            arg=file.element_handle(),
-        )
         self.expect_header_at_toolbar(file)
 
     def test_collapsing_a_stuck_file_lets_the_user_scroll(self) -> None:
@@ -4495,13 +4486,7 @@ self.onmessage = async (event) => {{
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
         file.locator(".file-header").click()
-        self.page.wait_for_function(
-            "(file) => Math.abs("
-            "file.querySelector('.file-header').getBoundingClientRect().top"
-            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
-            ") <= 1",
-            arg=file.element_handle(),
-        )
+        self.expect_header_at_toolbar(file)
         # The collapse's scroll-back must not fight a user who scrolls.
         main_scroll_top = "el => el.closest('.main').scrollTop"
         top_before = file.evaluate(main_scroll_top)
