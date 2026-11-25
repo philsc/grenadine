@@ -4153,11 +4153,14 @@ impl<'a> TurnSink<'a> {
         store_images(self.state, self.id, worktree, &mut kind)?;
         // A background task that finishes wakes the agent up again, even
         // for a message that only reports usage. A result's window and
-        // end don't. A permission request still waiting keeps its status.
-        let wakes = !matches!(
-            kind,
-            AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
-        );
+        // end don't, and neither does the task's own start or end: the
+        // agent's answer to it follows. A permission request still
+        // waiting keeps its status.
+        let wakes = !kind.is_task()
+            && !matches!(
+                kind,
+                AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
+            );
         if wakes {
             let woken = self.state.agents.with_live(self.id, |l| {
                 let woken = std::mem::take(&mut l.background);
@@ -4182,7 +4185,11 @@ impl<'a> TurnSink<'a> {
                 return Ok(());
             }
         }
-        self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        // A task's end between two results doesn't make the second one
+        // a new answer.
+        if !kind.is_task() {
+            self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        }
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
@@ -5235,9 +5242,13 @@ if [ "$prompt" != go ]; then
   echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
   exit
 fi
+echo '{{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_1","is_backgrounded":true}}'
 echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Started"}}]}},"parent_tool_use_id":null}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
-sleep 3
+sleep 1
+echo '{{"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"toolu_2","is_backgrounded":true}}'
+sleep 2
+echo '{{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_1","status":"completed"}}'
 echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Done"}}]}},"parent_tool_use_id":null}}'
 sleep 1
 echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}}'
@@ -5286,8 +5297,21 @@ sleep 3
             transcript,
             [
                 AgentEventKind::Prompt("go".into()),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                },
                 AgentEventKind::Text("Started".into()),
                 ended(0.25),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_2".into(),
+                    task: "b2".into(),
+                },
+                AgentEventKind::TaskEnded {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                    status: grenadine_core::api::TaskStatus::Completed,
+                },
                 AgentEventKind::Text("Done".into()),
                 ended(0.5),
                 AgentEventKind::Prompt("next".into()),

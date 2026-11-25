@@ -675,11 +675,19 @@ if long:
         size = 1024 + (29 * 1024) * i // max(count - 1, 1)
         padding = ("0123456789abcdef" * ((size // 16) + 1))[:size]
         result(tool_use, f"result {i}: {padding}")
-emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
-# `background N` keeps the process going for N seconds after its answer,
-# as Claude Code does for a background task.
+# `background N` runs a command of N seconds in the background: the call
+# returns at once, and the process goes on after its answer until the
+# command's task is over, as Claude Code's does.
+background = None
 if prompt.startswith("background "):
-    time.sleep(float(prompt.removeprefix("background ")))
+    seconds = prompt.removeprefix("background ")
+    background = use("Bash", {"command": f"sleep {seconds}", "run_in_background": True})
+    emit({"type": "system", "subtype": "task_started", "task_id": "b1", "tool_use_id": background, "is_backgrounded": True, "task_type": "local_bash"})
+    result(background, "Command running in background with ID: b1.")
+emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
+if background:
+    time.sleep(float(seconds))
+    emit({"type": "system", "subtype": "task_notification", "task_id": "b1", "tool_use_id": background, "status": "completed", "output_file": "", "summary": ""})
 """
 
 
@@ -8456,9 +8464,20 @@ class AgentTest(ServerTestCase):
         # Answered, but its process is still holding a background task.
         status = self.page.locator(".agent-status-line .agent-status")
         expect(status).to_have_text("waiting on background task", timeout=10_000)
-        expect(self.page.locator(".activity")).to_contain_text(
-            "Waiting on a background task"
+        # The line says which call it waits for and leads to its row,
+        # which shows the task still running rather than a finished call.
+        transcript = self.page.locator(".transcript")
+        row = transcript.locator(".tool").filter(has_text="sleep 8")
+        expect(row.get_by_role("img", name="Running in background")).to_be_visible()
+        expect(row.locator(".tool-status")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
+        activity = self.page.locator(".activity")
+        expect(activity).to_contain_text(
+            re.compile(r"Waiting on Bash sleep 8\s*· \d+s")
         )
+        self.page.evaluate("window.scrollTo(0, 0)")
+        activity.get_by_role("button", name="Waiting on Bash sleep 8").click()
+        expect(row).to_be_in_viewport()
         expect(count).to_have_text(str(base + 1))
         follow_up = self.page.get_by_label("Follow-up")
         expect(follow_up).to_have_attribute(
@@ -8470,10 +8489,13 @@ class AgentTest(ServerTestCase):
         # A follow-up waits for the process, then runs.
         follow_up.fill("after it")
         follow_up.press("Enter")
-        transcript = self.page.locator(".transcript")
         expect(transcript.locator(".turn-prompt").last).to_have_text(
             "after it", timeout=20_000
         )
+        # The task is over, and its row says how it went.
+        expect(row.get_by_role("img", name="Succeeded")).to_be_visible()
+        expect(row.locator(".spinner")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
         expect(status).to_have_text("idle", timeout=20_000)
         expect(self.page.locator(".turn-end")).to_have_text(
             ["Done · $0.01", "Done · $0.01"]
