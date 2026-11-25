@@ -194,10 +194,10 @@ pub fn PrAgentPanel(key: PrKey) -> impl IntoView {
         let open_draft = open_draft.clone();
         move |_| {
             open.update(|o| *o = !*o);
-            if open.get_untracked()
-                && sessions.with_untracked(Vec::is_empty)
-                && draft.get_untracked().is_none()
-            {
+            // Until the sessions arrive it isn't known that there are none;
+            // once they do, the effect above opens the form if it has to.
+            let none = matches!(listed.get_untracked(), Some(Ok(l)) if l.is_empty());
+            if open.get_untracked() && none && draft.get_untracked().is_none() {
                 open_draft();
             }
         }

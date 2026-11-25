@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -7399,6 +7400,40 @@ class AgentTest(ServerTestCase):
         # The other tab shows its own transcript.
         tabs.nth(1).click()
         expect(transcript.locator(".turn-prompt")).to_have_text(["say two"])
+
+    def test_pr_agents_panel_expanded_before_its_sessions_load(self) -> None:
+        self.start_pr_session("say one")
+
+        # The session list arrives only after the panel is expanded.
+        held: list[Route] = []
+        arriving = threading.Event()
+
+        def hold(route: Route) -> None:
+            if arriving.is_set():
+                route.continue_()
+            else:
+                held.append(route)
+
+        self.page.route(
+            f"**/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents", hold
+        )
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        self.wait_held(held)
+        # Not knowing the sessions isn't having none.
+        expect(panel.locator(".pr-agents-tabs").get_by_role("tab")).to_have_count(0)
+        expect(panel.locator(".agent-form")).to_have_count(0)
+
+        arriving.set()
+        for route in held:
+            route.continue_()
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
+        expect(tabs).to_have_count(1)
+        expect(tabs.first).to_contain_text("say one")
+        expect(tabs.first).to_have_attribute("aria-selected", "true")
+        expect(panel.locator(".transcript .turn-prompt")).to_have_text(["say one"])
 
     def test_pr_agents_panel_survives_reload_and_sync(self) -> None:
         self.start_pr_session("say one")
