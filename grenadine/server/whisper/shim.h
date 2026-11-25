@@ -12,9 +12,12 @@ extern "C" {
 
 typedef struct gr_whisper gr_whisper;
 
-// Loads the ggml model at `path`, or returns NULL. whisper.cpp's own
-// logging is turned off.
-gr_whisper *gr_whisper_load(const char *path);
+// Loads the ggml model at `path`, or returns NULL. whisper.cpp's and
+// ggml's errors, such as why a model can't be loaded, go to `on_error`,
+// for this and every later call; their other logging is dropped.
+// `on_error` may be called on any thread.
+gr_whisper *gr_whisper_load(const char *path,
+                            void (*on_error)(const char *message));
 
 // Transcribes `n` samples of 16 kHz mono audio in English, with `prompt`
 // (may be empty) as the text that came before. `quick` skips the retries

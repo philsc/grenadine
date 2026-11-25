@@ -10,10 +10,18 @@ struct gr_whisper {
   whisper_context *ctx;
 };
 
-static void quiet(enum ggml_log_level, const char *, void *) {}
+using error_callback = void (*)(const char *);
 
-gr_whisper *gr_whisper_load(const char *path) {
-  whisper_log_set(quiet, nullptr);
+static void log_errors(enum ggml_log_level level, const char *text,
+                       void *on_error) {
+  if (level == GGML_LOG_LEVEL_ERROR) {
+    reinterpret_cast<error_callback>(on_error)(text);
+  }
+}
+
+gr_whisper *gr_whisper_load(const char *path,
+                            void (*on_error)(const char *message)) {
+  whisper_log_set(log_errors, reinterpret_cast<void *>(on_error));
   whisper_context_params params = whisper_context_default_params();
   params.use_gpu = false;
   params.flash_attn = true;

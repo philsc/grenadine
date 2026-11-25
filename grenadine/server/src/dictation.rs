@@ -170,15 +170,23 @@ impl Segmenter {
 
 impl Phrase {
     /// Cuts the phrase after the quietest frame of its tail and returns
-    /// the frames after that as the start of the next phrase.
+    /// the frames after that as the start of the next phrase. That start
+    /// has enough speech not to be dropped if a pause follows right away.
     fn cut(&mut self) -> Phrase {
         // The latest of the quietest, so less goes to the next phrase.
+        let mut after = 0;
         let quietest = self
             .tail
             .iter()
             .enumerate()
-            .min_by(|(i, a), (j, b)| a.0.total_cmp(&b.0).then(j.cmp(i)))
-            .map_or(0, |(i, _)| i);
+            .rev()
+            .filter(|(_, f)| {
+                let enough = after >= MIN_SPEECH_FRAMES;
+                after += usize::from(f.1);
+                enough
+            })
+            .min_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
+            .map_or(self.tail.len().saturating_sub(1), |(i, _)| i);
         let tail = self.tail.split_off(quietest + 1);
         let audio = self.audio.split_off(self.audio.len() - tail.len() * FRAME);
         let speech_frames = tail.iter().filter(|f| f.1).count();
@@ -215,7 +223,10 @@ struct RawWhisper {
 }
 
 unsafe extern "C" {
-    fn gr_whisper_load(path: *const c_char) -> *mut RawWhisper;
+    fn gr_whisper_load(
+        path: *const c_char,
+        on_error: extern "C" fn(*const c_char),
+    ) -> *mut RawWhisper;
     fn gr_whisper_transcribe(
         w: *mut RawWhisper,
         samples: *const f32,
@@ -226,6 +237,13 @@ unsafe extern "C" {
     ) -> *mut c_char;
     fn gr_whisper_free_text(text: *mut c_char);
     fn gr_whisper_free(w: *mut RawWhisper);
+}
+
+/// Logs an error of whisper.cpp's.
+extern "C" fn log_error(message: *const c_char) {
+    // SAFETY: whisper.cpp passes a C string that's valid for the call.
+    let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    tracing::error!("whisper.cpp: {}", message.trim_end());
 }
 
 /// A whisper.cpp model. It transcribes one phrase at a time.
@@ -242,7 +260,7 @@ impl Whisper {
     fn load(path: &Path) -> Result<Whisper> {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())?;
         // SAFETY: c_path is a valid C string for the call.
-        let raw = unsafe { gr_whisper_load(c_path.as_ptr()) };
+        let raw = unsafe { gr_whisper_load(c_path.as_ptr(), log_error) };
         if raw.is_null() {
             bail!("can't load the Whisper model {}", path.display());
         }
@@ -679,6 +697,53 @@ mod tests {
         // The rest goes on as the next phrase.
         let rest = s.finish().unwrap();
         assert_eq!(at + rest.len(), 25 * SAMPLE_RATE);
+    }
+
+    #[test]
+    fn keeps_speech_just_after_a_long_phrase_is_cut() {
+        // With the preroll, the phrase is cut 19.8 s into the speech, right
+        // after a dip, and the speaker pauses a few frames later.
+        for extra in [0, 20, 40, 60] {
+            let mut s = Segmenter::default();
+            s.push(&silence(1000));
+            let mut done = s.push(&speech(19_800 + extra));
+            done.extend(s.push(&silence(1000)));
+            assert_eq!(done.len(), 2, "{extra}");
+            // The preroll, all the speech and the pause.
+            let total: usize = done.iter().map(Vec::len).sum();
+            assert!(ms(total) >= 200 + 19_800 + extra, "{extra}: {}", ms(total));
+        }
+    }
+
+    /// Collects what's logged.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn logs_why_a_model_does_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, b"not a ggml model").unwrap();
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish();
+        let loaded = tracing::subscriber::with_default(subscriber, || Whisper::load(&path));
+        assert!(loaded.is_err());
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("bad magic"), "{log}");
     }
 
     #[test]
