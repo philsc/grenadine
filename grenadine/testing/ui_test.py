@@ -5048,8 +5048,24 @@ class AgentTest(ServerTestCase):
         expect(prompt).to_have_value("/b")
         prompt.press_sequentially("a")
         expect(suggestions).to_have_count(2)
-        # A click completes like Tab.
+        # A click completes like Tab, but only with the primary button.
+        suggestions.filter(has_text="/baz").click(button="middle")
+        expect(prompt).to_have_value("/ba")
+        expect(prompt).to_be_focused()
         suggestions.filter(has_text="/baz").click()
+        expect(prompt).to_have_value("/baz ")
+
+        # A click in the box goes on with the prompt: the list closes, and
+        # Tab no longer changes the command.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Tab")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(suggestions).to_have_count(2)
+        prompt.click()
+        expect(suggestions).to_have_count(0)
         expect(prompt).to_have_value("/baz ")
 
         # Enter sends the prompt as typed, even with the list open.

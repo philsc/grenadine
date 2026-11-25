@@ -113,7 +113,7 @@ pub enum Source {
 }
 
 /// The suggestions for one prompt box; `SlashList` shows them, and the
-/// box's handlers call `input`, `keydown`, `caret_moved` and `blur`.
+/// box's handlers call `input`, `keydown`, `caret_moved`, `clicked` and `blur`.
 #[derive(Clone, Copy)]
 pub struct Suggest {
     textarea: NodeRef<leptos::html::Textarea>,
@@ -235,6 +235,12 @@ impl Suggest {
         self.caret_moved();
     }
 
+    /// The box was clicked, which goes on with the prompt.
+    pub fn clicked(self) {
+        self.cycle.set(None);
+        self.caret_moved();
+    }
+
     pub fn blur(self) {
         self.close();
     }
@@ -338,7 +344,9 @@ pub fn SlashList(suggest: Suggest, #[prop(optional)] above: bool) -> impl IntoVi
                             // Keeps the box focused, unlike a click.
                             on:mousedown=move |ev| {
                                 ev.prevent_default();
-                                suggest.pick(names.clone(), i);
+                                if ev.button() == 0 {
+                                    suggest.pick(names.clone(), i);
+                                }
                             }
                         >
                             {format!("/{name}")}

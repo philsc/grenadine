@@ -2017,7 +2017,7 @@ pub fn NewSession(
                             }
                         }
                         on:keyup=move |_| suggest.caret_moved()
-                        on:click=move |_| suggest.caret_moved()
+                        on:click=move |_| suggest.clicked()
                         on:blur=move |_| suggest.blur()
                     ></textarea>
                     <SlashList suggest=suggest />
@@ -5260,7 +5260,7 @@ fn Composer(
                     }
                 }
                 on:keyup=move |_| suggest.caret_moved()
-                on:click=move |_| suggest.caret_moved()
+                on:click=move |_| suggest.clicked()
                 on:blur=move |_| suggest.blur()
             ></textarea>
             <SlashList suggest=suggest above=true />
