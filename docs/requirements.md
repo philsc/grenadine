@@ -878,12 +878,13 @@ cancel the build, which must put the clone back likewise.
 
 **UPDATE-4.** The restart must wait until no session runs a turn, has
 prompts queued, is landing its work, is having a handoff written or is
-finishing an automatic review, no session is being deleted or scanned for
-what it left behind, and no terminal runs a command in the
-foreground. A terminal whose shell is at its prompt must not hold it up.
-The user must be able to cancel it, or to restart at once after being told
-which sessions that stops. While it waits, the page must show how many
-open terminals the restart closes.
+finishing an automatic review, no session is being deleted, including its
+Bazel output bases, or scanned for what it left behind, no merge that a page
+may still follow runs or has branches left to delete, and no terminal runs a
+command in the foreground. A terminal whose shell is at its prompt must not
+hold it up. The user must be able to cancel it, or to restart at once after
+being told which sessions that stops and which merges it affects. While it
+waits, the page must show how many open terminals the restart closes.
 
 **UPDATE-5.** The restart must keep the server's process ID, terminal and
 arguments. SIGINT and SIGTERM must still stop the server, also while it
@@ -899,3 +900,6 @@ when the clone or Bazel's output changed during the wait. If that build is
 gone, the server must keep running and show that the update failed. A clone
 that changes during the build must fail the update.
 _Why:_ the wait can take hours, and work in the clone goes on meanwhile.
+
+**UPDATE-8.** An update must not remove or overwrite files next to the
+database that no update created.

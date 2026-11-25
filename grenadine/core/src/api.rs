@@ -512,6 +512,9 @@ pub struct MergeProgress {
     pub warning: Option<String>,
 }
 
+/// How long the page polls a merge before it gives up.
+pub const MERGE_POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// The state GitHub reports for an asynchronous merge request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeStatus {
@@ -1292,11 +1295,13 @@ pub enum UpdatePhase {
     /// Fetching and checking out the newest commit.
     CheckingOut,
     Building,
-    /// Built, and waiting for the sessions to finish.
+    /// Built, and waiting for the sessions and merges to finish.
     Waiting {
         /// The commit that was built.
         target: String,
         sessions: Vec<BusySession>,
+        /// The PRs being merged.
+        merges: Vec<PrKey>,
         /// How many terminals are open, which the restart closes.
         terminals: usize,
     },

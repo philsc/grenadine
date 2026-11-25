@@ -17,7 +17,7 @@ See [AGENTS.md](AGENTS.md) for building, testing and linting.
 
 ## Updating
 
-The Debug tab's "Update and restart" button checks out the newest `origin/main` in the clone that `bazel run` started the server from, builds it, and restarts the server in place once no agent session is busy and no terminal runs a command. The clone must have a detached HEAD without local changes:
+The Debug tab's "Update and restart" button checks out the newest `origin/main` in the clone that `bazel run` started the server from, builds it, and restarts the server in place once no agent session is busy, no PR is being merged and no terminal runs a command. The clone must have a detached HEAD without local changes:
 
 ```sh
 git fetch origin && git checkout --detach origin/main

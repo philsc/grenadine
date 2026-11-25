@@ -1,7 +1,7 @@
 //! Updates the server to the latest `origin/main`: checks it out in the
 //! clone that `bazel run` started the server from, builds it while the
-//! server goes on serving, waits until no session is busy, and has `main`
-//! exec the new build in place of this process.
+//! server goes on serving, waits until no session is busy and no merge
+//! runs, and has `main` exec the new build in place of this process.
 //!
 //! The new build is copied next to the database, and the copy is what
 //! runs: the wait can take hours, and other builds in the clone replace or
@@ -28,10 +28,14 @@ const TARGET: &str = "//grenadine/server";
 /// The argument that has the server binary act as `install`.
 pub const INSTALL_ARG: &str = "install-update";
 
+/// The launch script's name in the directory of the copies.
+const SCRIPT: &str = "launch.sh";
+
 /// Stands for no `-c` in a copy's path.
 const NO_MODE: &str = "default";
 
-/// How often a waiting update looks whether the sessions are done.
+/// How often a waiting update looks whether the sessions and merges are
+/// done.
 const WAIT_POLL: Duration = Duration::from_secs(1);
 
 /// What the running server was built from, and how to build it again.
@@ -43,7 +47,8 @@ pub struct Build {
     /// The `-c` to build with, if the running binary's path tells.
     mode: Option<String>,
     bazel: PathBuf,
-    /// Where the new build is copied. Holds nothing else.
+    /// Where the new build is copied. An update refuses to use it when it
+    /// holds anything that updates don't create.
     dir: PathBuf,
 }
 
@@ -143,17 +148,12 @@ impl Build {
     async fn build(&self, target: &str) -> Result<PathBuf> {
         // The running server may be a copy in there; it goes on without
         // its file.
-        match std::fs::remove_dir_all(&self.dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(e).with_context(|| format!("can't clear {}", self.dir.display()));
-            }
-            _ => {}
-        }
+        clear(&self.dir).with_context(|| format!("can't clear {}", self.dir.display()))?;
         let installed = self.installed(target);
         let parent = installed.parent().expect("it's in the directory");
         std::fs::create_dir_all(parent)
             .with_context(|| format!("can't create {}", parent.display()))?;
-        let script = self.dir.join("launch.sh");
+        let script = self.dir.join(SCRIPT);
 
         let mut cmd = tokio::process::Command::new(&self.bazel);
         cmd.arg("run")
@@ -177,6 +177,35 @@ impl Build {
         run_step(cmd, "starting the new build").await?;
         Ok(installed)
     }
+}
+
+/// Removes what earlier updates left in `dir`. Removes nothing when there's
+/// anything else in it: the user may have had a directory of that name.
+fn clear(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?.collect::<std::io::Result<Vec<_>>>()?,
+    };
+    let is_copy = |name: &str| name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut copies = Vec::new();
+    let mut scripts = Vec::new();
+    for entry in entries {
+        // Doesn't follow symlinks.
+        let kind = entry.file_type()?;
+        let name = entry.file_name();
+        match name.to_str() {
+            Some(SCRIPT) if kind.is_file() => scripts.push(entry.path()),
+            Some(name) if kind.is_dir() && is_copy(name) => copies.push(entry.path()),
+            _ => bail!("{} isn't from an update", entry.path().display()),
+        }
+    }
+    for copy in copies {
+        std::fs::remove_dir_all(copy)?;
+    }
+    for script in scripts {
+        std::fs::remove_file(script)?;
+    }
+    Ok(())
 }
 
 /// Runs `cmd`; a failure says that `what` failed, and why.
@@ -347,7 +376,7 @@ impl Updater {
         true
     }
 
-    /// Restarts without waiting for the sessions.
+    /// Restarts without waiting for the sessions and merges.
     pub fn force(&self) -> bool {
         self.decide(Decision::Force)
     }
@@ -503,18 +532,20 @@ async fn build_cancelled(state: &State) {
     }
 }
 
-/// Waits until no session is busy or the user decides.
+/// Waits until no session is busy and no merge runs, or the user decides.
 async fn wait(state: &Arc<State>, target: String, binary: PathBuf) {
     loop {
         let sessions = agent::busy_sessions(state);
+        let merges = crate::api::busy_merges(state);
         let terminals = state.agents.terminals.count();
         {
             let mut inner = state.update.inner.lock().unwrap();
             let next = match inner.decision.take() {
                 Some(Decision::Cancel) => UpdatePhase::Idle,
-                None if !sessions.is_empty() => UpdatePhase::Waiting {
+                None if !sessions.is_empty() || !merges.is_empty() => UpdatePhase::Waiting {
                     target: target.clone(),
                     sessions,
+                    merges,
                     terminals,
                 },
                 // While the server still runs.
@@ -715,6 +746,46 @@ chmod 755 "$script"
         assert_eq!(from(&b), Some(("abc".into(), None)));
         let other = Path::new("/x/bazel-out/k8-opt/bin/grenadine/server/server");
         assert_eq!(installed_from(other, &b.dir), None);
+    }
+
+    #[test]
+    fn clears_only_what_updates_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().join("x-update");
+        clear(&dir).unwrap();
+        let copy = dir.join("0123456789abcdef".repeat(3).split_at(40).0);
+        std::fs::create_dir_all(copy.join("opt")).unwrap();
+        std::fs::write(copy.join("opt/grenadine"), "").unwrap();
+        std::fs::write(dir.join(SCRIPT), "").unwrap();
+        for name in ["notes", &"f".repeat(40)] {
+            let mine = dir.join(name);
+            std::fs::write(&mine, "mine").unwrap();
+            let e = format!("{:#}", clear(&dir).unwrap_err());
+            assert!(e.contains("isn't from an update"), "{e}");
+            assert!(mine.exists() && copy.exists() && dir.join(SCRIPT).exists());
+            std::fs::remove_file(mine).unwrap();
+        }
+        clear(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn waits_for_merges() {
+        let f = fixture();
+        let state = state(Some(build(&f, BAZEL)));
+        let key = grenadine_core::api::PrKey {
+            repo: "o/n".into(),
+            number: 1,
+        };
+        state.starting_merges.lock().unwrap().push(key.clone());
+        assert!(start(&state));
+        let phase = until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
+        let UpdatePhase::Waiting { merges, .. } = phase else {
+            unreachable!()
+        };
+        assert_eq!(merges, [key]);
+        state.starting_merges.lock().unwrap().clear();
+        until(&state, |p| *p == UpdatePhase::Restarting).await;
     }
 
     /// The clone can change and Bazel's output go away during the wait.

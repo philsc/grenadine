@@ -16,10 +16,11 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
-    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
-    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
-    ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
+    CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MERGE_POLL_LIMIT,
+    MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment,
+    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings,
+    ReviewerCandidates, ReviewerChange, ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp,
+    WriteHandoff, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -635,8 +636,11 @@ pub struct PendingMerge {
     /// GitHub's terminal answer when it came with the request itself;
     /// `None` while the merge runs and the endpoint asks GitHub.
     terminal: Option<MergeStatus>,
-    /// The landed merge's branches were deleted already.
+    /// The landed merge's branches were deleted already, or are being.
     cleaned: bool,
+    /// The merge ended and its branches are deleted: nothing is left to do
+    /// for it.
+    settled: bool,
     /// When the merge was started. GitHub forgets a merge's result after
     /// a day, so grenadine does too.
     started: std::time::Instant,
@@ -679,10 +683,55 @@ fn remember_merge(
             delete,
             terminal,
             cleaned: false,
+            settled: false,
             started: std::time::Instant::now(),
         },
     );
     uuid
+}
+
+/// How long a merge that the page polls holds up a restart: somewhat
+/// longer than the page polls. The page may be closed, and then nothing
+/// asks how the merge went.
+const MERGE_BUSY: std::time::Duration =
+    MERGE_POLL_LIMIT.saturating_add(std::time::Duration::from_secs(60));
+
+/// The PRs whose merge a restart would forget, along with the branches to
+/// delete once it lands.
+pub fn busy_merges(state: &State) -> Vec<PrKey> {
+    let mut keys = state.starting_merges.lock().unwrap().clone();
+    keys.extend(
+        state
+            .merges
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| !p.settled && p.started.elapsed() < MERGE_BUSY)
+            .map(|p| p.key.clone()),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Has the PR count as being merged until it's dropped: while GitHub is
+/// asked to merge it, before `remember_merge`.
+struct StartingMerge<'a>(&'a State, PrKey);
+
+impl StartingMerge<'_> {
+    fn new<'a>(state: &'a State, key: &PrKey) -> StartingMerge<'a> {
+        state.starting_merges.lock().unwrap().push(key.clone());
+        StartingMerge(state, key.clone())
+    }
+}
+
+impl Drop for StartingMerge<'_> {
+    fn drop(&mut self) {
+        let mut starting = self.0.starting_merges.lock().unwrap();
+        if let Some(i) = starting.iter().position(|k| *k == self.1) {
+            starting.swap_remove(i);
+        }
+    }
 }
 
 async fn merge(
@@ -694,6 +743,7 @@ async fn merge(
     if !is_sha(&m.head_oid) {
         return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
     }
+    let _starting = StartingMerge::new(&state, &key);
     let delete = match m.delete_branch {
         true => state.github.merge_refs(&key).await?,
         false => Vec::new(),
@@ -747,6 +797,13 @@ async fn merge_progress(
         Some(status) => status,
         None => state.github.merge_progress(&key, &uuid).await?,
     };
+    if status != MergeStatus::Pending
+        && let Some(p) = state.merges.lock().unwrap().get_mut(&uuid)
+    {
+        p.terminal = Some(status.clone());
+        // A landed merge's branches are still to be deleted.
+        p.settled |= status != MergeStatus::Merged;
+    }
     if matches!(status, MergeStatus::Failed(_) | MergeStatus::Enqueued) {
         state.resync(key.clone());
     }
@@ -776,6 +833,9 @@ async fn merge_progress(
                 failed.push(format!("{branch}: {e:#}"));
             }
         }
+        if let Some(p) = state.merges.lock().unwrap().get_mut(&uuid) {
+            p.settled = true;
+        }
         if !failed.is_empty() {
             warning = Some(format!(
                 "Merged, but the branch wasn't deleted: {}",
@@ -803,6 +863,7 @@ async fn enqueue(
                 "a stacked PR can't jump the queue".into(),
             ));
         }
+        let _starting = StartingMerge::new(&state, &key);
         let done = state
             .github
             .merge_async(&key, "merge_queue", None, &e.head_oid, None, false)
@@ -1851,6 +1912,44 @@ async fn image(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
 mod tests {
     use super::*;
     use grenadine_core::api::Side;
+
+    #[tokio::test]
+    async fn a_merge_is_busy_until_it_settles_or_its_page_gave_up() {
+        let state = crate::sync::test_state();
+        let key = |number| PrKey {
+            repo: "o/n".into(),
+            number,
+        };
+        let starting = StartingMerge::new(&state, &key(1));
+        assert_eq!(busy_merges(&state), [key(1)]);
+        let uuid = remember_merge(
+            &state,
+            key(1),
+            Vec::new(),
+            MergeAsync::Pending("u-1".into()),
+        );
+        drop(starting);
+        remember_merge(
+            &state,
+            key(2),
+            Vec::new(),
+            MergeAsync::Done(MergeStatus::Merged),
+        );
+        assert_eq!(busy_merges(&state), [key(1), key(2)]);
+
+        let settle = |uuid: &str| {
+            state.merges.lock().unwrap().get_mut(uuid).unwrap().settled = true;
+        };
+        settle(&uuid);
+        assert_eq!(busy_merges(&state), [key(2)]);
+
+        let mut merges = state.merges.lock().unwrap();
+        for p in merges.values_mut() {
+            p.started = std::time::Instant::now().checked_sub(MERGE_BUSY).unwrap();
+        }
+        drop(merges);
+        assert!(busy_merges(&state).is_empty());
+    }
 
     #[test]
     fn thread_places_github_would_refuse_are_refused() {

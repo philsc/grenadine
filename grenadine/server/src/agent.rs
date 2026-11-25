@@ -537,8 +537,8 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
-    /// How many deletions of each session are under way.
-    deleting: std::sync::Mutex<HashMap<String, usize>>,
+    /// The sessions being deleted, by ID.
+    deleting: Arc<std::sync::Mutex<HashMap<String, Deletions>>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether each new session's first prompt is summarized.
@@ -1001,7 +1001,7 @@ impl Agents {
             worktrees,
             base_url,
             slices,
-            deleting: std::sync::Mutex::default(),
+            deleting: Arc::default(),
             live: std::sync::Mutex::default(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
@@ -1902,23 +1902,44 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
 }
 
 /// Has the session count as busy while it's being deleted.
-struct Deleting(Arc<State>, String);
+struct Deleting {
+    deleting: Arc<std::sync::Mutex<HashMap<String, Deletions>>>,
+    id: String,
+}
+
+/// What's under way to delete a session.
+struct Deletions {
+    /// The session's title, since its row goes before the rest is done.
+    title: String,
+    guards: usize,
+}
 
 impl Deleting {
-    fn new(state: &Arc<State>, id: &str) -> Deleting {
-        let mut deleting = state.agents.deleting.lock().unwrap();
-        *deleting.entry(id.to_owned()).or_default() += 1;
-        Deleting(state.clone(), id.to_owned())
+    fn new(state: &State, session: &AgentSession) -> Deleting {
+        let deleting = state.agents.deleting.clone();
+        deleting
+            .lock()
+            .unwrap()
+            .entry(session.id.clone())
+            .or_insert_with(|| Deletions {
+                title: session.summary.as_ref().unwrap_or(&session.title).clone(),
+                guards: 0,
+            })
+            .guards += 1;
+        Deleting {
+            deleting,
+            id: session.id.clone(),
+        }
     }
 }
 
 impl Drop for Deleting {
     fn drop(&mut self) {
-        let mut deleting = self.0.agents.deleting.lock().unwrap();
-        if let Some(n) = deleting.get_mut(&self.1) {
-            *n -= 1;
-            if *n == 0 {
-                deleting.remove(&self.1);
+        let mut deleting = self.deleting.lock().unwrap();
+        if let Some(d) = deleting.get_mut(&self.id) {
+            d.guards -= 1;
+            if d.guards == 0 {
+                deleting.remove(&self.id);
             }
         }
     }
@@ -1944,7 +1965,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
     }
     // Before the interrupt, so that the session is busy throughout. It ends
     // once the scan counts.
-    let _deleting = Deleting::new(state, id);
+    let _deleting = Deleting::new(state, &session);
     // The transcript goes with the session; the scan reads it after.
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
@@ -2007,7 +2028,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             .iter()
             .filter_map(|b| b.parent().map(Path::to_owned)),
     );
+    let removing = Deleting::new(state, &scanned);
     std::thread::spawn(move || {
+        let _removing = removing;
         remove_output_bases(output_bases(&roots, |workspace| {
             workspace.starts_with(&worktree)
         }))
@@ -2256,7 +2279,8 @@ pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<
 /// The sessions a restart of the server would interrupt: those running a
 /// turn, also one that waits for the user's approval, with prompts queued,
 /// landing their work, having a handoff written, doing an automatic review
-/// that isn't finished, being deleted or scanned for what they left behind,
+/// that isn't finished, being deleted, also after they're gone while their
+/// Bazel output bases are removed, or scanned for what they left behind,
 /// or with a command running in a terminal.
 pub fn busy_sessions(state: &State) -> Vec<BusySession> {
     let terminals = state.agents.terminals.busy();
@@ -2276,7 +2300,12 @@ pub fn busy_sessions(state: &State) -> Vec<BusySession> {
     };
     ids.extend(terminals.keys().cloned());
     // The deletions first: one ends when its scan has started.
-    ids.extend(state.agents.deleting.lock().unwrap().keys().cloned());
+    let deleting: HashMap<String, String> = {
+        let deleting = state.agents.deleting.lock().unwrap();
+        let titles = deleting.iter().map(|(id, d)| (id.clone(), d.title.clone()));
+        titles.collect()
+    };
+    ids.extend(deleting.keys().cloned());
     let scanning = crate::cleanup::scanning(state);
     ids.extend(scanning.keys().cloned());
     let mut starting = Vec::new();
@@ -2306,7 +2335,10 @@ pub fn busy_sessions(state: &State) -> Vec<BusySession> {
                 Ok(Some(s)) => s.summary.unwrap_or(s.title),
                 _ => match scanning.get(&id) {
                     Some(title) => format!("Cleanup scan: {title}"),
-                    None => String::new(),
+                    None => match deleting.get(&id) {
+                        Some(title) => format!("Deleting: {title}"),
+                        None => String::new(),
+                    },
                 },
             };
             let terminals = terminals.get(&id).copied().unwrap_or(0);
@@ -10027,6 +10059,23 @@ esac
         assert_eq!(busy[0].title, "Cleanup scan: Run the e2e tests");
         std::fs::write(gate, "").unwrap();
         until(&|| busy_sessions(&state).is_empty()).await;
+    }
+
+    /// The session's row is gone by the time the thread that removes its
+    /// output bases ends.
+    #[tokio::test]
+    async fn a_deletion_is_busy_until_its_last_guard_goes() {
+        let state = crate::sync::test_state();
+        let session = tests::session_row(&uuid(), "o/n", Path::new("/w"));
+        let deletion = Deleting::new(&state, &session);
+        let removing = Deleting::new(&state, &session);
+        drop(deletion);
+        let removing = std::thread::spawn(move || removing).join().unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].title, "Deleting: t");
+        drop(removing);
+        assert!(busy_sessions(&state).is_empty());
     }
 
     #[tokio::test]

@@ -9694,9 +9694,19 @@ chmod 755 "$script"
         self.page.goto(self.url + "#/debug")
         self.section().get_by_role("button", name="Update and restart").click()
         expect(self.bar()).to_contain_text("waiting for 1 session")
+        # A refused cancel's error goes once the update goes on.
+        cancel = "**/api/update/cancel"
+        self.page.route(
+            cancel, lambda route: route.fulfill(status=409, body="too late")
+        )
+        self.bar().get_by_role("button", name="Cancel").click()
+        error = self.bar().locator(".error")
+        expect(error).to_contain_text("too late")
+        self.page.unroute(cancel)
         self.page.goto(session)
         self.end_session()
         expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        expect(error).to_have_count(0)
 
     def test_waits_for_a_terminal(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

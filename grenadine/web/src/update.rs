@@ -1,7 +1,7 @@
 //! The server's update to a newer version: its section in the Debug tab,
 //! and the bar below the top bar that follows it on every page.
 
-use grenadine_core::api::{BusySession, CommitInfo, UpdatePhase, UpdateStatus};
+use grenadine_core::api::{BusySession, CommitInfo, PrKey, UpdatePhase, UpdateStatus};
 use leptos::prelude::*;
 
 use crate::{Updates, ago, api};
@@ -65,8 +65,16 @@ fn count(n: usize, what: &str) -> String {
     }
 }
 
-fn waiting_label(sessions: usize, terminals: usize) -> String {
-    let mut text = format!("Update ready, waiting for {}", count(sessions, "session"));
+fn waiting_label(sessions: usize, merges: &[PrKey], terminals: usize) -> String {
+    let mut waits = Vec::new();
+    if sessions > 0 {
+        waits.push(count(sessions, "session"));
+    }
+    if !merges.is_empty() {
+        let prs: Vec<_> = merges.iter().map(pr_name).collect();
+        waits.push(format!("the merge of {}", prs.join(", ")));
+    }
+    let mut text = format!("Update ready, waiting for {}", waits.join(" and "));
     if terminals > 0 {
         text.push_str(&format!(
             "; the restart closes {}",
@@ -76,8 +84,15 @@ fn waiting_label(sessions: usize, terminals: usize) -> String {
     text
 }
 
-fn confirm_text(sessions: &[BusySession], terminals: usize) -> String {
-    let mut text = "Restart now? This stops these sessions:\n".to_owned();
+fn pr_name(key: &PrKey) -> String {
+    format!("{}#{}", key.repo, key.number)
+}
+
+fn confirm_text(sessions: &[BusySession], merges: &[PrKey], terminals: usize) -> String {
+    let mut text = "Restart now?".to_owned();
+    if !sessions.is_empty() {
+        text.push_str(" This stops these sessions:\n");
+    }
     for s in sessions {
         let title = if s.title.is_empty() { &s.id } else { &s.title };
         text.push_str(&format!("\n• {title}"));
@@ -86,10 +101,18 @@ fn confirm_text(sessions: &[BusySession], terminals: usize) -> String {
             text.push_str(&format!(" (a command runs in {running})"));
         }
     }
-    text.push_str("\n\nPrompts queued in them are lost.");
+    if !sessions.is_empty() {
+        text.push_str("\n\nPrompts queued in them are lost.");
+    }
+    if !merges.is_empty() {
+        text.push_str("\n\nGitHub goes on with these merges, but their branches may stay:\n");
+        for key in merges {
+            text.push_str(&format!("\n• {}", pr_name(key)));
+        }
+    }
     if terminals > 0 {
         let closed = count(terminals, "open terminal");
-        text.push_str(&format!(" {closed} will close."));
+        text.push_str(&format!("\n\n{closed} will close."));
     }
     text
 }
@@ -103,9 +126,22 @@ fn short(c: &CommitInfo) -> String {
 pub fn UpdateBar() -> impl IntoView {
     let Status { status, loaded } = expect_context();
     let error = RwSignal::new(None::<String>);
+    let kind =
+        Memo::new(move |_| status.with(|s| s.as_ref().map(|s| std::mem::discriminant(&s.phase))));
+    // An error is about a button of the phase it was clicked in.
+    Effect::new(move |_| {
+        kind.track();
+        error.set(None);
+    });
+    let show = move |clicked_in, result: api::Result<()>| {
+        if kind.get_untracked() == clicked_in {
+            error.set(result.err());
+        }
+    };
     let cancel = move |_| {
+        let clicked_in = kind.get_untracked();
         leptos::task::spawn_local(async move {
-            error.set(api::cancel_update().await.err());
+            show(clicked_in, api::cancel_update().await);
         });
     };
     let phase_view = move || {
@@ -121,19 +157,21 @@ pub fn UpdateBar() -> impl IntoView {
             UpdatePhase::Restarting => view! { <span>"Restarting…"</span> }.into_any(),
             UpdatePhase::Waiting {
                 sessions,
+                merges,
                 terminals,
                 ..
             } => {
-                let label = waiting_label(sessions.len(), terminals);
+                let label = waiting_label(sessions.len(), &merges, terminals);
                 let force = move |_| {
                     if !window()
-                        .confirm_with_message(&confirm_text(&sessions, terminals))
+                        .confirm_with_message(&confirm_text(&sessions, &merges, terminals))
                         .unwrap_or(false)
                     {
                         return;
                     }
+                    let clicked_in = kind.get_untracked();
                     leptos::task::spawn_local(async move {
-                        error.set(api::force_update().await.err());
+                        show(clicked_in, api::force_update().await);
                     });
                 };
                 view! {
@@ -171,7 +209,6 @@ pub fn UpdateBar() -> impl IntoView {
         let phase = phase_view();
         let reload = reload();
         let error = error.get();
-        // An error is about a button that's gone once the phase is idle.
         (phase.is_some() || reload.is_some()).then(|| {
             view! {
                 <div class="update-bar" role="status">
@@ -276,17 +313,40 @@ mod tests {
             terminals,
         };
         let busy = [session("1", "Fix it", 0), session("2", "", 2)];
-        let text = confirm_text(&busy, 3);
+        let text = confirm_text(&busy, &[], 3);
         assert!(
             text.contains("• Fix it\n• 2 (a command runs in 2 terminals)\n"),
             "{text}"
         );
-        assert!(text.ends_with(" 3 open terminals will close."), "{text}");
-        assert!(!confirm_text(&busy, 0).contains("open terminal"));
-        assert_eq!(waiting_label(1, 0), "Update ready, waiting for 1 session");
+        assert!(text.ends_with("\n3 open terminals will close."), "{text}");
+        assert!(!confirm_text(&busy, &[], 0).contains("open terminal"));
         assert_eq!(
-            waiting_label(2, 1),
+            waiting_label(1, &[], 0),
+            "Update ready, waiting for 1 session"
+        );
+        assert_eq!(
+            waiting_label(2, &[], 1),
             "Update ready, waiting for 2 sessions; the restart closes 1 terminal"
         );
+    }
+
+    #[test]
+    fn names_the_merges() {
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 5,
+        };
+        let merges = [key];
+        assert_eq!(
+            waiting_label(0, &merges, 0),
+            "Update ready, waiting for the merge of o/n#5"
+        );
+        assert_eq!(
+            waiting_label(1, &merges, 0),
+            "Update ready, waiting for 1 session and the merge of o/n#5"
+        );
+        let text = confirm_text(&[], &merges, 0);
+        assert!(text.ends_with("\n• o/n#5"), "{text}");
+        assert!(!text.contains("session"), "{text}");
     }
 }
