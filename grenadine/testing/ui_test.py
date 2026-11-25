@@ -7727,7 +7727,8 @@ class AgentTest(ServerTestCase):
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill("write more")
         follow_up.press("Enter")
-        expect(transcript.locator(".turn-end")).to_have_count(3)
+        # Three turns and the landing.
+        expect(transcript.locator(".turn-end")).to_have_count(4)
         actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up").nth(1)
         expect(opened).to_contain_text(re.compile(r"Opened PR #\d+"))
