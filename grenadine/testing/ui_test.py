@@ -5813,6 +5813,30 @@ class AgentTest(ServerTestCase):
         )
         urllib.request.urlopen(req).close()
 
+    def test_a_started_session_is_listed_before_the_list_is_refetched(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        # From here on, the list stays as it was before the start.
+        self.page.route(
+            "**/api/agents",
+            lambda route: route.continue_() if route.request.method == "POST" else None,
+        )
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        session_url = self.page.url
+        expect(self.section(self.OTHER_REPO).locator("a.agent-item")).to_have_attribute(
+            "href", "#" + session_url.split("#")[1]
+        )
+
+        # The Agents tab goes back to it rather than to a new draft.
+        tabs = self.page.locator(".topbar-tabs a")
+        tabs.filter(has_text="Inboxes").click()
+        agents = tabs.filter(has_text="Agents")
+        expect(self.page.locator(".inboxes")).to_be_visible()
+        agents.click()
+        expect(self.page).to_have_url(session_url)
+
     def test_tabs_remember_their_last_page(self) -> None:
         pr_a = self.open_pr("Tab memory A")
         pr_b = self.open_pr("Tab memory B")
