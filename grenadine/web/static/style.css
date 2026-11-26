@@ -3074,6 +3074,12 @@ body.resizing-sidebar * {
   margin: 4px 0;
   font-weight: 600;
 }
+.rerun-checks {
+  margin: 4px 0 8px;
+}
+.rerun-checks .error {
+  margin: 4px 0 0;
+}
 .merge-status.ok {
   color: var(--add-fg);
 }

@@ -11,7 +11,7 @@ use grenadine_core::api::{
     MergeMethod, MergeQueueInfo, MergeState, MergeStatus, NewThread, Person, PrKey, QueueEntry,
     QueueState, RequestPriority, RequestedReviewer, Review, ReviewComment, ReviewDecision,
     ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, Side, StackMerge, StackMergePr,
-    StackPr, SubmitReview, TeamRef, ThreadCounts,
+    StackPr, StaleRun, SubmitReview, TeamRef, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -277,11 +277,12 @@ const SEARCH_STATUS_FIELDS: &str = "reviewDecision isInMergeQueue
 /// uses it must append it.
 const CHECKS_FRAGMENT: &str = "
 fragment Checks on StatusCheckRollup {
+  state
   contexts(first: 100) {
     nodes {
       ... on CheckRun {
         name status conclusion detailsUrl startedAt
-        checkSuite { workflowRun { workflow { name } } }
+        checkSuite { workflowRun { databaseId workflow { name } } }
       }
       ... on StatusContext { context state targetUrl }
     }
@@ -602,9 +603,10 @@ fn review_error(errors: &[Value]) -> Option<String> {
         })
 }
 
-/// The checks of a `...Checks` fragment, the `statusCheckRollup` of a
-/// commit.
-fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
+/// The contexts of a `...Checks` fragment, the `statusCheckRollup` of a
+/// commit, split into the ones that count and the check runs that later
+/// runs of the same check replaced.
+fn split_contexts(rollup: Option<&Value>) -> (Vec<&Value>, Vec<&Value>) {
     // A commit keeps the runs that later runs of the same workflow
     // superseded, e.g. ones a concurrency group cancelled. Only the run of
     // each check that started last counts; one that hasn't started yet is a
@@ -629,11 +631,17 @@ fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
             })
             .or_insert(c);
     }
-    contexts
+    contexts.into_iter().partition(|&c| {
+        str_at(c, "/name").is_empty() || latest.values().any(|&kept| std::ptr::eq(kept, c))
+    })
+}
+
+/// The checks of a `...Checks` fragment, the `statusCheckRollup` of a
+/// commit.
+fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
+    split_contexts(rollup)
+        .0
         .into_iter()
-        .filter(|&c| {
-            str_at(c, "/name").is_empty() || latest.values().any(|&kept| std::ptr::eq(kept, c))
-        })
         .filter_map(|c| {
             let opt = |ptr: &str| {
                 Some(str_at(c, ptr))
@@ -653,6 +661,41 @@ fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
                     url: opt("/targetUrl"),
                 })
             }
+        })
+        .collect()
+}
+
+/// The replaced runs that fail a commit's checks for GitHub alone: the
+/// failed or cancelled runs that `head_checks` drops, when GitHub's
+/// combined state of the `...Checks` fragment is failing while every
+/// check that `head_checks` keeps is done and none failed. GitHub's
+/// state can count a replaced run, so a push that starts a workflow twice
+/// leaves the cancelled twin failing the commit, and a required check
+/// with it, until that run is re-run. While a check still runs there's
+/// nothing to say yet: it may be the re-run that replaces one.
+fn stale_runs(rollup: Option<&Value>) -> Vec<StaleRun> {
+    let failing = matches!(
+        rollup.map(|r| str_at(r, "/state")),
+        Some("FAILURE" | "ERROR")
+    );
+    if !failing || combined_ci(&head_checks(rollup)) != Some(CiStatus::Passing) {
+        return Vec::new();
+    }
+    split_contexts(rollup)
+        .1
+        .into_iter()
+        .filter(|c| {
+            check_run_status(str_at(c, "/status"), str_at(c, "/conclusion"))
+                == Some(CiStatus::Failing)
+        })
+        .map(|c| StaleRun {
+            name: str_at(c, "/name").to_owned(),
+            url: Some(str_at(c, "/detailsUrl"))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            run_id: c
+                .pointer("/checkSuite/workflowRun/databaseId")
+                .and_then(Value::as_u64),
         })
         .collect()
 }
@@ -804,7 +847,8 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             url: str_at(c, "/url").to_owned(),
         })
         .collect();
-    let checks = head_checks(pr.pointer("/head/nodes/0/commit/statusCheckRollup"));
+    let rollup = pr.pointer("/head/nodes/0/commit/statusCheckRollup");
+    let checks = head_checks(rollup);
     let repo = &data["repository"];
     let methods = [
         ("/mergeCommitAllowed", MergeMethod::Merge),
@@ -848,6 +892,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
                         .and_then(Value::as_bool)
                         == Some(true)
                 }),
+            stale_runs: stale_runs(rollup),
             queue: queue_info(pr),
             stack: stack_merge(pr),
         },
@@ -891,6 +936,7 @@ fn stack_merge(pr: &Value) -> Option<StackMerge> {
                     ci: combined_ci(&head_checks(
                         p.pointer("/commits/nodes/0/commit/statusCheckRollup"),
                     )),
+                    stale_runs: stale_runs(p.pointer("/commits/nodes/0/commit/statusCheckRollup")),
                 },
             ))
         })
@@ -1889,6 +1935,22 @@ impl GitHub {
             json!({ "pr": self.pr_id(key).await? }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Re-runs the GitHub Actions workflow run `run` of `repo`, which
+    /// replaces its checks on the commit.
+    pub async fn rerun_workflow(&self, repo: &str, run: u64) -> Result<()> {
+        let url = format!("{}/repos/{repo}/actions/runs/{run}/rerun", self.api);
+        let resp = self
+            .stacks_send("rerun_workflow", repo, self.http.post(url))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let v: Value = resp.json().await.unwrap_or_default();
+            let reason = v["message"].as_str().unwrap_or("no reason given");
+            bail!("GitHub didn't re-run the checks ({status}): {reason}");
+        }
         Ok(())
     }
 
@@ -3228,6 +3290,7 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: true,
                 requires_conversation_resolution: true,
+                stale_runs: vec![],
                 queue: Some(MergeQueueInfo {
                     method: Some(MergeMethod::Squash),
                     entry: Some(QueueEntry {
@@ -3421,6 +3484,7 @@ mod tests {
                     delete_branch_on_merge: false,
                     can_merge_as_admin: false,
                     requires_conversation_resolution: false,
+                    stale_runs: vec![],
                     queue: None,
                     stack: None,
                 },
@@ -3518,6 +3582,54 @@ mod tests {
             Some(CiStatus::Failing)
         );
     }
+
+    #[test]
+    fn stale_runs_are_the_replaced_runs_github_still_counts() {
+        let run = |conclusion: &str, started: &str, id: Option<u64>| {
+            let mut run = check_run("test", conclusion, started);
+            run["detailsUrl"] = json!(format!("https://ci.example/{started}"));
+            run["checkSuite"]["workflowRun"]["databaseId"] = json!(id);
+            run
+        };
+        let rollup = |state: &str, runs: Vec<Value>| {
+            let rollup = json!({ "state": state, "contexts": { "nodes": runs } });
+            stale_runs(Some(&rollup))
+        };
+        let cancelled = run("CANCELLED", "2026-01-01T00:00:00Z", Some(7));
+        let passed = run("SUCCESS", "2026-01-01T00:00:02Z", Some(8));
+        // GitHub counts the cancelled run though a later one passed.
+        assert_eq!(
+            rollup("FAILURE", vec![cancelled.clone(), passed.clone()]),
+            [StaleRun {
+                name: "test".into(),
+                url: Some("https://ci.example/2026-01-01T00:00:00Z".into()),
+                run_id: Some(7),
+            }]
+        );
+        // Another app's check has no workflow run to re-run.
+        let other = run("CANCELLED", "2026-01-01T00:00:00Z", None);
+        assert_eq!(
+            rollup("FAILURE", vec![other, passed.clone()])[0].run_id,
+            None
+        );
+        // GitHub doesn't count it: nothing is stale.
+        assert_eq!(
+            rollup("SUCCESS", vec![cancelled.clone(), passed.clone()]),
+            []
+        );
+        // The run that counts failed, which is the reason then.
+        let failed = run("FAILURE", "2026-01-01T00:00:02Z", Some(8));
+        assert_eq!(rollup("FAILURE", vec![cancelled.clone(), failed]), []);
+        // A check still runs, maybe the re-run.
+        let mut running = run("", "2026-01-01T00:00:02Z", Some(8));
+        running["status"] = json!("IN_PROGRESS");
+        assert_eq!(rollup("FAILURE", vec![cancelled.clone(), running]), []);
+        // A replaced run that passed isn't what fails the checks.
+        let lint = json!({ "context": "lint", "state": "FAILURE" });
+        assert_eq!(rollup("FAILURE", vec![passed.clone(), passed, lint]), []);
+        assert_eq!(stale_runs(None), []);
+    }
+
     #[test]
     fn merge_async_status_maps_the_states() {
         assert_eq!(
@@ -3594,6 +3706,7 @@ mod tests {
                         conflicting: Some(false),
                         state: MergeState::Clean,
                         ci: Some(CiStatus::Passing),
+                        stale_runs: vec![],
                     },
                     StackMergePr {
                         number: 12,
@@ -3603,6 +3716,11 @@ mod tests {
                         conflicting: Some(true),
                         state: MergeState::Dirty,
                         ci: Some(CiStatus::Passing),
+                        stale_runs: vec![StaleRun {
+                            name: "test".into(),
+                            url: None,
+                            run_id: None,
+                        }],
                     },
                 ],
             })

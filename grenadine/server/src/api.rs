@@ -1,5 +1,6 @@
 //! The HTTP API used by the web UI, and the UI's static files.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -101,6 +102,10 @@ fn api_routes() -> Router<Arc<State>> {
             get(reviewer_candidates),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/rerun-checks",
+            post(rerun_checks),
+        )
         .route(
             "/api/pr/{owner}/{name}/{number}/merge/{uuid}",
             get(merge_progress),
@@ -711,6 +716,37 @@ async fn merge(
     state.resync(key.clone());
     let uuid = remember_merge(&state, key, delete, merged?);
     Ok(Json(Merged { uuid }))
+}
+
+/// Re-runs the replaced runs that fail the checks for GitHub alone, on
+/// the PR's head and on the heads of the open PRs below it in its GitHub
+/// stack, which merging it merges too. The runs are read from GitHub
+/// again, since the page's may be re-running already.
+async fn rerun_checks(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let pr = state.github.pr(&key).await?;
+    let merge = pr.review.map(|r| r.merge);
+    let runs: BTreeSet<u64> = merge
+        .iter()
+        .flat_map(|m| {
+            let below = m.stack.iter().flat_map(|s| &s.below);
+            m.stale_runs.iter().chain(below.flat_map(|p| &p.stale_runs))
+        })
+        .filter_map(|r| r.run_id)
+        .collect();
+    let mut done = Ok(());
+    for run in runs {
+        done = state.github.rerun_workflow(&key.repo, run).await;
+        if done.is_err() {
+            break;
+        }
+    }
+    state.resync(key);
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// How the merge GitHub runs as `uuid` is doing. A merged merge's

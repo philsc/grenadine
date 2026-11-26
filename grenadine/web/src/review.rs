@@ -7,7 +7,7 @@ use grenadine_core::api::{
     AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
     MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision,
     ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, ReviewerChange, StackMergePr,
-    SubmitReview, TeamRef, Version, reviewer_change, submit_blocker,
+    StaleRun, SubmitReview, TeamRef, Version, reviewer_change, submit_blocker,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -42,6 +42,25 @@ pub fn latest_reviews<'a>(reviews: &'a [Review], author: &str) -> Vec<&'a Review
     out
 }
 
+/// What `runs`, replaced runs that GitHub still counts, do to the
+/// checks, naming each check once; `None` without any.
+fn stale_reason(runs: &[StaleRun]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    for r in runs {
+        if !names.contains(&r.name.as_str()) {
+            names.push(&r.name);
+        }
+    }
+    let (last, rest) = names.split_last()?;
+    Some(match rest.is_empty() {
+        true => format!("GitHub still counts a replaced run of {last} that didn't pass"),
+        false => format!(
+            "GitHub still counts replaced runs of {} and {last} that didn't pass",
+            rest.join(", ")
+        ),
+    })
+}
+
 /// Why GitHub blocks merging the PR, each reason the way GitHub's merge
 /// box words it, `unresolved` being the PR's unresolved review threads.
 /// GitHub's API reports no reasons, so they're worked out from the
@@ -58,6 +77,7 @@ fn block_reasons(info: &ReviewInfo, unresolved: usize) -> Vec<String> {
         let s = if unresolved == 1 { "" } else { "s" };
         reasons.push(format!("{unresolved} conversation{s} must be resolved"));
     }
+    reasons.extend(stale_reason(&info.merge.stale_runs));
     if reasons.is_empty() {
         reasons.push("required checks or rules aren't satisfied".into());
     }
@@ -110,11 +130,15 @@ pub fn merge_status(info: &ReviewInfo, unresolved: usize) -> (&'static str, Stri
             ("ok", "Ready to join the merge queue.".into())
         }
         MergeState::Clean | MergeState::HasHooks => ("ok", "Ready to merge.".into()),
-        MergeState::Unstable if queue.is_some() => (
-            "warn",
-            "Can join the merge queue, but not every check passed.".into(),
-        ),
-        MergeState::Unstable => ("warn", "Can be merged, but not every check passed.".into()),
+        MergeState::Unstable => {
+            let can = match queue.is_some() {
+                true => "Can join the merge queue",
+                false => "Can be merged",
+            };
+            let but = stale_reason(&info.merge.stale_runs)
+                .unwrap_or_else(|| "not every check passed".into());
+            ("warn", format!("{can}, but {but}."))
+        }
         MergeState::Behind => ("warn", "This branch is out of date with its base.".into()),
         MergeState::Draft => ("warn", "This PR is a draft.".into()),
         MergeState::Dirty => (
@@ -1276,7 +1300,10 @@ fn below_mergeable(p: &StackMergePr, admin: bool) -> Result<Option<String>, Stri
         false => Err(why),
     };
     match p.state {
-        MergeState::Blocked => bypass(format!("#{n} is blocked by its branch's rules.")),
+        MergeState::Blocked => bypass(match stale_reason(&p.stale_runs) {
+            Some(why) => format!("#{n} is blocked: {why}."),
+            None => format!("#{n} is blocked by its branch's rules."),
+        }),
         MergeState::Behind => bypass(format!("#{n} is behind its base.")),
         MergeState::Unknown => Err(format!(
             "GitHub hasn't worked out yet whether #{n} can be merged."
@@ -1295,6 +1322,9 @@ fn below_status(p: &StackMergePr) -> &'static str {
         return "Conflicts";
     }
     match p.state {
+        MergeState::Blocked if !p.stale_runs.is_empty() => {
+            "Blocked by a replaced run that didn't pass"
+        }
         MergeState::Blocked => "Blocked by rules",
         MergeState::Behind => "Behind",
         MergeState::Unknown => "GitHub hasn't worked it out yet",
@@ -1936,11 +1966,49 @@ fn queue_controls(info: &ReviewInfo, target: MergeTarget) -> impl IntoView + use
     }
 }
 
+/// The name of re-running the checks of `key` in `OpenBoxes`.
+fn rerun_name(key: &PrKey) -> String {
+    format!("rerun.{}#{}", key.repo, key.number)
+}
+
+/// Re-running the replaced runs that GitHub still counts, on the PR and
+/// on the PRs below it in its stack; `None` when there are none or none
+/// is a GitHub Actions run, which is all that can be re-run from here.
+fn rerun_checks(info: &ReviewInfo) -> Option<impl IntoView + use<>> {
+    let below = info.merge.stack.iter().flat_map(|s| &s.below);
+    let mut runs = info
+        .merge
+        .stale_runs
+        .iter()
+        .chain(below.flat_map(|p| &p.stale_runs));
+    if !runs.any(|r| r.run_id.is_some()) {
+        return None;
+    }
+    let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
+    let boxes = expect_context::<OpenBoxes>();
+    let name = StoredValue::new(rerun_name(&key));
+    let busy = move || name.with_value(|n| boxes.sending(n));
+    let error = move || name.with_value(|n| boxes.error(n));
+    let rerun = move |_| {
+        let key = key.clone();
+        name.with_value(|n| boxes.send(n, async move { api::rerun_checks(&key).await }, || {}));
+    };
+    Some(view! {
+        <div class="rerun-checks">
+            <button type="button" disabled=busy on:click=rerun>
+                {move || if busy() { "Re-running…" } else { "Re-run them" }}
+            </button>
+            {move || error().map(|e| view! { <p class="error">{e}</p> })}
+        </div>
+    })
+}
+
 /// Whether the PR can be merged and merging it. Only for open PRs; the
 /// checks are in the sidebar. `sidebar` gives it the sidebar's look: a
 /// "Merge" heading like its other sections' instead of a border.
 pub fn merge_box(info: &ReviewInfo, target: MergeTarget, sidebar: bool) -> impl IntoView + use<> {
     let (class, text) = merge_status(info, target.unresolved_threads);
+    let rerun = rerun_checks(info);
     let controls = if info.merge.queue.is_some() {
         queue_controls(info, target.clone()).into_any()
     } else {
@@ -1950,6 +2018,7 @@ pub fn merge_box(info: &ReviewInfo, target: MergeTarget, sidebar: bool) -> impl 
         <section class="merge-box" class:in-sidebar=sidebar>
             {sidebar.then(|| view! { <h2>"Merge"</h2> })}
             <p class=format!("merge-status {class}")>{text}</p>
+            {rerun}
             {controls}
         </section>
     }
@@ -1996,6 +2065,7 @@ mod tests {
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                stale_runs: vec![],
                 queue: None,
                 stack: None,
             },
@@ -2097,6 +2167,64 @@ mod tests {
         assert_eq!(
             merge_status(&i, 2).1,
             "Merging is blocked: required checks or rules aren't satisfied."
+        );
+    }
+
+    fn stale(name: &str) -> StaleRun {
+        StaleRun {
+            name: name.into(),
+            url: None,
+            run_id: Some(7),
+        }
+    }
+
+    #[test]
+    fn replaced_runs_explain_the_checks() {
+        let mut i = info();
+        i.merge.state = MergeState::Blocked;
+        i.merge.stale_runs = vec![stale("format")];
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Merging is blocked: GitHub still counts a replaced run of format \
+             that didn't pass."
+        );
+        // Each check is named once, after the other reasons.
+        i.decision = Some(ReviewDecision::ReviewRequired);
+        i.merge.stale_runs = vec![stale("format"), stale("test"), stale("format")];
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Merging is blocked: it needs an approving review; GitHub still \
+             counts replaced runs of format and test that didn't pass."
+        );
+        // They are what "not every check passed" is about, too.
+        i.merge.state = MergeState::Unstable;
+        assert_eq!(
+            merge_status(&i, 0),
+            (
+                "warn",
+                "Can be merged, but GitHub still counts replaced runs of format \
+                 and test that didn't pass."
+                    .into()
+            )
+        );
+        i.merge.stale_runs.clear();
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Can be merged, but not every check passed."
+        );
+        // A PR below in the stack says the same.
+        let mut below = below_pr(3, MergeState::Blocked);
+        assert_eq!(below_status(&below), "Blocked by rules");
+        below.stale_runs = vec![stale("test")];
+        assert_eq!(
+            below_status(&below),
+            "Blocked by a replaced run that didn't pass"
+        );
+        assert_eq!(
+            below_mergeable(&below, false),
+            Err("#3 is blocked: GitHub still counts a replaced run of test \
+                 that didn't pass."
+                .into())
         );
     }
 
@@ -2366,6 +2494,7 @@ mod tests {
             conflicting: Some(false),
             state,
             ci: None,
+            stale_runs: vec![],
         }
     }
 

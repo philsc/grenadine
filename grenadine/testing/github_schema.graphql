@@ -587,6 +587,7 @@ type CheckSuite {
 }
 
 type WorkflowRun {
+  databaseId: Int
   workflow: Workflow!
 }
 
