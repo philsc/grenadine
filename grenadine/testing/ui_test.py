@@ -8416,24 +8416,6 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
-    def close_tab(self, url: str) -> None:
-        """Waits for the browser to show `url` in a tab and closes it.
-
-        It asks the browser because Playwright sometimes loses a
-        background tab's navigation, or the tab itself."""
-        cdp = self.browser.new_browser_cdp_session()
-        self.addCleanup(cdp.detach)
-        deadline = time.monotonic() + 15
-        while True:
-            pages = cdp.send("Target.getTargets")["targetInfos"]
-            ids = [t["targetId"] for t in pages if t["url"] == url]
-            if ids:
-                break
-            self.assertLess(time.monotonic(), deadline, f"no tab shows {url}: {pages}")
-            self.page.wait_for_timeout(50)
-        for id in ids:
-            cdp.send("Target.closeTarget", {"targetId": id})
-
     def test_links_navigate_without_hash_navigations(self) -> None:
         """WebKit on iOS reloads the page after a hash navigation, so the
         app's links mustn't cause any. Only the browser's own hashchange
@@ -8496,10 +8478,28 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(second)
         expect(header).to_contain_text("look at")
 
-        # The browser still opens other tabs.
-        entry(first).click(modifiers=["ControlOrMeta"])
-        self.close_tab(first)
+        # A click with a modifier is the browser's, as when Ctrl-click
+        # opens a new tab. The test's own listener, which runs after the
+        # app's, keeps the browser from opening one.
+        length = self.page.evaluate("history.length")
+        prevented = entry(first).evaluate(
+            """(link) => {
+              let prevented;
+              const check = (e) => {
+                prevented = e.defaultPrevented;
+                e.preventDefault();
+              };
+              addEventListener("click", check);
+              link.dispatchEvent(new MouseEvent("click", {
+                bubbles: true, cancelable: true, ctrlKey: true,
+              }));
+              removeEventListener("click", check);
+              return prevented;
+            }"""
+        )
+        self.assertIs(prevented, False)
         self.assertEqual(self.page.url, second)
+        self.assertEqual(self.page.evaluate("history.length"), length)
 
         # Deleting the open session goes to a new draft.
         navigations = self.page.evaluate("window.hashNavigations")
