@@ -3532,13 +3532,19 @@ fn ActivityBar(
                     };
                     let waited = since.map(|at| elapsed(now.get() - at));
                     let task = running.first().map(|(id, label, _)| {
-                        let text = match running.len() {
-                            1 => format!("Waiting on {}", label.trim_end()),
-                            n => format!("Waiting on {n} background tasks"),
+                        let (text, hint) = match running.len() {
+                            1 => (
+                                format!("Waiting on {}", label.trim_end()),
+                                "Show the tool call",
+                            ),
+                            n => (
+                                format!("Waiting on {n} background tasks"),
+                                "Show the oldest tool call",
+                            ),
                         };
                         let row = tool_row_id(id);
                         view! {
-                            <button type="button" class="link activity-task" title="Show the tool call" on:click=move |_| scroll_to_center(&row)>{text}</button>
+                            <button type="button" class="link activity-task" title=hint on:click=move |_| scroll_to_center(&row)>{text}</button>
                         }
                     });
                     view! {
