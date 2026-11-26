@@ -702,16 +702,25 @@ pub fn systemd_available() -> bool {
 const AGENTS_SLICE: &str = "grenadine.slice";
 
 /// The sessions' share of a busy CPU, against systemd's default of 100
-/// for the server and everything else the user runs. A few sessions
-/// building and testing at once otherwise make the server slow to answer
-/// the page.
+/// for what else runs under the user's systemd manager, e.g. its
+/// services and the scopes of a desktop's or tmux's programs. A few
+/// sessions building and testing at once otherwise make a server that
+/// runs there slow to answer the page.
 const AGENTS_CPU_WEIGHT: u32 = 20;
 
-/// Makes the sessions' processes yield the CPU to everything else when
-/// it is busy, until the next boot; with idle cores they run as fast as
-/// before. The weight is on the slice above them all because a weight
-/// only ranks a slice among its siblings: one on each session's slice or
-/// scope would rank the sessions among themselves.
+/// Makes the sessions' processes yield the CPU to what else runs under
+/// the user's systemd manager when it is busy; with idle cores they run
+/// as fast as before. The weight is on the slice above them all because
+/// a weight only ranks a slice among its siblings: one on each session's
+/// slice or scope would rank the sessions among themselves.
+///
+/// For the same reason it doesn't reach outside the manager. A login
+/// session's scope and the system's services are siblings of the whole
+/// manager, which keeps its own weight, so against them the sessions
+/// still get all of the manager's share; see [`in_user_manager`].
+///
+/// The setting is the manager's, so it lasts until the manager stops, at
+/// the latest the next boot; every start of the server sets it again.
 pub fn lower_agents_cpu_weight() -> Result<()> {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
@@ -723,6 +732,26 @@ pub fn lower_agents_cpu_weight() -> Result<()> {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
+}
+
+/// Whether this process runs under a systemd user manager, next to the
+/// sessions' slice, which is what [`lower_agents_cpu_weight`] puts it
+/// ahead of. A server started from a plain SSH or console login isn't: it
+/// is in the login session's scope, beside the manager. `None` if the
+/// kernel doesn't say.
+pub fn in_user_manager() -> Option<bool> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    Some(cgroup_in_user_manager(&own))
+}
+
+/// Whether `/proc/<pid>/cgroup`'s text names a cgroup inside a systemd
+/// user manager's, `user@<uid>.service`.
+fn cgroup_in_user_manager(cgroups: &str) -> bool {
+    cgroups
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .flat_map(|path| path.split('/'))
+        .any(|part| part.starts_with("user@") && part.ends_with(".service"))
 }
 
 /// The systemd user slice the session's processes run in. A cgroup holds on
@@ -4532,6 +4561,25 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn only_cgroups_below_a_user_manager_are_in_it() {
+        // A service or scope the manager started, and a session's shell.
+        assert!(cgroup_in_user_manager(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
+        ));
+        assert!(cgroup_in_user_manager(
+            "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
+        ));
+        // A login session is beside the manager, and so is the system's.
+        assert!(!cgroup_in_user_manager(
+            "0::/user.slice/user-1000.slice/session-3.scope\n"
+        ));
+        assert!(!cgroup_in_user_manager(
+            "0::/system.slice/grenadine.service\n"
+        ));
+        assert!(!cgroup_in_user_manager(""));
+    }
 
     #[test]
     fn uuids() {
