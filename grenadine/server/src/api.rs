@@ -16,7 +16,7 @@ use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
     CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
-    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PING,
     PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
     ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
 };
@@ -976,13 +976,8 @@ async fn system_stats(AxState(state): St) -> ApiResult<Json<grenadine_core::api:
     Ok(Json(stats))
 }
 
-/// Keep-alives as a named "ping" event rather than a comment, so that the
-/// page sees them and can tell a quiet stream from a dead connection.
 /// How often a socket of events gets a [`PING`].
 const PING_EVERY: Duration = Duration::from_secs(15);
-/// What tells the page that its connection is alive. Pages can't see
-/// WebSocket pings, so this is a message; it isn't JSON, unlike events.
-const PING: &str = "ping";
 
 /// `events` with a [`PING`] every `every` among them; it ends when
 /// `events` does.
@@ -1056,12 +1051,11 @@ fn watch_keys(state: &State, query: &[(String, String)]) -> Vec<PrKey> {
         .collect()
 }
 
-/// The SSE stream of server events. `watch` parameters register the PRs
-/// the page is showing for the life of the stream; a watched PR the
-/// background inboxes don't cover gets a sync, however often it synced
-/// before, and the polls keep it fresh while it's watched.
 /// The server's events from now on, and a watch on the PRs that `query`
-/// names for as long as the caller keeps it.
+/// names for as long as the caller keeps it: its `watch` parameters are
+/// the PRs the page is showing. A watched PR the background inboxes
+/// don't cover gets a sync, however often it synced before, and the
+/// polls keep it fresh while it's watched.
 fn watch_events(
     state: &Arc<State>,
     query: &[(String, String)],
@@ -2173,16 +2167,33 @@ mod tests {
         let (events, quiet) = tokio::sync::mpsc::unbounded_channel::<String>();
         let quiet = tokio_stream::wrappers::UnboundedReceiverStream::new(quiet);
         let every = Duration::from_millis(20);
-        let mut messages = std::pin::pin!(with_pings(quiet, every));
+        // Before the pings start counting, or a pause in between would
+        // make the first one look early.
         let start = tokio::time::Instant::now();
+        let mut messages = std::pin::pin!(with_pings(quiet, every));
         assert_eq!(messages.next().await.as_deref(), Some(PING));
         assert!(start.elapsed() >= every);
+        // On a slow machine another ping may be due before what's
+        // expected next, so the pings in between are passed over.
         events.send("{}".into()).unwrap();
-        assert_eq!(messages.next().await.as_deref(), Some("{}"));
+        let event = loop {
+            match messages.next().await {
+                Some(message) if message == PING => {}
+                other => break other,
+            }
+        };
+        assert_eq!(event.as_deref(), Some("{}"));
         assert_eq!(messages.next().await.as_deref(), Some(PING));
         // The pings don't keep an ended stream going.
         drop(events);
-        assert_eq!(messages.next().await, None);
+        let ended = async {
+            while let Some(message) = messages.next().await {
+                assert_eq!(message, PING);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), ended)
+            .await
+            .expect("the stream ends once its events do");
     }
 
     /// A watch registers while its stream lives and unregisters when the

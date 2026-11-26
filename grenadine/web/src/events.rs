@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use grenadine_core::api::PING;
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use web_sys::{MessageEvent, WebSocket};
@@ -44,9 +45,6 @@ fn retry_delay(failures: u32) -> Duration {
         .saturating_mul(2u32.saturating_pow(failures))
         .min(RETRY_LONGEST)
 }
-
-/// The server's message that only says the connection is alive.
-const PING: &str = "ping";
 
 /// The WebSocket URL of `path` on the page's server.
 pub fn socket_url(path: &str) -> String {

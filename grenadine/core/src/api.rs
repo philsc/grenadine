@@ -1239,7 +1239,12 @@ pub struct LeftoverResources {
     pub processes: u32,
 }
 
-/// Pushed to the page over server-sent events.
+/// What the server sends among the events to tell the page that its
+/// connection is alive. Pages can't see WebSocket pings, so this is a
+/// message; it isn't JSON, unlike the events.
+pub const PING: &str = "ping";
+
+/// Pushed to the page as JSON text messages over a WebSocket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerEvent {
     /// The inbox list or the PRs in an inbox changed.
