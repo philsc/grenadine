@@ -93,6 +93,28 @@ pub(crate) fn sessions() -> LocalResource<api::Result<Vec<AgentSession>>> {
     expect_context()
 }
 
+/// Lists `session`, which was just started, without waiting for the list
+/// to be refetched; until it's listed, it counts as deleted.
+fn list_started(
+    sessions: LocalResource<api::Result<Vec<AgentSession>>>,
+    updates: Updates,
+    session: &AgentSession,
+) {
+    let listed = sessions
+        .with_untracked(|l| matches!(l, Some(Ok(l)) if l.iter().any(|s| s.id == session.id)));
+    if listed {
+        return;
+    }
+    // The newest session comes first. This drops the answer of a refetch
+    // on its way, which may predate the session, so ask for another.
+    sessions.update(|l| {
+        if let Some(Ok(l)) = l {
+            l.insert(0, session.clone());
+        }
+    });
+    updates.agents.update(|n| *n += 1);
+}
+
 /// The sessions that text in the transcript of session `own` may refer to.
 /// Doesn't change with what only the sessions' pages show, like a status.
 fn session_refs(own: String) -> Memo<Vec<SessionRef>> {
@@ -658,6 +680,8 @@ fn date(unix_seconds: i64) -> String {
 /// picked and handed off to a new session that plans how to clean them up.
 #[component]
 pub fn CleanupView() -> impl IntoView {
+    let updates = expect_context::<Updates>();
+    let listed = sessions();
     let cleanup = cleanup_resource();
     let repos = LocalResource::new(api::repos);
     let picked = RwSignal::new(Vec::<i64>::new());
@@ -714,6 +738,7 @@ pub fn CleanupView() -> impl IntoView {
                         let _ = s.set_item(&mode_key(&session.id), PermissionMode::plan().as_str());
                         let _ = s.set_item(&session_model_key(&session.id), &picked);
                     }
+                    list_started(listed, updates, &session);
                     go(&agent_hash(&session.id));
                 }
                 Err(e) => error.set(Some(e)),
@@ -1624,6 +1649,7 @@ pub fn NewSession(
     let drafts = expect_context::<Drafts>();
     let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
+    let listed = sessions();
     let saved = drafts.open(&draft);
     // Drafts saved before they defaulted to `GENERAL` have no repository.
     let repo = RwSignal::new(match &pr {
@@ -1851,6 +1877,7 @@ pub fn NewSession(
                     // Its follow-ups go on in the mode and with the model
                     // it started with.
                     adopt_start(&id, &session.id);
+                    list_started(listed, updates, &session);
                     // Go to the session only while its draft is still
                     // open; the user may have moved on while it started.
                     if crate::current_hash() == drafts::hash(&id) {
