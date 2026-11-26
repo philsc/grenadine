@@ -720,12 +720,10 @@ async fn finish(
             return Ok(());
         }
     }
-    // Every prompt after the first asked to post again.
     let retries = events
         .iter()
-        .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
-        .count()
-        .saturating_sub(1);
+        .filter(|e| matches!(&e.kind, AgentEventKind::Prompt(p) if p == RETRY))
+        .count();
     let Some(&delay) = state.post_retries.get(retries) else {
         return state.db.finish_auto_review(
             review.id,
