@@ -1938,10 +1938,14 @@ impl GitHub {
         Ok(())
     }
 
-    /// Re-runs the GitHub Actions workflow run `run` of `repo`, which
-    /// replaces its checks on the commit.
+    /// Re-runs the failed and cancelled jobs of the GitHub Actions
+    /// workflow run `run` of `repo`, which replaces their checks on the
+    /// commit. The jobs that passed keep their runs.
     pub async fn rerun_workflow(&self, repo: &str, run: u64) -> Result<()> {
-        let url = format!("{}/repos/{repo}/actions/runs/{run}/rerun", self.api);
+        let url = format!(
+            "{}/repos/{repo}/actions/runs/{run}/rerun-failed-jobs",
+            self.api
+        );
         let resp = self
             .stacks_send("rerun_workflow", repo, self.http.post(url))
             .await?;

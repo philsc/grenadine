@@ -771,24 +771,28 @@ class FakeGitHub:
         ):
             return self._merge_async_status(m[1], int(m[2]), m[3], api_version)
         if method == "POST" and (
-            m := re.fullmatch(r"/repos/([^/]+/[^/]+)/actions/runs/(\d+)/rerun", path)
+            m := re.fullmatch(
+                r"/repos/([^/]+/[^/]+)/actions/runs/(\d+)/rerun-failed-jobs", path
+            )
         ):
             return self._rerun(m[1], int(m[2]))
         return 404, {"message": "Not Found"}
 
     def _rerun(self, slug: str, run_id: int) -> tuple[int, Any]:
-        """The endpoint that re-runs a workflow run: its check runs start
-        over, and here pass at once."""
+        """The endpoint that re-runs a workflow run's failed and cancelled
+        jobs: their check runs start over, and here pass at once."""
         repo = self.repos.get(slug)
         prs = list(repo.prs.values()) if repo else []
         found = False
         for pr in prs:
             for run in pr.check_runs:
-                if run.run_id == run_id:
+                if run.run_id != run_id:
+                    continue
+                found = True
+                if run.conclusion != "SUCCESS":
                     run.status, run.conclusion = "COMPLETED", "SUCCESS"
                     run.started_at = self.tick()
                     pr.touch()
-                    found = True
         if not found:
             return 404, {"message": "Not Found"}
         return 201, {}

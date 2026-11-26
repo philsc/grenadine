@@ -284,7 +284,7 @@ class FakeGitHubTest(unittest.TestCase):
         )
         # Re-running the cancelled run makes it pass.
         self.assertEqual(pr.checks(), "FAILURE")
-        route = "/repos/test/test/actions/runs/{}/rerun"
+        route = "/repos/test/test/actions/runs/{}/rerun-failed-jobs"
         self.assertEqual(self.gh._route("POST", route.format(9), {}, b"", None)[0], 404)
         self.assertEqual(self.gh._route("POST", route.format(7), {}, b"", None)[0], 201)
         self.assertEqual(pr.checks(), "SUCCESS")

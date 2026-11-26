@@ -64,8 +64,10 @@ fn stale_reason(runs: &[StaleRun]) -> Option<String> {
 /// Why GitHub blocks merging the PR, each reason the way GitHub's merge
 /// box words it, `unresolved` being the PR's unresolved review threads.
 /// GitHub's API reports no reasons, so they're worked out from the
-/// branch's rules and the PR's state; when none is known a catch-all
-/// stands in.
+/// branch's rules and the PR's state. When none is known, replaced runs
+/// that GitHub still counts stand in, or else a catch-all. They're left
+/// out next to a known reason: the API doesn't say whether their check is
+/// required, so they may not block anything then.
 fn block_reasons(info: &ReviewInfo, unresolved: usize) -> Vec<String> {
     let mut reasons = Vec::new();
     match info.decision {
@@ -77,9 +79,11 @@ fn block_reasons(info: &ReviewInfo, unresolved: usize) -> Vec<String> {
         let s = if unresolved == 1 { "" } else { "s" };
         reasons.push(format!("{unresolved} conversation{s} must be resolved"));
     }
-    reasons.extend(stale_reason(&info.merge.stale_runs));
     if reasons.is_empty() {
-        reasons.push("required checks or rules aren't satisfied".into());
+        reasons.push(
+            stale_reason(&info.merge.stale_runs)
+                .unwrap_or_else(|| "required checks or rules aren't satisfied".into()),
+        );
     }
     reasons
 }
@@ -2188,13 +2192,19 @@ mod tests {
             "Merging is blocked: GitHub still counts a replaced run of format \
              that didn't pass."
         );
-        // Each check is named once, after the other reasons.
-        i.decision = Some(ReviewDecision::ReviewRequired);
+        // Each check is named once.
         i.merge.stale_runs = vec![stale("format"), stale("test"), stale("format")];
         assert_eq!(
             merge_status(&i, 0).1,
-            "Merging is blocked: it needs an approving review; GitHub still \
-             counts replaced runs of format and test that didn't pass."
+            "Merging is blocked: GitHub still counts replaced runs of format \
+             and test that didn't pass."
+        );
+        // Another reason may be the only one: their checks may not be
+        // required.
+        i.decision = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(
+            merge_status(&i, 0).1,
+            "Merging is blocked: it needs an approving review."
         );
         // They are what "not every check passed" is about, too.
         i.merge.state = MergeState::Unstable;

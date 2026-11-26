@@ -1458,11 +1458,9 @@ class InboxTest(ServerTestCase):
         )
         status = self.page.locator(".merge-box .merge-status")
         # Its first `test` run was cancelled for the one that passed, and
-        # GitHub still counts it.
-        expect(status).to_have_text(
-            "Merging is blocked: it needs an approving review; GitHub still"
-            " counts a replaced run of test that didn't pass."
-        )
+        # GitHub still counts it, but `test` isn't required: the review is
+        # the reason.
+        expect(status).to_have_text("Merging is blocked: it needs an approving review.")
         expect(status).to_have_class(re.compile(r"\bbad\b"))
         # It's not an Actions run that could be re-run from here.
         expect(
@@ -3671,11 +3669,11 @@ class StackMergeTest(ServerTestCase):
         expect(rows.nth(0)).to_contain_text("Ready")
         expect(box.get_by_role("button", name="Re-run them")).to_have_count(0)
         # Both PRs' cancelled runs were re-run, and nothing else.
-        reruns = [r for r in self.gh.requests if r.endswith("/rerun")]
+        reruns = [r for r in self.gh.requests if r.endswith("/rerun-failed-jobs")]
         self.assertEqual(
             sorted(reruns),
             [
-                f"POST /repos/{scenarios.GHSTACK_REPO}/actions/runs/{run}/rerun"
+                f"POST /repos/{scenarios.GHSTACK_REPO}/actions/runs/{run}/rerun-failed-jobs"
                 for run in (500, 501)
             ],
         )
