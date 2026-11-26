@@ -6847,6 +6847,42 @@ class AgentTest(ServerTestCase):
         ).to_have_count(1)
         expect(draft).to_have_count(0)
 
+    def test_leaving_a_session_while_its_follow_up_is_sent(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # The session's page is gone by the time the send is answered.
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(follow_up).to_have_count(0)
+        held[0].continue_()
+
+        # The follow-up went, so it's no draft anymore, though the box
+        # that held it is gone.
+        self.page.wait_for_function(
+            "() => !Object.values(localStorage).includes('say later')"
+        )
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        expect(follow_up).to_have_value("")
+
     def test_a_session_opened_before_its_start_answers_keeps_its_mode(self) -> None:
         held = self.hold_agent_answers()
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")

@@ -4949,22 +4949,22 @@ fn Composer(
         let ids = files.ids();
         let mode = mode.get_untracked();
         let model = model_arg(model);
+        // Read here because the task outlives the composer, which owns it.
+        let id = id.get_value();
         spawn_local(async move {
-            match api::send_agent_message(
-                &id.get_value(),
-                text,
-                sent_images,
-                ids.clone(),
-                mode,
-                model,
-            )
-            .await
-            {
+            match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
+                    // The session may have been left by now. The signals
+                    // are gone then, and with them what keeps the draft
+                    // in step, so the kept draft is emptied here as well.
                     prompt.set(String::new());
+                    if let Some(s) = storage() {
+                        let _ = s.remove_item(&draft_key(&id));
+                    }
                     images.set(Vec::new());
-                    image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
-                    files.sent(&ids);
+                    let key = image_drafts::agent_key(&id);
+                    image_drafts::forget(&key);
+                    files.sent(&key, &ids);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
