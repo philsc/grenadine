@@ -405,6 +405,7 @@ fn StatusBadge(status: AgentStatus) -> impl IntoView {
 
 /// A repository's section in the sidebar: the ids of the drafts in it,
 /// then its sessions.
+#[derive(Clone, PartialEq)]
 struct RepoGroup {
     repo: String,
     drafts: Vec<String>,
@@ -479,6 +480,29 @@ pub fn Sidebar(
             drafts.listed(open)
         })
     });
+    let loaded = Memo::new(move |_| match (repos.get(), sessions.get()) {
+        (Some(Err(e)), _) | (_, Some(Err(e))) => Some(Err(e)),
+        (Some(Ok(repos)), Some(Ok(sessions))) => {
+            Some(Ok(by_repo(with_general(repos), sessions, listed.get())))
+        }
+        _ => None,
+    });
+    // Whether the sections show. They stay while only what's in them
+    // changes, so that a click or the focus in one isn't lost.
+    let state = Memo::new(move |_| {
+        loaded.with(|l| {
+            l.as_ref()
+                .map(|r| r.as_ref().map(|_| ()).map_err(String::clone))
+        })
+    });
+    let groups = Memo::new(move |_| {
+        loaded.with(|l| match l {
+            Some(Ok(groups)) => groups.clone(),
+            _ => Vec::new(),
+        })
+    });
+    let names =
+        Memo::new(move |_| groups.with(|g| g.iter().map(|g| g.repo.clone()).collect::<Vec<_>>()));
     // Deleting from the sidebar failed.
     let error = RwSignal::new(None::<String>);
     // The repository whose settings are open.
@@ -507,16 +531,18 @@ pub fn Sidebar(
         <aside class="agent-sidebar">
             <a class="agent-new" href="#/agents">"+ New session"</a>
             {move || error.get().map(|e| view! { <p class="error pad">{e}</p> })}
-            {move || match (repos.get(), sessions.get()) {
-                (Some(Err(e)), _) | (_, Some(Err(e))) => {
-                    view! { <p class="error pad">{e}</p> }.into_any()
-                }
-                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(with_general(repos), sessions, listed.get())
-                    .into_iter()
-                    .map(|g| view! { <RepoSessions group=g route=route error=error settings=settings /> })
-                    .collect_view()
-                    .into_any(),
-                _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
+            {move || match state.get() {
+                None => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),
+                Some(Ok(())) => view! {
+                    <For
+                        each=move || names.get()
+                        key=|r| r.clone()
+                        let:repo
+                    >
+                        <RepoSessions repo groups route error settings />
+                    </For>
+                }.into_any(),
             }}
             <CleanupSection route=route />
             <Settings open=settings />
@@ -809,16 +835,12 @@ pub fn CleanupView() -> impl IntoView {
 /// A repository's drafts, then its sessions.
 #[component]
 fn RepoSessions(
-    group: RepoGroup,
+    repo: String,
+    groups: Memo<Vec<RepoGroup>>,
     route: Signal<Route>,
     error: RwSignal<Option<String>>,
     settings: RwSignal<Option<String>>,
 ) -> impl IntoView {
-    let RepoGroup {
-        repo,
-        drafts,
-        sessions: list,
-    } = group;
     let new = format!("#/agents/new/{repo}");
     let (title, none) = if repo == GENERAL {
         (
@@ -832,6 +854,19 @@ fn RepoSessions(
         )
     };
     let configurable = repo != GENERAL;
+    let group = {
+        let repo = repo.clone();
+        Memo::new(move |_| groups.with(|g| g.iter().find(|g| g.repo == repo).cloned()))
+    };
+    let drafts = move || group.with(|g| g.as_ref().map(|g| g.drafts.clone()).unwrap_or_default());
+    let sessions =
+        move || group.with(|g| g.as_ref().map(|g| g.sessions.clone()).unwrap_or_default());
+    let empty = Memo::new(move |_| {
+        group.with(|g| {
+            g.as_ref()
+                .is_none_or(|g| g.drafts.is_empty() && g.sessions.is_empty())
+        })
+    });
     view! {
         <section class="agent-repo">
             <h2 class="agent-repo-name">
@@ -839,71 +874,111 @@ fn RepoSessions(
                 {configurable.then(|| view! { <SettingsButton repo=repo.clone() open=settings /> })}
                 <a href=new.clone() title=title>"+"</a>
             </h2>
-            {if list.is_empty() && drafts.is_empty() {
+            {move || if empty.get() {
                 view! {
-                    <p class="agent-none muted">{none} <a href=new>"Start one"</a></p>
+                    <p class="agent-none muted">{none} <a href=new.clone()>"Start one"</a></p>
                 }.into_any()
             } else {
                 view! {
                     <ul class="agent-list">
-                        {drafts.into_iter().map(|id| view! { <DraftEntry id=id route=route /> }).collect_view()}
-                        {list.into_iter().map(|a| {
-                            let id = a.id.clone();
-                            let is_open = move |id: &str| {
-                                route.with_untracked(|r| matches!(r, Route::Agent(s) if s == id))
-                            };
-                            let selected = {
-                                let id = id.clone();
-                                move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
-                            };
-                            let delete = {
-                                let session = a.clone();
-                                move |_| {
-                                    error.set(None);
-                                    // Its page can't show it any more.
-                                    let leave = is_open(&id);
-                                    delete_session(
-                                        &session,
-                                        move || if leave { go("#/agents") },
-                                        move |e| error.set(Some(e)),
-                                    );
-                                }
-                            };
-                            let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
-                            let mut meta: Vec<String> = vec![cost(a.cost, a.cost_unit)];
-                            if let Some(n) = a.pr {
-                                meta.insert(0, format!("#{n}"));
+                        <For each=drafts key=|id| id.clone() let:id>
+                            <DraftEntry id route />
+                        </For>
+                        <For
+                            each=sessions
+                            key=|s| s.id.clone()
+                            children=move |s| {
+                                // What was last listed; once it isn't any
+                                // more, the entry is about to go.
+                                let current = Memo::new(move |prev: Option<&AgentSession>| {
+                                    group
+                                        .with(|g| {
+                                            let all = &g.as_ref()?.sessions;
+                                            all.iter().find(|x| x.id == s.id).cloned()
+                                        })
+                                        .unwrap_or_else(|| prev.unwrap_or(&s).clone())
+                                });
+                                view! { <SessionEntry session=current route error /> }
                             }
-                            // The PR count covers a wrap-up's PR.
-                            if let Some(landed @ Landed::Checkout { .. }) = &a.landed {
-                                meta.push(landed_label(landed));
-                            }
-                            view! {
-                                <li class="agent-entry">
-                                    <a class="agent-item" class:selected=selected href=agent_hash(&a.id)>
-                                        <span class="agent-title" title=a.title.clone()>{label}</span>
-                                        <span class="agent-status-line">
-                                            <StatusBadge status=a.status />
-                                            {(a.unstaged > 0).then(|| view! { <UnstagedCount count=a.unstaged /> })}
-                                            {a.prs.map(|prs| view! { <PrCount prs /> })}
-                                            <span class="agent-meta muted">{meta.join(" · ")}</span>
-                                        </span>
-                                    </a>
-                                    <button
-                                        class="icon agent-delete"
-                                        title="Delete session"
-                                        aria-label="Delete session"
-                                        on:click=delete
-                                    >
-                                        <TrashIcon />
-                                    </button>
-                                </li>
-                            }
-                        }).collect_view()}
+                        />
                     </ul>
                 }.into_any()
             }}
         </section>
+    }
+}
+
+/// A session's entry in the sidebar. It changes in place, so that what the
+/// pointer or the focus is on stays. If one update lists several sessions
+/// above it, though, `For` takes the entry out of the page and puts it back,
+/// which loses the focus.
+#[component]
+fn SessionEntry(
+    session: Memo<AgentSession>,
+    route: Signal<Route>,
+    error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let id = session.with_untracked(|s| s.id.clone());
+    let href = agent_hash(&id);
+    let selected = {
+        let id = id.clone();
+        move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
+    };
+    let delete = move |_| {
+        error.set(None);
+        // Its page can't show it any more.
+        let leave = route.with_untracked(|r| matches!(r, Route::Agent(s) if *s == id));
+        delete_session(
+            &session.get_untracked(),
+            move || {
+                if leave {
+                    go("#/agents")
+                }
+            },
+            move |e| error.set(Some(e)),
+        );
+    };
+    let title = Memo::new(move |_| session.with(|s| s.title.clone()));
+    let label =
+        Memo::new(move |_| session.with(|s| s.summary.clone().unwrap_or_else(|| s.title.clone())));
+    let status = Memo::new(move |_| session.with(|s| s.status));
+    let unstaged = Memo::new(move |_| session.with(|s| s.unstaged));
+    let prs = Memo::new(move |_| session.with(|s| s.prs));
+    let meta = Memo::new(move |_| {
+        session.with(|s| {
+            let mut meta: Vec<String> = vec![cost(s.cost, s.cost_unit)];
+            if let Some(n) = s.pr {
+                meta.insert(0, format!("#{n}"));
+            }
+            // The PR count covers a wrap-up's PR.
+            if let Some(landed @ Landed::Checkout { .. }) = &s.landed {
+                meta.push(landed_label(landed));
+            }
+            meta.join(" · ")
+        })
+    });
+    view! {
+        <li class="agent-entry">
+            <a class="agent-item" class:selected=selected href=href>
+                <span class="agent-title" title=move || title.get()>{move || label.get()}</span>
+                <span class="agent-status-line">
+                    <span class=move || status_class(status.get())>
+                        {move || status_label(status.get())}
+                    </span>
+                    {move || (unstaged.get() > 0).then(|| view! { <UnstagedCount count=unstaged.get() /> })}
+                    {move || prs.get().map(|prs| view! { <PrCount prs /> })}
+                    <span class="agent-meta muted">{move || meta.get()}</span>
+                </span>
+            </a>
+            <button
+                class="icon agent-delete"
+                title="Delete session"
+                aria-label="Delete session"
+                on:click=delete
+            >
+                <TrashIcon />
+            </button>
+        </li>
     }
 }
 

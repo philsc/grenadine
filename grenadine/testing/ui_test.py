@@ -6731,6 +6731,62 @@ class AgentTest(ServerTestCase):
         expect(entries.filter(has_text="say held")).to_have_count(1)
         expect(draft).to_have_count(0)
 
+    def test_sidebar_entries_stay_their_sessions(self) -> None:
+        # When a session is listed above another, an entry must not turn
+        # into the other's: a click or the focus on it would go along.
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        session = self.page.url.rsplit("/", 1)[1]
+        links = self.section(self.OTHER_REPO).locator("a.agent-item")
+        link = self.page.locator(f'a.agent-item[href="#/agents/{session}"]')
+        entry = self.page.locator(".agent-entry").filter(has=link)
+        delete = entry.get_by_role("button", name="Delete session")
+        status = link.locator(".agent-status")
+        expect(status).to_have_text("idle")
+        parts = [link, link.locator(".agent-title"), status, delete]
+        for part in parts:
+            part.evaluate("el => { el.__kept = true; }")
+        delete.focus()
+
+        def post(path: str, data: dict) -> None:
+            resp = self.page.request.post(
+                f"{self.url}api/agents{path}",
+                headers={"Origin": self.url.rstrip("/")},
+                data=data,
+            )
+            self.assertTrue(resp.ok, resp.text())
+
+        def expect_kept() -> None:
+            for part in parts:
+                self.assertTrue(part.evaluate("el => el.__kept === true"))
+            expect(delete).to_be_focused()
+
+        # A turn of its own changes the entry in place.
+        post(
+            f"/{session}/messages",
+            {"prompt": "say more", "permission_mode": "auto"},
+        )
+        expect(link).to_contain_text("$0.02")
+        expect(status).to_have_text("idle")
+        expect_kept()
+
+        # Another session takes its place in the list.
+        post(
+            "",
+            {
+                "backend": "claude",
+                "repo": self.OTHER_REPO,
+                "prompt": "say two",
+                "permission_mode": "auto",
+            },
+        )
+        expect(links).to_have_count(2)
+        expect(links.last).to_have_attribute("href", f"#/agents/{session}")
+        expect_kept()
+
     def test_leaving_a_form_while_its_start_fetches_the_settings(self) -> None:
         # A start asked for before the repository's settings arrived
         # fetches them itself; leaving the form meanwhile doesn't stop it.
