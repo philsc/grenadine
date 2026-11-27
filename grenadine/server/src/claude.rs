@@ -590,9 +590,14 @@ fn bash_hook_settings() -> Result<Value> {
     // Not the executable's path: once a build has replaced the file, the
     // path has another version's binary, or none, at it.
     let exe = format!("/proc/{}/exe", std::process::id());
-    // Claude Code only blocks the command on 2, and the executable is gone
-    // once the server is, which a job can outlive.
-    let hook = format!("{exe} {} || exit 2", crate::cleanup::BASH_HOOK_ARG);
+    // Claude Code only blocks the command on 2. A job can outlive the
+    // server, and then the PID, and with it the executable, can be another
+    // process's: only the server's hook prints the allow marker.
+    let hook = format!(
+        "[ \"$({exe} {})\" = {} ] || exit 2",
+        crate::cleanup::BASH_HOOK_ARG,
+        crate::cleanup::BASH_HOOK_ALLOW,
+    );
     Ok(json!({"hooks": {"PreToolUse": [{
         "matcher": "Bash",
         "hooks": [{"type": "command", "command": hook}],

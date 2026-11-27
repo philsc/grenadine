@@ -323,16 +323,25 @@ const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
 /// The argument that has the server binary act as `bash_hook`.
 pub const BASH_HOOK_ARG: &str = "cleanup-bash-hook";
 
+/// What `bash_hook` prints when it lets a command run. The hook's command
+/// blocks the command unless it gets exactly this, so another binary that
+/// exits 0 on an unknown argument doesn't let every command through.
+pub const BASH_HOOK_ALLOW: &str = "grenadine-allow";
+
 /// Claude Code's PreToolUse hook for the cleanup jobs: reads the hook's
 /// input on stdin and returns the exit status, 2 to block a Bash command
-/// that `allowed_command` refuses. Claude Code's allowed tools only match
-/// a command's prefix, so this keeps out the options that would run
-/// commands or write files.
+/// that `allowed_command` refuses, and prints `BASH_HOOK_ALLOW` if it lets
+/// the command run. Claude Code's allowed tools only match a command's
+/// prefix, so this keeps out the options that would run commands or write
+/// files.
 pub fn bash_hook() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     match hook_decision(&input) {
-        Ok(()) => 0,
+        Ok(()) => {
+            println!("{BASH_HOOK_ALLOW}");
+            0
+        }
         Err(why) => {
             eprintln!("{why}");
             2

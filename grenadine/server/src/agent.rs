@@ -6175,8 +6175,12 @@ esac
         // Each Bash command goes through the hook, which checks its
         // options.
         assert!(args.contains("--settings {\"hooks\""), "{args}");
-        // It blocks the command when the hook can't run.
-        let hook = format!("{} || exit 2", crate::cleanup::BASH_HOOK_ARG);
+        // It blocks the command unless the hook prints its allow marker.
+        let hook = format!(
+            "{})\\\" = {} ] || exit 2",
+            crate::cleanup::BASH_HOOK_ARG,
+            crate::cleanup::BASH_HOOK_ALLOW,
+        );
         assert!(args.contains(&hook), "{args}");
         let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
         assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
