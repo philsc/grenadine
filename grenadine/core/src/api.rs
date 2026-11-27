@@ -512,6 +512,9 @@ pub struct MergeProgress {
     pub warning: Option<String>,
 }
 
+/// How long the page polls a merge before it gives up.
+pub const MERGE_POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// The state GitHub reports for an asynchronous merge request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeStatus {
@@ -1290,6 +1293,66 @@ pub enum ServerEvent {
     RepoSettingsChanged(String),
     /// A review of the viewer's PRs started, finished or went away.
     AutoReviewsChanged,
+    /// The server's update to a newer version started, went on or ended.
+    UpdateChanged,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    pub sha: String,
+    /// The first line of the message.
+    pub title: String,
+    /// When it was committed, in Unix seconds.
+    pub date: i64,
+}
+
+/// A session that a restart would interrupt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusySession {
+    /// Empty while an automatic review's session is being created.
+    pub id: String,
+    pub title: String,
+    /// How many of its terminals run a command.
+    pub terminals: usize,
+}
+
+/// Where the server's update to a newer version stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdatePhase {
+    #[default]
+    Idle,
+    /// Fetching and checking out the newest commit.
+    CheckingOut,
+    Building,
+    /// Built, and waiting for the sessions and merges to finish.
+    Waiting {
+        /// The commit that was built.
+        target: String,
+        sessions: Vec<BusySession>,
+        /// The PRs being merged.
+        merges: Vec<PrKey>,
+        /// How many terminals are open, which the restart closes.
+        terminals: usize,
+    },
+    Restarting,
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    /// The commit the server runs. `None` when it can't update itself
+    /// because it wasn't started with `bazel run`.
+    pub running: Option<CommitInfo>,
+    pub phase: UpdatePhase,
+}
+
+/// What an update would bring.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheck {
+    /// The commits that aren't running yet, newest first.
+    pub behind: Vec<CommitInfo>,
 }
 
 /// A login shell in an agent session's worktree.
