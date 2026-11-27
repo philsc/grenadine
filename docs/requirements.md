@@ -884,7 +884,8 @@ may still follow runs or has branches left to delete, and no terminal runs a
 command in the foreground. A terminal whose shell is at its prompt must not
 hold it up. The user must be able to cancel it, or to restart at once after
 being told which sessions that stops and which merges it affects. While it
-waits, the page must show how many open terminals the restart closes.
+waits, the page must show how many open terminals the restart closes. Cancelling it must put the clone back
+as cancelling the build does.
 
 **UPDATE-5.** The restart must keep the server's process ID, terminal and
 arguments. SIGINT and SIGTERM must still stop the server, also while it

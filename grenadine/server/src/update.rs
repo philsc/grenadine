@@ -473,7 +473,7 @@ pub fn start(state: &Arc<State>) -> bool {
             _ = state.shutdown.cancelled() => return,
         };
         match result {
-            Ok(Some((target, binary))) => wait(&state, target, binary).await,
+            Ok(Some((old, target, binary))) => wait(&state, old, target, binary).await,
             Ok(None) => set_phase(&state, UpdatePhase::Idle),
             Err(e) => {
                 tracing::warn!("can't update: {e:#}");
@@ -485,9 +485,10 @@ pub fn start(state: &Arc<State>) -> bool {
     true
 }
 
-/// Checks out the branch's tip and builds it. Returns it and the binary, or
-/// `None` if the user cancelled the build.
-async fn prepare(state: &Arc<State>) -> Result<Option<(String, PathBuf)>> {
+/// Checks out the branch's tip and builds it. Returns the commit the clone
+/// was at, the tip and the binary, or `None` if the user cancelled the
+/// build.
+async fn prepare(state: &Arc<State>) -> Result<Option<(String, String, PathBuf)>> {
     let (old, target) = with_clone(state, Build::check_out).await?;
     tracing::info!("building {target}");
     set_phase(state, UpdatePhase::Building);
@@ -512,13 +513,20 @@ async fn prepare(state: &Arc<State>) -> Result<Option<(String, PathBuf)>> {
         _ = build_cancelled(state) => Ok(None),
     };
     if let Ok(Some(binary)) = built {
-        return Ok(Some((target, binary)));
+        // A Cancel that comes now is `wait`'s.
+        return Ok(Some((old, target, binary)));
     }
+    restore(state, old, target).await;
+    built.map(|_| None)
+}
+
+/// Moves the clone back to `old` unless it has changed since the update
+/// moved it to `target`.
+async fn restore(state: &Arc<State>, old: String, target: String) {
     let restored = with_clone(state, move |b| b.restore(&old, &target)).await;
     if let Err(e) = restored {
         tracing::warn!("can't move the clone back: {e:#}");
     }
-    built.map(|_| None)
 }
 
 /// Waits until the user cancels the build.
@@ -533,45 +541,56 @@ async fn build_cancelled(state: &State) {
 }
 
 /// Waits until no session is busy and no merge runs, or the user decides.
-async fn wait(state: &Arc<State>, target: String, binary: PathBuf) {
+/// A cancel puts the clone back at `old`, as one of the build does.
+async fn wait(state: &Arc<State>, old: String, target: String, binary: PathBuf) {
     loop {
         let sessions = agent::busy_sessions(state);
         let merges = crate::api::busy_merges(state);
         let terminals = state.agents.terminals.count();
-        {
+        let next = {
             let mut inner = state.update.inner.lock().unwrap();
             let next = match inner.decision.take() {
-                Some(Decision::Cancel) => UpdatePhase::Idle,
-                None if !sessions.is_empty() || !merges.is_empty() => UpdatePhase::Waiting {
+                // The phase stays until the clone is back, so that another
+                // update can't start meanwhile.
+                Some(Decision::Cancel) => None,
+                None if !sessions.is_empty() || !merges.is_empty() => Some(UpdatePhase::Waiting {
                     target: target.clone(),
                     sessions,
                     merges,
                     terminals,
-                },
+                }),
                 // While the server still runs.
-                _ if !binary.exists() => UpdatePhase::Failed {
+                _ if !binary.exists() => Some(UpdatePhase::Failed {
                     error: format!("{} is gone", binary.display()),
-                },
-                _ => UpdatePhase::Restarting,
+                }),
+                _ => Some(UpdatePhase::Restarting),
             };
-            if next == UpdatePhase::Restarting {
-                inner.restart_into = Some(binary.clone());
-            }
-            let changed = inner.phase != next;
-            inner.phase = next.clone();
-            drop(inner);
-            if changed {
-                state.send(ServerEvent::UpdateChanged);
-            }
-            match next {
-                UpdatePhase::Waiting { .. } => {}
-                UpdatePhase::Restarting => {
-                    tracing::info!("restarting into {target}");
-                    state.update.restart.notify_one();
-                    return;
+            if let Some(next) = &next {
+                if *next == UpdatePhase::Restarting {
+                    inner.restart_into = Some(binary.clone());
                 }
-                _ => return,
+                let changed = inner.phase != *next;
+                inner.phase = next.clone();
+                drop(inner);
+                if changed {
+                    state.send(ServerEvent::UpdateChanged);
+                }
             }
+            next
+        };
+        match next {
+            None => {
+                restore(state, old, target).await;
+                set_phase(state, UpdatePhase::Idle);
+                return;
+            }
+            Some(UpdatePhase::Waiting { .. }) => {}
+            Some(UpdatePhase::Restarting) => {
+                tracing::info!("restarting into {target}");
+                state.update.restart.notify_one();
+                return;
+            }
+            Some(_) => return,
         }
         tokio::select! {
             _ = state.update.decided.notified() => {}
@@ -911,7 +930,10 @@ chmod 755 "$script"
     #[tokio::test]
     async fn waits_for_busy_sessions() {
         let f = fixture();
-        let state = state(Some(build(&f, BAZEL)));
+        let b = build(&f, BAZEL);
+        let first = b.running.sha.clone();
+        let state = state(Some(b));
+        add_commit(&f.upstream, "b", "1\n");
         assert!(!state.update.force(), "nothing to force yet");
         assert!(!cancel(&state));
 
@@ -924,9 +946,11 @@ chmod 755 "$script"
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "busy");
 
-        // Cancelled, it doesn't restart, and can be started again.
+        // Cancelled, it doesn't restart, puts the clone back, and can be
+        // started again.
         assert!(cancel(&state));
         until(&state, |p| *p == UpdatePhase::Idle).await;
+        assert_eq!(head(&f), first);
         assert!(start(&state));
         until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
         assert!(state.update.force());

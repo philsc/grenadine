@@ -2129,7 +2129,10 @@ async fn run(state: Arc<State>, id: String) {
             l.background = false;
             l.interrupted
         });
-        let status = if interrupted {
+        // Shutting down stops the turn, which may then look as if it
+        // failed.
+        let stopped = status != AgentStatus::Idle && state.shutdown.is_cancelled();
+        let status = if interrupted || stopped {
             AgentStatus::Interrupted
         } else {
             status
@@ -2139,6 +2142,15 @@ async fn run(state: Arc<State>, id: String) {
             set_status(&state, &id, status);
         }
         last = status;
+        // The queued prompts are lost, rather than started as the server
+        // goes.
+        if state.shutdown.is_cancelled() {
+            state.agents.with_live(&id, |l| {
+                l.queue.clear();
+                l.running = false;
+            });
+            return;
+        }
     }
 }
 
@@ -4378,7 +4390,8 @@ impl<'a> TurnSink<'a> {
     /// How the turn went once the backend's output is done: `unfinished`
     /// explains a turn that never reported an end.
     pub fn finish(self, unfinished: impl FnOnce() -> String) -> Result<AgentStatus> {
-        let interrupted = self.state.agents.interrupted(self.id);
+        let interrupted =
+            self.state.agents.interrupted(self.id) || self.state.shutdown.is_cancelled();
         Ok(match self.ended {
             Some(true) => AgentStatus::Idle,
             Some(false) => AgentStatus::Failed,
@@ -6380,6 +6393,74 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 .filter(|e| matches!(e, AgentEventKind::Prompt(_)))
                 .count(),
             1
+        );
+        let session = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(session.status, AgentStatus::Interrupted);
+    }
+
+    /// Shutting down stops the running turns, which then count as
+    /// interrupted rather than failed, and starts none of the queued ones.
+    #[tokio::test]
+    async fn shutting_down_interrupts_the_turns() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // Like Claude Code, it exits without a result when it's stopped.
+        let state = state_with_claude(
+            &fx,
+            dir.path(),
+            "#!/bin/sh\ntrap 'exit 1' INT\ncat >/dev/null\nwhile :; do sleep 0.05; done\n",
+        );
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        send(
+            &state,
+            &session.id,
+            "queued".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        for _ in 0..750 {
+            if state.agents.with_live(&session.id, |l| l.stopper.is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        state.shutdown.cancel();
+        wait_for_status(&state, &session.id, AgentStatus::Interrupted).await;
+        for _ in 0..100 {
+            if !state.agents.with_live(&session.id, |l| l.running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let transcript = wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|e| matches!(e, AgentEventKind::Prompt(_)))
+                .count(),
+            1,
+            "the queued prompt never ran"
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|e| matches!(e, AgentEventKind::Error(_))),
+            "{transcript:?}"
         );
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Interrupted);
