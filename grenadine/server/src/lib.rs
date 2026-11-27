@@ -22,6 +22,7 @@ mod mcp;
 mod pr_plan;
 mod ratelimit;
 mod reflow;
+mod slash_commands;
 mod stack;
 mod summary;
 mod sync;

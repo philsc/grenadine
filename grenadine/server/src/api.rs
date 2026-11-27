@@ -159,6 +159,7 @@ fn api_routes() -> Router<Arc<State>> {
                 .layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/backends", get(agent_backends))
+        .route("/api/slash-commands", get(slash_commands))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route(
             "/api/agents/{id}/messages",
@@ -189,6 +190,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/agents/{id}/prs", get(agent_prs))
+        .route("/api/agents/{id}/slash-commands", get(agent_slash_commands))
         .route("/api/images/{id}", get(image))
         .route("/api/agents/{id}/processes", get(processes))
         .route(
@@ -1341,6 +1343,35 @@ async fn offers(
         return Some((StatusCode::BAD_REQUEST, message).into_response());
     }
     None
+}
+
+#[derive(Deserialize)]
+struct SlashCommandsQuery {
+    repo: String,
+    backend: grenadine_core::api::AgentBackend,
+}
+
+/// The commands a new session's prompt in the repository can start with.
+async fn slash_commands(
+    AxState(state): St,
+    Query(q): Query<SlashCommandsQuery>,
+) -> ApiResult<Response> {
+    if !can_start_in(&state, &q.repo) {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(crate::slash_commands::list(
+        &state, &q.repo, q.backend, None,
+    )?)
+    .into_response())
+}
+
+/// The commands the session's next prompt can start with.
+async fn agent_slash_commands(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let list = crate::slash_commands::list(&state, &session.repo, session.backend, Some(&id))?;
+    Ok(Json(list).into_response())
 }
 
 /// Whether sessions can start in `repo`: a configured repository, or

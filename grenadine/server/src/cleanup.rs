@@ -553,12 +553,7 @@ fn failed_scan(session: &AgentSession, e: &anyhow::Error) -> Vec<(String, String
 /// Where Claude Code keeps the session's full transcript: its config dir's
 /// `projects/`, in a directory named after the working directory.
 pub(crate) fn transcript_path(session: &AgentSession) -> PathBuf {
-    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
-        });
+    let config = crate::claude::config_dir();
     let project: String = session
         .worktree
         .chars()
