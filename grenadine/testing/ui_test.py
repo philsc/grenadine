@@ -217,6 +217,10 @@ def devin_scenario(tmp: Path) -> dict:
                 ],
             },
             {
+                "match": "Your review isn't on the pull request.",
+                "steps": [end],
+            },
+            {
                 "match": "Review pull request",
                 "steps": [
                     update(
@@ -405,6 +409,7 @@ if "--json-schema" in args:
     print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
 import os
+import pathlib
 import re
 content = json.loads(sys.stdin.read())["message"]["content"]
 images = sum(block["type"] == "image" for block in content)
@@ -655,7 +660,13 @@ if review and "Slow" in review[1]:
 # A "Paced" one's takes long enough to open its page while it runs.
 if review and "Paced" in review[1]:
     time.sleep(5)
-if review and "Quiet" not in review[1]:
+# A "Retried" PR's review only posts once it's asked again.
+pending = pathlib.Path("pending-review.json")
+if review and "Retried" in review[1]:
+    pending.write_text(json.dumps([review[2], review[3]]))
+elif prompt.startswith("Your review isn't on the pull request.") and pending.exists():
+    review = [None, "", *json.loads(pending.read_text())]
+if review and "Quiet" not in review[1] and "Retried" not in review[1]:
     request = urllib.request.Request(
         f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
         data=json.dumps({"body": "Looks good."}).encode(),
@@ -809,6 +820,7 @@ class ServerTestCase(unittest.TestCase):
                 # The fake GitHub shows posted reviews at once, so a review
                 # that posts nothing needn't be looked for over 25s.
                 "--review-post-checks=0,1",
+                "--review-post-retries=1,1",
                 # The fake claude can't update itself.
                 "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
@@ -9350,6 +9362,21 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("button", name="Delete", exact=True).click()
         expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
 
+    def test_a_review_that_posts_when_asked_again(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Retried change")
+        self.page.goto(self.url + "#/auto-reviews")
+        entry = self.review_entry("Retried change")
+        expect(entry.locator(".agent-status")).to_have_text("posted", timeout=60_000)
+        self.assertEqual(len(pr.issue_comments), 1)
+        # What it was asked is in its transcript.
+        entry.locator("a.agent-item").click()
+        expect(
+            self.page.locator(
+                ".transcript .turn-prompt",
+                has_text="Your review isn't on the pull request.",
+            )
+        ).to_have_count(1)
+
     def test_a_devin_review(self) -> None:
         dialog = self.settings(self.DEVIN_REPO)
         dialog.get_by_label("Review with").select_option(label="Devin")
@@ -9379,7 +9406,13 @@ class AutoReviewTest(ServerTestCase):
         entry.locator("a.agent-item").click()
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"Review pull request {pr.url}")
-        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])
+        expect(transcript.locator(".turn-end").first).to_have_text("Done · 0.050 ACU")
+        # It was asked to post again before grenadine gave up.
+        expect(
+            transcript.locator(
+                ".turn-prompt", has_text="Your review isn't on the pull request."
+            )
+        ).to_have_count(2)
 
     def test_review_with_lists_only_installed_backends(self) -> None:
         # With only Devin installed, it's the only backend offered. The
