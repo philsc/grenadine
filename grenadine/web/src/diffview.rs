@@ -380,7 +380,11 @@ pub fn DiffView(
         async move {
             let loaded = load.await;
             if let Ok((files, _)) = &loaded {
-                memlog::diff(files.len(), files.iter().map(|f| changed_lines(f)).sum());
+                let mode = rebase_older.get_untracked();
+                memlog::diff(
+                    files.len(),
+                    files.iter().map(|f| changed_lines(f, mode)).sum(),
+                );
             }
             loaded
         }
@@ -506,9 +510,10 @@ pub fn DiffView(
     }
 }
 
-/// The file's added and removed lines, for the page memory log.
-fn changed_lines(file: &FileData) -> usize {
-    let s = file.stats(false);
+/// The file's added and removed lines in `rebase_older` mode, for the
+/// page memory log.
+fn changed_lines(file: &FileData, rebase_older: bool) -> usize {
+    let s = file.stats(rebase_older);
     s.added + s.removed
 }
 
@@ -1630,7 +1635,10 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
     Effect::new(move |_| {
         keyed.with(|next| {
             if !next.is_empty() {
-                memlog::diff(next.len(), next.iter().map(|(_, f)| changed_lines(f)).sum());
+                memlog::diff(
+                    next.len(),
+                    next.iter().map(|(_, f)| changed_lines(f, false)).sum(),
+                );
             }
         });
     });

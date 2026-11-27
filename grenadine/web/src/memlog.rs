@@ -28,8 +28,6 @@ const AFTER_NAV: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(target_arch = "wasm32")]
 const KEY: &str = "grenadine-memlog";
-#[cfg(target_arch = "wasm32")]
-const PREVIOUS_KEY: &str = "grenadine-memlog-previous";
 
 /// The tab's session storage.
 #[cfg(target_arch = "wasm32")]
@@ -84,7 +82,7 @@ pub struct Entry {
 
 thread_local! {
     static LOG: RefCell<VecDeque<Entry>> = RefCell::default();
-    /// The previous page load's log, moved aside at `start`.
+    /// The previous page load's log, read from session storage at `start`.
     static PREVIOUS: RefCell<Vec<Entry>> = RefCell::default();
 }
 
@@ -224,9 +222,10 @@ pub fn diff(files: usize, changed_lines: usize) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn start() {}
 
-/// Moves any previous page load's log aside, records the first sample,
-/// and starts the periodic sampling and the navigation listener. The
-/// interval and the listener live for the page's lifetime.
+/// Loads any previous page load's log into memory, records the first
+/// sample (which overwrites the stored copy), and starts the periodic
+/// sampling and the navigation listener. The interval and the listener
+/// live for the page's lifetime.
 #[cfg(target_arch = "wasm32")]
 pub fn start() {
     use leptos::prelude::{set_interval_with_handle, set_timeout, window_event_listener_untyped};
@@ -234,7 +233,6 @@ pub fn start() {
     if let Some(storage) = storage()
         && let Ok(Some(json)) = storage.get_item(KEY)
     {
-        let _ = storage.set_item(PREVIOUS_KEY, &json);
         PREVIOUS.with_borrow_mut(|p| *p = serde_json::from_str(&json).unwrap_or_default());
     }
     record("sample", None, true);
@@ -293,7 +291,14 @@ pub fn download() {
         anchor.set_download(&name);
         anchor.click();
     }
-    let _ = web_sys::Url::revoke_object_url(&url);
+    // Some browsers start the download after `click` returns, so the URL
+    // has to outlive it for a while.
+    leptos::prelude::set_timeout(
+        move || {
+            let _ = web_sys::Url::revoke_object_url(&url);
+        },
+        std::time::Duration::from_secs(60),
+    );
 }
 
 /// No-op on the host, where there is no document to download to.
