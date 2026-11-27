@@ -2184,6 +2184,24 @@ pub enum AgentEventKind {
         #[serde(alias = "cost_usd")]
         cost: Option<f64>,
     },
+    /// The backend started a task for tool call `id`, such as a command
+    /// or a subagent. One that's still running after the call's
+    /// `ToolResult` runs in the background. A `TaskEnded` with the same
+    /// `task` follows, unless the turn's process ends first.
+    TaskStarted {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+    },
+    /// A task that a tool call started is over.
+    TaskEnded {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+        status: TaskStatus,
+    },
     /// How full the context window is. Never stored; the session keeps
     /// the latest values. `None` leaves a value unchanged.
     Usage {
@@ -2199,6 +2217,16 @@ pub enum AgentEventKind {
     Landed(Landed),
     /// Wrapping up stopped; carries why.
     WrapUpFailed(String),
+}
+
+/// How a task that a tool call started went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Completed,
+    Failed,
+    /// Ended before it was done, e.g. by the agent.
+    Stopped,
 }
 
 /// One hunk of the change a file tool made, as the backend reports it.
@@ -2221,6 +2249,15 @@ impl AgentEventKind {
                 | AgentEventKind::ThinkingDelta(_)
                 | AgentEventKind::Usage { .. }
                 | AgentEventKind::Model(_)
+        )
+    }
+
+    /// Whether the event is about a task that a tool call started,
+    /// rather than something the agent did.
+    pub fn is_task(&self) -> bool {
+        matches!(
+            self,
+            AgentEventKind::TaskStarted { .. } | AgentEventKind::TaskEnded { .. }
         )
     }
 }
