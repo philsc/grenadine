@@ -1,31 +1,30 @@
 //! The HTTP API used by the web UI, and the UI's static files.
 
 use std::collections::BTreeSet;
-use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State as AxState};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, DictationInfo, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress,
-    MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
-    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates,
-    ReviewerChange, ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff,
-    submit_blocker,
+    CleanupState, DictationInfo, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs,
+    MERGE_POLL_LIMIT, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
+    NewCleanupSession, NewComment, NewReply, NewThread, PING, PermissionMode, PrDetail, PrKey,
+    PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, Side, SubmitReview,
+    WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 
 use crate::agent::{self, Decision};
 use crate::attachments;
@@ -138,6 +137,10 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/debug/github", get(github_usage))
         .route("/api/debug/system", get(system_stats))
         .route("/api/events", get(events))
+        .route("/api/update", get(update_status).post(start_update))
+        .route("/api/update/check", get(check_update))
+        .route("/api/update/force", post(force_update))
+        .route("/api/update/cancel", post(cancel_update))
         .route("/api/repos", get(repos))
         .route(
             "/api/repos/{owner}/{name}/settings",
@@ -155,6 +158,7 @@ fn api_routes() -> Router<Arc<State>> {
                 .layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/backends", get(agent_backends))
+        .route("/api/slash-commands", get(slash_commands))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route(
             "/api/agents/{id}/messages",
@@ -185,6 +189,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/agents/{id}/prs", get(agent_prs))
+        .route("/api/agents/{id}/slash-commands", get(agent_slash_commands))
         .route("/api/images/{id}", get(image))
         .route("/api/agents/{id}/processes", get(processes))
         .route(
@@ -639,8 +644,11 @@ pub struct PendingMerge {
     /// GitHub's terminal answer when it came with the request itself;
     /// `None` while the merge runs and the endpoint asks GitHub.
     terminal: Option<MergeStatus>,
-    /// The landed merge's branches were deleted already.
+    /// The landed merge's branches were deleted already, or are being.
     cleaned: bool,
+    /// The merge ended and its branches are deleted: nothing is left to do
+    /// for it.
+    settled: bool,
     /// When the merge was started. GitHub forgets a merge's result after
     /// a day, so grenadine does too.
     started: std::time::Instant,
@@ -683,10 +691,55 @@ fn remember_merge(
             delete,
             terminal,
             cleaned: false,
+            settled: false,
             started: std::time::Instant::now(),
         },
     );
     uuid
+}
+
+/// How long a merge that the page polls holds up a restart: somewhat
+/// longer than the page polls. The page may be closed, and then nothing
+/// asks how the merge went.
+const MERGE_BUSY: std::time::Duration =
+    MERGE_POLL_LIMIT.saturating_add(std::time::Duration::from_secs(60));
+
+/// The PRs whose merge a restart would forget, along with the branches to
+/// delete once it lands.
+pub fn busy_merges(state: &State) -> Vec<PrKey> {
+    let mut keys = state.starting_merges.lock().unwrap().clone();
+    keys.extend(
+        state
+            .merges
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|p| !p.settled && p.started.elapsed() < MERGE_BUSY)
+            .map(|p| p.key.clone()),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Has the PR count as being merged until it's dropped: while GitHub is
+/// asked to merge it, before `remember_merge`.
+struct StartingMerge<'a>(&'a State, PrKey);
+
+impl StartingMerge<'_> {
+    fn new<'a>(state: &'a State, key: &PrKey) -> StartingMerge<'a> {
+        state.starting_merges.lock().unwrap().push(key.clone());
+        StartingMerge(state, key.clone())
+    }
+}
+
+impl Drop for StartingMerge<'_> {
+    fn drop(&mut self) {
+        let mut starting = self.0.starting_merges.lock().unwrap();
+        if let Some(i) = starting.iter().position(|k| *k == self.1) {
+            starting.swap_remove(i);
+        }
+    }
 }
 
 async fn merge(
@@ -698,6 +751,7 @@ async fn merge(
     if !is_sha(&m.head_oid) {
         return Err(refuse(StatusCode::BAD_REQUEST, "bad head_oid".into()));
     }
+    let _starting = StartingMerge::new(&state, &key);
     let delete = match m.delete_branch {
         true => state.github.merge_refs(&key).await?,
         false => Vec::new(),
@@ -802,6 +856,13 @@ async fn merge_progress(
         Some(status) => status,
         None => state.github.merge_progress(&key, &uuid).await?,
     };
+    if status != MergeStatus::Pending
+        && let Some(p) = state.merges.lock().unwrap().get_mut(&uuid)
+    {
+        p.terminal = Some(status.clone());
+        // A landed merge's branches are still to be deleted.
+        p.settled |= status != MergeStatus::Merged;
+    }
     if matches!(status, MergeStatus::Failed(_) | MergeStatus::Enqueued) {
         state.resync(key.clone());
     }
@@ -831,6 +892,9 @@ async fn merge_progress(
                 failed.push(format!("{branch}: {e:#}"));
             }
         }
+        if let Some(p) = state.merges.lock().unwrap().get_mut(&uuid) {
+            p.settled = true;
+        }
         if !failed.is_empty() {
             warning = Some(format!(
                 "Merged, but the branch wasn't deleted: {}",
@@ -858,6 +922,7 @@ async fn enqueue(
                 "a stacked PR can't jump the queue".into(),
             ));
         }
+        let _starting = StartingMerge::new(&state, &key);
         let done = state
             .github
             .merge_async(&key, "merge_queue", None, &e.head_oid, None, false)
@@ -1036,21 +1101,89 @@ async fn system_stats(AxState(state): St) -> ApiResult<Json<grenadine_core::api:
     Ok(Json(stats))
 }
 
-/// Keep-alives as a named "ping" event rather than a comment, so that the
-/// page sees them and can tell a quiet stream from a dead connection.
-fn keep_alive() -> KeepAlive {
-    KeepAlive::new().event(Event::default().event("ping"))
+/// Where the server's update to a newer version stands.
+async fn update_status(AxState(state): St) -> Json<grenadine_core::api::UpdateStatus> {
+    Json(state.update.status())
 }
 
-/// The SSE stream of server events; it ends on shutdown so that open
+/// What an update would bring.
+async fn check_update(AxState(state): St) -> ApiResult<Json<grenadine_core::api::UpdateCheck>> {
+    Ok(Json(crate::update::check(&state).await?))
+}
+
+async fn start_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(crate::update::start(&state), "can't start an update now")
+}
+
+/// Restarts into the waiting update without waiting any longer.
+async fn force_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(state.update.force(), "no update is waiting")
+}
+
+/// Drops the update being built or waiting, or dismisses a failed one.
+async fn cancel_update(AxState(state): St) -> ApiResult<StatusCode> {
+    accepted(crate::update::cancel(&state), "no update can be cancelled")
+}
+
+fn accepted(ok: bool, otherwise: &str) -> ApiResult<StatusCode> {
+    if !ok {
+        return Err(refuse(StatusCode::CONFLICT, otherwise.into()));
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// How often a socket of events gets a [`PING`].
+const PING_EVERY: Duration = Duration::from_secs(15);
+
+/// `events` with a [`PING`] every `every` among them; it ends when
+/// `events` does.
+fn with_pings(events: impl Stream<Item = String>, every: Duration) -> impl Stream<Item = String> {
+    let start = tokio::time::Instant::now() + every;
+    let pings =
+        IntervalStream::new(tokio::time::interval_at(start, every)).map(|_| Some(PING.to_owned()));
+    events
+        .map(Some)
+        .chain(tokio_stream::once(None))
+        .merge(pings)
+        .map_while(|message| message)
+}
+
+/// Sends the page each of `events` as a text message, with pings among
+/// them, until the events end or the page goes away. The event streams
+/// are WebSockets because a browser only keeps six HTTP connections to a
+/// server: as server-sent events, three tabs' streams took them all and
+/// every further request waited forever.
+async fn send_events(mut socket: WebSocket, events: impl Stream<Item = String>) {
+    let mut messages = std::pin::pin!(with_pings(events, PING_EVERY));
+    loop {
+        tokio::select! {
+            message = messages.next() => {
+                let Some(text) = message else { break };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            received = socket.recv() => match received {
+                // The page sends nothing; axum answers pings itself.
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+const CROSS_ORIGIN_EVENTS: &str = "cross-origin events connection";
+
+/// The server's events as JSON; the stream ends on shutdown so that open
 /// connections don't block the server's graceful shutdown.
-fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
+fn event_stream(state: &State) -> impl Stream<Item = String> + use<> {
     let shutdown = state.shutdown.clone();
     futures::StreamExt::take_until(
         BroadcastStream::new(state.events.subscribe()).filter_map(|e| {
             // A lagging receiver misses events; tell it to refetch everything.
             let e = e.unwrap_or(grenadine_core::api::ServerEvent::InboxesChanged);
-            Event::default().json_data(e).ok().map(Ok)
+            serde_json::to_string(&e).ok()
         }),
         shutdown.cancelled_owned(),
     )
@@ -1074,15 +1207,16 @@ fn watch_keys(state: &State, query: &[(String, String)]) -> Vec<PrKey> {
         .collect()
 }
 
-/// The SSE stream of server events. `watch` parameters register the PRs
-/// the page is showing for the life of the stream; a watched PR the
-/// background inboxes don't cover gets a sync, however often it synced
-/// before, and the polls keep it fresh while it's watched.
-async fn events(
-    AxState(state): St,
-    Query(query): Query<Vec<(String, String)>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let keys = watch_keys(&state, &query);
+/// The server's events from now on, and a watch on the PRs that `query`
+/// names for as long as the caller keeps it: its `watch` parameters are
+/// the PRs the page is showing. A watched PR the background inboxes
+/// don't cover gets a sync, however often it synced before, and the
+/// polls keep it fresh while it's watched.
+fn watch_events(
+    state: &Arc<State>,
+    query: &[(String, String)],
+) -> (crate::sync::Watch, impl Stream<Item = String> + use<>) {
+    let keys = watch_keys(state, query);
     for key in &keys {
         // A database error doesn't block the stream; it only skips the
         // watch's sync.
@@ -1090,14 +1224,25 @@ async fn events(
             state.sync_once(key.clone());
         }
     }
-    // The guard lives in the stream's map closure, so a dropped
-    // connection, a closed tab or a reload unregisters the watch.
-    let watch = state.watch(keys);
-    let stream = event_stream(&state).map(move |event| {
-        let _guard = &watch;
-        event
-    });
-    Sse::new(stream).keep_alive(keep_alive())
+    (state.watch(keys), event_stream(state))
+}
+
+async fn events(
+    AxState(state): St,
+    Query(query): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, CROSS_ORIGIN_EVENTS).into_response();
+    }
+    let (watch, events) = watch_events(&state, &query);
+    // The socket's task holds the watch, so a dropped connection, a
+    // closed tab or a reload unregisters it.
+    ws.on_upgrade(move |socket| async move {
+        send_events(socket, events).await;
+        drop(watch);
+    })
 }
 
 /// The configured repositories, for the page's repository pickers.
@@ -1248,6 +1393,35 @@ async fn offers(
         return Some((StatusCode::BAD_REQUEST, message).into_response());
     }
     None
+}
+
+#[derive(Deserialize)]
+struct SlashCommandsQuery {
+    repo: String,
+    backend: grenadine_core::api::AgentBackend,
+}
+
+/// The commands a new session's prompt in the repository can start with.
+async fn slash_commands(
+    AxState(state): St,
+    Query(q): Query<SlashCommandsQuery>,
+) -> ApiResult<Response> {
+    if !can_start_in(&state, &q.repo) {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(crate::slash_commands::list(
+        &state, &q.repo, q.backend, None,
+    )?)
+    .into_response())
+}
+
+/// The commands the session's next prompt can start with.
+async fn agent_slash_commands(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let list = crate::slash_commands::list(&state, &session.repo, session.backend, Some(&id))?;
+    Ok(Json(list).into_response())
 }
 
 /// Whether sessions can start in `repo`: a configured repository, or
@@ -1853,13 +2027,10 @@ async fn approve(
     })
 }
 
-/// The session's transcript so far, then its new events as they happen.
-/// The stream ends when the page falls behind; the browser reconnects and
-/// gets the whole transcript again.
-fn agent_event_stream(
-    state: &State,
-    id: &str,
-) -> ApiResult<impl Stream<Item = Result<Event, Infallible>> + use<>> {
+/// The session's transcript so far, then its new events as they happen,
+/// as JSON. The stream ends when the page falls behind; the page
+/// reconnects and gets the whole transcript again.
+fn agent_event_stream(state: &State, id: &str) -> ApiResult<impl Stream<Item = String> + use<>> {
     // Subscribe first so that nothing falls between the stored events and
     // the live ones; live events that were stored already are skipped.
     let live = state.agents.subscribe(id);
@@ -1870,20 +2041,27 @@ fn agent_event_stream(
         .filter(move |e: &AgentEvent| e.seq.is_none_or(|s| s > last));
     let events = tokio_stream::iter(past)
         .chain(live)
-        .filter_map(|e| Event::default().json_data(e).ok().map(Ok));
+        .filter_map(|e| serde_json::to_string(&e).ok());
     Ok(futures::StreamExt::take_until(
         events,
         state.shutdown.clone().cancelled_owned(),
     ))
 }
 
-async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+async fn agent_events(
+    AxState(state): St,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    if !same_origin(&headers) {
+        return Ok((StatusCode::FORBIDDEN, CROSS_ORIGIN_EVENTS).into_response());
+    }
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    Ok(Sse::new(agent_event_stream(&state, &id)?)
-        .keep_alive(keep_alive())
-        .into_response())
+    let events = agent_event_stream(&state, &id)?;
+    Ok(ws.on_upgrade(move |socket| send_events(socket, events)))
 }
 
 /// An image of a session's transcript. Images never change once stored.
@@ -1898,6 +2076,44 @@ async fn image(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
 mod tests {
     use super::*;
     use grenadine_core::api::Side;
+
+    #[tokio::test]
+    async fn a_merge_is_busy_until_it_settles_or_its_page_gave_up() {
+        let state = crate::sync::test_state();
+        let key = |number| PrKey {
+            repo: "o/n".into(),
+            number,
+        };
+        let starting = StartingMerge::new(&state, &key(1));
+        assert_eq!(busy_merges(&state), [key(1)]);
+        let uuid = remember_merge(
+            &state,
+            key(1),
+            Vec::new(),
+            MergeAsync::Pending("u-1".into()),
+        );
+        drop(starting);
+        remember_merge(
+            &state,
+            key(2),
+            Vec::new(),
+            MergeAsync::Done(MergeStatus::Merged),
+        );
+        assert_eq!(busy_merges(&state), [key(1), key(2)]);
+
+        let settle = |uuid: &str| {
+            state.merges.lock().unwrap().get_mut(uuid).unwrap().settled = true;
+        };
+        settle(&uuid);
+        assert_eq!(busy_merges(&state), [key(2)]);
+
+        let mut merges = state.merges.lock().unwrap();
+        for p in merges.values_mut() {
+            p.started = std::time::Instant::now().checked_sub(MERGE_BUSY).unwrap();
+        }
+        drop(merges);
+        assert!(busy_merges(&state).is_empty());
+    }
 
     #[test]
     fn thread_places_github_would_refuse_are_refused() {
@@ -2085,6 +2301,147 @@ mod tests {
         assert!(matches!(next, Ok(None)));
     }
 
+    /// Asks for `path` as a WebSocket from a page at `origin`.
+    async fn open_socket(
+        addr: std::net::SocketAddr,
+        path: &str,
+        origin: &str,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .header("Origin", origin)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The next frame the server sent: its opcode and payload. The
+    /// server's frames aren't masked.
+    async fn frame(io: &mut (impl tokio::io::AsyncRead + Unpin)) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let read = async {
+            let opcode = io.read_u8().await.unwrap() & 0x0f;
+            let len = match io.read_u8().await.unwrap() {
+                126 => io.read_u16().await.unwrap() as usize,
+                127 => io.read_u64().await.unwrap() as usize,
+                n => n as usize,
+            };
+            let mut payload = vec![0; len];
+            io.read_exact(&mut payload).await.unwrap();
+            (opcode, payload)
+        };
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("no frame")
+    }
+
+    const TEXT: u8 = 1;
+    const CLOSE: u8 = 8;
+
+    #[tokio::test]
+    async fn a_session_socket_replays_the_transcript_then_follows_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+        let origin = format!("http://{addr}");
+        let id = agent::uuid();
+        state
+            .db
+            .create_agent(&AgentSession::fixture(&id, "o/n"))
+            .unwrap();
+        let text = |t: &str| grenadine_core::api::AgentEventKind::Text(t.into());
+        agent::emit(&state, &id, text("stored")).unwrap();
+        let path = format!("/api/agents/{id}/events");
+
+        // Any website could otherwise read the transcript.
+        let evil = open_socket(addr, &path, "http://evil.example").await;
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+        let unknown = format!("/api/agents/{}/events", agent::uuid());
+        let unknown = open_socket(addr, &unknown, &origin).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let response = open_socket(addr, &path, &origin).await;
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut io = response.upgrade().await.unwrap();
+        let mut event = async || {
+            let (opcode, payload) = frame(&mut io).await;
+            assert_eq!(opcode, TEXT);
+            serde_json::from_slice::<AgentEvent>(&payload).unwrap()
+        };
+        let stored = event().await;
+        assert_eq!((stored.seq, stored.kind), (Some(1), text("stored")));
+        agent::emit(&state, &id, text("live")).unwrap();
+        let live = event().await;
+        assert_eq!((live.seq, live.kind), (Some(2), text("live")));
+
+        // Open sockets don't hold up the server's shutdown.
+        state.shutdown.cancel();
+        assert_eq!(frame(&mut io).await.0, CLOSE);
+    }
+
+    #[tokio::test]
+    async fn the_events_socket_sends_server_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+
+        let evil = open_socket(addr, "/api/events", "http://evil.example").await;
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+
+        let response = open_socket(addr, "/api/events", &format!("http://{addr}")).await;
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut io = response.upgrade().await.unwrap();
+        state.send(ServerEvent::CleanupChanged);
+        let (opcode, payload) = frame(&mut io).await;
+        assert_eq!(opcode, TEXT);
+        assert!(matches!(
+            serde_json::from_slice(&payload).unwrap(),
+            ServerEvent::CleanupChanged
+        ));
+    }
+
+    /// A quiet stream still says something, so that the page can tell a
+    /// dead connection from one with nothing to say.
+    #[tokio::test]
+    async fn quiet_event_streams_are_pinged() {
+        let (events, quiet) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let quiet = tokio_stream::wrappers::UnboundedReceiverStream::new(quiet);
+        let every = Duration::from_millis(20);
+        // Before the pings start counting, or a pause in between would
+        // make the first one look early.
+        let start = tokio::time::Instant::now();
+        let mut messages = std::pin::pin!(with_pings(quiet, every));
+        assert_eq!(messages.next().await.as_deref(), Some(PING));
+        assert!(start.elapsed() >= every);
+        // On a slow machine another ping may be due before what's
+        // expected next, so the pings in between are passed over.
+        events.send("{}".into()).unwrap();
+        let event = loop {
+            match messages.next().await {
+                Some(message) if message == PING => {}
+                other => break other,
+            }
+        };
+        assert_eq!(event.as_deref(), Some("{}"));
+        assert_eq!(messages.next().await.as_deref(), Some(PING));
+        // The pings don't keep an ended stream going.
+        drop(events);
+        let ended = async {
+            while let Some(message) = messages.next().await {
+                assert_eq!(message, PING);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), ended)
+            .await
+            .expect("the stream ends once its events do");
+    }
+
     /// A watch registers while its stream lives and unregisters when the
     /// stream ends; two streams on the same PR keep it watched until
     /// both end.
@@ -2101,9 +2458,9 @@ mod tests {
             repo: "owner/name".into(),
             number: 7,
         };
-        let query = || Query(vec![("watch".to_owned(), "pr/owner/name/7".to_owned())]);
-        let one = events(AxState(state.clone()), query()).await;
-        let two = events(AxState(state.clone()), query()).await;
+        let query = [("watch".to_owned(), "pr/owner/name/7".to_owned())];
+        let one = watch_events(&state, &query);
+        let two = watch_events(&state, &query);
         assert_eq!(
             state.watched(),
             std::collections::BTreeSet::from([key.clone()])
@@ -2125,17 +2482,16 @@ mod tests {
         });
         let state =
             crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
-        let stream = events(
-            AxState(state.clone()),
-            Query(vec![
+        let stream = watch_events(
+            &state,
+            &[
                 ("watch".into(), "bogus".into()),
                 ("watch".into(), "pr/owner/name".into()),
                 ("watch".into(), "pr/owner/name/abc".into()),
                 ("watch".into(), "pr/other/repo/7".into()),
                 ("other".into(), "pr/owner/name/7".into()),
-            ]),
-        )
-        .await;
+            ],
+        );
         assert!(state.watched().is_empty());
         drop(stream);
     }

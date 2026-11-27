@@ -3,6 +3,7 @@
 //! requests and a box for follow-up prompts.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,7 @@ use crate::inboxes::{load_flag, save_flag, storage};
 use crate::markdown::SessionRef;
 use crate::settings::{Settings, SettingsButton};
 use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
+use crate::slash::{self, SlashList, Suggest};
 use crate::tool_summaries::{self, ToolSummaries};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
@@ -1748,6 +1750,14 @@ pub fn NewSession(
             let _ = t.set_selection_range(end, end);
         }
     });
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Repo {
+            repo: repo.get(),
+            backend: backend.get(),
+        }),
+    );
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
@@ -1985,22 +1995,34 @@ pub fn NewSession(
                     </label>
                     <label>"Model" <ModelSelect model=model backend=backend.into() /></label>
                 </div>
-                <textarea
-                    node_ref=textarea
-                    class="agent-prompt"
-                    rows="5"
-                    placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
-                    aria-label="Prompt"
-                    prop:value=move || prompt.get()
-                    on:input=move |ev| prompt.set(event_target_value(&ev))
-                    on:paste=move |ev| images::paste(ev, attached)
-                    on:keydown=move |ev| {
-                        if submits(&ev) {
-                            ev.prevent_default();
-                            start();
+                <div class="slash-anchor">
+                    <textarea
+                        node_ref=textarea
+                        class="agent-prompt"
+                        rows="5"
+                        placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
+                        aria-label="Prompt"
+                        prop:value=move || prompt.get()
+                        on:input=move |ev| {
+                            prompt.set(event_target_value(&ev));
+                            suggest.input();
                         }
-                    }
-                ></textarea>
+                        on:paste=move |ev| images::paste(ev, attached)
+                        on:keydown=move |ev| {
+                            if suggest.keydown(&ev) {
+                                return;
+                            }
+                            if submits(&ev) {
+                                ev.prevent_default();
+                                start();
+                            }
+                        }
+                        on:keyup=move |ev| suggest.keyup(&ev)
+                        on:click=move |_| suggest.clicked()
+                        on:blur=move |_| suggest.blur()
+                    ></textarea>
+                    <SlashList suggest=suggest />
+                </div>
                 <Attachments images=images />
                 <FileChips files=files />
                 {move || {
@@ -5128,6 +5150,14 @@ fn writes_handoff(events: &[Arc<AgentEvent>]) -> bool {
     !writing.is_empty()
 }
 
+thread_local! {
+    /// The follow-up box on the page for each session that has one, so
+    /// that a send that outlives its box can empty the one that took its
+    /// place; see `Composer`'s `send`.
+    static COMPOSERS: RefCell<HashMap<String, (RwSignal<String>, Attached)>> =
+        RefCell::default();
+}
+
 #[component]
 fn Composer(
     session: Signal<AgentSession>,
@@ -5143,11 +5173,34 @@ fn Composer(
     let backend = Signal::derive(move || session.with(|s| s.backend));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
+    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Session(id.get_value())),
+    );
     // The images pasted so far, kept with the draft in IndexedDB, and the
     // other files, kept in localStorage.
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
     let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
     let attached = Attached { images, files };
+    let session_id = id.get_value();
+    COMPOSERS.with(|c| {
+        c.borrow_mut()
+            .insert(session_id.clone(), (prompt, attached))
+    });
+    on_cleanup(move || {
+        COMPOSERS.with(|c| {
+            let mut composers = c.borrow_mut();
+            // Unless the session's next box is on the page already.
+            if composers
+                .get(&session_id)
+                .is_some_and(|(p, _)| *p == prompt)
+            {
+                composers.remove(&session_id);
+            }
+        });
+    });
     let error = RwSignal::new(None::<String>);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
@@ -5171,22 +5224,49 @@ fn Composer(
         let ids = files.ids();
         let mode = mode.get_untracked();
         let model = model_arg(model);
+        // Read here because the task outlives the composer, which owns it.
+        let id = id.get_value();
         spawn_local(async move {
-            match api::send_agent_message(
-                &id.get_value(),
-                text,
-                sent_images,
-                ids.clone(),
-                mode,
-                model,
-            )
-            .await
-            {
+            let sent = text.clone();
+            match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
-                    prompt.set(String::new());
-                    images.set(Vec::new());
-                    image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
-                    files.sent(&ids);
+                    // The session may have been left by now. This box's
+                    // signals are gone then, and with them what keeps the
+                    // draft in step, so the kept draft is emptied here as
+                    // well. If the session was come back to meanwhile,
+                    // its new box read the draft before it was emptied
+                    // and would go on offering it: that box is the one to
+                    // empty. Like this one, it doesn't know of the send
+                    // until then, so Enter in it before the answer sends
+                    // the follow-up twice.
+                    let (prompt, attached) = COMPOSERS
+                        .with(|c| c.borrow().get(&id).copied())
+                        .unwrap_or((prompt, attached));
+                    // Only the sent text goes: what the box holds
+                    // instead by now was typed since and is the next
+                    // draft. A box that is gone answers `None`, and the
+                    // kept draft is then all there is to look at.
+                    match prompt.try_with_untracked(|p| *p == sent) {
+                        Some(true) => {
+                            prompt.set(String::new());
+                            if let Some(s) = storage() {
+                                let _ = s.remove_item(&draft_key(&id));
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            let key = draft_key(&id);
+                            if let Some(s) = storage()
+                                && s.get_item(&key).ok().flatten().as_deref() == Some(&*sent)
+                            {
+                                let _ = s.remove_item(&key);
+                            }
+                        }
+                    }
+                    attached.images.set(Vec::new());
+                    let key = image_drafts::agent_key(&id);
+                    image_drafts::forget(&key);
+                    attached.files.sent(&key, &ids);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
@@ -5211,20 +5291,33 @@ fn Composer(
             on:dragover=images::drag_over
             on:drop=move |ev| images::drop(ev, attached)
         >
+            <div class="slash-anchor">
             <textarea
+                node_ref=textarea
                 rows="3"
                 aria-label="Follow-up"
                 placeholder=move || if writing_handoff.get() { "Writing a handoff… You can reply once it's written.".to_owned() } else if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
-                on:input=move |ev| prompt.set(event_target_value(&ev))
+                on:input=move |ev| {
+                    prompt.set(event_target_value(&ev));
+                    suggest.input();
+                }
                 on:paste=move |ev| images::paste(ev, attached)
                 on:keydown=move |ev| {
+                    if suggest.keydown(&ev) {
+                        return;
+                    }
                     if submits(&ev) {
                         ev.prevent_default();
                         send();
                     }
                 }
+                on:keyup=move |ev| suggest.keyup(&ev)
+                on:click=move |_| suggest.clicked()
+                on:blur=move |_| suggest.blur()
             ></textarea>
+            <SlashList suggest=suggest above=true />
+            </div>
             <Attachments images=images />
             <FileChips files=files />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}

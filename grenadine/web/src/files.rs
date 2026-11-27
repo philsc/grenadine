@@ -291,15 +291,16 @@ impl Files {
     }
 
     /// Takes off the files whose uploads went with the prompt as `ids`:
-    /// they're the prompt's now. Files attached since it went stay.
-    pub fn sent(self, ids: &[String]) {
+    /// they're the prompt's now. Files attached since it went stay. `key`
+    /// is the draft's, passed in because the composer that owns these
+    /// files may be gone by the time its prompt is sent.
+    pub fn sent(self, key: &str, ids: &[String]) {
         let went = |up: &Upload| ids.contains(&up.id);
         self.list
             .update(|l| l.retain(|f| !matches!(&f.state, FileState::Ready(up) if went(up))));
-        let key = self.key.get_value();
-        let mut kept = stored(&key);
+        let mut kept = stored(key);
         kept.retain(|up| !went(up));
-        keep(&key, &kept);
+        keep(key, &kept);
     }
 }
 

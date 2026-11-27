@@ -1,5 +1,6 @@
 //! The settings that apply everywhere rather than to one repository:
-//! the theme and what tool rows show. They live in the browser's local
+//! the theme, what tool rows show and which commands prompts don't
+//! suggest. They live in the browser's local
 //! storage, so they carry over between sessions on the same machine.
 
 use leptos::prelude::*;
@@ -13,6 +14,8 @@ use crate::tool_summaries::{self, ToolSummaries};
 pub(crate) struct GlobalSettings {
     pub(crate) theme: RwSignal<Theme>,
     pub(crate) tool_summaries: RwSignal<ToolSummaries>,
+    /// The commands left out of a prompt's suggestions, as typed.
+    pub(crate) hidden_commands: RwSignal<String>,
 }
 
 /// Loads the persisted settings into signals; writes to them apply at
@@ -21,6 +24,7 @@ pub(crate) fn provide() -> GlobalSettings {
     GlobalSettings {
         theme: theme::signal(),
         tool_summaries: tool_summaries::signal(),
+        hidden_commands: crate::slash::hidden_signal(),
     }
 }
 
@@ -108,6 +112,19 @@ fn Dialog(open: RwSignal<bool>) -> impl IntoView {
                                 <option value="description">"Description"</option>
                             </select>
                         </label>
+                        <label>"Hidden commands"
+                            <textarea
+                                rows="3"
+                                prop:value=move || settings.hidden_commands.get()
+                                on:input=move |ev| {
+                                    settings.hidden_commands.set(event_target_value(&ev))
+                                }
+                            ></textarea>
+                        </label>
+                        <p class="hint muted">
+                            "Left out of the suggestions when a prompt starts with /: names \
+                             separated by spaces or commas."
+                        </p>
                     </fieldset>
                 </div>
             </div>

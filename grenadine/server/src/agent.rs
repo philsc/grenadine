@@ -18,8 +18,9 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, Attachment, GENERAL, Landed, LandedPr, NewAgent, PermissionMode,
-    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, Attachment, AutoReviewState, BusySession, GENERAL, Landed,
+    LandedPr, NewAgent, PermissionMode, PrDetail, PrKey, PromptImage, ServerEvent, SessionKind,
+    WrapUp, WrapUpTarget, leading_command,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -536,6 +537,8 @@ pub struct Agents {
     /// slice.
     slices: bool,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// The sessions being deleted, by ID.
+    deleting: Arc<std::sync::Mutex<HashMap<String, Deletions>>>,
     /// The scans of deleted sessions for what they left behind.
     pub scans: crate::cleanup::Scans,
     /// Whether each new session's first prompt is summarized.
@@ -584,6 +587,8 @@ struct Live {
     landing: bool,
     /// A background job is writing a handoff the user asked for.
     writing_handoff: bool,
+    /// The automatic review that the session did is being finished.
+    finishing_review: bool,
     /// The user's handoff proposals being answered or answered since the
     /// server started, so that one starts at most one session.
     answered_handoffs: HashSet<String>,
@@ -614,6 +619,7 @@ impl Live {
             wrap_up: None,
             landing: false,
             writing_handoff: false,
+            finishing_review: false,
             answered_handoffs: HashSet::new(),
         }
     }
@@ -696,6 +702,94 @@ pub fn systemd_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The slice that holds the sessions and sits right below the user's
+/// systemd manager. It's two levels above a session's slice, since the
+/// dashes in [`slice`]'s names nest them: `grenadine.slice` holds
+/// `grenadine-agent.slice`, which holds the sessions' slices. The weight
+/// has to be on this one: `grenadine-agent.slice` has no siblings to be
+/// ranked among, and its parent would still compete at the default.
+const AGENTS_SLICE: &str = "grenadine.slice";
+
+/// The sessions' share of a busy CPU, against systemd's default of 100
+/// for what else runs under the user's systemd manager, e.g. its
+/// services and the scopes of a desktop's or tmux's programs. A few
+/// sessions building and testing at once otherwise make a server that
+/// runs there slow to answer the page. A session's terminals run in its
+/// slice too, so what the user starts in one has the same share.
+const AGENTS_CPU_WEIGHT: u32 = 20;
+
+/// Makes the sessions' processes yield the CPU to what else runs under
+/// the user's systemd manager when it is busy; with idle cores they run
+/// as fast as before. The weight is on the slice above them all because
+/// a weight only ranks a slice among its siblings: one on each session's
+/// slice or scope would rank the sessions among themselves.
+///
+/// For the same reason it doesn't reach outside the manager. A login
+/// session's scope is a sibling of the whole manager, which keeps its
+/// own weight, and the system's services are further out still, so
+/// against them the sessions still get all of the manager's share; see
+/// [`cpu_weight_caveat`].
+///
+/// The setting is the manager's, so it lasts until the manager stops, at
+/// the latest the next boot; every start of the server sets it again.
+/// That also replaces a weight the user gave the slice themselves with
+/// `systemctl --user set-property`: there is no setting yet to pick
+/// another weight or none.
+pub fn lower_agents_cpu_weight() -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
+        .arg(format!("CPUWeight={AGENTS_CPU_WEIGHT}"))
+        .stdin(Stdio::null())
+        .output()
+        .context("can't run systemctl")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Why [`lower_agents_cpu_weight`]'s setting doesn't put this process
+/// ahead of the sessions, if something says it doesn't.
+///
+/// A server started from a plain SSH or console login isn't under the
+/// user's systemd manager: it is in the login session's scope, beside the
+/// manager. And systemd accepts a weight that does nothing when the
+/// manager wasn't given the `cpu` controller, as older systemds' weren't by
+/// default.
+pub fn cpu_weight_caveat() -> Option<&'static str> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let Some(manager) = user_manager_cgroup(&own) else {
+        return Some(
+            "the server runs outside the systemd user manager, so busy sessions can still slow it down; start it with `systemd-run --user --scope` to put it ahead of them",
+        );
+    };
+    let controllers = Path::new("/sys/fs/cgroup")
+        .join(manager.trim_start_matches('/'))
+        .join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(controllers).ok()?;
+    (!controllers.split_whitespace().any(|c| c == "cpu")).then_some(
+        "the systemd user manager doesn't control the CPU, so the sessions' lower CPU weight does nothing; delegate `cpu` to user@.service to let it",
+    )
+}
+
+/// The cgroup of the systemd user manager, `user@<uid>.service`, that
+/// `/proc/<pid>/cgroup`'s text names a cgroup inside of, if it does.
+fn user_manager_cgroup(cgroups: &str) -> Option<&str> {
+    cgroups
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .find_map(|path| {
+            let mut end = 0;
+            for part in path.split('/').skip(1) {
+                end += 1 + part.len();
+                if part.starts_with("user@") && part.ends_with(".service") {
+                    return Some(&path[..end]);
+                }
+            }
+            None
+        })
 }
 
 /// The systemd user slice the session's processes run in. A cgroup holds on
@@ -995,6 +1089,7 @@ impl Agents {
             worktrees,
             base_url,
             slices,
+            deleting: Arc::default(),
             live: std::sync::Mutex::default(),
             scans: crate::cleanup::Scans::new(scans),
             summaries: summaries.into(),
@@ -1940,6 +2035,50 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
     Ok(true)
 }
 
+/// Has the session count as busy while it's being deleted.
+struct Deleting {
+    deleting: Arc<std::sync::Mutex<HashMap<String, Deletions>>>,
+    id: String,
+}
+
+/// What's under way to delete a session.
+struct Deletions {
+    /// The session's title, since its row goes before the rest is done.
+    title: String,
+    guards: usize,
+}
+
+impl Deleting {
+    fn new(state: &State, session: &AgentSession) -> Deleting {
+        let deleting = state.agents.deleting.clone();
+        deleting
+            .lock()
+            .unwrap()
+            .entry(session.id.clone())
+            .or_insert_with(|| Deletions {
+                title: session.summary.as_ref().unwrap_or(&session.title).clone(),
+                guards: 0,
+            })
+            .guards += 1;
+        Deleting {
+            deleting,
+            id: session.id.clone(),
+        }
+    }
+}
+
+impl Drop for Deleting {
+    fn drop(&mut self) {
+        let mut deleting = self.deleting.lock().unwrap();
+        if let Some(d) = deleting.get_mut(&self.id) {
+            d.guards -= 1;
+            if d.guards == 0 {
+                deleting.remove(&self.id);
+            }
+        }
+    }
+}
+
 /// Stops the session and removes it along with its worktree and branch, or
 /// a general session's directory. Returns false when there is no such
 /// session. A session whose backend this build doesn't know goes too, but
@@ -1958,6 +2097,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             repo = session.repo
         );
     }
+    // Before the interrupt, so that the session is busy throughout. It ends
+    // once the scan counts.
+    let _deleting = Deleting::new(state, &session);
     // The transcript goes with the session; the scan reads it after.
     let events = state.db.agent_events(id)?;
     let scanned = session.clone();
@@ -2020,7 +2162,9 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             .iter()
             .filter_map(|b| b.parent().map(Path::to_owned)),
     );
+    let removing = Deleting::new(state, &scanned);
     std::thread::spawn(move || {
+        let _removing = removing;
         remove_output_bases(output_bases(&roots, |workspace| {
             workspace.starts_with(&worktree)
         }))
@@ -2121,7 +2265,10 @@ async fn run(state: Arc<State>, id: String) {
             l.background = false;
             l.interrupted
         });
-        let status = if interrupted {
+        // Shutting down stops the turn, which may then look as if it
+        // failed.
+        let stopped = status != AgentStatus::Idle && state.shutdown.is_cancelled();
+        let status = if interrupted || stopped {
             AgentStatus::Interrupted
         } else {
             status
@@ -2131,6 +2278,15 @@ async fn run(state: Arc<State>, id: String) {
             set_status(&state, &id, status);
         }
         last = status;
+        // The queued prompts are lost, rather than started as the server
+        // goes.
+        if state.shutdown.is_cancelled() {
+            state.agents.with_live(&id, |l| {
+                l.queue.clear();
+                l.running = false;
+            });
+            return;
+        }
     }
 }
 
@@ -2266,6 +2422,102 @@ impl Drop for Landing {
 /// between turns.
 pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<String>)> {
     state.agents.with_live(id, |l| l.turn.clone())
+}
+
+/// The sessions a restart of the server would interrupt: those running a
+/// turn, also one that waits for the user's approval, with prompts queued,
+/// landing their work, having a handoff written, doing an automatic review
+/// that isn't finished, being deleted, also after they're gone while their
+/// Bazel output bases are removed, or scanned for what they left behind,
+/// or with a command running in a terminal.
+pub fn busy_sessions(state: &State) -> Vec<BusySession> {
+    let terminals = state.agents.terminals.busy();
+    let mut ids: std::collections::BTreeSet<String> = {
+        let live = state.agents.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, l)| {
+                l.running
+                    || !l.queue.is_empty()
+                    || l.wrap_up.is_some()
+                    || l.landing
+                    || l.writing_handoff
+                    || l.finishing_review
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    ids.extend(terminals.keys().cloned());
+    // The deletions first: one ends when its scan has started.
+    let deleting: HashMap<String, String> = {
+        let deleting = state.agents.deleting.lock().unwrap();
+        let titles = deleting.iter().map(|(id, d)| (id.clone(), d.title.clone()));
+        titles.collect()
+    };
+    ids.extend(deleting.keys().cloned());
+    let scanning = crate::cleanup::scanning(state);
+    ids.extend(scanning.keys().cloned());
+    let mut starting = Vec::new();
+    match state.db.auto_reviews() {
+        Ok(reviews) => {
+            for r in reviews {
+                if r.state != AutoReviewState::Running {
+                    continue;
+                }
+                match r.session {
+                    Some(id) => {
+                        ids.insert(id);
+                    }
+                    None => starting.push(BusySession {
+                        id: String::new(),
+                        title: format!("Review #{}: {}", r.key.number, r.title),
+                        terminals: 0,
+                    }),
+                }
+            }
+        }
+        Err(e) => tracing::warn!("can't list the auto-reviews: {e:#}"),
+    }
+    ids.into_iter()
+        .map(|id| {
+            let title = match state.db.agent(&id) {
+                Ok(Some(s)) => s.summary.unwrap_or(s.title),
+                _ => match scanning.get(&id) {
+                    Some(title) => format!("Cleanup scan: {title}"),
+                    None => match deleting.get(&id) {
+                        Some(title) => format!("Deleting: {title}"),
+                        None => String::new(),
+                    },
+                },
+            };
+            let terminals = terminals.get(&id).copied().unwrap_or(0);
+            BusySession {
+                id,
+                title,
+                terminals,
+            }
+        })
+        .chain(starting)
+        .collect()
+}
+
+/// Has the session count as busy while its automatic review is finished.
+pub fn set_finishing_review(state: &State, id: &str, finishing: bool) {
+    state
+        .agents
+        .with_existing_live(id, |l| l.finishing_review = finishing);
+}
+
+/// Has the session count as busy until the guard is dropped.
+#[cfg(test)]
+pub(crate) fn busy_for_test(state: &Arc<State>, id: &str) -> impl Drop + use<> {
+    struct Busy(Arc<State>, String);
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            self.0.agents.with_live(&self.1, |l| l.running = false);
+        }
+    }
+    state.agents.with_live(id, |l| l.running = true);
+    Busy(state.clone(), id.to_owned())
 }
 
 /// Marks the session as having a handoff written for the user. False,
@@ -4064,6 +4316,12 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
+    // Reviews' prompts are written by the server, not the user.
+    if session.kind != SessionKind::AutoReview
+        && let Some(name) = leading_command(&prompt)
+    {
+        state.db.add_skill_use(&session.repo, name, now())?;
+    }
     if !images.is_empty() {
         emit(state, id, AgentEventKind::Images(images.clone()))?;
     }
@@ -4190,6 +4448,13 @@ impl<'a> TurnSink<'a> {
         Ok(())
     }
 
+    /// The backend listed the commands a prompt can start with.
+    pub fn commands(&mut self, backend: AgentBackend, names: &[String]) -> Result<()> {
+        self.state
+            .db
+            .set_slash_commands(self.id, self.repo, backend, names, now())
+    }
+
     /// Stores `kind` in the transcript the way a turn's events are kept:
     /// images into the database, usage into the session's row, costs
     /// billed and repeated turn ends suppressed.
@@ -4274,7 +4539,8 @@ impl<'a> TurnSink<'a> {
     /// How the turn went once the backend's output is done: `unfinished`
     /// explains a turn that never reported an end.
     pub fn finish(self, unfinished: impl FnOnce() -> String) -> Result<AgentStatus> {
-        let interrupted = self.state.agents.interrupted(self.id);
+        let interrupted =
+            self.state.agents.interrupted(self.id) || self.state.shutdown.is_cancelled();
         Ok(match self.ended {
             Some(true) => AgentStatus::Idle,
             Some(false) => AgentStatus::Failed,
@@ -4560,6 +4826,34 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn only_cgroups_below_a_user_manager_name_it() {
+        let manager = Some("/user.slice/user-1000.slice/user@1000.service");
+        // A service or scope the manager started, and a session's shell.
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
+            ),
+            manager
+        );
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
+            ),
+            manager
+        );
+        // A login session is beside the manager, and so is the system's.
+        assert_eq!(
+            user_manager_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
+        );
+        assert_eq!(
+            user_manager_cgroup("0::/system.slice/grenadine.service\n"),
+            None
+        );
+        assert_eq!(user_manager_cgroup(""), None);
+    }
 
     #[test]
     fn uuids() {
@@ -5262,6 +5556,67 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         assert_eq!(session.cost, 0.5);
     }
 
+    /// A turn keeps the commands claude lists, for the session and its
+    /// repository, and counts the one its prompt starts with, unless
+    /// it's an automatic review's.
+    #[tokio::test]
+    async fn keeps_the_commands_claude_lists() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test","slash_commands":["foo","doctor"],"skills":["foo","bar"],"terminal_slash_commands":["doctor"]}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let req = |prompt: &str| NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: None,
+            prompt: prompt.into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            draft: None,
+        };
+        let session = create(&state, req("/foo go")).await.unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let review = create_session(
+            &state,
+            req("/foo Review pull request"),
+            SessionKind::AutoReview,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &review.id, 1).await;
+
+        let expected = vec!["bar".to_owned(), "foo".to_owned()];
+        assert_eq!(
+            state.db.agent_slash_commands(&session.id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            state
+                .db
+                .repo_slash_commands("owner/name", AgentBackend::Claude)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        let listed =
+            crate::slash_commands::list(&state, "owner/name", AgentBackend::Claude, None).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|c| (c.name.as_str(), c.uses))
+                .collect::<Vec<_>>(),
+            [("bar", 0), ("foo", 1)]
+        );
+    }
+
     /// Waits until the session's status is `status`.
     async fn wait_for_status(state: &State, id: &str, status: AgentStatus) {
         for _ in 0..1500 {
@@ -5721,7 +6076,7 @@ esac
 
     /// A session whose fake claude starts a container, and answers scans
     /// with `scan` after logging their arguments and input to `dir`.
-    async fn scanned_session(
+    pub(crate) async fn scanned_session(
         dir: &Path,
         scan: &str,
     ) -> (crate::git::tests::Fixture, Arc<State>, AgentSession) {
@@ -5820,7 +6175,13 @@ esac
         // Each Bash command goes through the hook, which checks its
         // options.
         assert!(args.contains("--settings {\"hooks\""), "{args}");
-        assert!(args.contains(crate::cleanup::BASH_HOOK_ARG), "{args}");
+        // It blocks the command unless the hook prints its allow marker.
+        let hook = format!(
+            "{})\\\" = {} ] || exit 2",
+            crate::cleanup::BASH_HOOK_ARG,
+            crate::cleanup::BASH_HOOK_ALLOW,
+        );
+        assert!(args.contains(&hook), "{args}");
         let input = std::fs::read_to_string(dir.path().join("scan_input")).unwrap();
         assert!(input.contains("$ docker run -d --name e2e pg\n"), "{input}");
 
@@ -6042,7 +6403,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
     }
 
     /// A session row with its worktree at `worktree`, never started.
-    fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
+    pub(crate) fn session_row(id: &str, repo: &str, worktree: &Path) -> AgentSession {
         AgentSession {
             title: "t".into(),
             branch: session_branch(id),
@@ -6274,6 +6635,74 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 .filter(|e| matches!(e, AgentEventKind::Prompt(_)))
                 .count(),
             1
+        );
+        let session = state.db.agent(&session.id).unwrap().unwrap();
+        assert_eq!(session.status, AgentStatus::Interrupted);
+    }
+
+    /// Shutting down stops the running turns, which then count as
+    /// interrupted rather than failed, and starts none of the queued ones.
+    #[tokio::test]
+    async fn shutting_down_interrupts_the_turns() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        // Like Claude Code, it exits without a result when it's stopped.
+        let state = state_with_claude(
+            &fx,
+            dir.path(),
+            "#!/bin/sh\ntrap 'exit 1' INT\ncat >/dev/null\nwhile :; do sleep 0.05; done\n",
+        );
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        send(
+            &state,
+            &session.id,
+            "queued".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        for _ in 0..750 {
+            if state.agents.with_live(&session.id, |l| l.stopper.is_some()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        state.shutdown.cancel();
+        wait_for_status(&state, &session.id, AgentStatus::Interrupted).await;
+        for _ in 0..100 {
+            if !state.agents.with_live(&session.id, |l| l.running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let transcript = wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|e| matches!(e, AgentEventKind::Prompt(_)))
+                .count(),
+            1,
+            "the queued prompt never ran"
+        );
+        assert!(
+            !transcript
+                .iter()
+                .any(|e| matches!(e, AgentEventKind::Error(_))),
+            "{transcript:?}"
         );
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Interrupted);
@@ -9882,5 +10311,161 @@ esac
             "{}",
             found[0].detail
         );
+    }
+
+    #[tokio::test]
+    async fn busy_sessions_are_those_a_restart_interrupts() {
+        let state = crate::sync::test_state();
+        let ids = || -> Vec<String> { busy_sessions(&state).into_iter().map(|s| s.id).collect() };
+        let with = |id: &str, f: fn(&mut Live)| state.agents.with_live(id, f);
+        with("idle", |_| {});
+        assert!(ids().is_empty());
+        with("a", |l| l.running = true);
+        with("b", |l| {
+            l.queue.push_back(Queued {
+                prompt: String::new(),
+                images: Vec::new(),
+                attachments: Vec::new(),
+                mode: PermissionMode::from("auto"),
+                model: None,
+            })
+        });
+        with("c", |l| l.landing = true);
+        with("d", |l| l.writing_handoff = true);
+        with("e", |l| {
+            l.wrap_up = Some(Pending {
+                target: WrapUpTarget::Checkout,
+                mode: PermissionMode::from("auto"),
+                model: None,
+                asked: false,
+            })
+        });
+        with("f", |l| l.finishing_review = true);
+        assert_eq!(ids(), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[tokio::test]
+    async fn deletions_and_scans_are_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let scan = format!(
+            r#"while [ ! -e {} ]; do sleep 0.05; done
+  echo '{{"type":"result","is_error":false,"structured_output":{{"items":[]}}}}'"#,
+            gate.display()
+        );
+        let (_fx, state, session) = tests::scanned_session(dir.path(), &scan).await;
+        let cloned = state.repos["owner/name"].clone();
+        let until = async |done: &dyn Fn() -> bool| {
+            for _ in 0..1500 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("stuck: {:?}", busy_sessions(&state));
+        };
+        until(&|| busy_sessions(&state).is_empty()).await;
+
+        // The deletion waits for the lock to remove the worktree.
+        let held = cloned.git_lock.lock().await;
+        let deleting = tokio::spawn({
+            let (state, id) = (state.clone(), session.id.clone());
+            async move { delete(&state, &id).await }
+        });
+        until(&|| !busy_sessions(&state).is_empty()).await;
+        assert_eq!(busy_sessions(&state)[0].id, session.id);
+        drop(held);
+        assert!(deleting.await.unwrap().unwrap());
+
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].title, "Cleanup scan: Run the e2e tests");
+        std::fs::write(gate, "").unwrap();
+        until(&|| busy_sessions(&state).is_empty()).await;
+    }
+
+    /// The session's row is gone by the time the thread that removes its
+    /// output bases ends.
+    #[tokio::test]
+    async fn a_deletion_is_busy_until_its_last_guard_goes() {
+        let state = crate::sync::test_state();
+        let session = tests::session_row(&uuid(), "o/n", Path::new("/w"));
+        let deletion = Deleting::new(&state, &session);
+        let removing = Deleting::new(&state, &session);
+        drop(deletion);
+        let removing = std::thread::spawn(move || removing).join().unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].title, "Deleting: t");
+        drop(removing);
+        assert!(busy_sessions(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_review_is_busy() {
+        let state = crate::sync::test_state();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 2,
+        };
+        let review = state
+            .db
+            .start_auto_review(&key, "abc", "t", "u", now())
+            .unwrap()
+            .unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1, "its session is being created");
+        assert_eq!(busy[0].title, "Review #2: t");
+
+        // No turn runs anymore, but the review isn't posted yet.
+        let dir = tempfile::tempdir().unwrap();
+        let session = tests::session_row(&uuid(), "o/n", dir.path());
+        state.db.create_agent(&session).unwrap();
+        state
+            .db
+            .set_auto_review_session(review, &session.id)
+            .unwrap();
+        let busy = busy_sessions(&state);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].id, session.id);
+
+        state
+            .db
+            .finish_auto_review(review, AutoReviewState::Posted, None, now())
+            .unwrap();
+        assert!(busy_sessions(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_is_busy_while_it_runs_a_command() {
+        let mut state = crate::sync::test_state();
+        Arc::get_mut(&mut state).unwrap().agents.terminals =
+            crate::terminal::Terminals::new("/bin/sh".into());
+        let dir = tempfile::tempdir().unwrap();
+        let session = tests::session_row(&uuid(), "o/n", dir.path());
+        let id = crate::terminal::open(&state, &session).unwrap().id;
+        let terminal = state.agents.terminals.get(&session.id, id).unwrap();
+        let until = async |done: &dyn Fn() -> bool| {
+            for _ in 0..1500 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the terminal got stuck");
+        };
+        until(&|| terminal.waiting_at_prompt()).await;
+        assert!(busy_sessions(&state).is_empty());
+        assert_eq!(state.agents.terminals.count(), 1);
+
+        terminal.write(b"sleep 600\n").await.unwrap();
+        until(&|| !busy_sessions(&state).is_empty()).await;
+        let busy = busy_sessions(&state);
+        assert_eq!((busy[0].id.as_str(), busy[0].terminals), (&*session.id, 1));
+
+        terminal.write(b"\x03").await.unwrap();
+        until(&|| busy_sessions(&state).is_empty()).await;
+        state.agents.terminals.close_all(&session.id).await;
+        assert_eq!(state.agents.terminals.count(), 0);
     }
 }

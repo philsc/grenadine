@@ -453,6 +453,7 @@ pub fn Debug() -> impl IntoView {
     });
     view! {
         <div class="debug">
+            <crate::update::ServerSection />
             <h1>"System"</h1>
             {move || match system.get() {
                 None => view! { <p class="muted">"Loading…"</p> }.into_any(),

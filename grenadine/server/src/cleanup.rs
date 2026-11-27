@@ -323,16 +323,25 @@ const READ_ONLY_COMMANDS: &[ReadOnlyCommand] = &[
 /// The argument that has the server binary act as `bash_hook`.
 pub const BASH_HOOK_ARG: &str = "cleanup-bash-hook";
 
+/// What `bash_hook` prints when it lets a command run. The hook's command
+/// blocks the command unless it gets exactly this, so another binary that
+/// exits 0 on an unknown argument doesn't let every command through.
+pub const BASH_HOOK_ALLOW: &str = "grenadine-allow";
+
 /// Claude Code's PreToolUse hook for the cleanup jobs: reads the hook's
 /// input on stdin and returns the exit status, 2 to block a Bash command
-/// that `allowed_command` refuses. Claude Code's allowed tools only match
-/// a command's prefix, so this keeps out the options that would run
-/// commands or write files.
+/// that `allowed_command` refuses, and prints `BASH_HOOK_ALLOW` if it lets
+/// the command run. Claude Code's allowed tools only match a command's
+/// prefix, so this keeps out the options that would run commands or write
+/// files.
 pub fn bash_hook() -> i32 {
     let mut input = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
     match hook_decision(&input) {
-        Ok(()) => 0,
+        Ok(()) => {
+            println!("{BASH_HOOK_ALLOW}");
+            0
+        }
         Err(why) => {
             eprintln!("{why}");
             2
@@ -457,17 +466,14 @@ impl Scans {
     }
 }
 
+/// The titles of the deleted sessions being scanned, by session ID.
+pub fn scanning(state: &State) -> BTreeMap<String, String> {
+    state.agents.scans.running.lock().unwrap().clone()
+}
+
 /// The cleanup items, and the sessions still being scanned.
 pub fn cleanup_state(state: &State) -> Result<CleanupState> {
-    let scanning = state
-        .agents
-        .scans
-        .running
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
+    let scanning = scanning(state).into_values().collect();
     Ok(CleanupState {
         items: state.db.cleanup_items()?,
         scanning,
@@ -556,12 +562,7 @@ fn failed_scan(session: &AgentSession, e: &anyhow::Error) -> Vec<(String, String
 /// Where Claude Code keeps the session's full transcript: its config dir's
 /// `projects/`, in a directory named after the working directory.
 pub(crate) fn transcript_path(session: &AgentSession) -> PathBuf {
-    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
-        });
+    let config = crate::claude::config_dir();
     let project: String = session
         .worktree
         .chars()
