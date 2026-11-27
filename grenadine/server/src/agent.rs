@@ -721,9 +721,10 @@ const AGENTS_CPU_WEIGHT: u32 = 20;
 /// slice or scope would rank the sessions among themselves.
 ///
 /// For the same reason it doesn't reach outside the manager. A login
-/// session's scope and the system's services are siblings of the whole
-/// manager, which keeps its own weight, so against them the sessions
-/// still get all of the manager's share; see [`cpu_weight_caveat`].
+/// session's scope is a sibling of the whole manager, which keeps its
+/// own weight, and the system's services are further out still, so
+/// against them the sessions still get all of the manager's share; see
+/// [`cpu_weight_caveat`].
 ///
 /// The setting is the manager's, so it lasts until the manager stops, at
 /// the latest the next boot; every start of the server sets it again.
