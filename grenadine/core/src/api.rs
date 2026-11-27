@@ -66,6 +66,48 @@ pub struct RepoSettings {
     pub session_modes: BTreeMap<AgentBackend, PermissionMode>,
 }
 
+/// The settings that apply to every repository and are kept on the
+/// server. Every field has a default, so settings saved before a field
+/// existed still load.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlobalSettings {
+    /// When `update_prs` asks before it pushes onto the PR a session
+    /// started from.
+    pub approve_pr_pushes: ApprovePrPushes,
+}
+
+/// Whether a session that started from a PR asks the user before
+/// `update_prs` stacks pull requests on that PR or replaces its commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovePrPushes {
+    #[default]
+    AlwaysAsk,
+    /// Asks only when the PR's author isn't the viewer.
+    UnlessMine,
+    NeverAsk,
+}
+
+impl ApprovePrPushes {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovePrPushes::AlwaysAsk => "always_ask",
+            ApprovePrPushes::UnlessMine => "unless_mine",
+            ApprovePrPushes::NeverAsk => "never_ask",
+        }
+    }
+
+    /// `as_str`'s inverse; anything else is `AlwaysAsk`.
+    pub fn parse(s: &str) -> ApprovePrPushes {
+        match s {
+            "unless_mine" => ApprovePrPushes::UnlessMine,
+            "never_ask" => ApprovePrPushes::NeverAsk,
+            _ => ApprovePrPushes::AlwaysAsk,
+        }
+    }
+}
+
 /// Which of the viewer's open PRs an auto-review session reviews.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1291,6 +1333,8 @@ pub enum ServerEvent {
     TerminalsChanged(String),
     /// The settings of this repository (`owner/name`) changed.
     RepoSettingsChanged(String),
+    /// The global settings changed.
+    GlobalSettingsChanged,
     /// A review of the viewer's PRs started, finished or went away.
     AutoReviewsChanged,
     /// The server's update to a newer version started, went on or ended.

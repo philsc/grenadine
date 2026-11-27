@@ -779,6 +779,17 @@ from another session, naming the PRs and the session. Taking PRs that no
 session manages, and taking a stack when a session starts, must not ask.
 _Why:_ taking PRs from a session stops that session's work on them.
 
+**AGENT-STACK-APPROVE-1.** A session started from a PR must ask the user
+before its `update_prs` stacks PRs on that PR or replaces its commits,
+unless the global "Approve PR pushes" setting says otherwise: "Always
+ask" (the default) always asks, "Ask unless my PR" doesn't ask when the
+viewer wrote the PR, and "Never ask" doesn't ask. A push that doesn't ask
+must still show the request, marked allowed by the setting, in the
+transcript. When the PR's author or the viewer isn't known, it must ask.
+Unattended reviews must be refused whatever the setting.
+_Why:_ the setting lives on the server because the server is what asks,
+so it holds with no page open.
+
 **AGENT-STACK-LEASE-1.** The first push of each PR a session took over
 must only go through while the PR's branch is still at the head
 Grenadine last synced. Each taken PR keeps its own head branch.
