@@ -293,6 +293,10 @@ pub async fn run(failed: Option<UpdateFailed>) -> Result<Exit> {
         tracing::warn!(
             "no systemd user manager: deleting a session only stops the processes still in its worktree"
         );
+    } else if let Err(e) = agent::lower_agents_cpu_weight() {
+        tracing::warn!("can't lower the sessions' CPU weight: {e:#}");
+    } else if let Some(why) = agent::cpu_weight_caveat() {
+        tracing::warn!("{why}");
     }
     // Before serving, since a session being created has a worktree but no
     // row yet. The output bases of what it removes go next.

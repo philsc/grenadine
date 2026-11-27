@@ -3,6 +3,7 @@
 //! too small for them: one image can be ~4 MB of base64.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use grenadine_core::api::PromptImage;
@@ -19,6 +20,13 @@ thread_local! {
     static DATABASE: RefCell<Option<Rc<web_sys::IdbDatabase>>> = const { RefCell::new(None) };
     /// Set once IndexedDB failed, so it isn't tried again and again.
     static FAILED: Cell<bool> = const { Cell::new(false) };
+    /// How often each key's images were forgotten, so that a load can
+    /// tell that what it read is gone.
+    static FORGOTTEN: RefCell<HashMap<String, u64>> = RefCell::default();
+}
+
+fn forgotten(key: &str) -> u64 {
+    FORGOTTEN.with(|f| f.borrow().get(key).copied().unwrap_or(0))
 }
 
 /// The key a new-session draft's images are stored under.
@@ -162,9 +170,14 @@ pub fn draft_images(key: String) -> RwSignal<Vec<PromptImage>> {
     let loaded = RwSignal::new(false);
     spawn_local({
         let key = key.clone();
+        let before = forgotten(&key);
         async move {
+            // Images forgotten while they were read went with a prompt
+            // sent from an earlier composer; merged in, they'd be stored
+            // again and go with the next one too.
             if let Some(db) = db().await
                 && let Some(stored) = get(&db, &key).await
+                && forgotten(&key) == before
             {
                 // Images added before the load finished come after the
                 // stored ones.
@@ -200,6 +213,7 @@ pub fn draft_images(key: String) -> RwSignal<Vec<PromptImage>> {
 /// Drops `key`'s stored images right away: the composer whose Effect
 /// would clear them may already be gone.
 pub fn forget(key: &str) {
+    FORGOTTEN.with(|f| *f.borrow_mut().entry(key.to_owned()).or_default() += 1);
     let key = key.to_owned();
     spawn_local(async move {
         if let Some(db) = db().await {

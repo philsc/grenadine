@@ -3,6 +3,7 @@
 //! requests and a box for follow-up prompts.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -5149,6 +5150,14 @@ fn writes_handoff(events: &[Arc<AgentEvent>]) -> bool {
     !writing.is_empty()
 }
 
+thread_local! {
+    /// The follow-up box on the page for each session that has one, so
+    /// that a send that outlives its box can empty the one that took its
+    /// place; see `Composer`'s `send`.
+    static COMPOSERS: RefCell<HashMap<String, (RwSignal<String>, Attached)>> =
+        RefCell::default();
+}
+
 #[component]
 fn Composer(
     session: Signal<AgentSession>,
@@ -5175,6 +5184,23 @@ fn Composer(
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
     let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
     let attached = Attached { images, files };
+    let session_id = id.get_value();
+    COMPOSERS.with(|c| {
+        c.borrow_mut()
+            .insert(session_id.clone(), (prompt, attached))
+    });
+    on_cleanup(move || {
+        COMPOSERS.with(|c| {
+            let mut composers = c.borrow_mut();
+            // Unless the session's next box is on the page already.
+            if composers
+                .get(&session_id)
+                .is_some_and(|(p, _)| *p == prompt)
+            {
+                composers.remove(&session_id);
+            }
+        });
+    });
     let error = RwSignal::new(None::<String>);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
@@ -5198,22 +5224,49 @@ fn Composer(
         let ids = files.ids();
         let mode = mode.get_untracked();
         let model = model_arg(model);
+        // Read here because the task outlives the composer, which owns it.
+        let id = id.get_value();
         spawn_local(async move {
-            match api::send_agent_message(
-                &id.get_value(),
-                text,
-                sent_images,
-                ids.clone(),
-                mode,
-                model,
-            )
-            .await
-            {
+            let sent = text.clone();
+            match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
-                    prompt.set(String::new());
-                    images.set(Vec::new());
-                    image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
-                    files.sent(&ids);
+                    // The session may have been left by now. This box's
+                    // signals are gone then, and with them what keeps the
+                    // draft in step, so the kept draft is emptied here as
+                    // well. If the session was come back to meanwhile,
+                    // its new box read the draft before it was emptied
+                    // and would go on offering it: that box is the one to
+                    // empty. Like this one, it doesn't know of the send
+                    // until then, so Enter in it before the answer sends
+                    // the follow-up twice.
+                    let (prompt, attached) = COMPOSERS
+                        .with(|c| c.borrow().get(&id).copied())
+                        .unwrap_or((prompt, attached));
+                    // Only the sent text goes: what the box holds
+                    // instead by now was typed since and is the next
+                    // draft. A box that is gone answers `None`, and the
+                    // kept draft is then all there is to look at.
+                    match prompt.try_with_untracked(|p| *p == sent) {
+                        Some(true) => {
+                            prompt.set(String::new());
+                            if let Some(s) = storage() {
+                                let _ = s.remove_item(&draft_key(&id));
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            let key = draft_key(&id);
+                            if let Some(s) = storage()
+                                && s.get_item(&key).ok().flatten().as_deref() == Some(&*sent)
+                            {
+                                let _ = s.remove_item(&key);
+                            }
+                        }
+                    }
+                    attached.images.set(Vec::new());
+                    let key = image_drafts::agent_key(&id);
+                    image_drafts::forget(&key);
+                    attached.files.sent(&key, &ids);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
