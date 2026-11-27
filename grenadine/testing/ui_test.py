@@ -9651,6 +9651,10 @@ class DictationTest(ServerTestCase):
     SERVER_FLAGS: ClassVar[list[str]] = ["--fake-dictation"]
 
     @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.prs = scenarios.review_cases(gh)
+
+    @classmethod
     def chrome_args(cls, tmp: Path) -> list[str]:
         speech = tmp / "speech.wav"
         write_speech(speech)
@@ -9712,6 +9716,51 @@ class DictationTest(ServerTestCase):
             "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
         )
         expect(other).to_be_focused()
+
+    def test_recording_survives_a_refetch(self) -> None:
+        pr = self.prs[scenarios.KEEP]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        conversation = self.page.locator("details.conversation")
+        conversation.get_by_role("button", name="Comment").click()
+        box = conversation.get_by_role("textbox", name="Comment")
+        conversation.get_by_role("button", name="Record").click()
+        expect(box).to_have_value(re.compile(r"phrase \d+\.$"))
+        phrases = box.input_value().count("phrase")
+
+        # A comment from outside the page refetches the PR, which rebuilds
+        # the box.
+        resp = self.page.request.post(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
+            headers={"Origin": self.url.rstrip("/")},
+            data={"body": "Ping"},
+        )
+        self.assertEqual(resp.status, 204, resp.text())
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            "1 comment"
+        )
+
+        # The recording goes on into the rebuilt box.
+        stop = conversation.get_by_role("button", name=re.compile("Stop"))
+        expect(stop).to_be_visible()
+        expect(box).to_have_js_property("readOnly", True)
+        self.page.wait_for_function(
+            "([t, n]) => t.value.split('phrase').length - 1 > n",
+            arg=[box.element_handle(), phrases],
+        )
+        stop.click()
+        expect(box).to_have_js_property("readOnly", False)
+        expect(conversation.get_by_role("button", name="Record")).to_be_visible()
+
+        # Cancel ends the recording with the box.
+        conversation.get_by_role("button", name="Record").click()
+        expect(stop).to_be_visible()
+        conversation.get_by_role("button", name="Cancel").click()
+        expect(box).to_have_count(0)
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # It opens again empty and not recording.
+        conversation.get_by_role("button", name="Comment").click()
+        expect(box).to_have_value("")
+        expect(conversation.get_by_role("button", name="Record")).to_be_visible()
 
 
 if __name__ == "__main__":

@@ -70,13 +70,18 @@ fn drop_draft(id: &str) {
 /// changes are being sent and why a send failed. Provided above the parts
 /// of the page that mount and unmount with its views, so that all of
 /// that survives them: an open box even before anything was typed into
-/// it, and a send that a sync of another change interrupts.
+/// it, a send that a sync of another change interrupts, and a recording
+/// into a box that a refetch of the PR rebuilds.
 #[derive(Clone, Copy)]
 pub struct OpenBoxes {
     open: RwSignal<HashSet<String>>,
     previews: RwSignal<HashSet<String>>,
     sending: RwSignal<HashSet<String>>,
     errors: RwSignal<HashMap<String, String>>,
+    /// The open boxes' texts and dictations, made in `owner` so that they
+    /// outlive the boxes.
+    dictations: StoredValue<HashMap<String, (RwSignal<String>, Dictation)>, LocalStorage>,
+    owner: StoredValue<Owner, LocalStorage>,
 }
 
 /// Inserts `name` into `set`, or removes it.
@@ -97,7 +102,28 @@ impl OpenBoxes {
             previews: RwSignal::new(Default::default()),
             sending: RwSignal::new(Default::default()),
             errors: RwSignal::new(Default::default()),
+            dictations: StoredValue::new_local(HashMap::new()),
+            owner: StoredValue::new_local(Owner::current().expect("OpenBoxes made in a component")),
         }
+    }
+
+    /// The text of the box for `draft`, starting out as `initial` (see
+    /// `draft_signal_from`), and dictation into it. Both stay the same
+    /// while the box is rebuilt, until it's closed.
+    fn dictation(self, draft: &str, initial: String) -> (RwSignal<String>, Dictation) {
+        if let Some(d) = self.dictations.with_value(|d| d.get(draft).copied()) {
+            return d;
+        }
+        let made = self.owner.with_value(|owner| {
+            owner.with(|| {
+                let text = draft_signal_from(comment_draft_key(draft), initial);
+                (text, Dictation::new(text, NodeRef::new()))
+            })
+        });
+        self.dictations.update_value(|d| {
+            d.insert(draft.to_owned(), made);
+        });
+        made
     }
 
     /// Whether the box for `draft` is open: opened and not closed since,
@@ -167,6 +193,9 @@ impl OpenBoxes {
     /// Closes the box for `draft` and drops its draft.
     pub fn close(self, draft: &str) {
         drop_draft(draft);
+        self.dictations.update_value(|d| {
+            d.remove(draft);
+        });
         self.set(draft, false);
         self.set_preview(draft, false);
         self.set_error(draft, None);
@@ -360,7 +389,10 @@ pub fn Composer(
     #[prop(optional)] allow_empty: bool,
 ) -> impl IntoView {
     let boxes = expect_context::<OpenBoxes>();
-    let text = draft_signal_from(comment_draft_key(&draft), initial.unwrap_or_default());
+    let (text, dictation) = boxes.dictation(&draft, initial.unwrap_or_default());
+    // The recording goes on while the box is rebuilt, e.g. when the PR is
+    // refetched, and ends with it otherwise.
+    dictation.end_with_box();
     let busy = {
         let draft = draft.clone();
         Signal::derive(move || boxes.sending(&draft))
@@ -372,7 +404,6 @@ pub fn Composer(
     let (alt_label, alt_send) = alt.unzip();
     let (send, alt_send) = (StoredValue::new(send), StoredValue::new(alt_send));
     let draft = StoredValue::new(draft);
-    let dictation = Dictation::new(text, NodeRef::new());
     let empty = move || text.with(|t| t.trim().is_empty());
     let blocked = move || (!allow_empty && empty()) || dictation.busy();
     // Sends with the main button's action, or with `alt`'s.

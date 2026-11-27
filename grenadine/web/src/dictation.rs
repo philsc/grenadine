@@ -275,8 +275,9 @@ impl Dictation {
         match self.phase.get_untracked() {
             Phase::Idle => self.start(),
             Phase::Starting | Phase::Recording => self.stop(),
-            // The last phrases are taking a while: drop them.
-            Phase::Finishing => self.cancel(),
+            // The last phrases are taking a while: drop them, and leave
+            // the box as a stop would.
+            Phase::Finishing => self.finish(),
         }
     }
 
@@ -506,7 +507,8 @@ impl Dictation {
         });
     }
 
-    /// Drops the recording, and the phrases still being transcribed.
+    /// Drops the recording, and the phrases still being transcribed, of a
+    /// box that's gone.
     fn cancel(self) {
         RECORDERS.with_borrow_mut(|r| r.remove(&self.id));
         self.phase.try_set(Phase::Idle);
