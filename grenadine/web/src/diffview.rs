@@ -1600,29 +1600,39 @@ pub fn WorktreeDiff(files: Signal<Vec<WorktreeFile>>, session: String) -> impl I
     // the file's contents stay the same, shared between the rows and the
     // page memory log.
     let cache = StoredValue::new_local(HashMap::<u64, Arc<FileData>>::new());
-    let keyed = RwSignal::new(Vec::<(u64, Arc<FileData>)>::new());
-    let keys = StoredValue::new_local(Vec::<u64>::new());
+    // Computed in the render pass, so the rows show without a tick's
+    // delay; only a change in the files' keys notifies `<For>`.
+    let keyed = Memo::new_with_compare(
+        move |_| {
+            let files = files.get();
+            let mut next = Vec::with_capacity(files.len());
+            let mut keep = HashMap::new();
+            for f in files {
+                let mut h = DefaultHasher::new();
+                f.hash(&mut h);
+                let k = h.finish();
+                let file = cache
+                    .with_value(|m| m.get(&k).cloned())
+                    .unwrap_or_else(|| worktree_file_data(f));
+                keep.insert(k, file.clone());
+                next.push((k, file));
+            }
+            cache.set_value(keep);
+            next
+        },
+        |old: Option<&Vec<(u64, Arc<FileData>)>>, new: Option<&Vec<(u64, Arc<FileData>)>>| {
+            let keys = |v: Option<&Vec<(u64, Arc<FileData>)>>| {
+                v.map(|v| v.iter().map(|(k, _)| *k).collect::<Vec<_>>())
+            };
+            keys(old) != keys(new)
+        },
+    );
     Effect::new(move |_| {
-        let files = files.get();
-        let mut next = Vec::with_capacity(files.len());
-        let mut keep = HashMap::new();
-        for f in files {
-            let mut h = DefaultHasher::new();
-            f.hash(&mut h);
-            let k = h.finish();
-            let file = cache
-                .with_value(|m| m.get(&k).cloned())
-                .unwrap_or_else(|| worktree_file_data(f));
-            keep.insert(k, file.clone());
-            next.push((k, file));
-        }
-        cache.set_value(keep);
-        let new_keys: Vec<u64> = next.iter().map(|(k, _)| *k).collect();
-        if !next.is_empty() && new_keys != keys.get_value() {
-            memlog::diff(next.len(), next.iter().map(|(_, f)| changed_lines(f)).sum());
-        }
-        keys.set_value(new_keys);
-        keyed.set(next);
+        keyed.with(|next| {
+            if !next.is_empty() {
+                memlog::diff(next.len(), next.iter().map(|(_, f)| changed_lines(f)).sum());
+            }
+        });
     });
     view! {
         <For each=move || keyed.get() key=|entry| entry.0 let:entry>

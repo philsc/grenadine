@@ -2,8 +2,10 @@
 //! storage so that a memory report can be matched to what the page was
 //! doing. Session storage has a quota of its own, so a growing log can't
 //! crowd out the local-storage drafts and settings, and it still
-//! survives a reload or a crash restore of the tab. Samples are taken every 30 s, on every hash navigation, and a
-//! few seconds after one; a diff finishing loading logs its size.
+//! survives a reload or a crash restore of the tab. Samples are taken
+//! every 30 s, on every hash navigation, and a few seconds after one; a
+//! diff finishing loading logs its size. Only the 30 s samples save the
+//! log to session storage.
 //!
 //! The browser-dependent parts are wasm32-only; the log's shapes and its
 //! buffer are tested on the host.
@@ -152,8 +154,36 @@ pub fn page_size() -> (u64, u32) {
     (0, 0)
 }
 
+/// Whether saving the log to session storage has failed before, so the
+/// failure is logged only once.
 #[cfg(target_arch = "wasm32")]
-fn record(kind: &str, diff: Option<Diff>) {
+static SAVE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Writes the log to session storage. A failed write, e.g. at the quota,
+/// removes the stored log, so a reload doesn't show an old snapshot as the
+/// previous page load's whole log.
+#[cfg(target_arch = "wasm32")]
+fn save(log: &VecDeque<Entry>) {
+    use std::sync::atomic::Ordering;
+
+    let Some(storage) = storage() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string(log) else {
+        return;
+    };
+    if let Err(e) = storage.set_item(KEY, &json) {
+        let _ = storage.remove_item(KEY);
+        if !SAVE_FAILED.swap(true, Ordering::Relaxed) {
+            web_sys::console::warn_2(&"memlog: can't save the log to session storage:".into(), &e);
+        }
+    }
+}
+
+/// Records an entry. Only `persist` ones write the whole log to session
+/// storage, so the log isn't serialized on every navigation and diff.
+#[cfg(target_arch = "wasm32")]
+fn record(kind: &str, diff: Option<Diff>, persist: bool) {
     let (wasm_bytes, dom_elements) = page_size();
     let entry = Entry {
         at: js_sys::Date::now() as u64,
@@ -169,10 +199,8 @@ fn record(kind: &str, diff: Option<Diff>) {
     };
     LOG.with_borrow_mut(|log| {
         push(log, entry);
-        if let Some(storage) = storage()
-            && let Ok(json) = serde_json::to_string(&*log)
-        {
-            let _ = storage.set_item(KEY, &json);
+        if persist {
+            save(log);
         }
     });
 }
@@ -186,6 +214,7 @@ pub fn diff(files: usize, changed_lines: usize) {
             files,
             changed_lines,
         }),
+        false,
     );
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (files, changed_lines);
@@ -208,11 +237,13 @@ pub fn start() {
         let _ = storage.set_item(PREVIOUS_KEY, &json);
         PREVIOUS.with_borrow_mut(|p| *p = serde_json::from_str(&json).unwrap_or_default());
     }
-    record("sample", None);
-    let _ = set_interval_with_handle(|| record("sample", None), SAMPLE_EVERY);
+    record("sample", None, true);
+    // Only the periodic samples save the log, so a crash loses at most
+    // the last `SAMPLE_EVERY` of it.
+    let _ = set_interval_with_handle(|| record("sample", None, true), SAMPLE_EVERY);
     let _handle = window_event_listener_untyped("hashchange", move |_| {
-        record("nav", None);
-        set_timeout(move || record("sample", None), AFTER_NAV);
+        record("nav", None, false);
+        set_timeout(move || record("sample", None, false), AFTER_NAV);
     });
 }
 

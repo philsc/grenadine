@@ -1,8 +1,12 @@
+import contextlib
 import gzip
+import io
 import json
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from tools.firefox_memory import summarize
 
@@ -98,8 +102,14 @@ class SummarizeTest(unittest.TestCase):
                     },
                     f,
                 )
-            with gzip.open(path, "rt") as f:
-                self.assertIn("resident", f.read())
+            out = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", ["summarize", str(path)]),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(summarize.main(), 0)
+            self.assertIn("== memory-report-x.json.gz", out.getvalue())
+            self.assertIn("resident=5MB", out.getvalue())
 
 
 if __name__ == "__main__":
