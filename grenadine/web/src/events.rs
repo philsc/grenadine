@@ -80,7 +80,10 @@ struct Connection {
 
 impl Connection {
     /// Connects to `path`. `on_close` runs when the connection closes
-    /// other than by being dropped, also when it never opened.
+    /// other than by being dropped, also when it never opened. That
+    /// includes a server that refuses the socket, e.g. for a session that
+    /// was deleted: a page can't tell that from a server that is down, so
+    /// a tab left on such a page keeps asking, at the longest delay.
     fn open(path: &str, handlers: &Rc<Handlers>, on_close: impl Fn() + 'static) -> Option<Self> {
         let socket = WebSocket::new(&socket_url(path)).ok()?;
         let h = handlers.clone();
