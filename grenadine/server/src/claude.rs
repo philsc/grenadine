@@ -10,7 +10,9 @@ use std::process::Stdio;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
-use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk};
+use grenadine_core::api::{
+    AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk, TaskStatus,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -305,7 +307,9 @@ async fn turn(
         match parse_line(&line) {
             Parsed::Started { model } => sink.started(id, model)?,
             Parsed::Events(events) => {
-                if let Some(last) = events.last() {
+                // A task starting or ending isn't the agent working, so
+                // it leaves the deadline alone.
+                if let Some(last) = events.last().filter(|e| !e.is_task()) {
                     deadline = matches!(last, AgentEventKind::TurnEnded { error: None, .. })
                         .then(|| tokio::time::Instant::now() + BACKGROUND_GRACE);
                 }
@@ -334,6 +338,24 @@ enum Parsed {
         model: Option<String>,
     },
     Events(Vec<AgentEventKind>),
+}
+
+/// What a `task_started` or `task_notification` line says about the tool
+/// call that started the task. `None` for a task without a tool call, or
+/// a status that isn't an end.
+fn task_event(v: &Value) -> Option<AgentEventKind> {
+    let id = v["tool_use_id"].as_str()?.to_owned();
+    let task = v["task_id"].as_str()?.to_owned();
+    if v["subtype"] == "task_started" {
+        return Some(AgentEventKind::TaskStarted { id, task });
+    }
+    let status = match v["status"].as_str()? {
+        "completed" => TaskStatus::Completed,
+        "failed" => TaskStatus::Failed,
+        "stopped" | "killed" => TaskStatus::Stopped,
+        _ => return None,
+    };
+    Some(AgentEventKind::TaskEnded { id, task, status })
 }
 
 /// The text of a tool result, whose content is a string or a list of blocks.
@@ -425,6 +447,16 @@ fn parse_line(line: &str) -> Parsed {
             return Parsed::Started {
                 model: (!model.is_empty()).then(|| model.to_owned()),
             };
+        }
+        // A task of the session's own agent, by the tool call that
+        // started it. Tasks of subagents have no row to show on.
+        Some("system")
+            if matches!(
+                v["subtype"].as_str(),
+                Some("task_started" | "task_notification")
+            ) && v["owned_by_subagent"].as_bool() != Some(true) =>
+        {
+            task_event(&v).into_iter().collect()
         }
         Some("stream_event") => {
             let delta = &v["event"]["delta"];
@@ -742,6 +774,45 @@ pub(crate) mod tests {
         assert_eq!(
             events(
                 r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_9"}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_4","description":"Sleep","is_backgrounded":true,"task_type":"local_bash"}"#
+            ),
+            [AgentEventKind::TaskStarted {
+                id: "toolu_4".into(),
+                task: "b1".into(),
+            }]
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_4","status":"failed","output_file":"/tmp/o","summary":"exit code 1"}"#
+            ),
+            [AgentEventKind::TaskEnded {
+                id: "toolu_4".into(),
+                task: "b1".into(),
+                status: TaskStatus::Failed,
+            }]
+        );
+        // A subagent's task, one without a tool call, and the patch that
+        // comes before a notification have no row to change.
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"toolu_5","owned_by_subagent":true}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_notification","task_id":"b3","status":"completed"}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed"}}"#
             ),
             []
         );

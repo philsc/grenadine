@@ -57,6 +57,8 @@ fn announce() {
 
 /// Handles plain clicks on the app's own links with `push` for the life
 /// of the current owner, wherever they are, rendered markdown included.
+/// Other clicks are the browser's, so that Ctrl-click still opens a new
+/// tab, for instance.
 pub fn follow_links() {
     let handle = window_event_listener(leptos::ev::click, |ev| {
         if ev.default_prevented()

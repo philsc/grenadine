@@ -115,6 +115,11 @@ struct Args {
     #[arg(long, hide = true, value_delimiter = ',', default_value = "0,5,20")]
     review_post_checks: Vec<u64>,
 
+    /// Seconds before each time the session of a review that isn't on
+    /// GitHub is asked again to post it. Tests shorten them.
+    #[arg(long, hide = true, value_delimiter = ',', default_value = "60,300")]
+    review_post_retries: Vec<u64>,
+
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
@@ -317,6 +322,11 @@ pub async fn run() -> Result<()> {
         off_inbox_interval: Duration::from_secs(args.off_inbox_interval),
         posted_checks: args
             .review_post_checks
+            .iter()
+            .map(|&s| Duration::from_secs(s))
+            .collect(),
+        post_retries: args
+            .review_post_retries
             .iter()
             .map(|&s| Duration::from_secs(s))
             .collect(),

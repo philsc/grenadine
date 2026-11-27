@@ -1136,6 +1136,12 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
+    /// Whether the session has live state.
+    #[cfg(test)]
+    pub fn has_live(&self, id: &str) -> bool {
+        self.live.lock().unwrap().contains_key(id)
+    }
+
     /// Runs `f` on the session's live state if it has any, e.g. not once
     /// the session is deleted.
     fn with_existing_live<T>(&self, id: &str, f: impl FnOnce(&mut Live) -> T) -> Option<T> {
@@ -1544,6 +1550,46 @@ pub fn send(
     model: Option<String>,
 ) {
     send_with_files(state, id, prompt, Vec::new(), Vec::new(), mode, model);
+}
+
+/// Sends `prompt` like `send`, but only to a session with no turn running
+/// or queued. Returns whether it sent it; a deleted session gets nothing.
+pub fn send_if_idle(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    mode: PermissionMode,
+    model: Option<String>,
+) -> bool {
+    let start = state.agents.with_existing_live(id, |l| {
+        if l.running || !l.queue.is_empty() || l.writing_handoff {
+            return false;
+        }
+        l.queue.push_back(Queued {
+            prompt,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            mode,
+            model,
+        });
+        l.running = true;
+        true
+    }) == Some(true);
+    if start {
+        tokio::spawn(run(state.clone(), id.to_owned()));
+    }
+    start
+}
+
+/// Whether the session has a turn running or queued. A deleted session
+/// has none.
+pub fn is_busy(state: &State, id: &str) -> bool {
+    state
+        .agents
+        .with_existing_live(id, |l| {
+            l.running || !l.queue.is_empty() || l.writing_handoff
+        })
+        .unwrap_or(false)
 }
 
 /// Queues a prompt with the images `save_images` saved for it and the
@@ -2115,6 +2161,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
 /// then goes on with a wrap-up that waited for them.
 async fn run(state: Arc<State>, id: String) {
     let mut last = AgentStatus::Idle;
+    let mut last_turn = None;
     loop {
         // Only a wrap-up that waited for this task is the task's to go on
         // with; one that comes once it stops running is wrap_up's.
@@ -2128,7 +2175,7 @@ async fn run(state: Arc<State>, id: String) {
         });
         let Some(queued) = prompt else {
             if !waiting {
-                crate::auto_review::session_done(&state, &id, last);
+                crate::auto_review::session_done(&state, &id, last, last_turn);
                 return;
             }
             if last == AgentStatus::Idle {
@@ -2146,6 +2193,7 @@ async fn run(state: Arc<State>, id: String) {
             }
             return;
         };
+        last_turn = Some((queued.mode.clone(), queued.model.clone()));
         let status = match turn(&state, &id, queued).await {
             Ok(status) => status,
             Err(e) => {
@@ -4240,11 +4288,14 @@ impl<'a> TurnSink<'a> {
         store_images(self.state, self.id, worktree, &mut kind)?;
         // A background task that finishes wakes the agent up again, even
         // for a message that only reports usage. A result's window and
-        // end don't. A permission request still waiting keeps its status.
-        let wakes = !matches!(
-            kind,
-            AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
-        );
+        // end don't, and neither does the task's own start or end: the
+        // agent's answer to it follows. A permission request still
+        // waiting keeps its status.
+        let wakes = !kind.is_task()
+            && !matches!(
+                kind,
+                AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
+            );
         if wakes {
             let woken = self.state.agents.with_live(self.id, |l| {
                 let woken = std::mem::take(&mut l.background);
@@ -4269,7 +4320,11 @@ impl<'a> TurnSink<'a> {
                 return Ok(());
             }
         }
-        self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        // A task's end between two results doesn't make the second one
+        // a new answer.
+        if !kind.is_task() {
+            self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        }
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
@@ -5350,9 +5405,13 @@ if [ "$prompt" != go ]; then
   echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
   exit
 fi
+echo '{{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_1","is_backgrounded":true}}'
 echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Started"}}]}},"parent_tool_use_id":null}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
-sleep 3
+sleep 1
+echo '{{"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"toolu_2","is_backgrounded":true}}'
+sleep 2
+echo '{{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_1","status":"completed"}}'
 echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Done"}}]}},"parent_tool_use_id":null}}'
 sleep 1
 echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}}'
@@ -5401,8 +5460,21 @@ sleep 3
             transcript,
             [
                 AgentEventKind::Prompt("go".into()),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                },
                 AgentEventKind::Text("Started".into()),
                 ended(0.25),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_2".into(),
+                    task: "b2".into(),
+                },
+                AgentEventKind::TaskEnded {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                    status: grenadine_core::api::TaskStatus::Completed,
+                },
                 AgentEventKind::Text("Done".into()),
                 ended(0.5),
                 AgentEventKind::Prompt("next".into()),

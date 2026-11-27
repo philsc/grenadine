@@ -671,6 +671,20 @@ pub struct Check {
     pub url: Option<String>,
 }
 
+/// A run of a check on the PR's head that didn't pass and that a later
+/// run of the same check replaced, e.g. one a workflow's concurrency
+/// group cancelled. Grenadine's checks leave it out, but GitHub can keep
+/// counting it, and then it fails the head's checks until it's re-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRun {
+    /// The check's name.
+    pub name: String,
+    pub url: Option<String>,
+    /// The GitHub Actions workflow run it belongs to, which can be
+    /// re-run; `None` for another app's check.
+    pub run_id: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MergeMethod {
     Merge,
@@ -757,6 +771,10 @@ pub struct MergeInfo {
     /// resolved before merging.
     #[serde(default)]
     pub requires_conversation_resolution: bool,
+    /// The replaced runs that fail the head's checks for GitHub while
+    /// every check that counts for grenadine passed or still runs.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
     /// `Some` when the base branch requires merging through a merge
     /// queue.
     #[serde(default)]
@@ -791,6 +809,12 @@ pub struct StackMergePr {
     pub state: MergeState,
     /// The combined state of its head's checks.
     pub ci: Option<CiStatus>,
+    /// Like `MergeInfo::stale_runs`, for its head.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
+    /// Whether its reviews let it merge, like `ReviewInfo::decision`.
+    #[serde(default)]
+    pub decision: Option<ReviewDecision>,
 }
 
 /// A team asked to review a PR, as GitHub names and addresses it.
@@ -2189,6 +2213,24 @@ pub enum AgentEventKind {
         #[serde(alias = "cost_usd")]
         cost: Option<f64>,
     },
+    /// The backend started a task for tool call `id`, such as a command
+    /// or a subagent. One that's still running after the call's
+    /// `ToolResult` runs in the background. A `TaskEnded` with the same
+    /// `task` follows, unless the turn's process ends first.
+    TaskStarted {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+    },
+    /// A task that a tool call started is over.
+    TaskEnded {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+        status: TaskStatus,
+    },
     /// How full the context window is. Never stored; the session keeps
     /// the latest values. `None` leaves a value unchanged.
     Usage {
@@ -2204,6 +2246,16 @@ pub enum AgentEventKind {
     Landed(Landed),
     /// Wrapping up stopped; carries why.
     WrapUpFailed(String),
+}
+
+/// How a task that a tool call started went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Completed,
+    Failed,
+    /// Ended before it was done, e.g. by the agent.
+    Stopped,
 }
 
 /// One hunk of the change a file tool made, as the backend reports it.
@@ -2226,6 +2278,15 @@ impl AgentEventKind {
                 | AgentEventKind::ThinkingDelta(_)
                 | AgentEventKind::Usage { .. }
                 | AgentEventKind::Model(_)
+        )
+    }
+
+    /// Whether the event is about a task that a tool call started,
+    /// rather than something the agent did.
+    pub fn is_task(&self) -> bool {
+        matches!(
+            self,
+            AgentEventKind::TaskStarted { .. } | AgentEventKind::TaskEnded { .. }
         )
     }
 }
