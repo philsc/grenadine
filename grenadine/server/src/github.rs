@@ -2776,6 +2776,17 @@ impl GitHub {
         Ok(out)
     }
 
+    /// The login of the user the token belongs to.
+    pub async fn viewer_login(&self) -> Result<String> {
+        let (data, _) = self
+            .graphql("viewer", &[], "query { viewer { login } }", json!({}))
+            .await?;
+        match data["viewer"]["login"].as_str() {
+            Some(login) if !login.is_empty() => Ok(login.to_owned()),
+            _ => bail!("GitHub didn't say who the viewer is"),
+        }
+    }
+
     /// The states of PRs and whether they conflict with their bases. PRs
     /// GitHub can't find, e.g. in a repository the token can't see, are
     /// missing from the result.
