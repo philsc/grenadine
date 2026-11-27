@@ -5222,7 +5222,6 @@ fn Composer(
         });
     });
     let error = RwSignal::new(None::<String>);
-    let textarea = NodeRef::<leptos::html::Textarea>::new();
     let dictation = Dictation::new(prompt, textarea);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
