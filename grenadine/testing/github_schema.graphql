@@ -523,6 +523,7 @@ type StatusCheckRollup {
 
 type StatusCheckRollupContextConnection {
   nodes: [StatusCheckRollupContext]
+  pageInfo: PageInfo!
 }
 
 union StatusCheckRollupContext = CheckRun | StatusContext
@@ -587,6 +588,7 @@ type CheckSuite {
 }
 
 type WorkflowRun {
+  databaseId: Int
   workflow: Workflow!
 }
 

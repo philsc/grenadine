@@ -139,6 +139,9 @@ pub struct State {
     /// When, after a review's session finished, its review is looked for
     /// on GitHub, each delay after the one before.
     pub posted_checks: Vec<Duration>,
+    /// How long a review that isn't on GitHub by then waits before its
+    /// session is asked again to post it, for each time it's asked.
+    pub post_retries: Vec<Duration>,
     /// The per-inbox search times and the requested searches.
     pub inbox_searches: std::sync::Mutex<InboxSearches>,
     /// PRs that `follow_up` will sync again.
@@ -1119,6 +1122,7 @@ pub fn test_state_with_agents(
         watched: std::sync::Mutex::new(BTreeMap::new()),
         off_inbox_interval: Duration::from_secs(600),
         posted_checks: vec![Duration::ZERO],
+        post_retries: Vec::new(),
         inbox_searches: std::sync::Mutex::new(InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
@@ -1528,6 +1532,7 @@ mod tests {
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                stale_runs: vec![],
                 queue: None,
                 stack: None,
             },

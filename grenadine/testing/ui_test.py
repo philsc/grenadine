@@ -217,6 +217,10 @@ def devin_scenario(tmp: Path) -> dict:
                 ],
             },
             {
+                "match": "Your review isn't on the pull request.",
+                "steps": [end],
+            },
+            {
                 "match": "Review pull request",
                 "steps": [
                     update(
@@ -405,6 +409,7 @@ if "--json-schema" in args:
     print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
 import os
+import pathlib
 import re
 content = json.loads(sys.stdin.read())["message"]["content"]
 images = sum(block["type"] == "image" for block in content)
@@ -655,7 +660,13 @@ if review and "Slow" in review[1]:
 # A "Paced" one's takes long enough to open its page while it runs.
 if review and "Paced" in review[1]:
     time.sleep(5)
-if review and "Quiet" not in review[1]:
+# A "Retried" PR's review only posts once it's asked again.
+pending = pathlib.Path("pending-review.json")
+if review and "Retried" in review[1]:
+    pending.write_text(json.dumps([review[2], review[3]]))
+elif prompt.startswith("Your review isn't on the pull request.") and pending.exists():
+    review = [None, "", *json.loads(pending.read_text())]
+if review and "Quiet" not in review[1] and "Retried" not in review[1]:
     request = urllib.request.Request(
         f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
         data=json.dumps({"body": "Looks good."}).encode(),
@@ -676,11 +687,19 @@ if long:
         size = 1024 + (29 * 1024) * i // max(count - 1, 1)
         padding = ("0123456789abcdef" * ((size // 16) + 1))[:size]
         result(tool_use, f"result {i}: {padding}")
-emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
-# `background N` keeps the process going for N seconds after its answer,
-# as Claude Code does for a background task.
+# `background N` runs a command of N seconds in the background: the call
+# returns at once, and the process goes on after its answer until the
+# command's task is over, as Claude Code's does.
+background = None
 if prompt.startswith("background "):
-    time.sleep(float(prompt.removeprefix("background ")))
+    seconds = prompt.removeprefix("background ")
+    background = use("Bash", {"command": f"sleep {seconds}", "run_in_background": True})
+    emit({"type": "system", "subtype": "task_started", "task_id": "b1", "tool_use_id": background, "is_backgrounded": True, "task_type": "local_bash"})
+    result(background, "Command running in background with ID: b1.")
+emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
+if background:
+    time.sleep(float(seconds))
+    emit({"type": "system", "subtype": "task_notification", "task_id": "b1", "tool_use_id": background, "status": "completed", "output_file": "", "summary": ""})
 """
 
 
@@ -791,6 +810,7 @@ class ServerTestCase(unittest.TestCase):
                 # The fake GitHub shows posted reviews at once, so a review
                 # that posts nothing needn't be looked for over 25s.
                 "--review-post-checks=0,1",
+                "--review-post-retries=1,1",
                 # The fake claude can't update itself.
                 "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
@@ -1457,8 +1477,17 @@ class InboxTest(ServerTestCase):
             "Review required"
         )
         status = self.page.locator(".merge-box .merge-status")
+        # Its first `test` run was cancelled for the one that passed, and
+        # GitHub still counts it, but `test` isn't required: the review is
+        # the reason.
         expect(status).to_have_text("Merging is blocked: it needs an approving review.")
         expect(status).to_have_class(re.compile(r"\bbad\b"))
+        # It's not an Actions run that could be re-run from here.
+        expect(
+            self.page.locator(".merge-box").get_by_role(
+                "button", name="Re-run the replaced runs"
+            )
+        ).to_have_count(0)
 
     def test_pr_page_of_a_conflicting_pr(self) -> None:
         pr = self.cases.prs["Leave me out of it"]
@@ -3640,6 +3669,40 @@ class StackMergeTest(ServerTestCase):
         expect(self.page.locator(".pr-header .state")).to_have_text("merged")
         self.assertEqual(top.state, "MERGED")
         self.assertEqual(low.state, "MERGED")
+
+    def test_rerunning_a_cancelled_twin_unblocks_the_stack(self) -> None:
+        low = self.prs[scenarios.GH_TWIN_LOW]
+        top = self.prs[scenarios.GH_TWIN]
+        self.open(scenarios.GH_TWIN)
+        box = self.merge_box()
+        status = box.locator(".merge-status")
+        # The checks that count passed, so the reason is the run GitHub
+        # still counts.
+        expect(status).to_have_text(
+            "Merging is blocked: GitHub still counts a replaced run of test"
+            " that didn't pass."
+        )
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text(
+            "Blocked by a replaced run that didn't pass"
+        )
+        box.get_by_role("button", name="Re-run the replaced runs").click()
+        expect(status).to_have_text("Ready to merge.")
+        expect(rows.nth(0)).to_contain_text("Ready")
+        expect(
+            box.get_by_role("button", name="Re-run the replaced runs")
+        ).to_have_count(0)
+        # Both PRs' cancelled runs were re-run, and nothing else.
+        reruns = [r for r in self.gh.requests if r.endswith("/rerun-failed-jobs")]
+        self.assertEqual(
+            sorted(reruns),
+            [
+                f"POST /repos/{scenarios.GHSTACK_REPO}/actions/runs/{run}/rerun-failed-jobs"
+                for run in (500, 501)
+            ],
+        )
+        self.assertEqual(low.merge_state_status(), "CLEAN")
+        self.assertEqual(top.merge_state_status(), "CLEAN")
 
     def test_a_merge_failing_at_run_time_shows_the_error(self) -> None:
         low = self.prs[scenarios.GH_FAIL_LOW]
@@ -8516,24 +8579,6 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
-    def close_tab(self, url: str) -> None:
-        """Waits for the browser to show `url` in a tab and closes it.
-
-        It asks the browser because Playwright sometimes loses a
-        background tab's navigation, or the tab itself."""
-        cdp = self.browser.new_browser_cdp_session()
-        self.addCleanup(cdp.detach)
-        deadline = time.monotonic() + 15
-        while True:
-            pages = cdp.send("Target.getTargets")["targetInfos"]
-            ids = [t["targetId"] for t in pages if t["url"] == url]
-            if ids:
-                break
-            self.assertLess(time.monotonic(), deadline, f"no tab shows {url}: {pages}")
-            self.page.wait_for_timeout(50)
-        for id in ids:
-            cdp.send("Target.closeTarget", {"targetId": id})
-
     def test_links_navigate_without_hash_navigations(self) -> None:
         """WebKit on iOS reloads the page after a hash navigation, so the
         app's links mustn't cause any. Only the browser's own hashchange
@@ -8596,10 +8641,28 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(second)
         expect(header).to_contain_text("look at")
 
-        # The browser still opens other tabs.
-        entry(first).click(modifiers=["ControlOrMeta"])
-        self.close_tab(first)
+        # A click with a modifier is the browser's, as when Ctrl-click
+        # opens a new tab. The test's own listener, which runs after the
+        # app's, keeps the browser from opening one.
+        length = self.page.evaluate("history.length")
+        prevented = entry(first).evaluate(
+            """(link) => {
+              let prevented;
+              const check = (e) => {
+                prevented = e.defaultPrevented;
+                e.preventDefault();
+              };
+              addEventListener("click", check);
+              link.dispatchEvent(new MouseEvent("click", {
+                bubbles: true, cancelable: true, ctrlKey: true,
+              }));
+              removeEventListener("click", check);
+              return prevented;
+            }"""
+        )
+        self.assertIs(prevented, False)
         self.assertEqual(self.page.url, second)
+        self.assertEqual(self.page.evaluate("history.length"), length)
 
         # Deleting the open session goes to a new draft.
         navigations = self.page.evaluate("window.hashNavigations")
@@ -8955,8 +9018,30 @@ class AgentTest(ServerTestCase):
         # Answered, but its process is still holding a background task.
         status = self.page.locator(".agent-status-line .agent-status")
         expect(status).to_have_text("waiting on background task", timeout=10_000)
-        expect(self.page.locator(".activity")).to_contain_text(
-            "Waiting on a background task"
+        # The line says which call it waits for and leads to its row,
+        # which shows the task still running rather than a finished call.
+        transcript = self.page.locator(".transcript")
+        row = transcript.locator(".tool").filter(has_text="sleep 8")
+        expect(row.get_by_role("img", name="Running in background")).to_be_visible()
+        expect(row.locator(".tool-status")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
+        activity = self.page.locator(".activity")
+        expect(activity).to_contain_text(
+            re.compile(r"Waiting on Bash sleep 8\s*· \d+s")
+        )
+        self.page.evaluate("window.scrollTo(0, 0)")
+        activity.get_by_role("button", name="Waiting on Bash sleep 8").click()
+        expect(row).to_be_in_viewport()
+        # Nothing that sticks to an edge of the page covers its summary.
+        self.assertTrue(
+            row.locator("summary").evaluate(
+                """el => {
+                    const box = el.getBoundingClientRect();
+                    const top = document.elementFromPoint(
+                        box.left + 4, box.top + box.height / 2);
+                    return el.contains(top);
+                }"""
+            )
         )
         expect(count).to_have_text(str(base + 1))
         follow_up = self.page.get_by_label("Follow-up")
@@ -8969,10 +9054,13 @@ class AgentTest(ServerTestCase):
         # A follow-up waits for the process, then runs.
         follow_up.fill("after it")
         follow_up.press("Enter")
-        transcript = self.page.locator(".transcript")
         expect(transcript.locator(".turn-prompt").last).to_have_text(
             "after it", timeout=20_000
         )
+        # The task is over, and its row says how it went.
+        expect(row.get_by_role("img", name="Succeeded")).to_be_visible()
+        expect(row.locator(".spinner")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
         expect(status).to_have_text("idle", timeout=20_000)
         expect(self.page.locator(".turn-end")).to_have_text(
             ["Done · $0.01", "Done · $0.01"]
@@ -9364,6 +9452,21 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("button", name="Delete", exact=True).click()
         expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
 
+    def test_a_review_that_posts_when_asked_again(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Retried change")
+        self.page.goto(self.url + "#/auto-reviews")
+        entry = self.review_entry("Retried change")
+        expect(entry.locator(".agent-status")).to_have_text("posted", timeout=60_000)
+        self.assertEqual(len(pr.issue_comments), 1)
+        # What it was asked is in its transcript.
+        entry.locator("a.agent-item").click()
+        expect(
+            self.page.locator(
+                ".transcript .turn-prompt",
+                has_text="Your review isn't on the pull request.",
+            )
+        ).to_have_count(1)
+
     def test_a_devin_review(self) -> None:
         dialog = self.settings(self.DEVIN_REPO)
         dialog.get_by_label("Review with").select_option(label="Devin")
@@ -9393,7 +9496,13 @@ class AutoReviewTest(ServerTestCase):
         entry.locator("a.agent-item").click()
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"Review pull request {pr.url}")
-        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])
+        expect(transcript.locator(".turn-end").first).to_have_text("Done · 0.050 ACU")
+        # It was asked to post again before grenadine gave up.
+        expect(
+            transcript.locator(
+                ".turn-prompt", has_text="Your review isn't on the pull request."
+            )
+        ).to_have_count(2)
 
     def test_review_with_lists_only_installed_backends(self) -> None:
         # With only Devin installed, it's the only backend offered. The

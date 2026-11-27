@@ -1,5 +1,6 @@
 //! The HTTP API used by the web UI, and the UI's static files.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,6 +101,10 @@ fn api_routes() -> Router<Arc<State>> {
             get(reviewer_candidates),
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
+        .route(
+            "/api/pr/{owner}/{name}/{number}/rerun-checks",
+            post(rerun_checks),
+        )
         .route(
             "/api/pr/{owner}/{name}/{number}/merge/{uuid}",
             get(merge_progress),
@@ -710,6 +715,57 @@ async fn merge(
     state.resync(key.clone());
     let uuid = remember_merge(&state, key, delete, merged?);
     Ok(Json(Merged { uuid }))
+}
+
+/// Re-runs the replaced runs that fail the checks for GitHub alone, on
+/// the PR's head and on the heads of the open PRs below it in its GitHub
+/// stack, which merging it merges too. The runs are read from GitHub
+/// again, since the page's may be re-running already.
+async fn rerun_checks(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let pr = state.github.pr(&key).await?;
+    let merge = pr.review.map(|r| r.merge);
+    let below: Vec<_> = merge
+        .iter()
+        .flat_map(|m| m.stack.iter().flat_map(|s| &s.below))
+        .collect();
+    let runs: BTreeSet<u64> = merge
+        .iter()
+        .flat_map(|m| &m.stale_runs)
+        .chain(below.iter().flat_map(|p| &p.stale_runs))
+        .filter_map(|r| r.run_id)
+        .collect();
+    // The PRs below whose runs are re-run, which their own pages and
+    // inbox rows show.
+    let rerun_below: Vec<PrKey> = below
+        .iter()
+        .filter(|p| p.stale_runs.iter().any(|r| r.run_id.is_some()))
+        .map(|p| PrKey {
+            repo: key.repo.clone(),
+            number: p.number,
+        })
+        .collect();
+    let mut done = Ok(());
+    for (i, &run) in runs.iter().enumerate() {
+        done = state.github.rerun_workflow(&key.repo, run).await;
+        if let Err(e) = done {
+            // The runs re-run already stay re-run, which the error says.
+            done = Err(match i {
+                0 => e,
+                _ => e.context(format!("Re-ran {i} of {} runs, then", runs.len())),
+            });
+            break;
+        }
+    }
+    state.resync(key);
+    for below in rerun_below {
+        state.resync(below);
+    }
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// How the merge GitHub runs as `uuid` is doing. A merged merge's
