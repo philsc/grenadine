@@ -113,7 +113,7 @@ pub enum Source {
 }
 
 /// The suggestions for one prompt box; `SlashList` shows them, and the
-/// box's handlers call `input`, `keydown`, `caret_moved`, `clicked` and `blur`.
+/// box's handlers call `input`, `keydown`, `keyup`, `clicked` and `blur`.
 #[derive(Clone, Copy)]
 pub struct Suggest {
     textarea: NodeRef<leptos::html::Textarea>,
@@ -206,7 +206,7 @@ impl Suggest {
     }
 
     /// Looks again at where the caret is.
-    pub fn caret_moved(self) {
+    fn caret_moved(self) {
         let Some(t) = self.textarea.get_untracked() else {
             return;
         };
@@ -225,6 +225,18 @@ impl Suggest {
         self.read.set_value(text);
         if self.word.get_untracked() != word {
             self.word.set(word);
+        }
+    }
+
+    /// Handles a key let go in the box. Tab and the modifiers are left
+    /// out: Tabbing into the box with a command in it doesn't open the
+    /// list, and Shift's keyup comes after Tab's on Shift+Tab.
+    pub fn keyup(self, ev: &web_sys::KeyboardEvent) {
+        if !matches!(
+            ev.key().as_str(),
+            "Tab" | "Shift" | "Control" | "Alt" | "Meta" | "CapsLock"
+        ) {
+            self.caret_moved();
         }
     }
 
@@ -341,9 +353,7 @@ pub fn SlashList(suggest: Suggest, #[prop(optional)] above: bool) -> impl IntoVi
                             role="option"
                             aria-selected=(i == at).to_string()
                             class:selected=i == at
-                            // Keeps the box focused, unlike a click.
                             on:mousedown=move |ev| {
-                                ev.prevent_default();
                                 if ev.button() == 0 {
                                     suggest.pick(names.clone(), i);
                                 }
@@ -355,7 +365,16 @@ pub fn SlashList(suggest: Suggest, #[prop(optional)] above: bool) -> impl IntoVi
                 })
                 .collect_view();
             view! {
-                <ul node_ref=list class="slash-suggest" class:above=above role="listbox" aria-label="Commands">
+                <ul
+                    node_ref=list
+                    class="slash-suggest"
+                    class:above=above
+                    role="listbox"
+                    aria-label="Commands"
+                    // Keeps the box focused on a press anywhere in the
+                    // list, its padding included, unlike a click.
+                    on:mousedown=|ev| ev.prevent_default()
+                >
                     {items}
                 </ul>
             }

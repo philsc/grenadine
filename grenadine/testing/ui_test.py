@@ -5134,6 +5134,34 @@ class AgentTest(ServerTestCase):
         follow_up.press("Tab")
         expect(selected).to_have_text("/c00")
         expect(selected).to_be_in_viewport(ratio=0.9)
+
+        # Tabbing into a box that holds a command, either way, doesn't
+        # open the list, so the next Tab moves on and leaves the text be.
+        follow_up.fill("/c")
+        expect(suggestions).to_have_count(30)
+        follow_up.evaluate("e => e.blur()")
+        expect(suggestions).to_have_count(0)
+        follow_up.focus()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        self.page.keyboard.press("Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        expect(follow_up).to_have_value("/c")
+        follow_up.press_sequentially("0")
+        expect(suggestions).to_have_count(10)
+
+        # A press on the list's padding keeps the box focused and the list
+        # open.
+        self.page.locator(".slash-suggest").click(position={"x": 20, "y": 1})
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(10)
+        expect(follow_up).to_have_value("/c0")
         self.page.unroute("**/api/agents/*/slash-commands")
 
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:

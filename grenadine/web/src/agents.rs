@@ -2016,7 +2016,7 @@ pub fn NewSession(
                                 start();
                             }
                         }
-                        on:keyup=move |_| suggest.caret_moved()
+                        on:keyup=move |ev| suggest.keyup(&ev)
                         on:click=move |_| suggest.clicked()
                         on:blur=move |_| suggest.blur()
                     ></textarea>
@@ -5259,7 +5259,7 @@ fn Composer(
                         send();
                     }
                 }
-                on:keyup=move |_| suggest.caret_moved()
+                on:keyup=move |ev| suggest.keyup(&ev)
                 on:click=move |_| suggest.clicked()
                 on:blur=move |_| suggest.blur()
             ></textarea>
