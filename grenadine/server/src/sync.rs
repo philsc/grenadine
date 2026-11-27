@@ -158,6 +158,8 @@ pub struct State {
     /// event streams end.
     /// The Claude Code sessions started from the UI.
     pub agents: crate::agent::Agents,
+    /// Transcribes what the user dictates into text boxes.
+    pub dictation: crate::dictation::Dictation,
     /// Where the database file lives; the Debug tab reports its disk.
     pub db_dir: std::path::PathBuf,
     /// Unix seconds when the server started.
@@ -1165,6 +1167,7 @@ pub fn test_state_with_agents(
         viewer: std::sync::Mutex::new(None),
         update: crate::update::Updater::new(None, None),
         shutdown: tokio_util::sync::CancellationToken::new(),
+        dictation: crate::dictation::Dictation::off(),
     })
 }
 

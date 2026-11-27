@@ -16,7 +16,7 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, EditPr, Enqueue, GENERAL, GlobalSettings, InboxEdit, InboxWithPrs,
+    CleanupState, DictationInfo, EditPr, Enqueue, GENERAL, GlobalSettings, InboxEdit, InboxWithPrs,
     MERGE_POLL_LIMIT, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
     NewCleanupSession, NewComment, NewReply, NewThread, PING, PermissionMode, PrDetail, PrKey,
     PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, Side, SubmitReview,
@@ -208,6 +208,8 @@ fn api_routes() -> Router<Arc<State>> {
             "/api/agents/{id}/terminals/{terminal}/ws",
             get(terminal_socket),
         )
+        .route("/api/dictation", get(dictation_info))
+        .route("/api/dictation/ws", get(dictation_socket))
         .route("/api/cleanup", get(cleanup))
         .route("/api/cleanup/sessions", post(create_cleanup_session))
         .route(
@@ -1681,6 +1683,29 @@ async fn terminal_socket(
         return StatusCode::NOT_FOUND.into_response();
     };
     ws.on_upgrade(move |socket| terminal::attach(state, t, socket))
+}
+
+async fn dictation_info(AxState(state): St) -> Json<DictationInfo> {
+    Json(DictationInfo {
+        available: state.dictation.available(),
+    })
+}
+
+async fn dictation_socket(
+    AxState(state): St,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // The microphone's audio is the user's; other sites mustn't open one.
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin dictation").into_response();
+    }
+    if !state.dictation.available() {
+        return (StatusCode::NOT_FOUND, "dictation is off").into_response();
+    }
+    ws.on_upgrade(move |socket| async move {
+        crate::dictation::session(&state.dictation, socket).await;
+    })
 }
 
 async fn delete_agent(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {

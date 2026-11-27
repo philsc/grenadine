@@ -1,0 +1,10 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# The C interface to whisper.cpp that the server's dictation module calls.
+cc_library(
+    name = "whisper",
+    srcs = ["shim.cc"],
+    hdrs = ["shim.h"],
+    visibility = ["//grenadine/server:__pkg__"],
+    deps = ["@whisper_cpp//:whisper"],
+)
