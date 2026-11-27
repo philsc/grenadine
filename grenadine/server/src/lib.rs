@@ -257,10 +257,8 @@ pub async fn run() -> Result<()> {
         );
     } else if let Err(e) = agent::lower_agents_cpu_weight() {
         tracing::warn!("can't lower the sessions' CPU weight: {e:#}");
-    } else if agent::in_user_manager() == Some(false) {
-        tracing::warn!(
-            "the server runs outside the systemd user manager, so busy sessions can still slow it down; start it with `systemd-run --user --scope` to put it ahead of them"
-        );
+    } else if let Some(why) = agent::cpu_weight_caveat() {
+        tracing::warn!("{why}");
     }
     // Before serving, since a session being created has a worktree but no
     // row yet. The output bases of what it removes go next.

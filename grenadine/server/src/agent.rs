@@ -698,7 +698,12 @@ pub fn systemd_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The slice above every session's slice; see [`slice`].
+/// The slice that holds the sessions and sits right below the user's
+/// systemd manager. It's two levels above a session's slice, since the
+/// dashes in [`slice`]'s names nest them: `grenadine.slice` holds
+/// `grenadine-agent.slice`, which holds the sessions' slices. The weight
+/// has to be on this one: `grenadine-agent.slice` has no siblings to be
+/// ranked among, and its parent would still compete at the default.
 const AGENTS_SLICE: &str = "grenadine.slice";
 
 /// The sessions' share of a busy CPU, against systemd's default of 100
@@ -717,7 +722,7 @@ const AGENTS_CPU_WEIGHT: u32 = 20;
 /// For the same reason it doesn't reach outside the manager. A login
 /// session's scope and the system's services are siblings of the whole
 /// manager, which keeps its own weight, so against them the sessions
-/// still get all of the manager's share; see [`in_user_manager`].
+/// still get all of the manager's share; see [`cpu_weight_caveat`].
 ///
 /// The setting is the manager's, so it lasts until the manager stops, at
 /// the latest the next boot; every start of the server sets it again.
@@ -734,24 +739,46 @@ pub fn lower_agents_cpu_weight() -> Result<()> {
     Ok(())
 }
 
-/// Whether this process runs under a systemd user manager, next to the
-/// sessions' slice, which is what [`lower_agents_cpu_weight`] puts it
-/// ahead of. A server started from a plain SSH or console login isn't: it
-/// is in the login session's scope, beside the manager. `None` if the
-/// kernel doesn't say.
-pub fn in_user_manager() -> Option<bool> {
+/// Why [`lower_agents_cpu_weight`]'s setting doesn't put this process
+/// ahead of the sessions, if something says it doesn't.
+///
+/// A server started from a plain SSH or console login isn't under the
+/// user's systemd manager: it is in the login session's scope, beside the
+/// manager. And systemd accepts a weight that does nothing when the
+/// manager wasn't given the `cpu` controller, as older systemds' weren't by
+/// default.
+pub fn cpu_weight_caveat() -> Option<&'static str> {
     let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    Some(cgroup_in_user_manager(&own))
+    let Some(manager) = user_manager_cgroup(&own) else {
+        return Some(
+            "the server runs outside the systemd user manager, so busy sessions can still slow it down; start it with `systemd-run --user --scope` to put it ahead of them",
+        );
+    };
+    let controllers = Path::new("/sys/fs/cgroup")
+        .join(manager.trim_start_matches('/'))
+        .join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(controllers).ok()?;
+    (!controllers.split_whitespace().any(|c| c == "cpu")).then_some(
+        "the systemd user manager doesn't control the CPU, so the sessions' lower CPU weight does nothing; delegate `cpu` to user@.service to let it",
+    )
 }
 
-/// Whether `/proc/<pid>/cgroup`'s text names a cgroup inside a systemd
-/// user manager's, `user@<uid>.service`.
-fn cgroup_in_user_manager(cgroups: &str) -> bool {
+/// The cgroup of the systemd user manager, `user@<uid>.service`, that
+/// `/proc/<pid>/cgroup`'s text names a cgroup inside of, if it does.
+fn user_manager_cgroup(cgroups: &str) -> Option<&str> {
     cgroups
         .lines()
         .filter_map(|line| line.splitn(3, ':').nth(2))
-        .flat_map(|path| path.split('/'))
-        .any(|part| part.starts_with("user@") && part.ends_with(".service"))
+        .find_map(|path| {
+            let mut end = 0;
+            for part in path.split('/').skip(1) {
+                end += 1 + part.len();
+                if part.starts_with("user@") && part.ends_with(".service") {
+                    return Some(&path[..end]);
+                }
+            }
+            None
+        })
 }
 
 /// The systemd user slice the session's processes run in. A cgroup holds on
@@ -4563,22 +4590,31 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn only_cgroups_below_a_user_manager_are_in_it() {
+    fn only_cgroups_below_a_user_manager_name_it() {
+        let manager = Some("/user.slice/user-1000.slice/user@1000.service");
         // A service or scope the manager started, and a session's shell.
-        assert!(cgroup_in_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
-        ));
-        assert!(cgroup_in_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
-        ));
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
+            ),
+            manager
+        );
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
+            ),
+            manager
+        );
         // A login session is beside the manager, and so is the system's.
-        assert!(!cgroup_in_user_manager(
-            "0::/user.slice/user-1000.slice/session-3.scope\n"
-        ));
-        assert!(!cgroup_in_user_manager(
-            "0::/system.slice/grenadine.service\n"
-        ));
-        assert!(!cgroup_in_user_manager(""));
+        assert_eq!(
+            user_manager_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
+        );
+        assert_eq!(
+            user_manager_cgroup("0::/system.slice/grenadine.service\n"),
+            None
+        );
+        assert_eq!(user_manager_cgroup(""), None);
     }
 
     #[test]
