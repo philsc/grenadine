@@ -509,7 +509,7 @@ impl Dictation {
 
     /// Drops the recording, and the phrases still being transcribed, of a
     /// box that's gone.
-    fn cancel(self) {
+    pub fn cancel(self) {
         RECORDERS.with_borrow_mut(|r| r.remove(&self.id));
         self.phase.try_set(Phase::Idle);
         self.interim.try_set(String::new());

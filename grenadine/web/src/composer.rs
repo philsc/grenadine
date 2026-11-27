@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -78,11 +79,15 @@ pub struct OpenBoxes {
     previews: RwSignal<HashSet<String>>,
     sending: RwSignal<HashSet<String>>,
     errors: RwSignal<HashMap<String, String>>,
-    /// The open boxes' texts and dictations, made in `owner` so that they
-    /// outlive the boxes.
-    dictations: StoredValue<HashMap<String, (RwSignal<String>, Dictation)>, LocalStorage>,
+    /// The open boxes' texts and dictations, each made in its own child of
+    /// `owner` so that they outlive the boxes, and are disposed of with
+    /// that child once their box is closed.
+    dictations: StoredValue<HashMap<String, BoxDictation>, LocalStorage>,
     owner: StoredValue<Owner, LocalStorage>,
 }
+
+/// An open box's text and dictation, and the owner they were made in.
+type BoxDictation = (RwSignal<String>, Dictation, Owner);
 
 /// Inserts `name` into `set`, or removes it.
 fn toggle(set: RwSignal<HashSet<String>>, name: &str, on: bool) {
@@ -111,19 +116,18 @@ impl OpenBoxes {
     /// `draft_signal_from`), and dictation into it. Both stay the same
     /// while the box is rebuilt, until it's closed.
     fn dictation(self, draft: &str, initial: String) -> (RwSignal<String>, Dictation) {
-        if let Some(d) = self.dictations.with_value(|d| d.get(draft).copied()) {
-            return d;
+        if let Some((text, dictation, _)) = self.dictations.with_value(|d| d.get(draft).cloned()) {
+            return (text, dictation);
         }
-        let made = self.owner.with_value(|owner| {
-            owner.with(|| {
-                let text = draft_signal_from(comment_draft_key(draft), initial);
-                (text, Dictation::new(text, NodeRef::new()))
-            })
+        let owner = self.owner.with_value(Owner::child);
+        let (text, dictation) = owner.with(|| {
+            let text = draft_signal_from(comment_draft_key(draft), initial);
+            (text, Dictation::new(text, NodeRef::new()))
         });
         self.dictations.update_value(|d| {
-            d.insert(draft.to_owned(), made);
+            d.insert(draft.to_owned(), (text, dictation, owner));
         });
-        made
+        (text, dictation)
     }
 
     /// Whether the box for `draft` is open: opened and not closed since,
@@ -193,9 +197,17 @@ impl OpenBoxes {
     /// Closes the box for `draft` and drops its draft.
     pub fn close(self, draft: &str) {
         drop_draft(draft);
-        self.dictations.update_value(|d| {
-            d.remove(draft);
-        });
+        if let Some((_, dictation, owner)) = self
+            .dictations
+            .try_update_value(|d| d.remove(draft))
+            .flatten()
+        {
+            // Right away, so that no phrase comes into the closed box and
+            // its draft is kept again.
+            dictation.cancel();
+            // Once the box is gone, which it may still be using until then.
+            set_timeout(move || owner.cleanup(), Duration::ZERO);
+        }
         self.set(draft, false);
         self.set_preview(draft, false);
         self.set_error(draft, None);
