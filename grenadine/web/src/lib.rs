@@ -7,6 +7,7 @@ mod api;
 mod auto_reviews;
 mod composer;
 mod debug;
+mod dictation;
 mod diffview;
 mod drafts;
 mod events;
@@ -305,6 +306,7 @@ fn App() -> impl IntoView {
     provide_context(drafts);
     provide_context(global_settings::provide());
     provide_context(LocalResource::new(api::agent_backends));
+    dictation::provide();
     provide_context(LocalResource::new(move || {
         updates.agents.track();
         api::agents()

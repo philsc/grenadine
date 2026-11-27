@@ -5,10 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::dictation::{Dictation, DictationLine, RecordButton};
 use crate::inboxes::storage;
 use crate::pr::PrLinks;
 use crate::{api, markdown};
@@ -69,14 +71,23 @@ fn drop_draft(id: &str) {
 /// changes are being sent and why a send failed. Provided above the parts
 /// of the page that mount and unmount with its views, so that all of
 /// that survives them: an open box even before anything was typed into
-/// it, and a send that a sync of another change interrupts.
+/// it, a send that a sync of another change interrupts, and a recording
+/// into a box that a refetch of the PR rebuilds.
 #[derive(Clone, Copy)]
 pub struct OpenBoxes {
     open: RwSignal<HashSet<String>>,
     previews: RwSignal<HashSet<String>>,
     sending: RwSignal<HashSet<String>>,
     errors: RwSignal<HashMap<String, String>>,
+    /// The open boxes' texts and dictations, each made in its own child of
+    /// `owner` so that they outlive the boxes, and are disposed of with
+    /// that child once their box is closed.
+    dictations: StoredValue<HashMap<String, BoxDictation>, LocalStorage>,
+    owner: StoredValue<Owner, LocalStorage>,
 }
+
+/// An open box's text and dictation, and the owner they were made in.
+type BoxDictation = (RwSignal<String>, Dictation, Owner);
 
 /// Inserts `name` into `set`, or removes it.
 fn toggle(set: RwSignal<HashSet<String>>, name: &str, on: bool) {
@@ -96,7 +107,27 @@ impl OpenBoxes {
             previews: RwSignal::new(Default::default()),
             sending: RwSignal::new(Default::default()),
             errors: RwSignal::new(Default::default()),
+            dictations: StoredValue::new_local(HashMap::new()),
+            owner: StoredValue::new_local(Owner::current().expect("OpenBoxes made in a component")),
         }
+    }
+
+    /// The text of the box for `draft`, starting out as `initial` (see
+    /// `draft_signal_from`), and dictation into it. Both stay the same
+    /// while the box is rebuilt, until it's closed.
+    fn dictation(self, draft: &str, initial: String) -> (RwSignal<String>, Dictation) {
+        if let Some((text, dictation, _)) = self.dictations.with_value(|d| d.get(draft).cloned()) {
+            return (text, dictation);
+        }
+        let owner = self.owner.with_value(Owner::child);
+        let (text, dictation) = owner.with(|| {
+            let text = draft_signal_from(comment_draft_key(draft), initial);
+            (text, Dictation::new(text, NodeRef::new()))
+        });
+        self.dictations.update_value(|d| {
+            d.insert(draft.to_owned(), (text, dictation, owner));
+        });
+        (text, dictation)
     }
 
     /// Whether the box for `draft` is open: opened and not closed since,
@@ -166,6 +197,17 @@ impl OpenBoxes {
     /// Closes the box for `draft` and drops its draft.
     pub fn close(self, draft: &str) {
         drop_draft(draft);
+        if let Some((_, dictation, owner)) = self
+            .dictations
+            .try_update_value(|d| d.remove(draft))
+            .flatten()
+        {
+            // Right away, so that no phrase comes into the closed box and
+            // its draft is kept again.
+            dictation.cancel();
+            // Once the box is gone, which it may still be using until then.
+            set_timeout(move || owner.cleanup(), Duration::ZERO);
+        }
         self.set(draft, false);
         self.set_preview(draft, false);
         self.set_error(draft, None);
@@ -267,7 +309,8 @@ fn send_hint() -> &'static str {
 /// A markdown text box with Write and Preview tabs. `draft` names the box
 /// in `OpenBoxes`, which keeps whether it shows its preview, and `repo` is
 /// where markdown references in the preview point. `on_submit` runs on
-/// Ctrl+Enter.
+/// Ctrl+Enter. `dictation` goes into the box, which then binds its
+/// textarea; the caller places its `RecordButton`.
 #[component]
 pub fn MarkdownEditor(
     text: RwSignal<String>,
@@ -278,12 +321,15 @@ pub fn MarkdownEditor(
     #[prop(default = 4)] rows: u32,
     #[prop(optional)] on_submit: Option<Callback<()>>,
     #[prop(optional)] autofocus: bool,
+    #[prop(optional)] dictation: Option<Dictation>,
 ) -> impl IntoView {
     let boxes = expect_context::<OpenBoxes>();
     let draft = StoredValue::new(draft);
     let preview = Signal::derive(move || draft.with_value(|d| boxes.preview(d)));
     let set_preview = move |on: bool| draft.with_value(|d| boxes.set_preview(d, on));
-    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let textarea =
+        dictation.map_or_else(NodeRef::<leptos::html::Textarea>::new, Dictation::textarea);
+    let dictating = move || dictation.is_some_and(Dictation::busy);
     if autofocus {
         Effect::new(move |_| {
             if let Some(t) = textarea.get() {
@@ -303,6 +349,8 @@ pub fn MarkdownEditor(
         <textarea
             node_ref=textarea
             class="markdown-editor"
+            class:dictating=dictating
+            prop:readOnly=dictating
             rows=rows
             aria-label=label
             placeholder=placeholder
@@ -312,6 +360,7 @@ pub fn MarkdownEditor(
             on:keydown=move |ev| {
                 if let Some(cb) = on_submit
                     && submits(&ev)
+                    && !dictating()
                 {
                     ev.prevent_default();
                     cb.run(());
@@ -328,6 +377,7 @@ pub fn MarkdownEditor(
             });
             view! { <div class="markdown composer-preview" inner_html=html></div> }
         })}
+        {dictation.map(|d| view! { <DictationLine dictation=d /> })}
     }
 }
 
@@ -351,7 +401,10 @@ pub fn Composer(
     #[prop(optional)] allow_empty: bool,
 ) -> impl IntoView {
     let boxes = expect_context::<OpenBoxes>();
-    let text = draft_signal_from(comment_draft_key(&draft), initial.unwrap_or_default());
+    let (text, dictation) = boxes.dictation(&draft, initial.unwrap_or_default());
+    // The recording goes on while the box is rebuilt, e.g. when the PR is
+    // refetched, and ends with it otherwise.
+    dictation.end_with_box();
     let busy = {
         let draft = draft.clone();
         Signal::derive(move || boxes.sending(&draft))
@@ -364,7 +417,7 @@ pub fn Composer(
     let (send, alt_send) = (StoredValue::new(send), StoredValue::new(alt_send));
     let draft = StoredValue::new(draft);
     let empty = move || text.with(|t| t.trim().is_empty());
-    let blocked = move || !allow_empty && empty();
+    let blocked = move || (!allow_empty && empty()) || dictation.busy();
     // Sends with the main button's action, or with `alt`'s.
     let submit_with = move |use_alt: bool| {
         if blocked() || busy.get_untracked() {
@@ -397,6 +450,7 @@ pub fn Composer(
                 placeholder=placeholder
                 on_submit=submit
                 autofocus=autofocus
+                dictation=dictation
             />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
@@ -407,6 +461,7 @@ pub fn Composer(
                     <button type="button" disabled=move || blocked() || busy.get()
                         on:click=move |_| submit_with(true)>{l}</button>
                 })}
+                <RecordButton dictation=dictation />
                 <button type="button" disabled=move || busy.get() on:click=move |_| {
                     text.set(String::new());
                     draft.with_value(|d| boxes.close(d));

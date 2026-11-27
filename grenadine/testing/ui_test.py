@@ -12,10 +12,12 @@ import base64
 import datetime
 import http.client
 import json
+import math
 import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,6 +26,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import wave
 import zoneinfo
 from collections.abc import Callable
 from pathlib import Path
@@ -736,6 +739,13 @@ class ServerTestCase(unittest.TestCase):
     REPOS: ClassVar[list[str]] = [scenarios.REPO]
     # Seconds between the server's polls of GitHub.
     POLL_INTERVAL: ClassVar[int] = 60
+    # More flags for the server.
+    SERVER_FLAGS: ClassVar[list[str]] = []
+
+    @classmethod
+    def chrome_args(cls, tmp: Path) -> list[str]:
+        """More flags for Chrome; `tmp` is the class's directory."""
+        return []
 
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -841,6 +851,7 @@ class ServerTestCase(unittest.TestCase):
                 "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
+                *cls.SERVER_FLAGS,
             ],
             env,
         )
@@ -874,7 +885,9 @@ class ServerTestCase(unittest.TestCase):
         )
         chrome_env["FONTCONFIG_FILE"] = str(fonts_conf)
         cls.browser = cls.playwright.chromium.launch(
-            executable_path=os.environ["CHROME"], env=chrome_env
+            executable_path=os.environ["CHROME"],
+            env=chrome_env,
+            args=cls.chrome_args(tmp),
         )
         cls.addClassCleanup(cls.browser.close)
 
@@ -10019,6 +10032,169 @@ class CleanupTest(ServerTestCase):
             ).click()
             expect(items).to_have_count(n)
         expect(select_all).to_have_count(0)
+
+
+def write_speech(path: Path) -> None:
+    """Writes a WAV that sounds enough like speech to the server: bursts of
+    syllable-like tones, 2 s each, with 1 s pauses."""
+    rate = 16000
+    samples = []
+    for _ in range(3):
+        samples += [0.0] * rate
+        for i in range(2 * rate):
+            t = i / rate
+            tones = sum(math.sin(2 * math.pi * f * t) for f in (220, 660, 1320)) / 3
+            # Four syllables a second.
+            samples.append(0.5 * tones * (0.6 + 0.4 * math.sin(2 * math.pi * 4 * t)))
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(v * 32767)) for v in samples))
+
+
+class DictationTest(ServerTestCase):
+    """Dictating into text boxes, with a fake transcriber and microphone.
+    The fake transcribes each phrase as "phrase N." and previews it as
+    "hearing N"."""
+
+    SERVER_FLAGS: ClassVar[list[str]] = ["--fake-dictation"]
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.prs = scenarios.review_cases(gh)
+
+    @classmethod
+    def chrome_args(cls, tmp: Path) -> list[str]:
+        speech = tmp / "speech.wav"
+        write_speech(speech)
+        return [
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
+            f"--use-file-for-fake-audio-capture={speech}",
+        ]
+
+    def test_dictates_at_the_cursor(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("Before after")
+        prompt.evaluate("t => t.setSelectionRange(6, 6)")
+        start = self.page.get_by_role("button", name="Start", exact=True)
+
+        self.page.get_by_role("button", name="Record").click()
+        # The box is read-only and can't be sent while recording.
+        expect(prompt).to_have_js_property("readOnly", True)
+        expect(start).to_be_disabled()
+        # The phrase being spoken shows under the box, and finished
+        # phrases go where the cursor was.
+        expect(self.page.locator(".dictation-interim")).to_contain_text("hearing")
+        expect(prompt).to_have_value("Before phrase 1. after")
+
+        self.page.get_by_role("button", name=re.compile("Stop")).click()
+        expect(prompt).to_have_js_property("readOnly", False)
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # Stopping finished the phrase being spoken, if there was one.
+        expect(prompt).to_have_value(
+            re.compile(r"^Before phrase 1\.( phrase \d\.)* after$")
+        )
+        expect(start).to_be_enabled()
+        # The cursor is after the inserted text.
+        value = prompt.input_value()
+        self.assertEqual(
+            prompt.evaluate("t => t.selectionStart"), len(value) - len(" after")
+        )
+        expect(prompt).to_be_focused()
+
+    def test_finishing_leaves_the_focus_where_the_user_went(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        prompt = self.page.get_by_label("Prompt")
+        self.page.get_by_role("button", name="Record").click()
+        expect(prompt).to_have_value(re.compile("phrase 1"))
+        # Stopping without a press leaves the focus in the other field, as
+        # when the user went there while the last phrases were transcribed.
+        other = self.page.get_by_label("Start from PR")
+        other.focus()
+        self.page.get_by_role("button", name="Stop").dispatch_event("click")
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # The cursor moved, so finishing is over.
+        self.page.wait_for_function(
+            "t => !t.readOnly && t.selectionStart === t.value.length",
+            arg=prompt.element_handle(),
+        )
+        # Past the animation frame that would focus the box.
+        self.page.evaluate(
+            "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+        )
+        expect(other).to_be_focused()
+
+    def test_recording_survives_a_refetch(self) -> None:
+        pr = self.prs[scenarios.KEEP]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        conversation = self.page.locator("details.conversation")
+        conversation.get_by_role("button", name="Comment").click()
+        box = conversation.get_by_role("textbox", name="Comment")
+        conversation.get_by_role("button", name="Record").click()
+        expect(box).to_have_value(re.compile(r"phrase \d+\.$"))
+        phrases = box.input_value().count("phrase")
+
+        # A comment from outside the page refetches the PR, which rebuilds
+        # the box.
+        resp = self.page.request.post(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}/comments",
+            headers={"Origin": self.url.rstrip("/")},
+            data={"body": "Ping"},
+        )
+        self.assertEqual(resp.status, 204, resp.text())
+        expect(self.page.locator("details.conversation summary")).to_have_text(
+            "1 comment"
+        )
+
+        # The recording goes on into the rebuilt box.
+        stop = conversation.get_by_role("button", name=re.compile("Stop"))
+        expect(stop).to_be_visible()
+        expect(box).to_have_js_property("readOnly", True)
+        self.page.wait_for_function(
+            "([t, n]) => t.value.split('phrase').length - 1 > n",
+            arg=[box.element_handle(), phrases],
+        )
+        stop.click()
+        expect(box).to_have_js_property("readOnly", False)
+        expect(conversation.get_by_role("button", name="Record")).to_be_visible()
+
+        # Cancel ends the recording with the box.
+        conversation.get_by_role("button", name="Record").click()
+        expect(stop).to_be_visible()
+        conversation.get_by_role("button", name="Cancel").click()
+        expect(box).to_have_count(0)
+        expect(self.page.locator(".dictation-line")).to_have_count(0)
+        # It opens again empty and not recording.
+        conversation.get_by_role("button", name="Comment").click()
+        expect(box).to_have_value("")
+        expect(conversation.get_by_role("button", name="Record")).to_be_visible()
+
+    def test_review_popup_stays_open_while_dictating(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        pr = self.prs[scenarios.APPROVE]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        panel = self.page.locator(".review-panel")
+        popup = panel.locator(".review-popup")
+        panel.locator(".review-button").click()
+        box = panel.get_by_role("textbox", name="Review summary")
+        panel.get_by_role("button", name="Record").click()
+        expect(box).to_have_js_property("readOnly", True)
+
+        # Escape, a press outside and the Review button would hide the Stop
+        # button with the popup, so they leave it open.
+        self.page.keyboard.press("Escape")
+        self.page.locator(".pr-header h1").click()
+        panel.locator(".review-button").click()
+        expect(popup).to_be_visible()
+
+        # Once stopped, the popup closes again.
+        panel.get_by_role("button", name=re.compile("Stop")).click()
+        expect(box).to_have_js_property("readOnly", False)
+        self.page.keyboard.press("Escape")
+        expect(popup).to_be_hidden()
 
 
 class UpdateTest(ServerTestCase):

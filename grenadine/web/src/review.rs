@@ -16,6 +16,7 @@ use crate::api;
 use crate::composer::{
     ComposerToggle, MarkdownEditor, OpenBoxes, comment_draft_key, draft_signal, sender,
 };
+use crate::dictation::{Dictation, DictationLine, RecordButton};
 use crate::hash_for;
 use crate::inboxes::CiIcon;
 use crate::pr::{CommentFrame, PersonChip, PrLinks, ReviewTarget, review_version, version_at};
@@ -1117,7 +1118,13 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
         let draft = draft.clone();
         Signal::derive(move || boxes.error(&draft))
     };
-    let blocker = move || body.with(|b| submit_blocker(event.get(), b, pending.get()));
+    let dictation = Dictation::new(body, NodeRef::new());
+    let blocker = move || {
+        if dictation.busy() {
+            return Some("Stop dictating first.");
+        }
+        body.with(|b| submit_blocker(event.get(), b, pending.get()))
+    };
     let (key, name) = (StoredValue::new(key), StoredValue::new(draft.clone()));
     let submit = move |_| {
         if blocker().is_some() {
@@ -1170,6 +1177,13 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
     // DOM under the pointer, so a click's target may already be detached and
     // `closest` can't place it in the panel; pointerdown also doesn't fire
     // when a selection drag that started in the textarea ends outside.
+    // While the summary is being dictated, the popup stays open: hiding it
+    // would hide the Stop button with it, and the microphone would stay on.
+    let close = move || {
+        if !untrack(|| dictation.busy()) {
+            open.set(false);
+        }
+    };
     let on_pointer = window_event_listener(leptos::ev::pointerdown, move |ev| {
         if !open.get_untracked() {
             return;
@@ -1180,12 +1194,12 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
             .and_then(|t| t.closest(".review-panel").ok().flatten())
             .is_some();
         if !inside {
-            open.set(false);
+            close();
         }
     });
     let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" {
-            open.set(false);
+            close();
         }
     });
     on_cleanup(move || {
@@ -1197,7 +1211,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
         // goes, and a <details>' open state lives in the DOM.
         <div class="review-panel" class:open=move || open.get()>
             <button type="button" class="review-button" aria-expanded=move || open.get().to_string()
-                on:click=move |_| open.update(|o| *o = !*o)>
+                on:click=move |_| if open.get_untracked() { close() } else { open.set(true) }>
                 "Review"
                 {move || (pending.get() > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending.get()}</span> })}
             </button>
@@ -1209,6 +1223,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
                     label="Review summary"
                     placeholder="Leave a summary (optional for approvals)…"
                     rows=5
+                    dictation=dictation
                 />
                 <div class="review-choices">
                     {choice(ReviewEvent::Comment, "Comment", "Feedback without approving")}
@@ -1221,6 +1236,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
                         disabled=move || busy.get() || blocker().is_some() on:click=submit>
                         {move || if busy.get() { "Submitting…" } else { "Submit review" }}
                     </button>
+                    <RecordButton dictation=dictation />
                     {move || reviewing.get().then(|| view! {
                         <button type="button" class="danger" disabled=move || busy.get() on:click=discard>"Discard review"</button>
                     })}
@@ -1427,13 +1443,31 @@ pub struct MergeChoice {
     warning: RwSignal<Option<String>>,
     /// The direct-merge controls are revealed on a merge-queue branch.
     bypass: RwSignal<bool>,
+    /// Dictation into the squash commit's message. It lives with the
+    /// page, since the merge box is rebuilt each time the PR refreshes.
+    dictation: Dictation,
 }
 
 impl MergeChoice {
     pub fn new() -> MergeChoice {
+        let message = RwSignal::new(None::<(String, String)>);
+        let dictation = Dictation::with_text(
+            Signal::derive(move || {
+                message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
+            }),
+            SignalSetter::map(move |body| {
+                message.update(|m| {
+                    if let Some(m) = m {
+                        m.1 = body;
+                    }
+                })
+            }),
+            NodeRef::new(),
+        );
         MergeChoice {
             method: RwSignal::new(None),
-            message: RwSignal::new(None),
+            message,
+            dictation,
             delete_branch: RwSignal::new(None),
             merged: RwSignal::new(false),
             warning: RwSignal::new(None),
@@ -1492,6 +1526,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         delete_branch,
         merged,
         warning,
+        dictation,
         ..
     } = expect_context::<MergeChoice>();
     let name = StoredValue::new(merge_name(&key));
@@ -1562,10 +1597,14 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
         why.join("\n")
     });
     let merge_base = stack_base.clone();
+    let message_box = dictation.textarea();
     let merge = move |_| {
         let (Some(m), Some(head)) = (chosen(), head.clone()) else {
             return;
         };
+        if dictation.busy() {
+            return;
+        }
         let (last, rest) = landing.split_last().expect("the merged PR lands");
         let numbers = match rest.is_empty() {
             true => format!("#{last}"),
@@ -1629,7 +1668,7 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
                     }).collect_view()}
                 </select>
                 <button type="button" class=if admin { "danger" } else { "primary" }
-                    disabled=move || busy() || merged.get() || is_blocked || target.head_oid.is_none()
+                    disabled=move || busy() || merged.get() || is_blocked || target.head_oid.is_none() || dictation.busy()
                     title=if admin { "Merges without waiting for the branch's rules, which you may bypass" } else { "" }
                     on:click=merge>
                     {move || match (busy(), merged.get(), admin) {
@@ -1658,15 +1697,26 @@ fn merge_controls(info: &ReviewInfo, target: MergeTarget, admin: bool) -> impl I
                     }
                 })}
             </div>
-            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| view! {
+            {move || (chosen() == Some(MergeMethod::Squash) && editing()).then(|| {
+                // The recording goes with the box, or it would go on with
+                // no Stop when the method changes.
+                dictation.end_with_box();
+                view! {
                 <div class="merge-message">
                     <input type="text" aria-label="Commit title"
                         prop:value=move || message.with(|m| m.as_ref().map(|m| m.0.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.0 = event_target_value(&ev) }) />
-                    <textarea rows="6" aria-label="Commit message"
+                    <textarea rows="6" aria-label="Commit message" node_ref=message_box
+                        class:dictating=move || dictation.busy()
+                        prop:readOnly=move || dictation.busy()
                         prop:value=move || message.with(|m| m.as_ref().map(|m| m.1.clone()).unwrap_or_default())
                         on:input=move |ev| message.update(|m| if let Some(m) = m { m.1 = event_target_value(&ev) })></textarea>
+                    <DictationLine dictation=dictation />
+                    <div class="form-buttons">
+                        <RecordButton dictation=dictation />
+                    </div>
                 </div>
+                }
             })}
             {move || error().map(|e| view! { <p class="error">{e}</p> })}
         </div>

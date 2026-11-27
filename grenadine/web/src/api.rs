@@ -9,9 +9,9 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, EditPr, Enqueue, GitHubUsage, GlobalSettings, InboxEdit, InboxWithPrs,
-    MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
-    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
+    CleanupState, DictationInfo, EditPr, Enqueue, GitHubUsage, GlobalSettings, InboxEdit,
+    InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment,
+    NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
     ReviewerCandidates, ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus,
     SystemStats, TerminalInfo, UpdateCheck, UpdateStatus, WorktreeChanges, WrapUp, WriteHandoff,
 };
@@ -338,6 +338,15 @@ pub fn changes_cache_stats() -> (usize, usize) {
 /// The configured repositories.
 pub async fn repos() -> Result<Vec<String>> {
     check(Request::get("/api/repos").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether the server transcribes dictation.
+pub async fn dictation_info() -> Result<DictationInfo> {
+    check(Request::get("/api/dictation").send().await)
         .await?
         .json()
         .await
