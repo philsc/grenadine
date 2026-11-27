@@ -4,10 +4,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use grenadine_core::api::{
-    AutoMerge, Check, CiStatus, Enqueue, IssueComment, MergeMethod, MergeRequest, MergeState,
-    MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review, ReviewDecision,
-    ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, ReviewerChange, StackMergePr,
-    StaleRun, SubmitReview, TeamRef, Version, reviewer_change, submit_blocker,
+    AutoMerge, Check, CiStatus, Enqueue, IssueComment, MERGE_POLL_LIMIT, MergeMethod, MergeRequest,
+    MergeState, MergeStatus, Person, PrDetail, PrKey, QueueState, RequestedReviewer, Review,
+    ReviewDecision, ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, ReviewerChange,
+    StackMergePr, StaleRun, SubmitReview, TeamRef, Version, reviewer_change, submit_blocker,
 };
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -1366,14 +1366,11 @@ async fn sleep(ms: i32) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// How long polling a merge gives up after, in milliseconds.
-const MERGE_POLL_LIMIT: f64 = 10.0 * 60.0 * 1000.0;
-
 /// Follows GitHub's asynchronous merge `uuid` until it lands, joins the
 /// merge queue or fails. `warning` takes what went wrong after merging,
 /// e.g. a branch that stayed.
 async fn poll_merge(key: &PrKey, uuid: &str, warning: RwSignal<Option<String>>) -> api::Result<()> {
-    let deadline = js_sys::Date::now() + MERGE_POLL_LIMIT;
+    let deadline = js_sys::Date::now() + MERGE_POLL_LIMIT.as_millis() as f64;
     loop {
         let progress = api::merge_progress(key, uuid).await?;
         match progress.status {

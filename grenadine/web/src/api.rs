@@ -13,7 +13,7 @@ use grenadine_core::api::{
     MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
     NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
     ReviewerCandidates, ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus,
-    SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
+    SystemStats, TerminalInfo, UpdateCheck, UpdateStatus, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -219,6 +219,42 @@ pub async fn system_stats() -> Result<SystemStats> {
         .json()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Where the server's update to a newer version stands.
+pub async fn update_status() -> Result<UpdateStatus> {
+    check(Request::get("/api/update").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What an update would bring. The server fetches for it.
+pub async fn check_update() -> Result<UpdateCheck> {
+    check(Request::get("/api/update/check").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn start_update() -> Result<()> {
+    post_update("/api/update").await
+}
+
+/// Restarts into the waiting update without waiting any longer.
+pub async fn force_update() -> Result<()> {
+    post_update("/api/update/force").await
+}
+
+/// Drops the waiting update, or dismisses a failed one.
+pub async fn cancel_update() -> Result<()> {
+    post_update("/api/update/cancel").await
+}
+
+async fn post_update(url: &str) -> Result<()> {
+    check(Request::post(url).send().await).await.map(|_| ())
 }
 
 pub async fn sync_status() -> Result<SyncStatus> {

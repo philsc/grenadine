@@ -9,6 +9,7 @@ reviews can refer to it.
 - [Reviews and merge state](#reviews-and-merge-state)
 - [Agent stacks](#agent-stacks)
 - [Agent handoffs](#agent-handoffs)
+- [Server updates](#server-updates)
 
 # Stacked PRs
 
@@ -865,3 +866,61 @@ that handed it off.
 
 **AGENT-HANDOFF-LINK-2.** The tool must return once the new session has
 started, without waiting for its work.
+
+# Server updates
+
+These requirements cover updating the running server to the newest
+`origin/main` from the UI.
+
+**UPDATE-1.** The Debug tab must show the commit the server runs, the
+commits of `origin/main` it doesn't have, and a button to update. A server
+that wasn't started with `bazel run` must not offer to update.
+
+**UPDATE-2.** An update must build in the clone that `bazel run` started
+the server from. It must refuse to touch a clone that has a branch checked
+out, uncommitted changes to tracked files, or commits that aren't in
+`origin/main`.
+_Why:_ the clone may hold someone's work.
+
+**UPDATE-3.** The server must go on serving during the build. A failed
+build must leave it running, show why the build failed, and put the clone
+back unless someone has changed it meanwhile. The user must be able to
+cancel the build, which must put the clone back likewise. So must stopping
+the server while it builds or waits to restart, and a restart that can't run
+the new build, after which the server must report the commit it really runs.
+_Why:_ a clone left at the new commit would have the next `bazel run` start
+the new version, which nobody chose.
+
+**UPDATE-4.** The restart must wait until no session runs a turn, has
+prompts queued, is landing its work, is having a handoff written or is
+finishing an automatic review, no session is being deleted, including its
+Bazel output bases, or scanned for what it left behind, no merge that a page
+may still follow runs or has branches left to delete, and no terminal runs a
+command in the foreground. A terminal whose shell is at its prompt must not
+hold it up. The user must be able to cancel it, or to restart at once after
+being told which sessions that stops and which merges it affects. While it
+waits, the page must show how many open terminals the restart closes.
+Cancelling it must put the clone back as cancelling the build does. Once
+it's cancelled, a request to restart at once must be refused.
+
+**UPDATE-5.** The restart must keep the server's process ID, terminal and
+arguments. SIGINT and SIGTERM must still stop the server, also while it
+restarts.
+
+**UPDATE-6.** Every page must show the update's progress. A page that was
+loaded from another commit than the server runs must offer a reload and
+must not reload by itself. The page must know its commit from the server
+that served it, also when the server restarts before the page's first
+request.
+_Why:_ the user may be in the middle of something.
+
+**UPDATE-7.** The restart must run the build that the update made, also
+when the clone or Bazel's output changed during the wait. If that build is
+gone, the server must keep running, show that the update failed and put the
+clone back as a failed build does. If the build can't be run once the
+server has shut down for it, the version that ran must start again and show
+why. A clone that changes during the build must fail the update.
+_Why:_ the wait can take hours, and work in the clone goes on meanwhile.
+
+**UPDATE-8.** An update must not remove or overwrite files next to the
+database that no update created.

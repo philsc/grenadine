@@ -283,6 +283,34 @@ input[type="text"] {
   margin-bottom: 4px;
 }
 
+/* The server's update, below the top bar */
+
+.update-bar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 4px 16px;
+  background: var(--warn-bg);
+  border-bottom: 1px solid var(--warn-border);
+  font-size: 12px;
+}
+.update-bar details {
+  flex-basis: 100%;
+}
+.update-bar pre,
+.update-server .error {
+  margin: 4px 0;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.update-server {
+  margin-bottom: 24px;
+}
+
 /* Debug tab */
 
 .debug {

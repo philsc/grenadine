@@ -148,6 +148,26 @@ impl Terminals {
         }
     }
 
+    /// How many terminals are open.
+    pub fn count(&self) -> usize {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.values().map(|s| s.open.len()).sum()
+    }
+
+    /// How many terminals run a command in the foreground, for each
+    /// session with any.
+    pub fn busy(&self) -> BTreeMap<String, usize> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .map(|(id, s)| {
+                let busy = s.open.values().filter(|t| !t.at_prompt()).count();
+                (id.clone(), busy)
+            })
+            .filter(|(_, busy)| *busy > 0)
+            .collect()
+    }
+
     fn remove(&self, session: &str, id: u64) {
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(s) = sessions.get_mut(session) {
@@ -445,8 +465,8 @@ fn waiting_for_input(syscall: &str) -> bool {
     }
 }
 
-/// Sends `signal` to the shell's process group; the shell leads it.
-fn signal_group(pid: u32, signal: libc::c_int) {
+/// Sends `signal` to the process group that `pid` leads, e.g. a shell's.
+pub(crate) fn signal_group(pid: u32, signal: libc::c_int) {
     // SAFETY: kill has no memory-safety preconditions.
     unsafe {
         libc::kill(-(pid as libc::pid_t), signal);

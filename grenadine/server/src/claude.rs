@@ -587,12 +587,17 @@ fn parse_line(line: &str) -> Parsed {
 /// The settings that have this binary check each of a job's Bash commands
 /// as its PreToolUse hook, `cleanup::bash_hook`.
 fn bash_hook_settings() -> Result<Value> {
-    let exe = std::env::current_exe().context("can't find the server's executable")?;
-    let exe = exe
-        .to_str()
-        .and_then(|e| shlex::try_quote(e).ok())
-        .ok_or_else(|| anyhow!("can't quote {}", exe.display()))?;
-    let hook = format!("{exe} {}", crate::cleanup::BASH_HOOK_ARG);
+    // Not the executable's path: once a build has replaced the file, the
+    // path has another version's binary, or none, at it.
+    let exe = format!("/proc/{}/exe", std::process::id());
+    // Claude Code only blocks the command on 2. A job can outlive the
+    // server, and then the PID, and with it the executable, can be another
+    // process's: only the server's hook prints the allow marker.
+    let hook = format!(
+        "[ \"$({exe} {})\" = {} ] || exit 2",
+        crate::cleanup::BASH_HOOK_ARG,
+        crate::cleanup::BASH_HOOK_ALLOW,
+    );
     Ok(json!({"hooks": {"PreToolUse": [{
         "matcher": "Bash",
         "hooks": [{"type": "command", "command": hook}],
