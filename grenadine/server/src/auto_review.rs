@@ -705,6 +705,8 @@ async fn finish(
     let answered = events
         .iter()
         .any(|e| matches!(e.kind, AgentEventKind::TurnEnded { error: None, .. }));
+    // A retry runs like the session's last turn, so whoever prompted the
+    // session last, e.g. someone looking into the review, decides how.
     let (mode, model) = match (last, turn) {
         (AgentStatus::Idle, Some(turn)) if answered => turn,
         // A session stopped before its turn ran is idle too.
@@ -1366,6 +1368,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","tot
             .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
             .count();
         assert_eq!(prompts, 1);
+        // Nothing brought back the deleted session's live state.
+        assert!(!state.agents.has_live(&id));
         assert!(state.db.agent(&id).unwrap().is_none());
     }
 

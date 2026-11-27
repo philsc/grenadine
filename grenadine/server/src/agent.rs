@@ -1049,6 +1049,12 @@ impl Agents {
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
     }
 
+    /// Whether the session has live state.
+    #[cfg(test)]
+    pub fn has_live(&self, id: &str) -> bool {
+        self.live.lock().unwrap().contains_key(id)
+    }
+
     /// Runs `f` on the session's live state if it has any, e.g. not once
     /// the session is deleted.
     fn with_existing_live<T>(&self, id: &str, f: impl FnOnce(&mut Live) -> T) -> Option<T> {
@@ -1460,7 +1466,7 @@ pub fn send(
 }
 
 /// Sends `prompt` like `send`, but only to a session with no turn running
-/// or queued. Returns whether it sent it.
+/// or queued. Returns whether it sent it; a deleted session gets nothing.
 pub fn send_if_idle(
     state: &Arc<State>,
     id: &str,
@@ -1468,7 +1474,7 @@ pub fn send_if_idle(
     mode: PermissionMode,
     model: Option<String>,
 ) -> bool {
-    let start = state.agents.with_live(id, |l| {
+    let start = state.agents.with_existing_live(id, |l| {
         if l.running || !l.queue.is_empty() || l.writing_handoff {
             return false;
         }
@@ -1481,18 +1487,22 @@ pub fn send_if_idle(
         });
         l.running = true;
         true
-    });
+    }) == Some(true);
     if start {
         tokio::spawn(run(state.clone(), id.to_owned()));
     }
     start
 }
 
-/// Whether the session has a turn running or queued.
+/// Whether the session has a turn running or queued. A deleted session
+/// has none.
 pub fn is_busy(state: &State, id: &str) -> bool {
-    state.agents.with_live(id, |l| {
-        l.running || !l.queue.is_empty() || l.writing_handoff
-    })
+    state
+        .agents
+        .with_existing_live(id, |l| {
+            l.running || !l.queue.is_empty() || l.writing_handoff
+        })
+        .unwrap_or(false)
 }
 
 /// Queues a prompt with the images `save_images` saved for it and the
