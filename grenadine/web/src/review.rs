@@ -1177,6 +1177,13 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
     // DOM under the pointer, so a click's target may already be detached and
     // `closest` can't place it in the panel; pointerdown also doesn't fire
     // when a selection drag that started in the textarea ends outside.
+    // While the summary is being dictated, the popup stays open: hiding it
+    // would hide the Stop button with it, and the microphone would stay on.
+    let close = move || {
+        if !untrack(|| dictation.busy()) {
+            open.set(false);
+        }
+    };
     let on_pointer = window_event_listener(leptos::ev::pointerdown, move |ev| {
         if !open.get_untracked() {
             return;
@@ -1187,12 +1194,12 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
             .and_then(|t| t.closest(".review-panel").ok().flatten())
             .is_some();
         if !inside {
-            open.set(false);
+            close();
         }
     });
     let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" {
-            open.set(false);
+            close();
         }
     });
     on_cleanup(move || {
@@ -1204,7 +1211,7 @@ pub fn ReviewPanel(pending: Memo<usize>, own: Memo<bool>) -> impl IntoView {
         // goes, and a <details>' open state lives in the DOM.
         <div class="review-panel" class:open=move || open.get()>
             <button type="button" class="review-button" aria-expanded=move || open.get().to_string()
-                on:click=move |_| open.update(|o| *o = !*o)>
+                on:click=move |_| if open.get_untracked() { close() } else { open.set(true) }>
                 "Review"
                 {move || (pending.get() > 0).then(|| view! { <span class="badge pending-count" title="Pending comments">{pending.get()}</span> })}
             </button>

@@ -10172,6 +10172,30 @@ class DictationTest(ServerTestCase):
         expect(box).to_have_value("")
         expect(conversation.get_by_role("button", name="Record")).to_be_visible()
 
+    def test_review_popup_stays_open_while_dictating(self) -> None:
+        self.page.set_viewport_size({"width": 1800, "height": 900})
+        pr = self.prs[scenarios.APPROVE]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        panel = self.page.locator(".review-panel")
+        popup = panel.locator(".review-popup")
+        panel.locator(".review-button").click()
+        box = panel.get_by_role("textbox", name="Review summary")
+        panel.get_by_role("button", name="Record").click()
+        expect(box).to_have_js_property("readOnly", True)
+
+        # Escape, a press outside and the Review button would hide the Stop
+        # button with the popup, so they leave it open.
+        self.page.keyboard.press("Escape")
+        self.page.locator(".pr-header h1").click()
+        panel.locator(".review-button").click()
+        expect(popup).to_be_visible()
+
+        # Once stopped, the popup closes again.
+        panel.get_by_role("button", name=re.compile("Stop")).click()
+        expect(box).to_have_js_property("readOnly", False)
+        self.page.keyboard.press("Escape")
+        expect(popup).to_be_hidden()
+
 
 class UpdateTest(ServerTestCase):
     # The server runs its new build from next to the database.
