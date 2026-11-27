@@ -457,7 +457,15 @@ def result(tool_use, content, is_error=False, patch=None):
     emit(line)
 
 
-emit({"type": "system", "subtype": "init", "session_id": "s", "model": model})
+emit({
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "model": model,
+    "slash_commands": ["bar", "baz", "clear", "doctor", "foo"],
+    "skills": ["bar", "baz", "foo"],
+    "terminal_slash_commands": ["doctor"],
+})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
     time.sleep(0.05)
@@ -758,8 +766,16 @@ class ServerTestCase(unittest.TestCase):
         devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
         devin.chmod(0o755)
 
+        # The skills a prompt is offered before any session listed its
+        # own: the same as the fake claude lists.
+        claude_config = tmp / "claude_config"
+        for skill in ["bar", "baz", "foo"]:
+            (claude_config / "skills" / skill).mkdir(parents=True)
+            (claude_config / "skills" / skill / "SKILL.md").write_text(f"# {skill}\n")
+
         env = dict(
             cls.gh.git_env(),
+            CLAUDE_CONFIG_DIR=str(claude_config),
             PATH=f"{bin_dir}:{os.environ['PATH']}",
             # Where the fake claude posts reviews.
             FAKE_GITHUB_API=api,
@@ -4981,6 +4997,172 @@ class AgentTest(ServerTestCase):
         dialog.get_by_label("Default skill").fill("")
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
+
+    def test_prompts_complete_slash_commands(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        suggestions = self.page.get_by_role("listbox", name="Commands").get_by_role(
+            "option"
+        )
+        selected = self.page.locator(".slash-suggest li.selected")
+
+        # One match is suggested as soon as it's the only one, and Tab
+        # completes it with a space.
+        prompt.press_sequentially("/f")
+        expect(suggestions).to_have_text(["/foo"])
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/foo ")
+        expect(prompt).to_be_focused()
+
+        # Several are listed alphabetically; Tab cycles through them, and
+        # Shift+Tab back.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_text(["/bar", "/baz"])
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(selected).to_have_text("/baz")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        prompt.press("Shift+Tab")
+        expect(prompt).to_have_value("/baz ")
+
+        # Typing goes on with the prompt and closes the list.
+        prompt.press_sequentially("go")
+        expect(prompt).to_have_value("/baz go")
+        expect(suggestions).to_have_count(0)
+
+        # Escape closes the list without changing the text; typing opens
+        # it again.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Escape")
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/b")
+        prompt.press_sequentially("a")
+        expect(suggestions).to_have_count(2)
+        # A click completes like Tab, but only with the primary button.
+        suggestions.filter(has_text="/baz").click(button="middle")
+        expect(prompt).to_have_value("/ba")
+        expect(prompt).to_be_focused()
+        suggestions.filter(has_text="/baz").click()
+        expect(prompt).to_have_value("/baz ")
+
+        # A click in the box goes on with the prompt: the list closes, and
+        # Tab no longer changes the command.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Tab")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(suggestions).to_have_count(2)
+        prompt.click()
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/baz ")
+
+        # Enter sends the prompt as typed, even with the list open.
+        prompt.fill("")
+        prompt.press_sequentially("/ba")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Enter")
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt").first).to_have_text("/ba")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The follow-up box offers the session's own commands, the most
+        # used first, without the terminal's or the hidden ones.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.press_sequentially("/baz again")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+
+        # Sending a bare command closes its list, even when the server only
+        # answers after the key is released.
+        held: list = []
+        self.page.route("**/api/agents/*/messages", lambda route: held.append(route))
+        follow_up.press_sequentially("/baz")
+        expect(suggestions).to_have_text(["/baz"])
+        follow_up.press("Enter")
+        expect(suggestions).to_have_text(["/baz"])
+        self.wait_held(held)
+        held.pop().continue_()
+        self.page.unroute("**/api/agents/*/messages")
+        expect(follow_up).to_have_value("")
+        expect(suggestions).to_have_count(0)
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/foo"])
+        follow_up.press("Tab")
+        expect(follow_up).to_have_value("/baz ")
+
+        # Hiding nothing shows the commands hidden by default too.
+        self.page.locator(".global-settings-button").click()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        # Only a changed setting is stored, so that new defaults show.
+        stored = "() => localStorage.getItem('hidden-commands')"
+        self.assertIsNone(self.page.evaluate(stored))
+        dialog.get_by_label("Hidden commands").fill("foo")
+        self.page.wait_for_function(f"({stored})() === 'foo'")
+        dialog.get_by_role("button", name="Close").click()
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/clear"])
+
+        # A long list scrolls to the highlighted command.
+        self.page.route(
+            "**/api/agents/*/slash-commands",
+            lambda route: route.fulfill(
+                json=[{"name": f"c{i:02}", "uses": 0} for i in range(30)]
+            ),
+        )
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_count(30)
+        follow_up.press("Shift+Tab")
+        expect(selected).to_have_text("/c29")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+        follow_up.press("Tab")
+        expect(selected).to_have_text("/c00")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+
+        # Tabbing into a box that holds a command, either way, doesn't
+        # open the list, so the next Tab moves on and leaves the text be.
+        follow_up.fill("/c")
+        expect(suggestions).to_have_count(30)
+        follow_up.evaluate("e => e.blur()")
+        expect(suggestions).to_have_count(0)
+        follow_up.focus()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        self.page.keyboard.press("Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        expect(follow_up).to_have_value("/c")
+        follow_up.press_sequentially("0")
+        expect(suggestions).to_have_count(10)
+
+        # A press on the list's padding keeps the box focused and the list
+        # open.
+        self.page.locator(".slash-suggest").click(position={"x": 20, "y": 1})
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(10)
+        expect(follow_up).to_have_value("/c0")
+        self.page.unroute("**/api/agents/*/slash-commands")
 
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:
         self.page.goto(self.url + "#/agents")

@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval, AutoMerge,
-    AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState,
-    EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged,
-    NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey,
-    PrMissing, PromptImage, RepoSettings, ReviewerCandidates, ReviewerChange, SessionProcesses,
-    SubmitReview, SyncStatus, SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
+    AgentBackend, AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval,
+    AutoMerge, AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress,
+    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, ReviewerCandidates,
+    ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus, SystemStats,
+    TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -313,6 +314,33 @@ pub async fn agent(id: &str) -> Result<Option<AgentSession>> {
 pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     check(
         Request::get(&format!("/api/agents/{id}/changes"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The commands a new session's prompt in `repo` can start with.
+pub async fn slash_commands(repo: &str, backend: AgentBackend) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get("/api/slash-commands")
+            .query([("repo", repo), ("backend", backend.as_str())])
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The commands the session's next prompt can start with.
+pub async fn agent_slash_commands(id: &str) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get(&format!("/api/agents/{id}/slash-commands"))
             .send()
             .await,
     )
