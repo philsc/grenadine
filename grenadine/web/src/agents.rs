@@ -5200,6 +5200,7 @@ fn Composer(
         // Read here because the task outlives the composer, which owns it.
         let id = id.get_value();
         spawn_local(async move {
+            let sent = text.clone();
             match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
                     // The session may have been left by now. This box's
@@ -5210,14 +5211,30 @@ fn Composer(
                     // and would go on offering it: that box is the one to
                     // empty. Like this one, it doesn't know of the send
                     // until then, so Enter in it before the answer sends
-                    // the follow-up twice, and what's typed into it
-                    // meanwhile is emptied with the rest.
+                    // the follow-up twice.
                     let (prompt, attached) = COMPOSERS
                         .with(|c| c.borrow().get(&id).copied())
                         .unwrap_or((prompt, attached));
-                    prompt.set(String::new());
-                    if let Some(s) = storage() {
-                        let _ = s.remove_item(&draft_key(&id));
+                    // Only the sent text goes: what the box holds
+                    // instead by now was typed since and is the next
+                    // draft. A box that is gone answers `None`, and the
+                    // kept draft is then all there is to look at.
+                    match prompt.try_with_untracked(|p| *p == sent) {
+                        Some(true) => {
+                            prompt.set(String::new());
+                            if let Some(s) = storage() {
+                                let _ = s.remove_item(&draft_key(&id));
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            let key = draft_key(&id);
+                            if let Some(s) = storage()
+                                && s.get_item(&key).ok().flatten().as_deref() == Some(&*sent)
+                            {
+                                let _ = s.remove_item(&key);
+                            }
+                        }
                     }
                     attached.images.set(Vec::new());
                     let key = image_drafts::agent_key(&id);
