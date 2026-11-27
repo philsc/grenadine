@@ -8,9 +8,10 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result, bail};
 use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
-    AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed,
-    Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo,
-    SessionKind, SlashCommand, Stack, ThreadCounts, Version, VersionKind, leading_command,
+    AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, GlobalSettings, Inbox,
+    InboxEdit, Landed, Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment,
+    ReviewDecision, ReviewInfo, SessionKind, SlashCommand, Stack, ThreadCounts, Version,
+    VersionKind, leading_command,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -554,6 +555,17 @@ const MIGRATIONS: &[Migration] = &[
 "#,
     ),
     Migration::BackfillSkillUses,
+    Migration::Sql(
+        r#"
+    -- The settings for every repository, the JSON of an
+    -- api::GlobalSettings in the one row there is. Without the row the
+    -- defaults apply.
+    CREATE TABLE global_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        json TEXT NOT NULL
+    );
+"#,
+    ),
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -920,6 +932,30 @@ impl Db {
             "INSERT INTO repo_settings (repo, json) VALUES (?, ?)
              ON CONFLICT (repo) DO UPDATE SET json = excluded.json",
             params![repo, serde_json::to_string(settings)?],
+        )?;
+        Ok(())
+    }
+
+    /// The settings for every repository; the defaults until some are
+    /// saved.
+    pub fn global_settings(&self) -> Result<GlobalSettings> {
+        let json: Option<String> = self
+            .conn()
+            .query_row("SELECT json FROM global_settings WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(match json {
+            Some(json) => serde_json::from_str(&json)?,
+            None => GlobalSettings::default(),
+        })
+    }
+
+    pub fn set_global_settings(&self, settings: &GlobalSettings) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO global_settings (id, json) VALUES (1, ?)
+             ON CONFLICT (id) DO UPDATE SET json = excluded.json",
+            [serde_json::to_string(settings)?],
         )?;
         Ok(())
     }
@@ -3244,6 +3280,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.repo_settings("o/n").unwrap(), RepoSettings::default());
+    }
+
+    #[test]
+    fn global_settings_round_trip() {
+        use grenadine_core::api::ApprovePrPushes;
+        let db = Db::in_memory();
+        assert_eq!(db.global_settings().unwrap(), GlobalSettings::default());
+        for approve_pr_pushes in [ApprovePrPushes::NeverAsk, ApprovePrPushes::UnlessMine] {
+            let settings = GlobalSettings { approve_pr_pushes };
+            db.set_global_settings(&settings).unwrap();
+            assert_eq!(db.global_settings().unwrap(), settings);
+        }
+        // Fields that a later version dropped are ignored.
+        db.conn()
+            .execute("UPDATE global_settings SET json = '{\"gone\": 1}'", [])
+            .unwrap();
+        assert_eq!(db.global_settings().unwrap(), GlobalSettings::default());
     }
 
     #[test]

@@ -55,6 +55,9 @@ pub struct Updates {
     pub repo_settings: RwSignal<u64>,
     /// Bumped when a review of the viewer's PRs started or ended.
     pub auto_reviews: RwSignal<u64>,
+    /// Bumped when the settings kept on the server for every repository
+    /// changed.
+    pub global_settings: RwSignal<u64>,
 }
 
 /// What the URL's hash shows.
@@ -215,6 +218,7 @@ fn listen(updates: Updates, url: Signal<String>) {
         Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
         Ok(ServerEvent::RepoSettingsChanged(_)) => updates.repo_settings.update(|n| *n += 1),
         Ok(ServerEvent::AutoReviewsChanged) => updates.auto_reviews.update(|n| *n += 1),
+        Ok(ServerEvent::GlobalSettingsChanged) => updates.global_settings.update(|n| *n += 1),
         Err(_) => {}
     };
     // After a reconnect (e.g. the server restarted or the machine slept)
@@ -230,6 +234,7 @@ fn listen(updates: Updates, url: Signal<String>) {
         updates.terminals.update(|n| *n += 1);
         updates.repo_settings.update(|n| *n += 1);
         updates.auto_reviews.update(|n| *n += 1);
+        updates.global_settings.update(|n| *n += 1);
         refetch_sync(updates, sync_events);
     };
     events::subscribe(url, on_message, on_open);
@@ -265,6 +270,7 @@ fn App() -> impl IntoView {
         terminals: RwSignal::new(0),
         repo_settings: RwSignal::new(0),
         auto_reviews: RwSignal::new(0),
+        global_settings: RwSignal::new(0),
     };
     provide_context(updates);
 

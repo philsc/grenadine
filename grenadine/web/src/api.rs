@@ -9,11 +9,11 @@ use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress,
-    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
-    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, ReviewerCandidates,
-    ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus, SystemStats,
-    TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
+    CleanupState, EditPr, Enqueue, GitHubUsage, GlobalSettings, InboxEdit, InboxWithPrs,
+    MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
+    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
+    ReviewerCandidates, ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus,
+    SystemStats, TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -66,6 +66,21 @@ pub async fn delete_inbox(id: i64) -> Result<()> {
     check(Request::delete(&format!("/api/inboxes/{id}")).send().await)
         .await
         .map(|_| ())
+}
+
+pub async fn global_settings() -> Result<GlobalSettings> {
+    check(Request::get("/api/settings").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn set_global_settings(settings: &GlobalSettings) -> Result<()> {
+    let req = Request::put("/api/settings")
+        .json(settings)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
 }
 
 pub async fn repo_settings(repo: &str) -> Result<RepoSettings> {

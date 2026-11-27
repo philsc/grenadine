@@ -162,6 +162,8 @@ pub struct State {
     pub started_at: i64,
     /// What /api/debug/system samples through.
     pub system: crate::system::Sampler,
+    /// The viewer's GitHub login once `viewer_login` looked it up.
+    pub viewer: tokio::sync::OnceCell<String>,
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -169,6 +171,16 @@ impl State {
     pub fn send(&self, event: ServerEvent) {
         // Failing only means that no page is listening.
         let _ = self.events.send(event);
+    }
+
+    /// The viewer's GitHub login, looked up on first use. A failed
+    /// lookup is tried again on the next call.
+    pub async fn viewer_login(&self) -> anyhow::Result<&str> {
+        let login = self
+            .viewer
+            .get_or_try_init(|| self.github.viewer_login())
+            .await?;
+        Ok(login)
     }
 
     /// The clone for `owner/name`, for callers that only read from it.
@@ -1130,6 +1142,7 @@ pub fn test_state_with_agents(
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
+        viewer: tokio::sync::OnceCell::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }

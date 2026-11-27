@@ -16,10 +16,11 @@ use futures::Stream;
 use grenadine_core::api::{
     AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
     AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
-    CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
-    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PING,
-    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
-    ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
+    CleanupState, EditPr, Enqueue, GENERAL, GlobalSettings, InboxEdit, InboxWithPrs, MergeProgress,
+    MergeRequest, MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
+    NewThread, PING, PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates,
+    ReviewerChange, ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff,
+    submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
@@ -136,6 +137,10 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/debug/github", get(github_usage))
         .route("/api/debug/system", get(system_stats))
         .route("/api/events", get(events))
+        .route(
+            "/api/settings",
+            get(global_settings).put(set_global_settings),
+        )
         .route("/api/repos", get(repos))
         .route(
             "/api/repos/{owner}/{name}/settings",
@@ -1150,6 +1155,20 @@ async fn events(
 /// The configured repositories, for the page's repository pickers.
 async fn repos(AxState(state): St) -> Json<Vec<String>> {
     Json(state.repos.keys().cloned().collect())
+}
+
+/// The settings for every repository.
+async fn global_settings(AxState(state): St) -> ApiResult<Json<GlobalSettings>> {
+    Ok(Json(state.db.global_settings()?))
+}
+
+async fn set_global_settings(
+    AxState(state): St,
+    Json(settings): Json<GlobalSettings>,
+) -> ApiResult<StatusCode> {
+    state.db.set_global_settings(&settings)?;
+    state.send(ServerEvent::GlobalSettingsChanged);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn repo_settings(
@@ -2716,6 +2735,31 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn global_settings_save_and_announce() {
+        use grenadine_core::api::ApprovePrPushes;
+        let state = crate::sync::test_state();
+        let mut events = state.events.subscribe();
+        let Json(got) = global_settings(AxState(state.clone()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(got, GlobalSettings::default());
+        let settings = GlobalSettings {
+            approve_pr_pushes: ApprovePrPushes::UnlessMine,
+        };
+        let status = set_global_settings(AxState(state.clone()), Json(settings.clone()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(state.db.global_settings().unwrap(), settings);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ServerEvent::GlobalSettingsChanged)
+        ));
     }
 
     /// A review model is saved only when the backend offers it.
