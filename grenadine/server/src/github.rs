@@ -456,6 +456,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             position
             pullRequest {
               number title headRefName state isDraft mergeable mergeStateStatus
+              reviewDecision
               commits(last: 1) {
                 nodes { commit { statusCheckRollup { ...Checks } } }
               }
@@ -937,6 +938,7 @@ fn stack_merge(pr: &Value) -> Option<StackMerge> {
                         p.pointer("/commits/nodes/0/commit/statusCheckRollup"),
                     )),
                     stale_runs: stale_runs(p.pointer("/commits/nodes/0/commit/statusCheckRollup")),
+                    decision: review_decision(str_at(p, "/reviewDecision")),
                 },
             ))
         })
@@ -3680,6 +3682,7 @@ mod tests {
                     "isDraft": number == 10,
                     "mergeable": if number == 12 { "CONFLICTING" } else { "MERGEABLE" },
                     "mergeStateStatus": if number == 12 { "DIRTY" } else { "CLEAN" },
+                    "reviewDecision": if number == 12 { "REVIEW_REQUIRED" } else { "APPROVED" },
                     "commits": {
                         "nodes": [{ "commit": { "statusCheckRollup": rollup(number) } }]
                     },
@@ -3711,6 +3714,7 @@ mod tests {
                         state: MergeState::Clean,
                         ci: Some(CiStatus::Passing),
                         stale_runs: vec![],
+                        decision: Some(ReviewDecision::Approved),
                     },
                     StackMergePr {
                         number: 12,
@@ -3725,6 +3729,7 @@ mod tests {
                             url: None,
                             run_id: None,
                         }],
+                        decision: Some(ReviewDecision::ReviewRequired),
                     },
                 ],
             })

@@ -812,6 +812,9 @@ pub struct StackMergePr {
     /// Like `MergeInfo::stale_runs`, for its head.
     #[serde(default)]
     pub stale_runs: Vec<StaleRun>,
+    /// Whether its reviews let it merge, like `ReviewInfo::decision`.
+    #[serde(default)]
+    pub decision: Option<ReviewDecision>,
 }
 
 /// A team asked to review a PR, as GitHub names and addresses it.

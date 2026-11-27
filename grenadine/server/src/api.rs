@@ -729,13 +729,25 @@ async fn rerun_checks(
     let key = writable(owner, name, number, &state)?;
     let pr = state.github.pr(&key).await?;
     let merge = pr.review.map(|r| r.merge);
+    let below: Vec<_> = merge
+        .iter()
+        .flat_map(|m| m.stack.iter().flat_map(|s| &s.below))
+        .collect();
     let runs: BTreeSet<u64> = merge
         .iter()
-        .flat_map(|m| {
-            let below = m.stack.iter().flat_map(|s| &s.below);
-            m.stale_runs.iter().chain(below.flat_map(|p| &p.stale_runs))
-        })
+        .flat_map(|m| &m.stale_runs)
+        .chain(below.iter().flat_map(|p| &p.stale_runs))
         .filter_map(|r| r.run_id)
+        .collect();
+    // The PRs below whose runs are re-run, which their own pages and
+    // inbox rows show.
+    let rerun_below: Vec<PrKey> = below
+        .iter()
+        .filter(|p| p.stale_runs.iter().any(|r| r.run_id.is_some()))
+        .map(|p| PrKey {
+            repo: key.repo.clone(),
+            number: p.number,
+        })
         .collect();
     let mut done = Ok(());
     for (i, &run) in runs.iter().enumerate() {
@@ -750,6 +762,9 @@ async fn rerun_checks(
         }
     }
     state.resync(key);
+    for below in rerun_below {
+        state.resync(below);
+    }
     done?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

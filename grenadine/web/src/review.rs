@@ -1304,7 +1304,7 @@ fn below_mergeable(p: &StackMergePr, admin: bool) -> Result<Option<String>, Stri
         false => Err(why),
     };
     match p.state {
-        MergeState::Blocked => bypass(match stale_reason(&p.stale_runs) {
+        MergeState::Blocked => bypass(match below_block_reason(p) {
             Some(why) => format!("#{n} is blocked: {why}."),
             None => format!("#{n} is blocked by its branch's rules."),
         }),
@@ -1313,6 +1313,17 @@ fn below_mergeable(p: &StackMergePr, admin: bool) -> Result<Option<String>, Stri
             "GitHub hasn't worked out yet whether #{n} can be merged."
         )),
         _ => Ok(None),
+    }
+}
+
+/// Why GitHub blocks merging `p`, a stack PR, as `block_reasons` words
+/// it: its reviews when they don't let it merge, or else the replaced
+/// runs GitHub still counts; `None` when neither is known.
+fn below_block_reason(p: &StackMergePr) -> Option<String> {
+    match p.decision {
+        Some(ReviewDecision::ReviewRequired) => Some("it needs an approving review".into()),
+        Some(ReviewDecision::ChangesRequested) => Some("changes were requested".into()),
+        _ => stale_reason(&p.stale_runs),
     }
 }
 
@@ -1329,8 +1340,12 @@ fn below_status(p: &StackMergePr) -> &'static str {
         return "Conflicts";
     }
     match p.state {
-        MergeState::Blocked if !p.stale_runs.is_empty() => STALE_ROW,
-        MergeState::Blocked => "Blocked by rules",
+        MergeState::Blocked => match p.decision {
+            Some(ReviewDecision::ReviewRequired) => "Needs an approving review",
+            Some(ReviewDecision::ChangesRequested) => "Changes requested",
+            _ if !p.stale_runs.is_empty() => STALE_ROW,
+            _ => "Blocked by rules",
+        },
         MergeState::Behind => "Behind",
         MergeState::Unknown => "GitHub hasn't worked it out yet",
         _ => match p.ci {
@@ -2252,6 +2267,15 @@ mod tests {
                  that didn't pass."
                 .into())
         );
+        // Its reviews explain the block instead, like the PR's own line.
+        below.decision = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(below_status(&below), "Needs an approving review");
+        assert_eq!(
+            below_mergeable(&below, false),
+            Err("#3 is blocked: it needs an approving review.".into())
+        );
+        below.decision = Some(ReviewDecision::ChangesRequested);
+        assert_eq!(below_status(&below), "Changes requested");
     }
 
     #[test]
@@ -2279,9 +2303,13 @@ mod tests {
         below.stale_runs = vec![stale("lint")];
         let mut behind = below_pr(4, MergeState::Behind);
         behind.stale_runs = vec![stale("format")];
+        // One whose review is missing has that as its row.
+        let mut unreviewed = below_pr(5, MergeState::Blocked);
+        unreviewed.stale_runs = vec![stale("docs")];
+        unreviewed.decision = Some(ReviewDecision::ReviewRequired);
         i.merge.stack = Some(StackMerge {
             base_ref: "main".into(),
-            below: vec![below, behind],
+            below: vec![below, behind, unreviewed],
         });
         assert_eq!(named(&i), ["lint"]);
     }
@@ -2553,6 +2581,7 @@ mod tests {
             state,
             ci: None,
             stale_runs: vec![],
+            decision: None,
         }
     }
 
