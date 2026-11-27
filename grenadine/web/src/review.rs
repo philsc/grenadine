@@ -1316,6 +1316,9 @@ fn below_mergeable(p: &StackMergePr, admin: bool) -> Result<Option<String>, Stri
     }
 }
 
+/// The readiness of a stack PR that replaced runs block.
+const STALE_ROW: &str = "Blocked by a replaced run that didn't pass";
+
 /// A stack PR's readiness in a line: what's keeping it from merging, or
 /// that nothing is.
 fn below_status(p: &StackMergePr) -> &'static str {
@@ -1326,9 +1329,7 @@ fn below_status(p: &StackMergePr) -> &'static str {
         return "Conflicts";
     }
     match p.state {
-        MergeState::Blocked if !p.stale_runs.is_empty() => {
-            "Blocked by a replaced run that didn't pass"
-        }
+        MergeState::Blocked if !p.stale_runs.is_empty() => STALE_ROW,
         MergeState::Blocked => "Blocked by rules",
         MergeState::Behind => "Behind",
         MergeState::Unknown => "GitHub hasn't worked it out yet",
@@ -1975,17 +1976,32 @@ fn rerun_name(key: &PrKey) -> String {
     format!("rerun.{}#{}", key.repo, key.number)
 }
 
-/// Re-running the replaced runs that GitHub still counts, on the PR and
-/// on the PRs below it in its stack; `None` when there are none or none
-/// is a GitHub Actions run, which is all that can be re-run from here.
-fn rerun_checks(info: &ReviewInfo) -> Option<impl IntoView + use<>> {
+/// Which of the replaced runs that GitHub still counts the merge box
+/// names, on the PR and on the PRs below it in its stack: the PR's own
+/// when `status`, its status line, names them, and a PR's below when its
+/// stack row does.
+fn named_stale_runs<'a>(info: &'a ReviewInfo, status: &str) -> Vec<&'a StaleRun> {
+    let own = &info.merge.stale_runs;
+    let own = match stale_reason(own) {
+        Some(why) if status.contains(&why) => own.as_slice(),
+        _ => &[],
+    };
     let below = info.merge.stack.iter().flat_map(|s| &s.below);
-    let mut runs = info
-        .merge
-        .stale_runs
+    let below = below.filter(|p| below_status(p) == STALE_ROW);
+    own.iter()
+        .chain(below.flat_map(|p| &p.stale_runs))
+        .collect()
+}
+
+/// Re-running the replaced runs that GitHub still counts, on the PR and
+/// on the PRs below it in its stack; `None` unless `status`, the PR's
+/// status line, or a stack row names some that are GitHub Actions runs,
+/// which is all that can be re-run from here.
+fn rerun_checks(info: &ReviewInfo, status: &str) -> Option<impl IntoView + use<>> {
+    if !named_stale_runs(info, status)
         .iter()
-        .chain(below.flat_map(|p| &p.stale_runs));
-    if !runs.any(|r| r.run_id.is_some()) {
+        .any(|r| r.run_id.is_some())
+    {
         return None;
     }
     let ReviewTarget { key, .. } = expect_context::<ReviewTarget>();
@@ -2000,7 +2016,7 @@ fn rerun_checks(info: &ReviewInfo) -> Option<impl IntoView + use<>> {
     Some(view! {
         <div class="rerun-checks">
             <button type="button" disabled=busy on:click=rerun>
-                {move || if busy() { "Re-running…" } else { "Re-run them" }}
+                {move || if busy() { "Re-running…" } else { "Re-run the replaced runs" }}
             </button>
             {move || error().map(|e| view! { <p class="error">{e}</p> })}
         </div>
@@ -2012,7 +2028,7 @@ fn rerun_checks(info: &ReviewInfo) -> Option<impl IntoView + use<>> {
 /// "Merge" heading like its other sections' instead of a border.
 pub fn merge_box(info: &ReviewInfo, target: MergeTarget, sidebar: bool) -> impl IntoView + use<> {
     let (class, text) = merge_status(info, target.unresolved_threads);
-    let rerun = rerun_checks(info);
+    let rerun = rerun_checks(info, &text);
     let controls = if info.merge.queue.is_some() {
         queue_controls(info, target.clone()).into_any()
     } else {
@@ -2022,15 +2038,15 @@ pub fn merge_box(info: &ReviewInfo, target: MergeTarget, sidebar: bool) -> impl 
         <section class="merge-box" class:in-sidebar=sidebar>
             {sidebar.then(|| view! { <h2>"Merge"</h2> })}
             <p class=format!("merge-status {class}")>{text}</p>
-            {rerun}
             {controls}
+            {rerun}
         </section>
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use grenadine_core::api::{MergeInfo, MergeQueueInfo, Person, QueueEntry};
+    use grenadine_core::api::{MergeInfo, MergeQueueInfo, Person, QueueEntry, StackMerge};
 
     use super::*;
 
@@ -2236,6 +2252,38 @@ mod tests {
                  that didn't pass."
                 .into())
         );
+    }
+
+    #[test]
+    fn named_replaced_runs_are_the_ones_a_line_mentions() {
+        let named = |i: &ReviewInfo| {
+            let status = merge_status(i, 0).1;
+            named_stale_runs(i, &status)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut i = info();
+        i.merge.state = MergeState::Blocked;
+        i.merge.stale_runs = vec![stale("test")];
+        assert_eq!(named(&i), ["test"]);
+        // The review explains the block, so the line doesn't name them.
+        i.decision = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(named(&i), Vec::<String>::new());
+        // Neither does a line about something else.
+        i.decision = None;
+        i.merge.state = MergeState::Behind;
+        assert_eq!(named(&i), Vec::<String>::new());
+        // A stack row names a PR's below it.
+        let mut below = below_pr(3, MergeState::Blocked);
+        below.stale_runs = vec![stale("lint")];
+        let mut behind = below_pr(4, MergeState::Behind);
+        behind.stale_runs = vec![stale("format")];
+        i.merge.stack = Some(StackMerge {
+            base_ref: "main".into(),
+            below: vec![below, behind],
+        });
+        assert_eq!(named(&i), ["lint"]);
     }
 
     #[test]

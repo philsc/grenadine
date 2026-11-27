@@ -1464,7 +1464,9 @@ class InboxTest(ServerTestCase):
         expect(status).to_have_class(re.compile(r"\bbad\b"))
         # It's not an Actions run that could be re-run from here.
         expect(
-            self.page.locator(".merge-box").get_by_role("button", name="Re-run them")
+            self.page.locator(".merge-box").get_by_role(
+                "button", name="Re-run the replaced runs"
+            )
         ).to_have_count(0)
 
     def test_pr_page_of_a_conflicting_pr(self) -> None:
@@ -3664,10 +3666,12 @@ class StackMergeTest(ServerTestCase):
         expect(rows.nth(0)).to_contain_text(
             "Blocked by a replaced run that didn't pass"
         )
-        box.get_by_role("button", name="Re-run them").click()
+        box.get_by_role("button", name="Re-run the replaced runs").click()
         expect(status).to_have_text("Ready to merge.")
         expect(rows.nth(0)).to_contain_text("Ready")
-        expect(box.get_by_role("button", name="Re-run them")).to_have_count(0)
+        expect(
+            box.get_by_role("button", name="Re-run the replaced runs")
+        ).to_have_count(0)
         # Both PRs' cancelled runs were re-run, and nothing else.
         reruns = [r for r in self.gh.requests if r.endswith("/rerun-failed-jobs")]
         self.assertEqual(

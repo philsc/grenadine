@@ -738,9 +738,14 @@ async fn rerun_checks(
         .filter_map(|r| r.run_id)
         .collect();
     let mut done = Ok(());
-    for run in runs {
+    for (i, &run) in runs.iter().enumerate() {
         done = state.github.rerun_workflow(&key.repo, run).await;
-        if done.is_err() {
+        if let Err(e) = done {
+            // The runs re-run already stay re-run, which the error says.
+            done = Err(match i {
+                0 => e,
+                _ => e.context(format!("Re-ran {i} of {} runs, then", runs.len())),
+            });
             break;
         }
     }
