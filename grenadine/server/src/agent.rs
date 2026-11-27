@@ -710,7 +710,8 @@ const AGENTS_SLICE: &str = "grenadine.slice";
 /// for what else runs under the user's systemd manager, e.g. its
 /// services and the scopes of a desktop's or tmux's programs. A few
 /// sessions building and testing at once otherwise make a server that
-/// runs there slow to answer the page.
+/// runs there slow to answer the page. A session's terminals run in its
+/// slice too, so what the user starts in one has the same share.
 const AGENTS_CPU_WEIGHT: u32 = 20;
 
 /// Makes the sessions' processes yield the CPU to what else runs under
@@ -726,6 +727,9 @@ const AGENTS_CPU_WEIGHT: u32 = 20;
 ///
 /// The setting is the manager's, so it lasts until the manager stops, at
 /// the latest the next boot; every start of the server sets it again.
+/// That also replaces a weight the user gave the slice themselves with
+/// `systemctl --user set-property`: there is no setting yet to pick
+/// another weight or none.
 pub fn lower_agents_cpu_weight() -> Result<()> {
     let out = std::process::Command::new("systemctl")
         .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
