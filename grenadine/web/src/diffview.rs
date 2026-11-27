@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -26,7 +26,7 @@ use crate::composer::{Composer, OpenBoxes, sender};
 use crate::highlight::{self, Highlighted, mark, plain_lines};
 use crate::inboxes::load_flag;
 use crate::memlog;
-use crate::pr::{Anchor, Placed, ThreadView, ThreadWhere, range_label};
+use crate::pr::{Anchor, Placed, ThreadJump, ThreadView, ThreadWhere, range_label};
 
 const CONTEXT: usize = 3;
 
@@ -37,14 +37,9 @@ pub struct Commenting {
 }
 
 impl Commenting {
-    /// The name of the draft of a comment on `line` (1-based) of `side`,
-    /// or on the whole file.
-    fn draft(&self, path: &str, at: Option<(Side, u32)>) -> String {
-        let at = match at {
-            Some((Side::Left, l)) => format!("L{l}"),
-            Some((Side::Right, l)) => format!("R{l}"),
-            None => "file".to_owned(),
-        };
+    /// The name of the draft of a comment on `at`, or on the whole file.
+    fn draft(&self, path: &str, at: Option<Target>) -> String {
+        let at = at.map_or_else(|| "file".to_owned(), Target::name);
         format!("{}{at}", self.draft_prefix(path))
     }
 
@@ -54,93 +49,146 @@ impl Commenting {
     }
 }
 
-/// A file's comment hooks: where its comments go, and the boxes they're
-/// written in.
+/// The lines a comment box is for: one line, or a range from `start` to
+/// `end`, which is where the box goes. Lines are 1-based.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Target {
+    start: Option<(Side, u32)>,
+    end: (Side, u32),
+}
+
+impl Target {
+    fn line(at: (Side, u32)) -> Target {
+        Target {
+            start: None,
+            end: at,
+        }
+    }
+
+    /// The target's part of its draft's name, like "R14" or "L9-R14".
+    fn name(self) -> String {
+        let line =
+            |(side, l): (Side, u32)| format!("{}{l}", if side == Side::Left { "L" } else { "R" });
+        match self.start {
+            Some(s) => format!("{}-{}", line(s), line(self.end)),
+            None => line(self.end),
+        }
+    }
+
+    /// The target `name` names.
+    fn parse(name: &str) -> Option<Target> {
+        let line = |at: &str| {
+            let side = match at.get(..1)? {
+                "L" => Side::Left,
+                "R" => Side::Right,
+                _ => return None,
+            };
+            let l: u32 = at[1..].parse().ok()?;
+            (l > 0).then_some((side, l))
+        };
+        match name.split_once('-') {
+            Some((s, e)) => Some(Target {
+                start: Some(line(s)?),
+                end: line(e)?,
+            }),
+            None => Some(Target::line(line(name)?)),
+        }
+    }
+
+    /// The label of a range, like "Lines +10 to +14"; `None` for a line.
+    fn label(self) -> Option<String> {
+        self.start.map(|s| range_label(s, self.end))
+    }
+}
+
+/// A file's comment hooks: where its comments go, the boxes they're
+/// written in, the line last clicked, which a shift-click makes a range
+/// from, with the draft of the box that click opened, and the drag across
+/// line numbers going on. The drag is the file's rather than its table's,
+/// which a re-render, e.g. once highlighting is done, replaces.
 #[derive(Clone)]
 struct FileCommenting {
     commenting: Commenting,
     path: String,
     boxes: OpenBoxes,
+    anchor: StoredValue<Option<((Side, u32), String)>>,
+    drag: StoredValue<Option<Drag>, LocalStorage>,
 }
 
 impl FileCommenting {
-    /// The lines (1-based) whose comment boxes are open; tracked.
-    fn open_lines(&self) -> HashSet<(Side, u32)> {
+    /// The lines whose comment boxes are open, in name order; tracked.
+    fn open_targets(&self) -> Vec<Target> {
         let prefix = self.commenting.draft_prefix(&self.path);
-        self.boxes
-            .open_with_prefix(&prefix)
+        let mut names: Vec<String> = self.boxes.open_with_prefix(&prefix).into_iter().collect();
+        names.sort();
+        names
             .iter()
-            .filter_map(|name| {
-                let at = name.strip_prefix(&prefix)?;
-                let side = match at.get(..1)? {
-                    "L" => Side::Left,
-                    "R" => Side::Right,
-                    _ => return None,
-                };
-                Some((side, at[1..].parse().ok()?))
-            })
+            .filter_map(|name| Target::parse(name.strip_prefix(&prefix)?))
             .collect()
     }
 
-    /// Opens the comment box for the line whose number cell is in or under
-    /// the click's target.
-    fn open_clicked(&self, ev: &leptos::ev::MouseEvent) {
-        let Some(cell) = ev
-            .target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|t| t.closest("td.commentable").ok().flatten())
-        else {
-            return;
-        };
-        let side = match cell.get_attribute("data-side").as_deref() {
-            Some("L") => Side::Left,
-            Some("R") => Side::Right,
-            _ => return,
-        };
-        let Some(line) = cell.get_attribute("data-line").and_then(|l| l.parse().ok()) else {
-            return;
-        };
-        self.boxes
-            .set(&self.commenting.draft(&self.path, Some((side, line))), true);
+    /// Opens the box for `at`, which a click on `clicked` picked.
+    fn open(&self, at: Target, clicked: (Side, u32)) {
+        let draft = self.commenting.draft(&self.path, Some(at));
+        self.boxes.set(&draft, true);
+        self.anchor.set_value(Some((clicked, draft)));
     }
 
-    /// A row with the comment box for `at`, shown while it's open.
-    fn box_row(&self, at: Option<(Side, u32)>, colspan: u32) -> AnyView {
-        let draft = self.commenting.draft(&self.path, at);
-        let boxes = self.boxes;
-        let this = self.clone();
-        (move || {
-            boxes.is_open(&draft).then(|| {
-                view! {
-                    <tr class="comment-row composer-row">
-                        <td colspan=colspan>{this.composer(at)}</td>
-                    </tr>
-                }
-            })
-        })
-        .into_any()
+    /// Makes the box the last click opened, if it's still open, the box for
+    /// `at`, keeping what was written in it; otherwise opens `at`'s box.
+    fn extend(&self, at: Target) {
+        let draft = self.commenting.draft(&self.path, Some(at));
+        let Some((clicked, last)) = self.anchor.get_value() else {
+            return;
+        };
+        if last != draft && self.boxes.is_open(&last) && !self.boxes.is_open(&draft) {
+            self.boxes.rename(&last, &draft);
+        } else {
+            self.boxes.set(&draft, true);
+        }
+        self.anchor.set_value(Some((clicked, draft)));
+    }
+
+    /// A row with the comment box for `at`.
+    fn box_row(&self, at: Target, colspan: u32) -> impl IntoView + use<> {
+        let lines = at
+            .label()
+            .map(|l| view! { <p class="muted composer-lines">{l}</p> });
+        view! {
+            <tr class="comment-row composer-row">
+                <td colspan=colspan>{lines}{self.composer(Some(at))}</td>
+            </tr>
+        }
     }
 
     /// The box for a comment on `at`, or on the whole file.
-    fn composer(&self, at: Option<(Side, u32)>) -> impl IntoView + use<> {
+    fn composer(&self, at: Option<Target>) -> impl IntoView + use<> {
         let draft = self.commenting.draft(&self.path, at);
         let (key, path) = (self.commenting.key.clone(), self.path.clone());
         let send = sender(move |body| {
             let key = key.clone();
+            let start = at.and_then(|t| t.start);
             let thread = NewThread {
                 path: path.clone(),
-                side: at.map_or(Side::Right, |(s, _)| s),
-                line: at.map(|(_, l)| l),
+                side: at.map_or(Side::Right, |t| t.end.0),
+                line: at.map(|t| t.end.1),
+                start_line: start.map(|(_, l)| l),
+                start_side: start.map(|(s, _)| s),
                 body,
             };
             async move { api::add_review_thread(&key, &thread).await }
         });
+        let placeholder = match at {
+            Some(Target { start: Some(_), .. }) => "Comment on these lines…",
+            Some(_) => "Comment on this line…",
+            None => "Comment on this file…",
+        };
         view! {
             <Composer
                 draft=draft
                 repo=self.commenting.key.repo.clone()
                 label="Add to review"
-                placeholder=if at.is_some() { "Comment on this line…" } else { "Comment on this file…" }
+                placeholder=placeholder
                 send=send
                 autofocus=true
             />
@@ -503,39 +551,73 @@ fn scroll_to(path: &str) {
 /// moving the file, since files the browser skipped lay out at their real
 /// heights once they're near the viewport. User input stops it.
 fn rescroll_to(path: String) {
-    rescroll_step(path, 60, 0, Rc::new(RescrollGuard::new()));
+    rescroll_step(
+        file_id(&path),
+        0,
+        60,
+        0,
+        Rc::new(RescrollGuard::new()),
+        Rc::new(|| {}),
+    );
 }
 
-fn rescroll_step(path: String, tries: u8, stable: u8, guard: Rc<RescrollGuard>) {
+/// Like `rescroll_to`, for the element with the DOM id `id`, which may
+/// take a while to show up, e.g. while a diff loads or a file renders.
+/// Calls `done` once it stopped, whether it got there or not.
+pub(crate) fn scroll_to_element(id: String, done: impl Fn() + 'static) {
+    rescroll_step(id, 200, 60, 0, Rc::new(RescrollGuard::new()), Rc::new(done));
+}
+
+/// One step of `rescroll_to`: `wait` is how many more steps to wait for
+/// the element, `tries` how many more to scroll it.
+fn rescroll_step(
+    id: String,
+    wait: u8,
+    tries: u8,
+    stable: u8,
+    guard: Rc<RescrollGuard>,
+    done: Rc<dyn Fn()>,
+) {
     if guard.cancelled.get() {
+        done();
         return;
     }
-    let Some(section) = document().get_element_by_id(&file_id(&path)) else {
+    let Some(el) = document().get_element_by_id(&id) else {
+        if wait == 0 {
+            done();
+        } else {
+            set_timeout(
+                move || rescroll_step(id, wait - 1, tries, stable, guard, done),
+                Duration::from_millis(50),
+            );
+        }
         return;
     };
-    let Some(main) = section.closest(".main").ok().flatten() else {
+    let Some(main) = el.closest(".main").ok().flatten() else {
+        done();
         return;
     };
     let margin = window()
-        .get_computed_style(&section)
+        .get_computed_style(&el)
         .ok()
         .flatten()
         .and_then(|s| s.get_property_value("scroll-margin-top").ok())
         .and_then(|v| v.strip_suffix("px").and_then(|v| v.parse().ok()))
         .unwrap_or(0.0);
-    let top = section.get_bounding_client_rect().top();
+    let top = el.get_bounding_client_rect().top();
     let target = main.get_bounding_client_rect().top() + margin;
     let stable = if (top - target).abs() <= 1.0 {
         stable + 1
     } else {
-        section.scroll_into_view();
+        el.scroll_into_view();
         0
     };
     if stable >= 8 || tries == 0 {
+        done();
         return;
     }
     set_timeout(
-        move || rescroll_step(path, tries - 1, stable, guard),
+        move || rescroll_step(id, 0, tries - 1, stable, guard, done),
         Duration::from_millis(50),
     );
 }
@@ -1224,11 +1306,15 @@ fn FileView(
     // comment boxes and no context for them either.
     let boxes = use_context::<OpenBoxes>();
     let path = c.path().to_owned();
+    let anchor = StoredValue::new(None);
+    let drag = StoredValue::new_local(None);
     let fc = move || {
         Option::zip(commenting.get(), boxes).map(|(commenting, boxes)| FileCommenting {
             commenting,
             path: path.clone(),
             boxes,
+            anchor,
+            drag,
         })
     };
     let binary = [&file.old, &file.new]
@@ -1241,6 +1327,16 @@ fn FileView(
             .and_then(|f| f.get(c.path()))
             .unwrap_or(!initial.all_rebase && initial.added + initial.removed <= BIG_FILE),
     );
+    // A thread the sidebar jumps to shows: its file expands.
+    if let Some(ThreadJump(jump)) = use_context::<ThreadJump>() {
+        Effect::new(move |_| {
+            if let Some(id) = jump.get()
+                && comments.with(|c| c.iter().any(|p| p.thread.root.id == id))
+            {
+                expanded.set(true);
+            }
+        });
+    }
     // Roughly: the changed lines and the context around each block.
     let rows = if expanded.get_untracked() {
         initial.added + initial.removed + initial.blocks * (2 * CONTEXT + 1)
@@ -1726,12 +1822,19 @@ enum Group {
     Row(usize),
 }
 
-/// The row groups of `rows`, given the lines with open comment boxes.
-fn groups(rows: &[Row], open: &HashSet<(Side, u32)>) -> Vec<Group> {
+/// The row groups of `rows`, given the open comment boxes. Rows with
+/// threads or boxes under them, and the rows of an open box's range, which
+/// it highlights, are rows of their own.
+fn groups(rows: &[Row], open: &[Target]) -> Vec<Group> {
+    let ends: HashSet<(Side, u32)> = open.iter().map(|t| t.end).collect();
+    let selected = selected_rows(rows, open);
     let mut groups = Vec::new();
     let mut start = 0;
     for (i, r) in rows.iter().enumerate() {
-        if !r.threads.is_empty() || r.lines.iter().any(|l| open.contains(l)) {
+        if !r.threads.is_empty()
+            || r.lines.iter().any(|l| ends.contains(l))
+            || selected.contains(&i)
+        {
             if start < i {
                 groups.push(Group::Plain(start, i));
             }
@@ -1745,6 +1848,27 @@ fn groups(rows: &[Row], open: &HashSet<(Side, u32)>) -> Vec<Group> {
     groups
 }
 
+/// The rows from the one showing `start` to the one showing `end`. Only
+/// `end`'s row when the diff doesn't show `start` or shows it after
+/// `end`; `None` when it doesn't show `end`.
+fn range_rows(rows: &[Row], start: (Side, u32), end: (Side, u32)) -> Option<RangeInclusive<usize>> {
+    let last = rows.iter().position(|r| r.lines.contains(&end))?;
+    let first = rows
+        .iter()
+        .position(|r| r.lines.contains(&start))
+        .filter(|&i| i <= last)
+        .unwrap_or(last);
+    Some(first..=last)
+}
+
+/// The rows the open boxes' ranges cover.
+fn selected_rows(rows: &[Row], open: &[Target]) -> HashSet<usize> {
+    open.iter()
+        .filter_map(|t| range_rows(rows, t.start?, t.end))
+        .flatten()
+        .collect()
+}
+
 /// A thread's range label for its header, like "Lines +26 to +29";
 /// `None` for single-line and file-level threads.
 fn thread_lines(p: &Placed) -> Option<String> {
@@ -1754,12 +1878,38 @@ fn thread_lines(p: &Placed) -> Option<String> {
     }
 }
 
-fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyView {
+/// A diff table's open comment boxes and the rows their ranges cover,
+/// worked out once per change for all its rows.
+#[derive(Clone, Copy)]
+struct OpenBoxRows {
+    targets: Memo<Vec<Target>>,
+    selected: Memo<HashSet<usize>>,
+}
+
+impl OpenBoxRows {
+    fn new(rows: Arc<Vec<Row>>, fc: FileCommenting) -> Self {
+        let targets = Memo::new(move |_| fc.open_targets());
+        let selected = Memo::new(move |_| targets.with(|t| selected_rows(&rows, t)));
+        OpenBoxRows { targets, selected }
+    }
+}
+
+fn group_view(
+    rows: &Arc<Vec<Row>>,
+    group: Group,
+    fc: Option<(&FileCommenting, OpenBoxRows)>,
+) -> AnyView {
     match group {
         Group::Plain(start, end) => {
             let mut html = String::new();
-            for r in &rows[start..end] {
-                let _ = write!(html, "<tr class=\"{}\">{}</tr>", r.class, r.cells);
+            for (i, r) in rows[start..end].iter().enumerate() {
+                let _ = write!(
+                    html,
+                    "<tr class=\"{}\" data-row=\"{}\">{}</tr>",
+                    r.class,
+                    start + i,
+                    r.cells
+                );
             }
             view! { <tbody inner_html=html></tbody> }.into_any()
         }
@@ -1774,15 +1924,30 @@ fn group_view(rows: &[Row], group: Group, fc: Option<&FileCommenting>) -> AnyVie
                     </tr>
                 }
             });
-            let boxes = fc.map(|fc| {
-                r.lines
-                    .iter()
-                    .map(|&at| fc.box_row(Some(at), 4))
-                    .collect_view()
+            let class = {
+                let (open, class) = (fc.map(|(_, o)| o), r.class.clone());
+                move || match open {
+                    Some(o) if o.selected.with(|s| s.contains(&i)) => {
+                        format!("{class} selecting-range")
+                    }
+                    _ => class.clone(),
+                }
+            };
+            let boxes = fc.map(|(fc, open)| {
+                let (lines, fc) = (r.lines.clone(), fc.clone());
+                let each = move || {
+                    open.targets.with(|t| {
+                        t.iter()
+                            .copied()
+                            .filter(|t| lines.contains(&t.end))
+                            .collect::<Vec<_>>()
+                    })
+                };
+                view! { <For each=each key=|t| *t children=move |t| fc.box_row(t, 4) /> }
             });
             view! {
                 <tbody>
-                    <tr class=r.class.clone() inner_html=r.cells.clone()></tr>
+                    <tr class=class data-row=i inner_html=r.cells.clone()></tr>
                     {threads}
                     {boxes}
                 </tbody>
@@ -1810,29 +1975,199 @@ fn fallback_label(c: &ReviewComment) -> String {
 /// The lines an "expand" button reveals per click.
 const EXPAND_LINES: usize = 20;
 
-/// A diff table of `rows`. Clicking a commentable line number opens a
-/// comment box under its row; clicking an "expand" button reveals hidden
-/// lines through `expand`.
+/// A line number cell's line, and the row it's in.
+type RowLine = (usize, (Side, u32));
+
+/// The commentable line number cell in or under `target`: its row and
+/// line.
+fn line_cell(target: Option<web_sys::EventTarget>) -> Option<RowLine> {
+    let cell = target?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .closest("td.commentable")
+        .ok()??;
+    let side = match cell.get_attribute("data-side")?.as_str() {
+        "L" => Side::Left,
+        "R" => Side::Right,
+        _ => return None,
+    };
+    let line = cell.get_attribute("data-line")?.parse().ok()?;
+    Some((row_under(Some(cell.into()))?, (side, line)))
+}
+
+/// The diff row in or under `target`.
+fn row_under(target: Option<web_sys::EventTarget>) -> Option<usize> {
+    target?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .closest("tr[data-row]")
+        .ok()??
+        .get_attribute("data-row")?
+        .parse()
+        .ok()
+}
+
+/// Whether a range between `a` and `b`, in either order, goes from the
+/// new side back to the old one, which GitHub refuses: a range may only
+/// cross from the old side to the new.
+fn crosses_back(a: RowLine, b: RowLine) -> bool {
+    let (first, last) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    first.0 != last.0 && first.1.0 == Side::Right && last.1.0 == Side::Left
+}
+
+/// Where a range that starts at `from` reaches toward row `to`: the last
+/// line it can take on the way. It stops before a row of hidden lines,
+/// and keeps to `from`'s side in the side-by-side view (`split`). In the
+/// unified view it takes `from`'s side's line of a row that has both, and
+/// passes a row whose only line would make the range cross back from the
+/// new side to the old one.
+fn range_reach(rows: &[Row], from: RowLine, to: usize, split: bool) -> RowLine {
+    let mut reach = from;
+    let mut i = from.0;
+    while i != to && to < rows.len() {
+        i = if to > i { i + 1 } else { i - 1 };
+        let r = &rows[i];
+        if r.class.split(' ').any(|c| c == "skip") {
+            break;
+        }
+        let line = r.lines.iter().find(|l| l.0 == from.1.0).or_else(|| {
+            r.lines
+                .first()
+                .filter(|&&l| !split && !crosses_back(from, (i, l)))
+        });
+        if let Some(&l) = line {
+            reach = (i, l);
+        }
+    }
+    reach
+}
+
+/// The box a range from `a` to `b`, in either order, opens: one on `b`'s
+/// line when they're on the same row.
+fn range_target(a: RowLine, b: RowLine) -> Target {
+    let (first, last) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+    Target {
+        start: (first.0 != last.0).then_some(first.1),
+        end: if a.0 == b.0 { b.1 } else { last.1 },
+    }
+}
+
+/// A drag across line numbers: the line it started on, where it reaches
+/// now, and what ends it.
+struct Drag {
+    from: RowLine,
+    to: RowLine,
+    up: WindowListenerHandle,
+}
+
+/// Highlights the rows of `table` a drag covers, and only those on the
+/// page.
+fn paint_drag(table: Option<&web_sys::Element>, rows: Option<RangeInclusive<usize>>) {
+    if let Ok(list) = document().query_selector_all("tr.dragging") {
+        for i in 0..list.length() {
+            if let Some(tr) = list
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            {
+                let _ = tr.class_list().remove_1("dragging");
+            }
+        }
+    }
+    let Some(table) = table else { return };
+    for i in rows.into_iter().flatten() {
+        if let Ok(Some(tr)) = table.query_selector(&format!("tr[data-row=\"{i}\"]")) {
+            let _ = tr.class_list().add_1("dragging");
+        }
+    }
+}
+
+/// A diff table of `rows`, side by side when `split`. Clicking a
+/// commentable line number opens a comment box under its row; dragging
+/// across line numbers, or shift-clicking one after clicking another,
+/// opens one on the lines between. Clicking an "expand" button reveals
+/// hidden lines through `expand`.
 fn diff_table(
     class: &'static str,
     rows: Vec<Row>,
+    split: bool,
     inline_changes: Signal<bool>,
     fc: Option<FileCommenting>,
     expand: Option<RwSignal<Vec<diff::Expand>>>,
 ) -> impl IntoView + use<> {
     let rows = Arc::new(rows);
+    let open = fc.clone().map(|fc| OpenBoxRows::new(rows.clone(), fc));
     let each = {
-        let (rows, fc) = (rows.clone(), fc.clone());
-        move || {
-            let open = fc
-                .as_ref()
-                .map(FileCommenting::open_lines)
-                .unwrap_or_default();
-            groups(&rows, &open)
+        let rows = rows.clone();
+        move || match open {
+            Some(o) => o.targets.with(|t| groups(&rows, t)),
+            None => groups(&rows, &[]),
+        }
+    };
+    let on_mousedown = {
+        let fc = fc.clone();
+        move |ev: leptos::ev::MouseEvent| {
+            let Some(fc) = &fc else { return };
+            let Some(from) = line_cell(ev.target()) else {
+                return;
+            };
+            // Pressing on a line number would start selecting the code's
+            // text otherwise.
+            ev.prevent_default();
+            // A shift-click is the click handler's.
+            if ev.button() != 0 || ev.shift_key() {
+                return;
+            }
+            let end = fc.clone();
+            let up = window_event_listener(leptos::ev::mouseup, move |_| {
+                let Some(d) = end.drag.try_update_value(Option::take).flatten() else {
+                    return;
+                };
+                d.up.remove();
+                paint_drag(None, None);
+                end.open(range_target(d.from, d.to), d.from.1);
+            });
+            let old = fc
+                .drag
+                .try_update_value(|d| d.replace(Drag { from, to: from, up }));
+            // A drag whose button went up outside the window.
+            if let Some(Some(old)) = old {
+                old.up.remove();
+            }
+        }
+    };
+    let on_mouseover = {
+        let (fc, rows) = (fc.clone(), rows.clone());
+        move |ev: leptos::ev::MouseEvent| {
+            let Some(fc) = &fc else { return };
+            let Some(to) = row_under(ev.target()) else {
+                return;
+            };
+            let cell = line_cell(ev.target());
+            let table = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .and_then(|t| t.closest("table").ok().flatten());
+            fc.drag.update_value(|d| {
+                if let Some(d) = d {
+                    d.to = range_reach(&rows, d.from, to, split);
+                    // The line number pointed at, when the range reaches
+                    // it: e.g. a context line's new side in the unified
+                    // view of a range from an old line.
+                    if let Some(c) = cell
+                        && c.0 == d.to.0
+                        && (!split || c.1.0 == d.from.1.0)
+                        && !crosses_back(d.from, c)
+                    {
+                        d.to = c;
+                    }
+                    let (a, b) = (d.from.0.min(d.to.0), d.from.0.max(d.to.0));
+                    paint_drag(table.as_ref(), Some(a..=b));
+                }
+            });
         }
     };
     let on_click = {
-        let fc = fc.clone();
+        let (fc, rows) = (fc.clone(), rows.clone());
         move |ev: leptos::ev::MouseEvent| {
             let button = ev
                 .target()
@@ -1859,16 +2194,52 @@ fn diff_table(
                 ev.stop_propagation();
                 return;
             }
-            if let Some(fc) = &fc {
-                fc.open_clicked(&ev);
+            let Some(fc) = &fc else { return };
+            let Some(clicked) = line_cell(ev.target()) else {
+                return;
+            };
+            // Plain clicks and drags are handled when the mouse button
+            // goes up, but a click without a mouse, e.g. from assistive
+            // technology, comes without a press.
+            if !ev.shift_key() {
+                if ev.detail() == 0 && fc.drag.with_value(Option::is_none) {
+                    fc.open(Target::line(clicked.1), clicked.1);
+                }
+                return;
+            }
+            match shift_range(&rows, fc.anchor.get_value().map(|(a, _)| a), clicked, split) {
+                Some(at) => fc.extend(at),
+                None => fc.open(Target::line(clicked.1), clicked.1),
             }
         }
     };
     view! {
-        <table class=class class:inline-changes=move || inline_changes.get() on:click=on_click>
-            <For each=each key=|g| *g children=move |g| group_view(&rows, g, fc.as_ref()) />
+        <table class=class class:inline-changes=move || inline_changes.get()
+            on:mousedown=on_mousedown on:mouseover=on_mouseover on:click=on_click>
+            <For each=each key=|g| *g children=move |g| group_view(&rows, g, fc.as_ref().zip(open)) />
         </table>
     }
+}
+
+/// The range a shift-click on `clicked` makes from the line last clicked,
+/// `anchor`: `None` when there's no such line in `rows`, it's on the same
+/// row, or the range would cross hidden lines, cross back from the new
+/// side to the old one or, side by side (`split`), cross the sides at all.
+fn shift_range(
+    rows: &[Row],
+    anchor: Option<(Side, u32)>,
+    clicked: RowLine,
+    split: bool,
+) -> Option<Target> {
+    let anchor = anchor?;
+    let row = rows.iter().position(|r| r.lines.contains(&anchor))?;
+    let from = (row, anchor);
+    let reach = range_reach(rows, from, clicked.0, split);
+    (row != clicked.0
+        && reach.0 == clicked.0
+        && (!split || clicked.1.0 == anchor.0)
+        && !crosses_back(from, clicked))
+    .then(|| range_target(from, clicked))
 }
 
 /// Marks the rows each unresolved multi-line thread spans with a
@@ -1882,18 +2253,10 @@ fn mark_ranges(rows: &mut [Row], comments: &[Placed]) {
         if p.thread.root.resolved {
             continue;
         }
-        let Some(end) = rows
-            .iter()
-            .position(|r| r.lines.contains(&(end_side, end_line)))
-        else {
+        let Some(range) = range_rows(rows, start, (end_side, end_line)) else {
             continue;
         };
-        let first = rows
-            .iter()
-            .position(|r| r.lines.contains(&start))
-            .filter(|&i| i <= end)
-            .unwrap_or(end);
-        for r in &mut rows[first..=end] {
+        for r in &mut rows[range] {
             if !r.class.split(' ').any(|c| c == "skip") {
                 r.class.push_str(" commented-range");
             }
@@ -2044,7 +2407,7 @@ fn unified_view(
     mark_ranges(&mut rows, comments);
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
-        {diff_table("diff unified", rows, inline_changes, fc.cloned(), expand)}
+        {diff_table("diff unified", rows, false, inline_changes, fc.cloned(), expand)}
         {outside}
     }
 }
@@ -2110,7 +2473,7 @@ fn split_view(
     mark_ranges(&mut rows, comments);
     let outside = outside_comments(rest_and_dropped(lc, dropped));
     view! {
-        {diff_table("diff split", rows, inline_changes, fc.cloned(), expand)}
+        {diff_table("diff split", rows, true, inline_changes, fc.cloned(), expand)}
         {outside}
     }
 }
@@ -2188,10 +2551,10 @@ mod tests {
             row(&[], 0),
         ];
         assert_eq!(
-            groups(&rows, &HashSet::new()),
+            groups(&rows, &[]),
             [Group::Plain(0, 1), Group::Row(1), Group::Plain(2, 5)]
         );
-        let open = HashSet::from([(Side::Left, 4), (Side::Left, 1)]);
+        let open = [Target::line((Side::Left, 4)), Target::line((Side::Left, 1))];
         assert_eq!(
             groups(&rows, &open),
             [
@@ -2202,6 +2565,154 @@ mod tests {
                 Group::Plain(4, 5)
             ]
         );
+        // A range's rows are highlighted, so they're rows of their own.
+        let range = [Target {
+            start: Some((Side::Left, 1)),
+            end: (Side::Right, 3),
+        }];
+        assert_eq!(
+            groups(&rows, &range),
+            [
+                Group::Row(0),
+                Group::Row(1),
+                Group::Row(2),
+                Group::Plain(3, 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn targets_round_trip_through_draft_names() {
+        let targets = [
+            Target::line((Side::Right, 14)),
+            Target::line((Side::Left, 3)),
+            Target {
+                start: Some((Side::Right, 10)),
+                end: (Side::Right, 14),
+            },
+            Target {
+                start: Some((Side::Left, 9)),
+                end: (Side::Right, 14),
+            },
+        ];
+        let names: Vec<String> = targets.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["R14", "L3", "R10-R14", "L9-R14"]);
+        for (t, n) in targets.iter().zip(&names) {
+            assert_eq!(Target::parse(n), Some(*t));
+        }
+        for bad in ["file", "R0", "X3", "R", "R3-", "-R3", "R1-R2-R3"] {
+            assert_eq!(Target::parse(bad), None, "{bad}");
+        }
+        assert_eq!(targets[3].label().as_deref(), Some("Lines -9 to +14"));
+        assert_eq!(targets[0].label(), None);
+    }
+
+    /// Unified rows: context 1, a removed line, an added line, context 3,
+    /// hidden lines, then context 10.
+    fn unified_rows() -> Vec<Row> {
+        let mut skip = row(&[], 0);
+        skip.class = "skip".into();
+        vec![
+            row(&[(Side::Left, 1), (Side::Right, 1)], 0),
+            row(&[(Side::Left, 2)], 0),
+            row(&[(Side::Right, 2)], 0),
+            row(&[(Side::Left, 3), (Side::Right, 3)], 0),
+            skip,
+            row(&[(Side::Left, 10), (Side::Right, 10)], 0),
+        ]
+    }
+
+    #[test]
+    fn a_range_reaches_up_to_hidden_lines() {
+        let rows = unified_rows();
+        // In the unified view, a row without the start's side gives its
+        // other line when the range goes from the old side to the new.
+        let old = (0, (Side::Left, 1));
+        assert_eq!(range_reach(&rows, old, 2, false), (2, (Side::Right, 2)));
+        let up = range_reach(&rows, (3, (Side::Right, 3)), 1, false);
+        assert_eq!(up, (1, (Side::Left, 2)));
+        // But not the other way: the removed line is passed.
+        let from = (0, (Side::Right, 1));
+        assert_eq!(range_reach(&rows, from, 1, false), from);
+        assert_eq!(range_reach(&rows, from, 3, false), (3, (Side::Right, 3)));
+        let up = range_reach(&rows, (3, (Side::Left, 3)), 2, false);
+        assert_eq!(up, (3, (Side::Left, 3)));
+        // It stops before the hidden lines.
+        assert_eq!(range_reach(&rows, from, 5, false), (3, (Side::Right, 3)));
+        // Upward too.
+        let up = range_reach(&rows, (3, (Side::Left, 3)), 0, false);
+        assert_eq!(up, (0, (Side::Left, 1)));
+        // Side by side, a row with nothing on the start's side is passed.
+        let split = [
+            row(&[(Side::Left, 1), (Side::Right, 1)], 0),
+            row(&[(Side::Right, 2)], 0),
+        ];
+        assert_eq!(range_reach(&split, old, 1, true), old);
+        assert_eq!(range_reach(&split, old, 1, false), (1, (Side::Right, 2)));
+    }
+
+    #[test]
+    fn range_targets_start_at_the_earlier_row() {
+        let a = (1, (Side::Left, 2));
+        let b = (3, (Side::Right, 3));
+        let range = Target {
+            start: Some((Side::Left, 2)),
+            end: (Side::Right, 3),
+        };
+        assert_eq!(range_target(a, b), range);
+        assert_eq!(range_target(b, a), range);
+        // On one row, the second line.
+        let other = (1, (Side::Right, 1));
+        assert_eq!(range_target(a, other), Target::line((Side::Right, 1)));
+        assert_eq!(range_target(a, a), Target::line(a.1));
+    }
+
+    #[test]
+    fn shift_clicks_make_ranges_only_where_github_takes_them() {
+        let rows = unified_rows();
+        let anchor = Some((Side::Right, 1));
+        assert_eq!(
+            shift_range(&rows, anchor, (3, (Side::Right, 3)), false),
+            Some(Target {
+                start: Some((Side::Right, 1)),
+                end: (Side::Right, 3),
+            })
+        );
+        // Upward, from the old side.
+        assert_eq!(
+            shift_range(&rows, Some((Side::Right, 3)), (1, (Side::Left, 2)), false),
+            Some(Target {
+                start: Some((Side::Left, 2)),
+                end: (Side::Right, 3),
+            })
+        );
+        // Nothing clicked before, the same row, across hidden lines, or
+        // a line the diff doesn't show.
+        assert_eq!(shift_range(&rows, None, (3, (Side::Right, 3)), false), None);
+        assert_eq!(
+            shift_range(&rows, anchor, (0, (Side::Left, 1)), false),
+            None
+        );
+        assert_eq!(
+            shift_range(&rows, anchor, (5, (Side::Right, 10)), false),
+            None
+        );
+        // From the new side down to a removed line, or up from the old
+        // side to an added one: GitHub refuses a range that ends on the old
+        // side after starting on the new.
+        assert_eq!(
+            shift_range(&rows, anchor, (1, (Side::Left, 2)), false),
+            None
+        );
+        assert_eq!(
+            shift_range(&rows, Some((Side::Left, 3)), (2, (Side::Right, 2)), false),
+            None
+        );
+        let gone = Some((Side::Right, 40));
+        assert_eq!(shift_range(&rows, gone, (3, (Side::Right, 3)), false), None);
+        // Side by side, only within a side.
+        assert_eq!(shift_range(&rows, anchor, (3, (Side::Left, 3)), true), None);
+        assert!(shift_range(&rows, anchor, (3, (Side::Right, 3)), true).is_some());
     }
 
     #[test]

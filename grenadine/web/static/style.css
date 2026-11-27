@@ -32,6 +32,8 @@
   --error-bg: #ffebe9;
   --upstream-stripe: rgba(128, 128, 128, 0.12);
   --mixed-stripe: rgba(212, 167, 44, 0.25);
+  --select-bg: rgba(212, 167, 44, 0.2);
+  --select-ln: rgba(212, 167, 44, 0.4);
 }
 
 :root[data-theme="dark"] {
@@ -59,6 +61,8 @@
   --error-bg: rgba(248, 81, 73, 0.1);
   --upstream-stripe: rgba(200, 200, 200, 0.08);
   --mixed-stripe: rgba(210, 153, 34, 0.18);
+  --select-bg: rgba(187, 128, 9, 0.2);
+  --select-ln: rgba(187, 128, 9, 0.45);
 }
 
 * {
@@ -1123,6 +1127,16 @@ input[type="text"] {
 .diff tr.commented-range td.ln {
   box-shadow: inset 3px 0 0 var(--accent);
 }
+/* The lines being picked for a comment, or that an open comment box on
+   a range covers. */
+.diff tr.dragging td.code,
+.diff tr.selecting-range td.code {
+  background: var(--select-bg);
+}
+.diff tr.dragging td.ln,
+.diff tr.selecting-range td.ln {
+  background: var(--select-ln);
+}
 .diff td.blank {
   background: var(--bg-subtle);
 }
@@ -1243,6 +1257,16 @@ input[type="text"] {
 .comment-meta {
   font-size: 12px;
 }
+/* The version a comment was written on, dimmed once it's outdated. */
+.comment-version {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.comment-version.old {
+  color: var(--fg-muted);
+  border-style: dashed;
+}
 .comment .markdown p {
   margin: 4px 0;
 }
@@ -1346,6 +1370,49 @@ select {
 textarea {
   width: 100%;
   resize: vertical;
+}
+
+/* A prompt box with the list of commands its first word can complete to,
+   which opens over what's below the box. */
+.slash-anchor {
+  position: relative;
+}
+.slash-anchor textarea {
+  display: block;
+}
+.slash-suggest {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  margin: 2px 0 0;
+  padding: 4px 0;
+  list-style: none;
+  min-width: 200px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.slash-suggest.above {
+  top: auto;
+  bottom: 100%;
+  margin: 0 0 2px;
+}
+.slash-suggest li {
+  padding: 2px 10px;
+  cursor: pointer;
+}
+.slash-suggest li:hover {
+  background: var(--bg-hover);
+}
+.slash-suggest li.selected {
+  background: var(--accent-bg);
+  color: var(--accent);
 }
 
 .agent-form {
@@ -1639,21 +1706,32 @@ textarea {
   flex-direction: column;
   gap: 8px;
 }
-.turn-prompt {
+.turn-msg {
+  display: flex;
+  flex-direction: column;
+}
+.turn-msg-user {
   align-self: flex-end;
+  align-items: flex-end;
   max-width: 85%;
+}
+.turn-time {
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 2px;
+}
+.turn-prompt {
   white-space: pre-wrap;
   background: var(--accent-bg);
   border-radius: 12px;
   padding: 6px 12px;
 }
 .turn-images {
-  align-self: flex-end;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
-  max-width: 85%;
+  max-width: 100%;
 }
 .turn-images img {
   display: block;
@@ -1685,6 +1763,66 @@ textarea {
   position: absolute;
   top: 2px;
   right: 2px;
+  padding: 0 5px;
+  line-height: 1.3;
+}
+.turn-files {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+}
+.prompt-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.prompt-files[hidden] {
+  display: none;
+}
+.prompt-file,
+.file-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85em;
+}
+.file-chip {
+  padding-right: 8px;
+  color: inherit;
+  text-decoration: none;
+}
+.file-chip:hover {
+  border-color: var(--fg-muted);
+}
+.prompt-file.bad {
+  border-color: var(--error-fg);
+  background: var(--error-bg);
+}
+.prompt-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 240px;
+}
+.prompt-file-status {
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.prompt-file.bad .prompt-file-status {
+  color: var(--error-fg);
+  white-space: normal;
+}
+.prompt-file progress {
+  width: 60px;
+}
+.prompt-file button {
   padding: 0 5px;
   line-height: 1.3;
 }
@@ -1785,6 +1923,12 @@ textarea {
   width: 14px;
   height: 14px;
 }
+/* A call whose task goes on in the background, in the colours of the
+   line that says the session waits for it. */
+.tool summary .spinner.background {
+  border-color: var(--warn-bg);
+  border-top-color: var(--warn-fg);
+}
 .tool-status {
   display: inline-block;
   width: 10px;
@@ -1814,7 +1958,8 @@ textarea {
 /* A long summary keeps to one line so the spinner and duration after it
    stay visible. */
 .approval p code,
-.tool summary code {
+.tool summary code,
+.tool-description {
   display: inline-block;
   max-width: 60%;
   overflow: hidden;
@@ -1910,6 +2055,11 @@ textarea {
 .approval p {
   margin: 0;
 }
+.approval .ask-times {
+  font-size: 11px;
+  color: var(--fg-muted);
+  margin-top: 4px;
+}
 .approval.pending {
   border-color: var(--warn-border);
   background: var(--warn-bg);
@@ -1932,6 +2082,29 @@ textarea {
   flex: 1;
   margin-left: auto;
   max-width: 24em;
+}
+.handoff .handoff-decline {
+  margin-left: auto;
+}
+/* What a handoff the user asked for should do, in its transcript row. */
+.handoff-instruction {
+  white-space: pre-wrap;
+}
+/* The box under the composer that asks for a handoff to be written. */
+.handoff-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+.handoff-ask .hint {
+  margin: 0;
+}
+.handoff-ask textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
 }
 .handed-off-from {
   margin: 0 0 4px;
@@ -2006,6 +2179,20 @@ textarea {
   color: var(--fg);
   background: var(--warn-bg);
   border-color: var(--warn-border);
+}
+/* The task the session waits for, which leads to its row. A long
+   command is cut short rather than wrapping; its time stays whole. */
+.activity-task {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  font-size: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-time {
+  flex: none;
 }
 .spinner {
   flex: none;
@@ -2098,10 +2285,13 @@ textarea {
   min-width: 0;
   min-height: 0;
 }
+/* The changes sidebar's overlay and the floating toggle position
+   themselves inside it, so the terminal panel under it stays visible. */
 .agent-panes {
   flex: 1;
   display: flex;
   min-height: 0;
+  position: relative;
 }
 
 .terminal-panel {
@@ -2198,69 +2388,114 @@ textarea {
   position: absolute;
   inset: 4px 0 0 8px;
 }
+.processes {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.processes table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+}
+.processes th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.processes th,
+.processes td {
+  padding: 1px 12px 1px 0;
+  white-space: nowrap;
+}
+.processes .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.processes tbody tr:hover {
+  background: var(--bg-hover);
+}
+/* Takes the width the numbers leave, and no more, however long the
+   command. */
+.processes .process-command {
+  width: 100%;
+  max-width: 0;
+  min-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.processes .process-toggle {
+  display: inline-block;
+  width: 1.4em;
+  padding: 0;
+  font: inherit;
+  color: var(--fg-muted);
+  text-align: left;
+  background: none;
+  border: none;
+}
+.processes button.process-toggle {
+  cursor: pointer;
+}
+.processes .process-terminal {
+  font-weight: 600;
+}
+.processes .process-hidden {
+  color: var(--fg-muted);
+}
+.processes[hidden],
 .terminal-body[hidden],
 .terminal-host[hidden] {
   display: none;
 }
 
-/* The worktree's changes only get room the transcript can spare; the
-   width is CHANGES_PANE_QUERY in agents.rs. */
-.changes-pane {
-  display: none;
+/* The worktree's changes fill the sidebar next to the transcript. Like
+   the PR sidebar's, the body scrolls on its own so the divider keeps its
+   place. */
+.changes-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 48px;
 }
-@media (min-width: 1500px) {
-  /* The transcript keeps its full width (that of .agent) when it
-     can, and the pane gets the rest. */
-  .agents-page > .main,
-  .agent-panes > .main {
-    flex: 0 1 960px;
-    min-width: 720px;
-  }
-  .changes-pane {
-    display: block;
-    flex: 1 1 480px;
-    min-width: 480px;
-    overflow-y: auto;
-    border-left: 1px solid var(--border);
-    padding: 12px 16px 48px;
-  }
-  .changes-pane h2 {
-    font-size: 16px;
-    margin: 4px 0 8px;
-  }
-  .associated-prs {
-    margin-bottom: 16px;
-  }
-  .associated-prs ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .associated-prs .pr-state {
-    display: inline-flex;
-    align-items: center;
-    margin-right: 4px;
-    color: var(--fg-muted);
-  }
-  .associated-prs .pr-state.merged {
-    color: #8250df;
-  }
-  .associated-prs .pr-state.queued {
-    color: #9a6700;
-  }
-  .associated-prs .pr-state.passing {
-    color: var(--add-fg);
-  }
-  .associated-prs .pr-state.running {
-    color: var(--warn-fg);
-  }
-  .associated-prs .pr-state.failing,
-  .associated-prs .pr-state.conflict {
-    color: var(--del-fg);
-  }
+.changes-pane h2 {
+  font-size: 16px;
+  margin: 4px 0 8px;
+}
+.associated-prs {
+  margin-bottom: 16px;
+}
+.associated-prs ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.associated-prs .pr-state {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  color: var(--fg-muted);
+}
+.associated-prs .pr-state.merged {
+  color: #8250df;
+}
+.associated-prs .pr-state.queued {
+  color: #9a6700;
+}
+.associated-prs .pr-state.passing {
+  color: var(--add-fg);
+}
+.associated-prs .pr-state.running {
+  color: var(--warn-fg);
+}
+.associated-prs .pr-state.failing,
+.associated-prs .pr-state.conflict {
+  color: var(--del-fg);
 }
 
 @media (max-width: 800px) {
@@ -2314,25 +2549,27 @@ textarea {
 }
 
 /* The sidebar is a full-height column whose body scrolls on its own.
-   Column or overlay is decided in pr.rs from the window width; the
+   Column or overlay is decided in sidebar.rs from the window width; the
    divider at its left edge resizes it. `width` is the fallback before
    the inline style lands. The aside itself doesn't scroll, so the
    divider keeps its place and the left of its hit area isn't clipped. */
-.pr-sidebar {
+.side-panel {
   flex: none;
   position: relative;
   display: flex;
   flex-direction: column;
   width: 320px;
   border-left: 1px solid var(--border);
-  font-size: 13px;
   background: var(--bg);
+}
+.pr-sidebar {
+  font-size: 13px;
 }
 .pr-sidebar-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 4px 16px 48px;
+  padding: 4px 16px 8px;
 }
 /* Straddles the sidebar's left border; drags resize it and a
    double-click restores the default split. */
@@ -2358,7 +2595,7 @@ body.resizing-sidebar * {
 }
 /* Too narrow for a column: the sidebar floats over the content's right
    edge instead. */
-.pr-sidebar.overlay {
+.side-panel.overlay {
   position: absolute;
   top: 0;
   right: 0;
@@ -2368,6 +2605,10 @@ body.resizing-sidebar * {
 }
 .pr-sidebar-body section {
   margin-bottom: 16px;
+}
+/* The body's own padding is the room under its last section. */
+.pr-sidebar-body > section:last-child {
+  margin-bottom: 0;
 }
 .pr-sidebar h2 {
   font-size: 15px;
@@ -2380,6 +2621,109 @@ body.resizing-sidebar * {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+/* The sidebar's tabs, above whichever tab's body shows. */
+.pr-sidebar-head {
+  flex: none;
+  padding: 4px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pr-sidebar-tabs {
+  display: flex;
+  gap: 2px;
+  align-self: stretch;
+}
+.pr-sidebar-tab {
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px 4px 0 0;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+}
+.pr-sidebar-tab:hover {
+  color: var(--fg);
+}
+.pr-sidebar-tab.selected {
+  color: var(--fg);
+  box-shadow: inset 0 -2px var(--accent);
+}
+.pr-sidebar-tab-count {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--bg-subtle);
+  font-size: 11px;
+  text-align: center;
+}
+.pr-sidebar-body[hidden] {
+  display: none;
+}
+
+/* The Threads tab: a filter, then the threads by file. */
+.thread-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 12px;
+}
+.thread-chip {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.thread-chip.on {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--fg);
+}
+.thread-chip-count {
+  font-weight: 600;
+}
+.pr-sidebar-body .thread-file {
+  margin-bottom: 20px;
+}
+.thread-file-path {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: normal;
+  overflow-wrap: anywhere;
+}
+.listed-thread {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.listed-thread-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  background: var(--bg-subtle);
+  font-size: 12px;
+}
+.listed-thread.resolved .listed-thread-where {
+  color: var(--fg-muted);
+}
+.threads-empty {
+  margin: 16px 0;
+}
+/* A thread the sidebar jumps to sits below the toolbar and its file's
+   sticky header. */
+.pr .thread {
+  scroll-margin-top: calc(var(--toolbar-height, 0px) + 48px);
 }
 
 /* The agents panel pinned under the sidebar's body, like the terminal
@@ -2793,6 +3137,12 @@ body.resizing-sidebar * {
   margin: 4px 0;
   font-weight: 600;
 }
+.rerun-checks {
+  margin: 4px 0 8px;
+}
+.rerun-checks .error {
+  margin: 4px 0 0;
+}
 .merge-status.ok {
   color: var(--add-fg);
 }
@@ -2896,6 +3246,10 @@ textarea.markdown-editor {
 }
 td.ln.commentable {
   cursor: pointer;
+}
+.composer-lines {
+  margin: 0 0 6px;
+  font-size: 12px;
 }
 td.ln.commentable:hover {
   color: var(--accent);

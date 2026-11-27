@@ -11,7 +11,7 @@ use grenadine_core::api::{
     MergeMethod, MergeQueueInfo, MergeState, MergeStatus, NewThread, Person, PrKey, QueueEntry,
     QueueState, RequestPriority, RequestedReviewer, Review, ReviewComment, ReviewDecision,
     ReviewEvent, ReviewInfo, ReviewState, ReviewerCandidates, Side, StackMerge, StackMergePr,
-    StackPr, SubmitReview, TeamRef, ThreadCounts,
+    StackPr, StaleRun, SubmitReview, TeamRef, ThreadCounts,
 };
 use grenadine_core::filter::{PrFacts, ReviewFact};
 use grenadine_core::versions::{Activity, ActivityKind, ForcePush};
@@ -132,6 +132,8 @@ pub struct ThreadState {
     /// The viewer may resolve the thread, or unresolve it if it's resolved.
     pub can_resolve: bool,
     pub side: Side,
+    /// The side a multi-line thread starts on.
+    pub start_side: Option<Side>,
 }
 
 /// The viewer's pending review on a PR, as `GitHub::pending_review`
@@ -206,8 +208,8 @@ pub struct PrStatus {
     pub base_ref: String,
     /// The head branch's tip commit.
     pub head_oid: String,
-    /// The combined state of the checks on its head; `None` when it has
-    /// none.
+    /// The combined state of the checks on its head, as `combined_ci`
+    /// works it out; `None` when it has none.
     pub ci: Option<CiStatus>,
 }
 
@@ -222,7 +224,9 @@ impl From<&PrData> for PrStatus {
             title: data.title.clone(),
             base_ref: data.base_ref.clone(),
             head_oid: data.head_oid.clone(),
-            ci: data.ci,
+            // The checks the PR page shows, when the review fields could
+            // be read.
+            ci: data.review.as_ref().map_or(data.ci, |r| r.ci),
         }
     }
 }
@@ -273,11 +277,13 @@ const SEARCH_STATUS_FIELDS: &str = "reviewDecision isInMergeQueue
 /// uses it must append it.
 const CHECKS_FRAGMENT: &str = "
 fragment Checks on StatusCheckRollup {
+  state
   contexts(first: 100) {
+    pageInfo { hasNextPage }
     nodes {
       ... on CheckRun {
         name status conclusion detailsUrl startedAt
-        checkSuite { workflowRun { workflow { name } } }
+        checkSuite { workflowRun { databaseId workflow { name } } }
       }
       ... on StatusContext { context state targetUrl }
     }
@@ -451,8 +457,9 @@ query($owner: String!, $name: String!, $number: Int!) {
             position
             pullRequest {
               number title headRefName state isDraft mergeable mergeStateStatus
+              reviewDecision
               commits(last: 1) {
-                nodes { commit { statusCheckRollup { state } } }
+                nodes { commit { statusCheckRollup { ...Checks } } }
               }
             }
           }
@@ -517,7 +524,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id diffSide
+          id diffSide startDiffSide
           isResolved viewerCanResolve viewerCanUnresolve
           resolvedBy { login name avatarUrl }
           comments(first: 1) { nodes { databaseId } }
@@ -598,9 +605,10 @@ fn review_error(errors: &[Value]) -> Option<String> {
         })
 }
 
-/// The checks of a `...Checks` fragment, the `statusCheckRollup` of a
-/// commit.
-fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
+/// The contexts of a `...Checks` fragment, the `statusCheckRollup` of a
+/// commit, split into the ones that count and the check runs that later
+/// runs of the same check replaced.
+fn split_contexts(rollup: Option<&Value>) -> (Vec<&Value>, Vec<&Value>) {
     // A commit keeps the runs that later runs of the same workflow
     // superseded, e.g. ones a concurrency group cancelled. Only the run of
     // each check that started last counts; one that hasn't started yet is a
@@ -625,11 +633,17 @@ fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
             })
             .or_insert(c);
     }
-    contexts
+    contexts.into_iter().partition(|&c| {
+        str_at(c, "/name").is_empty() || latest.values().any(|&kept| std::ptr::eq(kept, c))
+    })
+}
+
+/// The checks of a `...Checks` fragment, the `statusCheckRollup` of a
+/// commit.
+fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
+    split_contexts(rollup)
+        .0
         .into_iter()
-        .filter(|&c| {
-            str_at(c, "/name").is_empty() || latest.values().any(|&kept| std::ptr::eq(kept, c))
-        })
         .filter_map(|c| {
             let opt = |ptr: &str| {
                 Some(str_at(c, ptr))
@@ -653,6 +667,47 @@ fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
         .collect()
 }
 
+/// The replaced runs that fail a commit's checks for GitHub alone: the
+/// failed or cancelled runs that `head_checks` drops, when GitHub's
+/// combined state of the `...Checks` fragment is failing while every
+/// check that `head_checks` keeps is done and none failed. GitHub's
+/// state can count a replaced run, so a push that starts a workflow twice
+/// leaves the cancelled twin failing the commit, and a required check
+/// with it, until that run is re-run. While a check still runs there's
+/// nothing to say yet: it may be the re-run that replaces one. Nor is
+/// there when the commit has more contexts than the fragment reads: one
+/// beyond them may be what fails.
+fn stale_runs(rollup: Option<&Value>) -> Vec<StaleRun> {
+    let failing = matches!(
+        rollup.map(|r| str_at(r, "/state")),
+        Some("FAILURE" | "ERROR")
+    );
+    let truncated = rollup
+        .and_then(|r| r.pointer("/contexts/pageInfo/hasNextPage"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !failing || truncated || combined_ci(&head_checks(rollup)) != Some(CiStatus::Passing) {
+        return Vec::new();
+    }
+    split_contexts(rollup)
+        .1
+        .into_iter()
+        .filter(|c| {
+            check_run_status(str_at(c, "/status"), str_at(c, "/conclusion"))
+                == Some(CiStatus::Failing)
+        })
+        .map(|c| StaleRun {
+            name: str_at(c, "/name").to_owned(),
+            url: Some(str_at(c, "/detailsUrl"))
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            run_id: c
+                .pointer("/checkSuite/workflowRun/databaseId")
+                .and_then(Value::as_u64),
+        })
+        .collect()
+}
+
 /// The combined state of `checks`. It's GitHub's rule, which counts
 /// checks that were skipped or neutral as passing, but without the runs
 /// that `head_checks` drops: GitHub's own combined state counts those
@@ -662,6 +717,34 @@ fn combined_ci(checks: &[Check]) -> Option<CiStatus> {
         .into_iter()
         .find(|&s| checks.iter().any(|c| c.status == Some(s)))
         .or((!checks.is_empty()).then_some(CiStatus::Passing))
+}
+
+/// Where the PR node of a `pr_statuses` lookup stands; `None` when
+/// GitHub didn't find the PR.
+fn pr_status(pr: &Value) -> Option<PrStatus> {
+    let state = str_at(pr, "/state");
+    if state.is_empty() {
+        return None;
+    }
+    // GitHub says UNKNOWN until it has tried merging.
+    let conflicting = match str_at(pr, "/mergeable") {
+        "CONFLICTING" => Some(true),
+        "MERGEABLE" => Some(false),
+        _ => None,
+    };
+    Some(PrStatus {
+        state: state.to_owned(),
+        queued: pr["isInMergeQueue"].as_bool().unwrap_or_default(),
+        conflicting,
+        title: str_at(pr, "/title").to_owned(),
+        base_ref: str_at(pr, "/baseRefName").to_owned(),
+        head_oid: str_at(pr, "/headRefOid").to_owned(),
+        // Not GitHub's own combined state, which a superseded cancelled
+        // run fails: the same as the PR page's.
+        ci: combined_ci(&head_checks(
+            pr.pointer("/commits/nodes/0/commit/statusCheckRollup"),
+        )),
+    })
 }
 
 /// A search's PR node as a hit.
@@ -772,7 +855,8 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
             url: str_at(c, "/url").to_owned(),
         })
         .collect();
-    let checks = head_checks(pr.pointer("/head/nodes/0/commit/statusCheckRollup"));
+    let rollup = pr.pointer("/head/nodes/0/commit/statusCheckRollup");
+    let checks = head_checks(rollup);
     let repo = &data["repository"];
     let methods = [
         ("/mergeCommitAllowed", MergeMethod::Merge),
@@ -816,6 +900,7 @@ fn review_info(data: &Value, pr: &Value) -> ReviewInfo {
                         .and_then(Value::as_bool)
                         == Some(true)
                 }),
+            stale_runs: stale_runs(rollup),
             queue: queue_info(pr),
             stack: stack_merge(pr),
         },
@@ -855,7 +940,12 @@ fn stack_merge(pr: &Value) -> Option<StackMerge> {
                         _ => None,
                     },
                     state: merge_state(str_at(p, "/mergeStateStatus")),
-                    ci: ci_status(str_at(p, "/commits/nodes/0/commit/statusCheckRollup/state")),
+                    // The checks its own page shows, without superseded runs.
+                    ci: combined_ci(&head_checks(
+                        p.pointer("/commits/nodes/0/commit/statusCheckRollup"),
+                    )),
+                    stale_runs: stale_runs(p.pointer("/commits/nodes/0/commit/statusCheckRollup")),
+                    decision: review_decision(str_at(p, "/reviewDecision")),
                 },
             ))
         })
@@ -1387,6 +1477,8 @@ impl GitHub {
                 "body": t.body,
                 "line": t.line,
                 "side": t.side.as_github(),
+                "startLine": t.start_line,
+                "startSide": t.start_line.map(|_| t.start_side.unwrap_or(t.side).as_github()),
             })]
         });
         let data = self
@@ -1444,10 +1536,11 @@ impl GitHub {
         self.mutate(
             std::slice::from_ref(&repo.to_owned()),
             "mutation($review: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide,
+                      $startLine: Int, $startSide: DiffSide,
                       $subject: PullRequestReviewThreadSubjectType) {
                addPullRequestReviewThread(input: {
                  pullRequestReviewId: $review, path: $path, body: $body, line: $line, side: $side,
-                 subjectType: $subject
+                 startLine: $startLine, startSide: $startSide, subjectType: $subject
                }) {
                  clientMutationId
                }
@@ -1458,6 +1551,8 @@ impl GitHub {
                 "body": t.body,
                 "line": t.line,
                 "side": t.line.map(|_| t.side.as_github()),
+                "startLine": t.start_line,
+                "startSide": t.start_line.map(|_| t.start_side.unwrap_or(t.side).as_github()),
                 "subject": if t.line.is_some() { "LINE" } else { "FILE" },
             }),
         )
@@ -1849,6 +1944,26 @@ impl GitHub {
             json!({ "pr": self.pr_id(key).await? }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Re-runs the failed and cancelled jobs of the GitHub Actions
+    /// workflow run `run` of `repo`, which replaces their checks on the
+    /// commit. The jobs that passed keep their runs.
+    pub async fn rerun_workflow(&self, repo: &str, run: u64) -> Result<()> {
+        let url = format!(
+            "{}/repos/{repo}/actions/runs/{run}/rerun-failed-jobs",
+            self.api
+        );
+        let resp = self
+            .stacks_send("rerun_workflow", repo, self.http.post(url))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let v: Value = resp.json().await.unwrap_or_default();
+            let reason = v["message"].as_str().unwrap_or("no reason given");
+            bail!("GitHub didn't re-run the checks ({status}): {reason}");
+        }
         Ok(())
     }
 
@@ -2611,6 +2726,7 @@ impl GitHub {
                         resolved_by: resolved.then(|| person_at(&t["resolvedBy"])).flatten(),
                         can_resolve: t[can].as_bool() == Some(true),
                         side: Side::from_github(str_at(t, "/diffSide")),
+                        start_side: t["startDiffSide"].as_str().map(Side::from_github),
                     },
                 ))
             }));
@@ -2673,7 +2789,7 @@ impl GitHub {
             let fields: String = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state isInMergeQueue mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }} }}\n"
+                        "p{i}: repository(owner: $o{i}, name: $n{i}) {{ pullRequest(number: $x{i}) {{ state isInMergeQueue mergeable title baseRefName headRefOid commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ ...Checks }} }} }} }} }} }}\n"
                     )
                 })
                 .collect();
@@ -2692,43 +2808,17 @@ impl GitHub {
                 .graphql(
                     "pr_statuses",
                     &repos,
-                    &format!("query({params}) {{\n{fields}}}"),
+                    &format!("query({params}) {{\n{fields}}}{CHECKS_FRAGMENT}"),
                     Value::Object(vars),
                 )
                 .await?;
             for (i, key) in chunk.iter().enumerate() {
-                let state = str_at(&data, &format!("/p{i}/pullRequest/state"));
-                if state.is_empty() {
-                    continue;
+                if let Some(status) = data
+                    .pointer(&format!("/p{i}/pullRequest"))
+                    .and_then(pr_status)
+                {
+                    out.insert(key.clone(), status);
                 }
-                // GitHub says UNKNOWN until it has tried merging.
-                let conflicting = match str_at(&data, &format!("/p{i}/pullRequest/mergeable")) {
-                    "CONFLICTING" => Some(true),
-                    "MERGEABLE" => Some(false),
-                    _ => None,
-                };
-                out.insert(
-                    key.clone(),
-                    PrStatus {
-                        state: state.to_owned(),
-                        queued: data
-                            .pointer(&format!("/p{i}/pullRequest/isInMergeQueue"))
-                            .and_then(Value::as_bool)
-                            .unwrap_or_default(),
-                        conflicting,
-                        title: str_at(&data, &format!("/p{i}/pullRequest/title")).to_owned(),
-                        base_ref: str_at(&data, &format!("/p{i}/pullRequest/baseRefName"))
-                            .to_owned(),
-                        head_oid: str_at(&data, &format!("/p{i}/pullRequest/headRefOid"))
-                            .to_owned(),
-                        ci: ci_status(str_at(
-                            &data,
-                            &format!(
-                                "/p{i}/pullRequest/commits/nodes/0/commit/statusCheckRollup/state"
-                            ),
-                        )),
-                    },
-                );
             }
         }
         Ok(out)
@@ -3213,6 +3303,7 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: true,
                 requires_conversation_resolution: true,
+                stale_runs: vec![],
                 queue: Some(MergeQueueInfo {
                     method: Some(MergeMethod::Squash),
                     entry: Some(QueueEntry {
@@ -3387,7 +3478,8 @@ mod tests {
             head_repo: Some("o/r".into()),
             force_pushes: vec![],
             commits: vec![],
-            ci: Some(CiStatus::Passing),
+            // GitHub's own state, failed by a superseded run.
+            ci: Some(CiStatus::Failing),
             review: Some(ReviewInfo {
                 viewer: "me".into(),
                 decision: None,
@@ -3396,7 +3488,7 @@ mod tests {
                 can_edit_reviewers: false,
                 comments: vec![],
                 checks: vec![],
-                ci: None,
+                ci: Some(CiStatus::Passing),
                 merge: MergeInfo {
                     conflicting: Some(true),
                     state: MergeState::Dirty,
@@ -3405,6 +3497,7 @@ mod tests {
                     delete_branch_on_merge: false,
                     can_merge_as_admin: false,
                     requires_conversation_resolution: false,
+                    stale_runs: vec![],
                     queue: None,
                     stack: None,
                 },
@@ -3431,8 +3524,137 @@ mod tests {
             review: None,
             ..data
         };
+        // Nor the checks the PR page reads, so GitHub's state stands in.
         assert_eq!(PrStatus::from(&data).conflicting, None);
+        assert_eq!(PrStatus::from(&data).ci, Some(CiStatus::Failing));
     }
+
+    fn status_node(rollup: Value) -> Value {
+        json!({
+            "state": "OPEN",
+            "isInMergeQueue": false,
+            "mergeable": "MERGEABLE",
+            "title": "Fix it",
+            "baseRefName": "main",
+            "headRefOid": "abc",
+            "commits": { "nodes": [{ "commit": { "statusCheckRollup": rollup } }] },
+        })
+    }
+
+    fn check_run(name: &str, conclusion: &str, started: &str) -> Value {
+        json!({
+            "name": name, "status": "COMPLETED", "conclusion": conclusion,
+            "detailsUrl": null, "startedAt": started,
+            "checkSuite": { "workflowRun": { "workflow": { "name": name } } },
+        })
+    }
+
+    #[test]
+    fn pr_status_reads_the_lookup() {
+        assert_eq!(
+            pr_status(&status_node(Value::Null)),
+            Some(PrStatus {
+                state: "OPEN".into(),
+                queued: false,
+                conflicting: Some(false),
+                title: "Fix it".into(),
+                base_ref: "main".into(),
+                head_oid: "abc".into(),
+                ci: None,
+            })
+        );
+        // A PR GitHub can't find.
+        assert_eq!(pr_status(&json!(null)), None);
+    }
+
+    #[test]
+    fn pr_status_ignores_superseded_runs() {
+        // A concurrency group cancelled the first run of `test`, which
+        // fails GitHub's own state, but the run that replaced it passed.
+        let rollup = json!({
+            "state": "FAILURE",
+            "contexts": { "nodes": [
+                check_run("test", "CANCELLED", "2026-01-01T00:00:00Z"),
+                check_run("test", "SUCCESS", "2026-01-01T00:00:02Z"),
+            ] },
+        });
+        assert_eq!(
+            pr_status(&status_node(rollup)).unwrap().ci,
+            Some(CiStatus::Passing)
+        );
+        // The latest run failing still fails it.
+        let rollup = json!({
+            "state": "FAILURE",
+            "contexts": { "nodes": [
+                check_run("test", "SUCCESS", "2026-01-01T00:00:00Z"),
+                check_run("test", "FAILURE", "2026-01-01T00:00:02Z"),
+            ] },
+        });
+        assert_eq!(
+            pr_status(&status_node(rollup)).unwrap().ci,
+            Some(CiStatus::Failing)
+        );
+    }
+
+    #[test]
+    fn stale_runs_are_the_replaced_runs_github_still_counts() {
+        let run = |conclusion: &str, started: &str, id: Option<u64>| {
+            let mut run = check_run("test", conclusion, started);
+            run["detailsUrl"] = json!(format!("https://ci.example/{started}"));
+            run["checkSuite"]["workflowRun"]["databaseId"] = json!(id);
+            run
+        };
+        let rollup = |state: &str, runs: Vec<Value>| {
+            let rollup = json!({ "state": state, "contexts": { "nodes": runs } });
+            stale_runs(Some(&rollup))
+        };
+        let cancelled = run("CANCELLED", "2026-01-01T00:00:00Z", Some(7));
+        let passed = run("SUCCESS", "2026-01-01T00:00:02Z", Some(8));
+        // GitHub counts the cancelled run though a later one passed.
+        assert_eq!(
+            rollup("FAILURE", vec![cancelled.clone(), passed.clone()]),
+            [StaleRun {
+                name: "test".into(),
+                url: Some("https://ci.example/2026-01-01T00:00:00Z".into()),
+                run_id: Some(7),
+            }]
+        );
+        // Another app's check has no workflow run to re-run.
+        let other = run("CANCELLED", "2026-01-01T00:00:00Z", None);
+        assert_eq!(
+            rollup("FAILURE", vec![other, passed.clone()])[0].run_id,
+            None
+        );
+        // GitHub doesn't count it: nothing is stale.
+        assert_eq!(
+            rollup("SUCCESS", vec![cancelled.clone(), passed.clone()]),
+            []
+        );
+        // The run that counts failed, which is the reason then.
+        let failed = run("FAILURE", "2026-01-01T00:00:02Z", Some(8));
+        assert_eq!(rollup("FAILURE", vec![cancelled.clone(), failed]), []);
+        // A check still runs, maybe the re-run.
+        let mut running = run("", "2026-01-01T00:00:02Z", Some(8));
+        running["status"] = json!("IN_PROGRESS");
+        assert_eq!(rollup("FAILURE", vec![cancelled.clone(), running]), []);
+        // A replaced run that passed isn't what fails the checks.
+        let lint = json!({ "context": "lint", "state": "FAILURE" });
+        assert_eq!(
+            rollup("FAILURE", vec![passed.clone(), passed.clone(), lint]),
+            []
+        );
+        // More contexts than were read: one of the rest may fail.
+        let truncated = json!({
+            "state": "FAILURE",
+            "contexts": {
+                "pageInfo": { "hasNextPage": true },
+                "nodes": [cancelled, passed],
+            },
+        });
+        assert_eq!(stale_runs(Some(&truncated)), []);
+        assert_eq!(stale_runs(None), []);
+    }
+
     #[test]
     fn merge_async_status_maps_the_states() {
         assert_eq!(
@@ -3455,6 +3677,19 @@ mod tests {
 
     #[test]
     fn stack_merge_reads_the_open_prs_below() {
+        // PR 12's first `test` run was cancelled, which fails GitHub's own
+        // state, but the run that superseded it passed.
+        let rollup = |number: u64| {
+            let runs = match number {
+                12 => vec![
+                    check_run("test", "CANCELLED", "2026-01-01T00:00:00Z"),
+                    check_run("test", "SUCCESS", "2026-01-01T00:00:02Z"),
+                ],
+                _ => vec![check_run("test", "SUCCESS", "2026-01-01T00:00:00Z")],
+            };
+            let state = if number == 12 { "FAILURE" } else { "SUCCESS" };
+            json!({ "state": state, "contexts": { "nodes": runs } })
+        };
         let pr = |number: u64, position: u64| {
             json!({
                 "position": position,
@@ -3466,8 +3701,9 @@ mod tests {
                     "isDraft": number == 10,
                     "mergeable": if number == 12 { "CONFLICTING" } else { "MERGEABLE" },
                     "mergeStateStatus": if number == 12 { "DIRTY" } else { "CLEAN" },
+                    "reviewDecision": if number == 12 { "REVIEW_REQUIRED" } else { "APPROVED" },
                     "commits": {
-                        "nodes": [{ "commit": { "statusCheckRollup": { "state": "SUCCESS" } } }]
+                        "nodes": [{ "commit": { "statusCheckRollup": rollup(number) } }]
                     },
                 },
             })
@@ -3496,6 +3732,8 @@ mod tests {
                         conflicting: Some(false),
                         state: MergeState::Clean,
                         ci: Some(CiStatus::Passing),
+                        stale_runs: vec![],
+                        decision: Some(ReviewDecision::Approved),
                     },
                     StackMergePr {
                         number: 12,
@@ -3505,6 +3743,12 @@ mod tests {
                         conflicting: Some(true),
                         state: MergeState::Dirty,
                         ci: Some(CiStatus::Passing),
+                        stale_runs: vec![StaleRun {
+                            name: "test".into(),
+                            url: None,
+                            run_id: None,
+                        }],
+                        decision: Some(ReviewDecision::ReviewRequired),
                     },
                 ],
             })

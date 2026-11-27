@@ -33,12 +33,12 @@ MERGING = "Merging"
 DRAFTS = "Drafts"
 DRAFTS_FROM_OTHERS = "Drafts from others"
 WAITING_FOR_REVIEWERS = "Waiting for reviewers"
-ALL_MY_OPEN = "All my open PRs"
+ALL_YOUR_OPEN = "All your open PRs"
 WAITING_FOR_AUTHOR = "Waiting for author"
-MERGED_BY_ME = "Merged by me"
-MERGED_BY_OTHERS = "Merged by others"
+YOUR_MERGED = "Your merged PRs"
+MERGED_FROM_OTHERS = "Merged PRs from others"
 ALL_OPEN = "All open PRs"
-UNMERGED_ON_MINE = "Unmerged PRs on mine"
+YOUR_UNMERGED = "Your unmerged PRs"
 
 STACK_BASE = "Lay the stack's foundation"
 STACK_TOP = "Build on the foundation"
@@ -308,20 +308,20 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # A comment-only review is an active review.
     pr = add(
         _simple_pr(repo, "returned-commented", "Get a comment-only review"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, COMMENTED)
 
     # A bot's comment-only review isn't an active human review.
     pr = add(
         _simple_pr(repo, "waiting-bot-commented", "Get only a bot's comment"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(BOT, COMMENTED)
 
     pr = add(
         _simple_pr(repo, "returned-changes", "Get changes requested"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, CHANGES_REQUESTED, body="Please split this up.")
     repo.issue_comment(pr, author=VIEWER, body="Will do, thanks!")
@@ -329,7 +329,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     pr = add(
         _simple_pr(repo, "approved", "Get approved", body=DESCRIPTION),
-        [APPROVED_INBOX, ALL_MY_OPEN, ALL_OPEN],
+        [APPROVED_INBOX, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.submit_review(OTHER, APPROVED)
 
@@ -337,7 +337,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # wants more approvals.
     pr = add(
         _simple_pr(repo, "waiting-more-approvals", "Get one of two approvals"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.review_required = True
     pr.required_approvals = 2
@@ -347,7 +347,7 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     # human review even when the PR has a partial approval.
     pr = add(
         _simple_pr(repo, "returned-approval-comment", "Get a comment over an approval"),
-        [RETURNED, ALL_MY_OPEN, ALL_OPEN],
+        [RETURNED, ALL_YOUR_OPEN, ALL_OPEN],
     )
     pr.review_required = True
     pr.required_approvals = 2
@@ -356,16 +356,16 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     add(
         _simple_pr(repo, "waiting-reviewers", "Wait for reviewers"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     add(
         _simple_pr(repo, "draft", "Stay a draft", draft=True),
-        [DRAFTS, ALL_MY_OPEN, ALL_OPEN],
+        [DRAFTS, ALL_YOUR_OPEN, ALL_OPEN],
     )
 
     pr = add(
         _simple_pr(repo, "merging", "Sit in the merge queue"),
-        [MERGING, ALL_MY_OPEN],
+        [MERGING, ALL_YOUR_OPEN],
     )
     pr.submit_review(OTHER, APPROVED)
     pr.queued = True
@@ -398,22 +398,22 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
 
     pr = add(_simple_pr(repo, "closed", "Get closed", author=OTHER), [])
     repo.close(pr)
-    # state:closed covers unmerged PRs too, so "Merged by me" has it.
-    pr = add(
-        _simple_pr(repo, "closed-mine", "Retract my PR"),
-        [MERGED_BY_ME, UNMERGED_ON_MINE],
-    )
+    pr = add(_simple_pr(repo, "closed-mine", "Retract my PR"), [YOUR_UNMERGED])
     repo.close(pr)
-    pr = add(_simple_pr(repo, "merged", "Get merged"), [MERGED_BY_ME])
+    pr = add(_simple_pr(repo, "merged", "Get merged"), [YOUR_MERGED])
     pr.submit_review(OTHER, APPROVED)
     pr.check_runs = [CheckRun("test")]
     repo.merge(pr)
     pr = add(
         _simple_pr(repo, "merged-others", "Land the other's PR", author=OTHER),
-        [MERGED_BY_OTHERS],
+        [MERGED_FROM_OTHERS],
     )
     pr.submit_review(VIEWER, APPROVED)
     repo.merge(pr)
+    # Merged PRs from others has only the merged ones.
+    pr = add(_simple_pr(repo, "closed-others", "Drop the other's PR", author=OTHER), [])
+    pr.submit_review(VIEWER, CHANGES_REQUESTED)
+    repo.close(pr)
     pr = add(
         _simple_pr(repo, "uninvolved", "Leave me out of it", author=OTHER),
         [ALL_OPEN],
@@ -426,14 +426,14 @@ def inbox_cases(gh: FakeGitHub) -> Inboxes:
     repo.push("dev/stack-base")
     add(
         repo.open_pr(STACK_BASE, head="dev/stack-base"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
     repo.checkout("dev/stack-top")
     repo.commit(STACK_TOP, {"stack/top.txt": "top\n"})
     repo.push("dev/stack-top")
     add(
         repo.open_pr(STACK_TOP, head="dev/stack-top", base="dev/stack-base"),
-        [WAITING_FOR_REVIEWERS, ALL_MY_OPEN, ALL_OPEN],
+        [WAITING_FOR_REVIEWERS, ALL_YOUR_OPEN, ALL_OPEN],
     )
 
     return Inboxes(prs, expected)
@@ -732,6 +732,10 @@ AUTO_DELETE = "Leave the branch to GitHub"
 SETTLE = "Wait for GitHub to decide"
 STACK_PARENT = "Carry another PR"
 STACK_CHILD = "Sit on another PR"
+RANGE_DRAG = "Comment on a range of lines"
+RANGE_SHIFT = "Stretch a comment over lines"
+RANGE_SIDES = "Comment across the sides"
+RANGE_SPLIT = "Comment on lines side by side"
 REVIEW_CASES = [
     REPLY,
     RESOLVE,
@@ -757,10 +761,18 @@ REVIEW_CASES = [
     SETTLE,
     STACK_PARENT,
     STACK_CHILD,
+    RANGE_DRAG,
+    RANGE_SHIFT,
+    RANGE_SIDES,
+    RANGE_SPLIT,
 ]
 # A file on main, which LEFT_LINE removes the third line of.
 OLD_PATH = "review/old.md"
 OLD_LINES = [f"Old line {i}" for i in range(1, 6)]
+# A file on main, whose lines 3 and 25 RANGE_SIDES and RANGE_SPLIT change,
+# so that their diffs hide the lines between.
+LONG_PATH = "review/long.md"
+LONG_LINES = [f"Long line {i}" for i in range(1, 31)]
 
 
 def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
@@ -772,7 +784,11 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     repo.checkout("main")
     repo.commit(
         "Seed the repo",
-        {"README.md": "# test\n", OLD_PATH: "\n".join(OLD_LINES) + "\n"},
+        {
+            "README.md": "# test\n",
+            OLD_PATH: "\n".join(OLD_LINES) + "\n",
+            LONG_PATH: "\n".join(LONG_LINES) + "\n",
+        },
     )
     repo.push("main")
     prs = {}
@@ -788,6 +804,12 @@ def review_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
         if title == LEFT_LINE:
             kept = OLD_LINES[:2] + OLD_LINES[3:]
             files[OLD_PATH] = "\n".join(kept) + "\n"
+        if title in (RANGE_SIDES, RANGE_SPLIT):
+            changed = [
+                f"New line {i + 1}" if i in (2, 24) else line
+                for i, line in enumerate(LONG_LINES)
+            ]
+            files[LONG_PATH] = "\n".join(changed) + "\n"
         repo.commit(title, files, author=author)
         repo.push(branch, actor=author)
         pr = repo.open_pr(title, head=branch, base=base, author=author)
@@ -862,6 +884,7 @@ GH_TOP = "Cap the stack"
 GH_DRAFT = "Sit on a draft"
 GH_BLOCKED = "Sit on a blocked PR"
 GH_FAIL = "Fail at merge time"
+GH_TWIN = "Sit on a cancelled twin"
 GHQ_LOW = "Queue from the stack's bottom"
 GHQ_TOP = "Queue the whole stack"
 # The PRs whose page the tests open, and the PR below each.
@@ -871,10 +894,12 @@ GHSTACK_CASES = [
     (GH_DRAFT, "Draft at the stack's bottom"),
     (GH_BLOCKED, "Blocked at the stack's bottom"),
     (GH_FAIL, "Fragile at the stack's bottom"),
+    (GH_TWIN, "Cancelled twin at the stack's bottom"),
 ]
 GH_DRAFT_LOW = "Draft at the stack's bottom"
 GH_BLOCKED_LOW = "Blocked at the stack's bottom"
 GH_FAIL_LOW = "Fragile at the stack's bottom"
+GH_TWIN_LOW = "Cancelled twin at the stack's bottom"
 
 
 def _gh_stack(
@@ -897,9 +922,10 @@ def _gh_stack(
 
 def stack_merge_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     """GitHub stacks to merge through: a plain one, one on a draft, one
-    on a blocked PR the viewer may bypass, and one whose bottom turns
-    unmergeable while the merge runs. A last stack lives on the merge
-    queue repository."""
+    on a blocked PR the viewer may bypass, one whose bottom turns
+    unmergeable while the merge runs, and one whose PRs' required check
+    ran twice, the first run having been cancelled for the second.
+    A last stack lives on the merge queue repository."""
     repo = gh.repo(GHSTACK_REPO)
     repo.checkout("main")
     repo.commit("Seed the repo", {"README.md": "# stacked\n"})
@@ -915,6 +941,20 @@ def stack_merge_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     prs[GH_BLOCKED_LOW].merge_state = "BLOCKED"
     for title in (GH_BLOCKED_LOW, GH_BLOCKED):
         prs[title].can_merge_as_admin = True
+    for run_id, title in enumerate((GH_TWIN_LOW, GH_TWIN), start=500):
+        # The run that passed started last, but GitHub still counts the
+        # cancelled one.
+        prs[title].check_runs = [
+            CheckRun(
+                "test",
+                conclusion="CANCELLED",
+                started_at=1,
+                workflow="Test",
+                run_id=run_id,
+            ),
+            CheckRun("test", started_at=2, workflow="Test", run_id=run_id + 10),
+        ]
+        prs[title].required_checks = True
 
     queue = gh.repo(QUEUE_REPO)
     if queue.merge_queue is None:

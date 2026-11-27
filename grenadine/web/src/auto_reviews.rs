@@ -3,7 +3,7 @@
 //! section of a PR's sidebar that shows its latest review and asks for
 //! another.
 
-use grenadine_core::api::{AutoReviewEntry, AutoReviewState, PrKey};
+use grenadine_core::api::{AutoReviewDetail, AutoReviewEntry, AutoReviewState, PrKey};
 use leptos::prelude::*;
 
 use crate::agents::{cost, status_class, status_label};
@@ -15,6 +15,12 @@ pub const LIST: &str = "#/auto-reviews";
 /// The page of the review that session `id` is doing.
 pub fn hash(id: &str) -> String {
     format!("{LIST}/{id}")
+}
+
+/// The page of the review `id`, which shows its session while it has one
+/// and what the session said once it's deleted.
+pub fn page_hash(id: i64) -> String {
+    format!("{LIST}/review/{id}")
 }
 
 fn state_label(s: AutoReviewState) -> &'static str {
@@ -70,15 +76,15 @@ pub fn Sidebar(route: Signal<Route>) -> impl IntoView {
 #[component]
 fn Entry(review: AutoReviewEntry, route: Signal<Route>) -> impl IntoView {
     let session = review.session.clone();
-    let selected = {
-        let session = session.clone();
-        move || route.with(|r| matches!(r, Route::AutoReview(id) if Some(id) == session.as_ref()))
+    let id = review.id;
+    let selected = move || {
+        route.with(|r| match r {
+            Route::AutoReviewPage(page) => *page == id,
+            Route::AutoReview(s) => Some(s) == session.as_ref(),
+            _ => false,
+        })
     };
-    // A posted review's session is gone; its review is on the PR.
-    let href = match &session {
-        Some(id) => hash(id),
-        None => hash_for(&review.key),
-    };
+    let href = page_hash(id);
     let badge = badge(&review);
     let mut meta = vec![
         review.head_oid.chars().take(8).collect::<String>(),
@@ -118,8 +124,8 @@ pub fn Overview() -> impl IntoView {
             <p>
                 "Grenadine reviews the pull requests you open in its repositories, each in an "
                 "unattended agent session that posts its review on the pull request. A session "
-                "whose review is on GitHub is deleted; one that failed or didn't post is kept so "
-                "you can see why."
+                "whose review is on GitHub is deleted, but its transcript stays on the review's "
+                "page; one that failed or didn't post is kept so you can see why."
             </p>
             <p class="muted">
                 "Which pull requests get reviewed, and the skill a review runs, are in each "
@@ -132,6 +138,131 @@ pub fn Overview() -> impl IntoView {
             </p>
         </div>
     }
+}
+
+/// What a review's page shows, so that refetches only remount it when
+/// that changes.
+#[derive(Clone, PartialEq)]
+enum Shown {
+    Loading,
+    Failed(String),
+    Missing,
+    /// The session doing the review, by its id.
+    Live(String),
+    /// The review without a session, and what its deleted one said if
+    /// that was kept.
+    Ended(Box<AutoReviewDetail>),
+}
+
+/// The page of one review: its session while there is one, then what
+/// the session said.
+#[component]
+pub fn ReviewPage(id: i64) -> impl IntoView {
+    let updates = expect_context::<Updates>();
+    // Whether the review's session is gone and the review has ended or its
+    // transcript was kept, which is written once, so that there is
+    // nothing left to refetch. Until then, any session's change can be
+    // this review's.
+    let settled = StoredValue::new(false);
+    // The resource can't stop tracking itself, since an AsyncDerived
+    // keeps the sources of its earlier runs; a memo drops them, so this
+    // one leaves the updates behind once the review is settled.
+    let changed = Memo::new(move |prev: Option<&(u64, u64)>| match prev {
+        Some(&prev) if settled.get_value() => prev,
+        _ => (updates.agents.get(), updates.auto_reviews.get()),
+    });
+    let detail = LocalResource::new(move || {
+        changed.track();
+        api::auto_review(id)
+    });
+    let shown = Memo::new(move |prev: Option<&Shown>| match detail.get() {
+        None => prev.cloned().unwrap_or(Shown::Loading),
+        Some(Err(e)) => Shown::Failed(e),
+        Some(Ok(None)) => Shown::Missing,
+        Some(Ok(Some(d))) => match d.review.session.clone() {
+            Some(session) => Shown::Live(session),
+            None => {
+                if d.saved.is_some() || d.review.finished_at.is_some() {
+                    settled.set_value(true);
+                }
+                Shown::Ended(Box::new(d))
+            }
+        },
+    });
+    move || match shown.get() {
+        Shown::Loading => {
+            view! { <main class="main"><p class="muted pad">"Loading…"</p></main> }.into_any()
+        }
+        Shown::Failed(e) => {
+            view! { <main class="main"><p class="error pad">{e}</p></main> }.into_any()
+        }
+        Shown::Missing => view! {
+            <main class="main"><p class="muted pad">"There is no such review."</p></main>
+        }
+        .into_any(),
+        Shown::Live(session) => {
+            view! { <crate::agents::AgentView id=session read_only=true /> }.into_any()
+        }
+        Shown::Ended(d) => ended(*d),
+    }
+}
+
+/// The page of a review whose session is gone or hasn't started.
+fn ended(d: AutoReviewDetail) -> AnyView {
+    let AutoReviewDetail {
+        review,
+        saved,
+        events,
+    } = d;
+    let now = (js_sys::Date::now() / 1000.0) as i64;
+    let mut meta = vec![
+        review.head_oid.chars().take(8).collect::<String>(),
+        cost(review.cost, review.cost_unit),
+    ];
+    meta.push(match review.finished_at {
+        Some(t) => ago(now, t),
+        None if review.state == AutoReviewState::Queued => {
+            format!("asked {}", ago(now, review.started_at))
+        }
+        None => format!("started {}", ago(now, review.started_at)),
+    });
+    // The session's title says it's a review, as it did while it ran.
+    let title = match &saved {
+        Some(s) => s.title.clone(),
+        None => format!("Review #{}: {}", review.key.number, review.title),
+    };
+    let note = match (&saved, review.state) {
+        (Some(_), _) => None,
+        (None, AutoReviewState::Queued) => {
+            Some("Waits to start until one of the running reviews ends.")
+        }
+        (None, AutoReviewState::Running) => Some("Starting its session…"),
+        (None, _) => Some("This review's session was deleted, and its transcript wasn't kept."),
+    };
+    view! {
+        <div class="agent-page">
+            <div class="agent-panes">
+                <main class="main">
+                    <div class="agent">
+                        <header class="agent-header">
+                            <h1>{title}</h1>
+                            <p class="muted">
+                                {badge(&review)}
+                                " "
+                                <a href=hash_for(&review.key)>{format!("{}#{}", review.key.repo, review.key.number)}</a>
+                                <GithubLink url=github_url(&review.key) />
+                                {format!(" · {}", meta.join(" · "))}
+                            </p>
+                            {review.error.clone().map(|e| view! { <p class="muted auto-review-error">{e}</p> })}
+                            {note.map(|n| view! { <p class="muted auto-review-note">{n}</p> })}
+                        </header>
+                        {saved.map(|s| view! { <crate::agents::SavedTranscript session=s events=events /> })}
+                    </div>
+                </main>
+            </div>
+        </div>
+    }
+    .into_any()
 }
 
 /// The badge of `review`: its session's status while it runs.
@@ -214,8 +345,8 @@ pub fn PrSection(key: PrKey, #[prop(into)] head: Signal<Option<String>>) -> impl
             _ => format!("started {}", ago(now, r.started_at)),
         });
         let moved = !active && head.get().is_some_and(|h| h != r.head_oid);
-        let session = r.session.clone().filter(|_| active).map(|id| {
-            view! { <a class="auto-review-session" href=hash(&id)>"Open session"</a> }
+        let session = (active && r.session.is_some()).then(|| {
+            view! { <a class="auto-review-session" href=page_hash(r.id)>"Open session"</a> }
         });
         let buttons = if active {
             let id = r.id;

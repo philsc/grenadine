@@ -65,7 +65,7 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
         sync_in_background: false,
     },
     DefaultInbox {
-        name: "All my open PRs",
+        name: "All your open PRs",
         filter: "state:open archived:false author:@me sort:updated-desc",
         count_in_total: false,
         sync_in_background: false,
@@ -77,14 +77,14 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
         sync_in_background: false,
     },
     DefaultInbox {
-        name: "Merged by me",
-        filter: "state:closed archived:false author:@me sort:updated-desc",
+        name: "Your merged PRs",
+        filter: "state:closed archived:false author:@me is:merged sort:updated-desc",
         count_in_total: false,
         sync_in_background: false,
     },
     DefaultInbox {
-        name: "Merged by others",
-        filter: "state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc",
+        name: "Merged PRs from others",
+        filter: "state:closed archived:false -author:@me is:merged (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc",
         count_in_total: false,
         sync_in_background: false,
     },
@@ -95,7 +95,7 @@ pub const DEFAULT_INBOXES: &[DefaultInbox] = &[
         sync_in_background: false,
     },
     DefaultInbox {
-        name: "Unmerged PRs on mine",
+        name: "Your unmerged PRs",
         filter: "state:closed archived:false author:@me is:unmerged sort:updated-desc",
         count_in_total: false,
         sync_in_background: false,

@@ -1,0 +1,88 @@
+%YAML 1.2
+---
+# SaltStack state files: YAML rendered through Jinja, Salt's default
+# renderer. The YAML syntax does the work; Jinja tags are matched first in
+# every YAML context, so a tag inside a key, a value or a string leaves the
+# YAML around it intact.
+name: Salt State
+file_extensions: [sls]
+scope: source.yaml.salt
+
+contexts:
+  main:
+    - match: ""
+      push: scope:source.yaml
+      with_prototype:
+        - include: jinja
+
+  jinja:
+    - match: '\{#'
+      scope: punctuation.definition.comment.begin.jinja
+      push: comment
+    - match: '\{%[-+]?'
+      scope: punctuation.section.embedded.begin.jinja
+      push: statement
+    - match: '\{\{[-+]?'
+      scope: punctuation.section.embedded.begin.jinja
+      push: expression
+
+  comment:
+    - meta_scope: comment.block.jinja
+    - match: '[-+]?#\}'
+      scope: punctuation.definition.comment.end.jinja
+      pop: true
+
+  statement:
+    - meta_scope: meta.embedded.block.jinja
+    - match: '[-+]?%\}'
+      scope: punctuation.section.embedded.end.jinja
+      pop: true
+    - match: '\b(?:if|elif|else|endif|for|endfor|set|endset|macro|endmacro|call|endcall|block|endblock|filter|endfilter|raw|endraw|with|endwith|import|from|include|extends|as|do|break|continue)\b'
+      scope: keyword.control.jinja
+    - include: code
+
+  expression:
+    - meta_scope: meta.embedded.expression.jinja
+    - match: '[-+]?\}\}'
+      scope: punctuation.section.embedded.end.jinja
+      pop: true
+    - include: code
+
+  code:
+    - match: '\b(?:in|is|not|and|or|if|else)\b'
+      scope: keyword.operator.word.jinja
+    - match: '\b(?:true|false|none|True|False|None)\b'
+      scope: constant.language.jinja
+    - match: '\b\d+(?:\.\d+)?\b'
+      scope: constant.numeric.jinja
+    - match: '"'
+      scope: punctuation.definition.string.begin.jinja
+      push: double-quoted
+    - match: "'"
+      scope: punctuation.definition.string.begin.jinja
+      push: single-quoted
+    - match: '(\|)\s*([A-Za-z_]\w*)'
+      captures:
+        1: keyword.operator.filter.jinja
+        2: support.function.filter.jinja
+    - match: '\b([A-Za-z_]\w*)\s*(?=\()'
+      captures:
+        1: variable.function.jinja
+    - match: '==|!=|<=|>=|<|>|\*\*|//|[-+*/%~=]'
+      scope: keyword.operator.jinja
+
+  double-quoted:
+    - meta_scope: string.quoted.double.jinja
+    - match: '\\.'
+      scope: constant.character.escape.jinja
+    - match: '"'
+      scope: punctuation.definition.string.end.jinja
+      pop: true
+
+  single-quoted:
+    - meta_scope: string.quoted.single.jinja
+    - match: '\\.'
+      scope: constant.character.escape.jinja
+    - match: "'"
+      scope: punctuation.definition.string.end.jinja
+      pop: true

@@ -9,6 +9,7 @@ server only for the classes it has tests from.
 """
 
 import base64
+import datetime
 import http.client
 import json
 import os
@@ -18,16 +19,18 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+import zoneinfo
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest_bazel
-from playwright.sync_api import Dialog, Locator, expect, sync_playwright
+from playwright.sync_api import Dialog, Locator, Route, expect, sync_playwright
 
 from grenadine.testing import scenarios
 from grenadine.testing.fake_github import (
@@ -36,8 +39,12 @@ from grenadine.testing.fake_github import (
     TEAM,
     TEAM_SLUG,
     TOKEN,
+    VIEWER,
     CheckRun,
+    Comment,
     FakeGitHub,
+    IssueComment,
+    PendingReview,
     PullRequest,
     Review,
 )
@@ -210,6 +217,10 @@ def devin_scenario(tmp: Path) -> dict:
                 ],
             },
             {
+                "match": "Your review isn't on the pull request.",
+                "steps": [end],
+            },
+            {
                 "match": "Review pull request",
                 "steps": [
                     update(
@@ -350,7 +361,8 @@ def devin_scenario(tmp: Path) -> dict:
 # wrap-up's naming prompt makes it call update_prs too, naming each new
 # pull request's branch dev/test/<subject>. `hang up` has it ask to run
 # a Bash command and hang up before anyone answers. It says how many
-# images came with the prompt. `long transcript N` has it run N Bash
+# images came with the prompt, and the name and size of each attached
+# file. `long transcript N` has it run N Bash
 # calls whose results grow from ~1 KB to ~30 KB and start with
 # "result i:", so a page can tell them and which call they answer apart.
 # `hand off PROMPT` hands PROMPT off to a new session with the handoff MCP
@@ -384,16 +396,28 @@ if "--json-schema" in args:
         output = {"summary": "Task: " + first}
     elif "stale" in schema["properties"]:
         output = {"stale": []}
+    elif "prompt" in schema["properties"]:
+        # A handoff written for the user from a session's transcript.
+        asked = request.split("# What the new session should do\n\n", 1)[1]
+        if asked.startswith("The user's own words:"):
+            output = {"prompt": "Carry on: " + asked.split("\n\n", 2)[1].strip()}
+        else:
+            output = {"prompt": "Carry on with it"}
     else:
         item = {"title": "Container e2e", "detail": "Remove it with `docker rm -f e2e`."}
         output = {"items": [item]}
     print(json.dumps({"type": "result", "is_error": False, "structured_output": output}), flush=True)
     sys.exit()
 import os
+import pathlib
 import re
 content = json.loads(sys.stdin.read())["message"]["content"]
 images = sum(block["type"] == "image" for block in content)
-prompt = "".join(block["text"] for block in content if block["type"] == "text")
+ATTACHED = "The user attached these files"
+texts = [block["text"] for block in content if block["type"] == "text"]
+prompt = "".join(text for text in texts if not text.startswith(ATTACHED))
+# The paths of the attached files, one per line after the first: "- PATH (SIZE)".
+attached = [line[2:].rsplit(" (", 1)[0] for text in texts if text.startswith(ATTACHED) for line in text.splitlines()[1:]]
 url = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]["grenadine"]["url"]
 mode = args[args.index("--permission-mode") + 1]
 model = args[args.index("--model") + 1] if "--model" in args else "claude-test"
@@ -433,7 +457,15 @@ def result(tool_use, content, is_error=False, patch=None):
     emit(line)
 
 
-emit({"type": "system", "subtype": "init", "session_id": "s", "model": model})
+emit({
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "model": model,
+    "slash_commands": ["bar", "baz", "clear", "doctor", "foo"],
+    "skills": ["bar", "baz", "foo"],
+    "terminal_slash_commands": ["doctor"],
+})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
     time.sleep(0.05)
@@ -441,6 +473,12 @@ usage = {"input_tokens": 3, "cache_creation_input_tokens": 1000, "cache_read_inp
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"You said: **{prompt}**"}], "usage": usage}})
 if images:
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"I see {images} images."}]}})
+for path in attached:
+    # Claude may read them without asking.
+    readable = f"Read(/{os.path.dirname(os.path.dirname(path))}/**)" in args
+    with open(path, "rb") as f:
+        size = len(f.read())
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"I read {os.path.basename(path)}: {size} bytes, readable: {readable}."}]}})
 # Grenadine asks it to commit before landing its work.
 if prompt.startswith("Wrap up: commit"):
     subprocess.run(["git", "add", "-A"], check=True)
@@ -476,6 +514,16 @@ if prompt.startswith("commit "):
         f.write(name)
     subprocess.run(["git", "add", "-A"], check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "Add " + name], check=True)
+# `describe` runs a Bash command that Claude described, asking first when
+# it must, and then one without a description.
+if prompt == "describe":
+    tool_input = {"command": "ls -la", "description": "List the files"}
+    tool_use = use("Bash", tool_input)
+    if mode == "manual":
+        approve("Bash", tool_input, tool_use)
+    result(tool_use, "notes.txt\n")
+    tool_use = use("Bash", {"command": "pwd"})
+    result(tool_use, "/\n")
 # `open pr URL` has it open a PR with gh, which prints the PR's URL.
 if prompt.startswith("open pr "):
     tool_use = use("Bash", {"command": "gh pr create --fill"})
@@ -573,6 +621,20 @@ if prompt == "question the plan":
     tool_use = use("AskUserQuestion", tool_input)
     name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
     result(tool_use, f'"{question}"="{name}"')
+# `refer to ID` mentions the session ID and asks a question about it.
+if prompt.startswith("refer to "):
+    short = prompt.split()[-1][:8]
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": f"Session {short} took over, see `{short}`."}]}})
+    question = f"Session {short} has it. Go on?\n\nAsk {short} first."
+    tool_input = {"questions": [{
+        "question": question,
+        "header": "Session",
+        "options": [{"label": "Take it back", "description": f"From {short}"}, {"label": f"Leave it with {short}", "description": ""}],
+        "multiSelect": False,
+    }]}
+    tool_use = use("AskUserQuestion", tool_input)
+    name = approve("AskUserQuestion", tool_input, tool_use)["updatedInput"]["answers"][question]
+    result(tool_use, f'"{question}"="{name}"')
 # In plan mode, it asks which file to write, then has its plan approved,
 # revising it with the feedback until it is. The file gets the mode the
 # approval switches to.
@@ -603,7 +665,16 @@ if mode == "plan":
 review = re.search(r"Review pull request \S+: \"([^\"]*)\" \(([^()\s]+/[^()\s]+)#(\d+)\)", prompt)
 if review and "Slow" in review[1]:
     time.sleep(60)
-if review and "Quiet" not in review[1]:
+# A "Paced" one's takes long enough to open its page while it runs.
+if review and "Paced" in review[1]:
+    time.sleep(5)
+# A "Retried" PR's review only posts once it's asked again.
+pending = pathlib.Path("pending-review.json")
+if review and "Retried" in review[1]:
+    pending.write_text(json.dumps([review[2], review[3]]))
+elif prompt.startswith("Your review isn't on the pull request.") and pending.exists():
+    review = [None, "", *json.loads(pending.read_text())]
+if review and "Quiet" not in review[1] and "Retried" not in review[1]:
     request = urllib.request.Request(
         f"{os.environ['FAKE_GITHUB_API']}/repos/{review[2]}/issues/{review[3]}/comments",
         data=json.dumps({"body": "Looks good."}).encode(),
@@ -624,7 +695,19 @@ if long:
         size = 1024 + (29 * 1024) * i // max(count - 1, 1)
         padding = ("0123456789abcdef" * ((size // 16) + 1))[:size]
         result(tool_use, f"result {i}: {padding}")
+# `background N` runs a command of N seconds in the background: the call
+# returns at once, and the process goes on after its answer until the
+# command's task is over, as Claude Code's does.
+background = None
+if prompt.startswith("background "):
+    seconds = prompt.removeprefix("background ")
+    background = use("Bash", {"command": f"sleep {seconds}", "run_in_background": True})
+    emit({"type": "system", "subtype": "task_started", "task_id": "b1", "tool_use_id": background, "is_backgrounded": True, "task_type": "local_bash"})
+    result(background, "Command running in background with ID: b1.")
 emit({"type": "result", "subtype": "success", "is_error": False, "result": "", "total_cost_usd": 0.01, "modelUsage": {"claude-test": {"contextWindow": 200000}}})
+if background:
+    time.sleep(float(seconds))
+    emit({"type": "system", "subtype": "task_notification", "task_id": "b1", "tool_use_id": background, "status": "completed", "output_file": "", "summary": ""})
 """
 
 
@@ -683,8 +766,16 @@ class ServerTestCase(unittest.TestCase):
         devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
         devin.chmod(0o755)
 
+        # The skills a prompt is offered before any session listed its
+        # own: the same as the fake claude lists.
+        claude_config = tmp / "claude_config"
+        for skill in ["bar", "baz", "foo"]:
+            (claude_config / "skills" / skill).mkdir(parents=True)
+            (claude_config / "skills" / skill / "SKILL.md").write_text(f"# {skill}\n")
+
         env = dict(
             cls.gh.git_env(),
+            CLAUDE_CONFIG_DIR=str(claude_config),
             PATH=f"{bin_dir}:{os.environ['PATH']}",
             # Where the fake claude posts reviews.
             FAKE_GITHUB_API=api,
@@ -735,6 +826,9 @@ class ServerTestCase(unittest.TestCase):
                 # The fake GitHub shows posted reviews at once, so a review
                 # that posts nothing needn't be looked for over 25s.
                 "--review-post-checks=0,1",
+                "--review-post-retries=1,1",
+                # The fake claude can't update itself.
+                "--claude-update-hours=0",
                 # The sandbox's user has no login shell.
                 "--shell=/bin/sh",
             ],
@@ -1311,6 +1405,43 @@ class InboxTest(ServerTestCase):
         expect(merge.locator(".checks")).to_have_count(0)
         expect(merge.locator(".merge-status")).to_have_text("Ready to merge.")
 
+    def test_timestamps_show_relative_with_local_title(self) -> None:
+        # A page in Pacific time shows relative times whose titles give
+        # the local time.
+        self.page.close()
+        self.page = self.browser.new_page(timezone_id="America/Los_Angeles")
+        self.addCleanup(self.page.close)
+        pr = self.cases.prs["Get changes requested"]
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+
+        la = zoneinfo.ZoneInfo("America/Los_Angeles")
+
+        def local(ts: int) -> str:
+            dt = datetime.datetime.fromtimestamp(ts, la)
+            off = dt.strftime("%z")
+            return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC{off[:3]}:{off[3:]}"
+
+        # The issue comment's time links to it on GitHub.
+        link = (
+            self.page.locator("details.conversation .comment")
+            .nth(1)
+            .locator(".comment-meta a")
+        )
+        expect(link).to_have_text(re.compile(r"just now|\d+[mhd] ago"))
+        expect(link).to_have_attribute("title", local(pr.issue_comments[0].created_at))
+
+        # A version's pushed time reads the same way.
+        with urllib.request.urlopen(
+            f"{self.url}api/pr/{scenarios.REPO}/{pr.number}"
+        ) as resp:
+            pushed_at = json.load(resp)["versions"][0]["pushed_at"]
+        pushed_ts = int(datetime.datetime.fromisoformat(pushed_at).timestamp())
+        picker = self.page.locator("details.picker")
+        picker.locator("summary").click()
+        vtime = picker.locator(".vtime").first
+        expect(vtime).to_have_text(re.compile(r"just now|\d+[mhd] ago"))
+        expect(vtime).to_have_attribute("title", local(pushed_ts))
+
     def test_pr_page_shows_checks(self) -> None:
         pr = self.cases.prs["Ask my team for a review"]
         self.page.set_viewport_size({"width": 1800, "height": 900})
@@ -1362,8 +1493,17 @@ class InboxTest(ServerTestCase):
             "Review required"
         )
         status = self.page.locator(".merge-box .merge-status")
+        # Its first `test` run was cancelled for the one that passed, and
+        # GitHub still counts it, but `test` isn't required: the review is
+        # the reason.
         expect(status).to_have_text("Merging is blocked: it needs an approving review.")
         expect(status).to_have_class(re.compile(r"\bbad\b"))
+        # It's not an Actions run that could be re-run from here.
+        expect(
+            self.page.locator(".merge-box").get_by_role(
+                "button", name="Re-run the replaced runs"
+            )
+        ).to_have_count(0)
 
     def test_pr_page_of_a_conflicting_pr(self) -> None:
         pr = self.cases.prs["Leave me out of it"]
@@ -1747,7 +1887,7 @@ class InboxTest(ServerTestCase):
         for label in ("Failing (1)", "Passed (1)", "Skipped (1)"):
             self.check_group(label).locator(".check-group-header").click()
 
-        body = self.page.locator(".pr-sidebar-body")
+        body = self.page.locator(".pr-overview")
         self.assertGreater(body.evaluate("el => el.scrollHeight - el.clientHeight"), 0)
         body.evaluate("el => el.scrollTop = el.scrollHeight")
 
@@ -2036,7 +2176,7 @@ class InboxPagingTest(ServerTestCase):
 
     def test_show_more_grows_the_list(self) -> None:
         self.page.goto(self.url)
-        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        inbox = self.inbox(scenarios.ALL_YOUR_OPEN)
         rows = inbox.locator(".pr-list li")
         more = inbox.get_by_role("button", name=re.compile(r"^Show \d+ more$"))
         expect(inbox.locator(".count")).to_have_text("37")
@@ -2068,7 +2208,7 @@ class InboxPagingTest(ServerTestCase):
 
     def test_shown_rows_survive_refreshes_but_reset_on_reload(self) -> None:
         self.page.goto(self.url)
-        inbox = self.inbox(scenarios.ALL_MY_OPEN)
+        inbox = self.inbox(scenarios.ALL_YOUR_OPEN)
         rows = inbox.locator(".pr-list li")
         expect(rows).to_have_count(15)
 
@@ -2374,6 +2514,30 @@ class EditPrTest(ServerTestCase):
         self.assertEqual(pr.body, "")
 
 
+class FileOrderTest(ServerTestCase):
+    """Lists a C++ header before the source files that share its stem."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.checkout("main")
+        repo.commit("Seed the repo", {"README.md": "# test\n"})
+        repo.push("main")
+        repo.checkout("order", "main")
+        repo.commit(
+            "Add foo",
+            {path: "int x;\n" for path in ("src/foo.cpp", "src/foo.h", "src/main.cpp")},
+        )
+        repo.push("order")
+        cls.pr = repo.open_pr("Add foo", head="order")
+
+    def test_headers_come_before_their_sources(self) -> None:
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{self.pr.number}")
+        expect(self.page.locator("section.file .file-header .path")).to_have_text(
+            ["src/foo.h", "src/foo.cpp", "src/main.cpp"]
+        )
+
+
 class ReviewTest(ServerTestCase):
     @classmethod
     def load(cls, gh: FakeGitHub) -> None:
@@ -2597,6 +2761,158 @@ class ReviewTest(ServerTestCase):
         expect(after.locator(".pending-badge")).to_have_count(1)
         expect(after).to_contain_text("Why remove this?")
 
+    def file_at(self, path: str) -> Locator:
+        return self.page.locator("section.file").filter(
+            has=self.page.locator(".file-header .path", has_text=exactly(path))
+        )
+
+    @staticmethod
+    def ln(file: Locator, side: str, line: int) -> Locator:
+        """The line number cell of `line` on `side`, "L" or "R"."""
+        return file.locator(
+            f'td.ln.commentable[data-side="{side}"][data-line="{line}"]'
+        )
+
+    def drag(self, start: Locator, end: Locator) -> None:
+        """Presses the mouse on `start` and moves it to `end`, holding it."""
+        start.hover()
+        self.page.mouse.down()
+        end.hover()
+
+    def side_by_side(self, on: bool) -> None:
+        self.page.get_by_label("Side by side").set_checked(on)
+
+    def test_drag_across_lines_comments_on_a_range(self) -> None:
+        pr = self.prs[scenarios.RANGE_DRAG]
+        self.open(scenarios.RANGE_DRAG)
+        self.side_by_side(False)
+        file = self.file()
+        self.drag(self.ln(file, "R", 3), self.ln(file, "R", 5))
+        expect(file.locator("tr.dragging")).to_have_count(3)
+        self.page.mouse.up()
+        expect(file.locator("tr.dragging")).to_have_count(0)
+        expect(file.locator("tr.selecting-range")).to_have_count(3)
+        expect(file.locator(".composer-lines")).to_have_text("Lines +3 to +5")
+        box = file.get_by_role("textbox", name="Add to review")
+        expect(box).to_be_focused()
+        expect(box).to_have_attribute("placeholder", "Comment on these lines…")
+        box.fill("These three.")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual(
+            (c.path, c.start_line, c.start_side, c.line, c.side),
+            (scenarios.REVIEW_PATH, 3, None, 5, "RIGHT"),
+        )
+        thread = file.locator(".thread", has_text="These three.")
+        expect(thread.locator(".thread-lines")).to_have_text("Lines +3 to +5")
+        expect(file.locator("tr.commented-range")).to_have_count(3)
+        expect(file.locator("tr.selecting-range")).to_have_count(0)
+
+    def test_shift_click_stretches_a_box_over_lines(self) -> None:
+        pr = self.prs[scenarios.RANGE_SHIFT]
+        self.open(scenarios.RANGE_SHIFT)
+        self.side_by_side(False)
+        file = self.file()
+        self.ln(file, "R", 4).click()
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Stretch me.")
+        expect(file.locator(".composer-lines")).to_have_count(0)
+        self.ln(file, "R", 7).click(modifiers=["Shift"])
+        # The box moved under line 7 with what was written in it.
+        expect(file.locator(".comment-composer")).to_have_count(1)
+        expect(file.locator(".composer-lines")).to_have_text("Lines +4 to +7")
+        expect(box).to_have_value("Stretch me.")
+        expect(file.locator("tr.selecting-range")).to_have_count(4)
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual((c.start_line, c.line, c.side), (4, 7, "RIGHT"))
+
+    def test_a_range_can_go_from_old_lines_to_new_ones(self) -> None:
+        pr = self.prs[scenarios.RANGE_SIDES]
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # From the removed line 3 to the new side of the context line 5.
+        self.drag(self.ln(file, "L", 3), self.ln(file, "R", 5))
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines -3 to +5")
+        expect(file.locator("tr.selecting-range")).to_have_count(4)
+        box = file.get_by_role("textbox", name="Add to review")
+        box.fill("Both sides.")
+        box.press("Control+Enter")
+        expect(box).to_have_count(0)
+        assert pr.pending
+        [c] = pr.pending.comments
+        self.assertEqual(
+            (c.path, c.start_line, c.start_side, c.line, c.side),
+            (scenarios.LONG_PATH, 3, "LEFT", 5, "RIGHT"),
+        )
+        thread = file.locator(".thread", has_text="Both sides.")
+        expect(thread.locator(".thread-lines")).to_have_text("Lines -3 to +5")
+
+    def test_a_click_without_a_mouse_opens_a_box(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # A click event with no press before it, as assistive technology
+        # sends.
+        self.ln(file, "R", 2).dispatch_event("click")
+        expect(file.locator(".comment-composer")).to_have_count(1)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
+    def test_a_range_cant_go_from_new_lines_back_to_old_ones(self) -> None:
+        self.open(scenarios.RANGE_SIDES)
+        self.side_by_side(False)
+        file = self.file_at(scenarios.LONG_PATH)
+        # GitHub refuses a range from the new side to the old one, so a drag
+        # from the new line 2 passes the removed line 3...
+        self.drag(self.ln(file, "R", 2), self.ln(file, "L", 3))
+        expect(file.locator("tr.dragging")).to_have_count(1)
+        # ...and takes a context line's new side when pointed at its old one.
+        self.ln(file, "L", 4).hover()
+        expect(file.locator("tr.dragging")).to_have_count(4)
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines +2 to +4")
+        composer = file.locator(".comment-composer")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # A shift-click onto the removed line comments on it alone.
+        self.ln(file, "R", 2).click()
+        self.ln(file, "L", 3).click(modifiers=["Shift"])
+        expect(composer).to_have_count(2)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
+    def test_ranges_keep_to_a_side_and_stop_at_hidden_lines(self) -> None:
+        self.open(scenarios.RANGE_SPLIT)
+        self.side_by_side(True)
+        file = self.file_at(scenarios.LONG_PATH)
+        composer = file.locator(".comment-composer")
+        # Side by side, a drag stays in the column it started in.
+        self.drag(self.ln(file, "L", 2), self.ln(file, "R", 5))
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines -2 to -5")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # Lines 7 to 21 are hidden: the drag stops at line 6.
+        self.drag(self.ln(file, "R", 5), self.ln(file, "R", 22))
+        expect(file.locator("tr.dragging")).to_have_count(2)
+        self.page.mouse.up()
+        expect(file.locator(".composer-lines")).to_have_text("Lines +5 to +6")
+        composer.get_by_role("button", name="Cancel").click()
+        expect(composer).to_have_count(0)
+
+        # A shift-click across them comments on its own line only.
+        self.ln(file, "R", 6).click()
+        self.ln(file, "R", 22).click(modifiers=["Shift"])
+        expect(composer).to_have_count(2)
+        expect(file.locator(".composer-lines")).to_have_count(0)
+
     def test_boxes_survive_a_refetch(self) -> None:
         pr = self.prs[scenarios.KEEP]
         self.open(scenarios.KEEP)
@@ -2709,7 +3025,18 @@ class ReviewTest(ServerTestCase):
         # viewport, so the scroll anchoring that keeps this row's place
         # also moves scrollTop. Its place is what mustn't move.
         row = file.locator("tr.line").nth(150)
-        y = row.bounding_box()["y"]
+        # The rows are laid out plain, then again once the background
+        # highlighter answers; measure the highlighted ones. Until the
+        # browser's next rendering update after the scroll, the file's
+        # content-visibility still skips them, and bounding_box() finds
+        # no box.
+        expect(row.locator(".sy-paragraph")).to_have_count(1)
+        deadline = time.monotonic() + 15
+        while (box := row.bounding_box()) is None:
+            if time.monotonic() > deadline:
+                self.fail("the row never got a box")
+            self.page.wait_for_timeout(50)
+        y = box["y"]
         # A remount of the diff would lose the marker.
         file.evaluate("el => el.setAttribute('data-marker', '1')")
 
@@ -3143,13 +3470,14 @@ class ReviewTest(ServerTestCase):
         # The box closes once the comment is sent.
         expect(conversation.get_by_role("textbox")).to_have_count(0)
 
-    def test_settings_dialog_only_has_the_theme(self) -> None:
+    def test_settings_dialog_only_has_global_settings(self) -> None:
         self.open(scenarios.CONVERSE)
         expect(self.page.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
         self.page.get_by_role("button", name="Settings", exact=True).click()
         dialog = self.page.get_by_role("dialog", name="Settings")
         expect(dialog.get_by_label("Theme")).to_have_count(1)
+        expect(dialog.get_by_label("Tool summaries")).to_have_count(1)
         expect(dialog.get_by_label("Open PR links in grenadine")).to_have_count(0)
 
 
@@ -3395,6 +3723,40 @@ class StackMergeTest(ServerTestCase):
         self.assertEqual(top.state, "MERGED")
         self.assertEqual(low.state, "MERGED")
 
+    def test_rerunning_a_cancelled_twin_unblocks_the_stack(self) -> None:
+        low = self.prs[scenarios.GH_TWIN_LOW]
+        top = self.prs[scenarios.GH_TWIN]
+        self.open(scenarios.GH_TWIN)
+        box = self.merge_box()
+        status = box.locator(".merge-status")
+        # The checks that count passed, so the reason is the run GitHub
+        # still counts.
+        expect(status).to_have_text(
+            "Merging is blocked: GitHub still counts a replaced run of test"
+            " that didn't pass."
+        )
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text(
+            "Blocked by a replaced run that didn't pass"
+        )
+        box.get_by_role("button", name="Re-run the replaced runs").click()
+        expect(status).to_have_text("Ready to merge.")
+        expect(rows.nth(0)).to_contain_text("Ready")
+        expect(
+            box.get_by_role("button", name="Re-run the replaced runs")
+        ).to_have_count(0)
+        # Both PRs' cancelled runs were re-run, and nothing else.
+        reruns = [r for r in self.gh.requests if r.endswith("/rerun-failed-jobs")]
+        self.assertEqual(
+            sorted(reruns),
+            [
+                f"POST /repos/{scenarios.GHSTACK_REPO}/actions/runs/{run}/rerun-failed-jobs"
+                for run in (500, 501)
+            ],
+        )
+        self.assertEqual(low.merge_state_status(), "CLEAN")
+        self.assertEqual(top.merge_state_status(), "CLEAN")
+
     def test_a_merge_failing_at_run_time_shows_the_error(self) -> None:
         low = self.prs[scenarios.GH_FAIL_LOW]
         top = self.prs[scenarios.GH_FAIL]
@@ -3449,8 +3811,17 @@ class VersionsTest(ServerTestCase):
         grow.reviews.append(
             Review(scenarios.OTHER, APPROVED, commit=shas[-1], submitted_at=gh.tick())
         )
-        # A thread made on v1 shows on the left of diffs starting at v1.
         repo = gh.repo(scenarios.REPO)
+        # A comment on the PR written between the pushes of v2 and v3-v5.
+        pushes = repo.pushes[grow.head]
+        grow.issue_comments.append(
+            IssueComment(
+                author=scenarios.OTHER,
+                body="Written on v2.",
+                created_at=(pushes[1].at + pushes[2].at) // 2,
+            )
+        )
+        # A thread made on v1 shows on the left of diffs starting at v1.
         repo.comment(
             grow,
             author=scenarios.OTHER,
@@ -3562,6 +3933,24 @@ class VersionsTest(ServerTestCase):
         # Base can't be the latest version, and Head can't be the base.
         expect(rows.nth(len(shas)).locator("input[name=base]")).to_be_disabled()
         expect(rows.nth(0).locator("input[name=head]")).to_be_disabled()
+
+    def test_conversation_says_which_version_each_entry_was_written_on(
+        self,
+    ) -> None:
+        self.open(scenarios.GROW)
+        comments = self.page.locator("details.conversation .comment")
+        expect(comments).to_have_count(2)
+        # The comment by its time, after v2's push and before v3's.
+        old = comments.nth(0).locator(".comment-version")
+        expect(old).to_have_text("on v2")
+        expect(old).to_have_class(re.compile(r"\bold\b"))
+        expect(old).to_have_attribute("title", "Written on v2; the PR is now at v6")
+        # The approval by its commit, the head.
+        latest = comments.nth(1).locator(".comment-version")
+        expect(comments.nth(1).locator(".comment-meta")).to_contain_text("approved")
+        expect(latest).to_have_text("on v6")
+        expect(latest).not_to_have_class(re.compile(r"\bold\b"))
+        expect(latest).to_have_attribute("title", "Written on v6, the latest version")
 
     def test_marks_the_last_reviewed_version(self) -> None:
         self.open(scenarios.GROW)
@@ -4107,9 +4496,21 @@ self.onmessage = async (event) => {{
         file.locator(".file-header").click()
         expect(file.locator("table.diff")).to_have_count(0)
 
-    def toolbar_bottom(self) -> float:
-        box = self.page.locator(".toolbar").bounding_box()
-        return box["y"] + box["height"]
+    def expect_header_at_toolbar(self, file: Locator) -> None:
+        """Expects `file`'s header to stick to the pinned toolbar's bottom
+        edge."""
+        # Pinning adds the title row a moment after the scroll, and a
+        # ResizeObserver moves the header below it just before the next
+        # frame is painted.
+        expect(self.page.locator(".toolbar-title")).to_be_visible()
+        expect(file.locator(".file-header")).to_be_visible()
+        self.page.wait_for_function(
+            "(file) => Math.abs("
+            "file.querySelector('.file-header').getBoundingClientRect().top"
+            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
+            ") <= 1",
+            arg=file.element_handle(),
+        )
 
     def test_file_headers_stick_below_the_toolbar(self) -> None:
         self.open(scenarios.BIG_DIFF)
@@ -4119,11 +4520,7 @@ self.onmessage = async (event) => {{
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         # Mid-file the header sticks to the toolbar's bottom edge.
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
-        header = file.locator(".file-header")
-        expect(header).to_be_visible()
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
     def test_toolbar_shows_the_title_only_while_pinned(self) -> None:
         pr = self.cases.prs[scenarios.BIG_DIFF]
@@ -4144,10 +4541,7 @@ self.onmessage = async (event) => {{
         expect(title).to_contain_text(pr.title)
         expect(title.locator(".pr-number")).to_have_text(f"#{pr.number}")
         # The row grew the toolbar; the stuck file header follows it.
-        header = file.locator(".file-header")
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
         main = self.page.locator(".pr-page .main")
         main.evaluate("el => el.scrollTop = 0")
@@ -4189,10 +4583,7 @@ self.onmessage = async (event) => {{
         self.open(scenarios.BIG_DIFF)
         path = scenarios.BIG_FILES[4]
         self.page.locator(".file-index a", has_text=path).click()
-        header = self.file(path).locator(".file-header")
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(self.file(path))
 
     def test_collapsing_a_stuck_file_keeps_its_header_in_view(self) -> None:
         self.open(scenarios.BIG_DIFF)
@@ -4201,20 +4592,9 @@ self.onmessage = async (event) => {{
         # out at their real height.
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
-        header = file.locator(".file-header")
-        header.click()
-        expect(header).to_be_visible()
+        file.locator(".file-header").click()
         # Collapsing scrolls the file back below the toolbar.
-        self.page.wait_for_function(
-            "(file) => Math.abs("
-            "file.querySelector('.file-header').getBoundingClientRect().top"
-            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
-            ") <= 1",
-            arg=file.element_handle(),
-        )
-        self.assertAlmostEqual(
-            header.bounding_box()["y"], self.toolbar_bottom(), delta=1
-        )
+        self.expect_header_at_toolbar(file)
 
     def test_collapsing_a_stuck_file_lets_the_user_scroll(self) -> None:
         self.open(scenarios.BIG_DIFF)
@@ -4222,13 +4602,7 @@ self.onmessage = async (event) => {{
         expect(file.locator("tr.line td.code.add")).to_have_count(300)
         file.evaluate("el => el.scrollIntoView({block: 'center'})")
         file.locator(".file-header").click()
-        self.page.wait_for_function(
-            "(file) => Math.abs("
-            "file.querySelector('.file-header').getBoundingClientRect().top"
-            " - document.querySelector('.toolbar').getBoundingClientRect().bottom"
-            ") <= 1",
-            arg=file.element_handle(),
-        )
+        self.expect_header_at_toolbar(file)
         # The collapse's scroll-back must not fight a user who scrolls.
         main_scroll_top = "el => el.closest('.main').scrollTop"
         top_before = file.evaluate(main_scroll_top)
@@ -4243,6 +4617,9 @@ self.onmessage = async (event) => {{
 # A new session's form; each is a draft of its own.
 DRAFT_URL = r"#/agents/draft/[0-9a-f]+$"
 
+# A 1x1 PNG, base64-encoded.
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
 # Pastes a PNG screenshot into the text box it's evaluated on.
 PASTE_IMAGE = """async (box) => {
     const canvas = document.createElement("canvas");
@@ -4254,6 +4631,211 @@ PASTE_IMAGE = """async (box) => {
     data.items.add(new File([blob], "screenshot.png", {type: "image/png"}));
     box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
 }"""
+
+
+GONE_PATH = "gone/old.py"
+
+
+class ThreadsTabTest(ServerTestCase):
+    """The PR sidebar's Threads tab."""
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        cls.cases = scenarios.versions_cases(gh)
+        grow = cls.cases.prs[scenarios.GROW]
+        shas = cls.cases.shas[scenarios.GROW]
+        repo = gh.repo(scenarios.REPO)
+        # GROW has an open thread with a reply and a resolved one; two
+        # more open ones, and the viewer's pending draft.
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Left over from v1.",
+            path=scenarios.STEPS_PY,
+            line=9,
+            commit=shas[0],
+        )
+        repo.comment(
+            grow,
+            author=scenarios.OTHER,
+            body="Doubling, eh?",
+            path=scenarios.STEPS_PY,
+            line=20,
+            commit=shas[-1],
+        )
+        grow.pending = PendingReview(
+            id=f"PRR_{gh.next_comment_id()}",
+            comments=[
+                Comment(
+                    id=gh.next_comment_id(),
+                    author=VIEWER,
+                    body="My draft note.",
+                    path=scenarios.STEPS_PY,
+                    commit=shas[-1],
+                    line=12,
+                    created_at=gh.tick(),
+                )
+            ],
+        )
+        # A thread on a file v1 added and v2 deleted: Base → v1 shows it
+        # on its line, v1 → v2 on the left, and the rest not at all.
+        repo.checkout("case/gone", "main")
+        v1 = repo.commit(
+            "Add two files",
+            {
+                GONE_PATH: "".join(f"gone line {i}\n" for i in range(1, 81)),
+                "gone/kept.py": "kept\n",
+            },
+        )
+        repo.push("case/gone")
+        cls.gone = repo.open_pr("Delete a commented file", head="case/gone")
+        gone = repo.comment(
+            cls.gone,
+            author=scenarios.OTHER,
+            body="Only on v1.",
+            path=GONE_PATH,
+            line=70,
+            commit=v1,
+        )
+        # As GitHub has it once the file is gone: no line on the head.
+        gone.outdated = True
+        repo.commit("Delete one", {GONE_PATH: None})
+        repo.push(cls.gone.head)
+        repo.commit("Edit the other", {"gone/kept.py": "kept, edited\n"})
+        repo.push(cls.gone.head)
+
+    def open_threads(self, height: int = 900, pr: PullRequest | None = None) -> None:
+        pr = pr or self.cases.prs[scenarios.GROW]
+        self.page.set_viewport_size({"width": 1800, "height": height})
+        self.page.goto(f"{self.url}#/{scenarios.REPO}/{pr.number}")
+        expect(self.page.locator(".pr-header h1")).to_have_text(
+            f"{pr.title} #{pr.number}"
+        )
+        self.page.get_by_role("tab", name=re.compile("^Threads")).click()
+
+    def threads(self) -> Locator:
+        return self.page.locator(".pr-threads .listed-thread")
+
+    def chip(self, name: str) -> Locator:
+        return self.page.locator(".thread-chip", has_text=name)
+
+    def test_lists_open_and_pending_threads_by_default(self) -> None:
+        self.open_threads()
+        tab = self.page.get_by_role("tab", name=re.compile("^Threads"))
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(tab.locator(".pr-sidebar-tab-count")).to_have_text("3")
+        expect(self.page.locator(".pr-overview")).to_be_hidden()
+
+        expect(self.chip("Open")).to_have_attribute("aria-pressed", "true")
+        expect(self.chip("Resolved")).to_have_attribute("aria-pressed", "false")
+        expect(self.chip("Pending")).to_have_attribute("aria-pressed", "true")
+        expect(self.page.locator(".thread-chip-count")).to_have_text(["3", "1", "1"])
+
+        # By line, each with its whole conversation.
+        threads = self.threads()
+        expect(threads.locator(".thread-jump")).to_have_text(
+            ["Line 1", "Line 9", "Line 12", "Line 20"]
+        )
+        expect(threads.nth(0).locator(".comment")).to_have_count(2)
+        expect(threads.nth(0)).to_contain_text("To explain.")
+        expect(threads.nth(2).locator(".pending-badge")).to_have_text("Pending")
+        expect(self.page.locator(".pr-threads .thread-file-path")).to_have_text(
+            [scenarios.STEPS_PY]
+        )
+
+        # Resolved threads join the list, and the open ones can go.
+        self.chip("Resolved").click()
+        expect(threads).to_have_count(5)
+        resolved = threads.nth(1)
+        expect(resolved).to_contain_text("Rename this.")
+        expect(resolved.locator(".thread-resolved")).to_have_text(
+            "Resolved by Other Person"
+        )
+        self.chip("Open").click()
+        expect(threads.locator(".thread-jump")).to_have_text(["Line 4", "Line 12"])
+
+        # The tab and the filter survive a reload.
+        self.page.reload()
+        expect(self.threads().locator(".thread-jump")).to_have_text(
+            ["Line 4", "Line 12"]
+        )
+        self.page.get_by_role("tab", name="Overview").click()
+        expect(self.page.locator(".pr-overview")).to_be_visible()
+        expect(self.page.locator(".pr-threads")).to_be_hidden()
+        self.page.reload()
+        expect(self.page.locator(".pr-overview")).to_be_visible()
+
+    def test_replies_in_the_tab_stay_out_of_the_diff(self) -> None:
+        self.open_threads()
+        self.threads().nth(0).get_by_role("button", name="Reply").click()
+        expect(self.page.locator(".pr-threads textarea")).to_have_count(1)
+        expect(self.page.locator(".pr .thread textarea")).to_have_count(0)
+
+    def test_a_listed_thread_shows_in_the_diff(self) -> None:
+        self.open_threads(height=400)
+        self.chip("Resolved").click()
+        resolved = self.threads().filter(has_text="Rename this.")
+        expect(resolved).to_have_count(1)
+        thread_id = resolved.get_attribute("data-thread")
+        target = self.page.locator(f"#thread-{thread_id}")
+        # Resolved threads start folded in the diff.
+        expect(target.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "false"
+        )
+        self.page.locator(".pr-page .main").evaluate(
+            "el => el.scrollTop = el.scrollHeight"
+        )
+        expect(target).not_to_be_in_viewport()
+
+        resolved.locator(".thread-jump").click()
+        expect(target.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "true"
+        )
+        expect(target).to_be_in_viewport()
+
+    def test_a_listed_thread_switches_to_its_version(self) -> None:
+        self.open_threads(height=400, pr=self.gone)
+        listed = self.threads().filter(has_text="Only on v1.")
+        thread_id = listed.get_attribute("data-thread")
+        expect(self.page.locator(".picker summary")).to_contain_text("Base → v3")
+        panel = self.page.locator(".comment-panel")
+        expect(panel.locator("summary")).to_have_text(
+            "1 comment threads the diff doesn't show"
+        )
+        # Closed, so the button isn't in the accessibility tree yet.
+        expect(panel.locator("button", has_text="on v1")).to_have_count(1)
+
+        # The latest diff doesn't have its file, so the diff shows the
+        # version the thread was made on.
+        listed.locator(".thread-jump").click()
+        expect(self.page.locator(".picker summary")).to_contain_text("Base → v1")
+        target = self.page.locator(f".file #thread-{thread_id}")
+        expect(target.locator(".thread-header")).to_have_attribute(
+            "aria-expanded", "true"
+        )
+        expect(target).to_be_in_viewport()
+
+    def test_picking_versions_ends_a_waiting_jump(self) -> None:
+        # The diff fails to load, so the jump waits for it.
+        changes = re.compile(r"/api/changes\?")
+        self.page.route(changes, lambda route: route.abort())
+        self.open_threads(pr=self.gone)
+        expect(self.page.get_by_text("Can't load the diff")).to_be_visible()
+        self.threads().filter(has_text="Only on v1.").locator(".thread-jump").click()
+        self.page.unroute(changes)
+
+        # Picked by hand, v2 → v3 stays once it loads: the jump that
+        # waited doesn't switch it to the thread's version.
+        picker = self.page.locator("details.picker")
+        picker.locator("summary").click()
+        rows = picker.locator("tbody tr")
+        rows.nth(3).locator("input[name=head]").check()
+        rows.nth(2).locator("input[name=base]").check()
+        self.page.keyboard.press("Escape")
+        expect(self.page.locator("section.file")).not_to_have_count(0)
+        expect(picker.locator("summary")).to_have_text(re.compile(r"^v2 .*→ v3 "))
+        self.page.wait_for_timeout(500)
+        expect(picker.locator("summary")).to_have_text(re.compile(r"^v2 .*→ v3 "))
 
 
 class AgentTest(ServerTestCase):
@@ -4453,6 +5035,172 @@ class AgentTest(ServerTestCase):
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
 
+    def test_prompts_complete_slash_commands(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        suggestions = self.page.get_by_role("listbox", name="Commands").get_by_role(
+            "option"
+        )
+        selected = self.page.locator(".slash-suggest li.selected")
+
+        # One match is suggested as soon as it's the only one, and Tab
+        # completes it with a space.
+        prompt.press_sequentially("/f")
+        expect(suggestions).to_have_text(["/foo"])
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/foo ")
+        expect(prompt).to_be_focused()
+
+        # Several are listed alphabetically; Tab cycles through them, and
+        # Shift+Tab back.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_text(["/bar", "/baz"])
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(selected).to_have_text("/baz")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        prompt.press("Shift+Tab")
+        expect(prompt).to_have_value("/baz ")
+
+        # Typing goes on with the prompt and closes the list.
+        prompt.press_sequentially("go")
+        expect(prompt).to_have_value("/baz go")
+        expect(suggestions).to_have_count(0)
+
+        # Escape closes the list without changing the text; typing opens
+        # it again.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Escape")
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/b")
+        prompt.press_sequentially("a")
+        expect(suggestions).to_have_count(2)
+        # A click completes like Tab, but only with the primary button.
+        suggestions.filter(has_text="/baz").click(button="middle")
+        expect(prompt).to_have_value("/ba")
+        expect(prompt).to_be_focused()
+        suggestions.filter(has_text="/baz").click()
+        expect(prompt).to_have_value("/baz ")
+
+        # A click in the box goes on with the prompt: the list closes, and
+        # Tab no longer changes the command.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Tab")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(suggestions).to_have_count(2)
+        prompt.click()
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/baz ")
+
+        # Enter sends the prompt as typed, even with the list open.
+        prompt.fill("")
+        prompt.press_sequentially("/ba")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Enter")
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt").first).to_have_text("/ba")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The follow-up box offers the session's own commands, the most
+        # used first, without the terminal's or the hidden ones.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.press_sequentially("/baz again")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+
+        # Sending a bare command closes its list, even when the server only
+        # answers after the key is released.
+        held: list = []
+        self.page.route("**/api/agents/*/messages", lambda route: held.append(route))
+        follow_up.press_sequentially("/baz")
+        expect(suggestions).to_have_text(["/baz"])
+        follow_up.press("Enter")
+        expect(suggestions).to_have_text(["/baz"])
+        self.wait_held(held)
+        held.pop().continue_()
+        self.page.unroute("**/api/agents/*/messages")
+        expect(follow_up).to_have_value("")
+        expect(suggestions).to_have_count(0)
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/foo"])
+        follow_up.press("Tab")
+        expect(follow_up).to_have_value("/baz ")
+
+        # Hiding nothing shows the commands hidden by default too.
+        self.page.locator(".global-settings-button").click()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        # Only a changed setting is stored, so that new defaults show.
+        stored = "() => localStorage.getItem('hidden-commands')"
+        self.assertIsNone(self.page.evaluate(stored))
+        dialog.get_by_label("Hidden commands").fill("foo")
+        self.page.wait_for_function(f"({stored})() === 'foo'")
+        dialog.get_by_role("button", name="Close").click()
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/clear"])
+
+        # A long list scrolls to the highlighted command.
+        self.page.route(
+            "**/api/agents/*/slash-commands",
+            lambda route: route.fulfill(
+                json=[{"name": f"c{i:02}", "uses": 0} for i in range(30)]
+            ),
+        )
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_count(30)
+        follow_up.press("Shift+Tab")
+        expect(selected).to_have_text("/c29")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+        follow_up.press("Tab")
+        expect(selected).to_have_text("/c00")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+
+        # Tabbing into a box that holds a command, either way, doesn't
+        # open the list, so the next Tab moves on and leaves the text be.
+        follow_up.fill("/c")
+        expect(suggestions).to_have_count(30)
+        follow_up.evaluate("e => e.blur()")
+        expect(suggestions).to_have_count(0)
+        follow_up.focus()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        self.page.keyboard.press("Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        expect(follow_up).to_have_value("/c")
+        follow_up.press_sequentially("0")
+        expect(suggestions).to_have_count(10)
+
+        # A press on the list's padding keeps the box focused and the list
+        # open.
+        self.page.locator(".slash-suggest").click(position={"x": 20, "y": 1})
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(10)
+        expect(follow_up).to_have_value("/c0")
+        self.page.unroute("**/api/agents/*/slash-commands")
+
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:
         self.page.goto(self.url + "#/agents")
         self.page.get_by_label("Repository").select_option(label="General")
@@ -4488,6 +5236,114 @@ class AgentTest(ServerTestCase):
         expect(model).to_have_value("sonnet")
         backend.select_option(label="Devin")
         expect(model).to_have_value("swe-2-high")
+
+    def test_more_tabs_than_http_connections_all_load(self) -> None:
+        # A browser keeps six HTTP connections to a server, shared by the
+        # tabs of a context. Every tab follows two event streams; over
+        # HTTP, three tabs' streams left no connection for a fourth tab.
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        self.page = context.new_page()
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("Count the tabs")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        for _ in range(4):
+            tab = context.new_page()
+            tab.goto(self.page.url)
+            expect(tab.locator(".transcript .turn-prompt").first).to_have_text(
+                "Count the tabs"
+            )
+            expect(tab.locator(".transcript .turn-end")).to_have_count(1)
+        # The first tab still gets what happens next.
+        self.page.get_by_label("Follow-up").fill("And again")
+        self.page.get_by_label("Follow-up").press("Enter")
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(2)
+        expect(tab.locator(".transcript .turn-end")).to_have_count(2)
+
+    def test_sessions_keep_their_own_models(self) -> None:
+        def start(model: str, prompt: str) -> str:
+            self.page.goto(self.url + "#/agents")
+            self.page.get_by_label("Repository").select_option(label="General")
+            self.page.get_by_label("Permissions").select_option(label="Auto")
+            self.page.get_by_label("Model").select_option(model)
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+            expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+            return self.page.url.split("/")[-1]
+
+        def send(text: str) -> str | None:
+            with self.page.expect_request(
+                re.compile(r"/api/agents/.*/messages$")
+            ) as req:
+                self.page.get_by_label("Follow-up").fill(text)
+                self.page.get_by_label("Follow-up").press("Enter")
+            # The box empties once the send is answered, unless something
+            # else was typed into it before then.
+            expect(self.page.get_by_label("Follow-up")).to_have_value("")
+            return req.value.post_data_json["model"]
+
+        picker = self.page.locator(".composer .agent-model-select")
+        first = start("sonnet", "first")
+        expect(picker).to_have_value("sonnet")
+        second = start("haiku", "second")
+        expect(picker).to_have_value("haiku")
+        # A session can't go back to the backend's default, which would
+        # only keep it on its model.
+        expect(picker.locator('option[value="default"]')).to_have_count(0)
+        # A pick for one session is that session's alone: neither the
+        # other session nor the next new one starts with it.
+        picker.select_option("")
+        self.page.goto(f"{self.url}#/agents/{first}")
+        expect(self.page.locator(".transcript .turn-prompt").first).to_have_text(
+            "first"
+        )
+        expect(picker).to_have_value("sonnet")
+        self.assertEqual(send("again"), "sonnet")
+        self.page.goto(self.url + "#/agents")
+        expect(self.page.get_by_label("Model")).to_have_value("haiku")
+
+        # A session with no pick of its own in this browser, e.g. one
+        # started in another, stays on the model it runs: its prompts ask
+        # for none, so the resumed session keeps all of its model's name,
+        # which the reported one may lack parts of.
+        third = start("haiku", "third")
+        self.page.evaluate(
+            f"() => localStorage.removeItem('grenadine.agent-model.session.{third}')"
+        )
+        self.page.reload()
+        expect(picker).to_have_value("")
+        expect(picker.locator("option:checked")).to_have_text("Current (haiku)")
+        self.assertIsNone(send("onwards"))
+        # Staying on it can be picked again after picking another.
+        picker.select_option("sonnet")
+        picker.select_option("")
+        self.assertIsNone(send("still"))
+        # A pick the backend no longer lists goes back to staying on the
+        # session's model, which is what asking for none does.
+        self.page.evaluate(
+            f"() => localStorage.setItem('grenadine.agent-model.session.{third}', 'gone')"
+        )
+        self.page.reload()
+        # Unlike Claude Code, the fake claude resumes on its default when
+        # asked for no model, so the entry's name may have changed.
+        expect(picker).to_have_value("")
+        expect(picker.locator("option:checked")).to_have_text(
+            re.compile(r"^Current \(")
+        )
+
+        # Deleting a session forgets its pick.
+        self.delete_session()
+        for id in (first, second):
+            self.delete_session_via_api(id)
+        kept = self.page.evaluate(
+            "() => Object.keys(localStorage).filter(k => k.startsWith('grenadine.agent-model.session.'))"
+        )
+        self.assertNotIn(f"grenadine.agent-model.session.{third}", kept)
 
     def test_a_draft_leaves_a_backend_no_longer_offered(self) -> None:
         # The last session was Devin's, but Devin can't list its models
@@ -4775,7 +5631,9 @@ class AgentTest(ServerTestCase):
         # bottom of the transcript in view.
         scroll_to(0)
         toggle_to("true")
-        expect(self.page.get_by_role("tab")).to_have_text(["Terminal 1"])
+        expect(self.page.get_by_role("tab", name=re.compile("^Terminal"))).to_have_text(
+            ["Terminal 1"]
+        )
         self.assertAlmostEqual(below(), 0, delta=1)
 
         # Scrolled up, the pane keeps its distance from the bottom as the
@@ -5097,9 +5955,13 @@ class AgentTest(ServerTestCase):
         )
         self.page.get_by_role("link", name="Agents").click()
         expect(item).not_to_have_class(re.compile(r"\bselected\b"))
-        # New sessions start with the model picked last.
-        expect(model).to_have_value("sonnet")
+        # New sessions start with the model picked last for one, not with
+        # the one this session's follow-ups go with.
+        expect(model).to_have_value("default")
         item.click()
+        expect(self.page.locator(".composer .agent-model-select")).to_have_value(
+            "sonnet"
+        )
         expect(transcript.locator(".turn-prompt")).to_have_text(
             ["please write a note", "thanks\nso much", "write more"]
         )
@@ -5110,6 +5972,42 @@ class AgentTest(ServerTestCase):
         item.click()
         expect(transcript.locator(".turn-end").last).to_be_in_viewport()
         expect(transcript.locator(".turn-prompt").first).not_to_be_in_viewport()
+
+    def test_transcript_message_times(self) -> None:
+        # Prompts and agent texts carry a muted local time under them,
+        # with the full local timestamp in the title.
+        self.page.close()
+        self.page = self.browser.new_page(timezone_id="America/Los_Angeles")
+        self.addCleanup(self.page.close)
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("please write a note")
+        self.page.get_by_role("button", name="Start").click()
+
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt")).to_have_text(["please write a note"])
+        expect(transcript.locator(".turn-text strong")).to_have_text(
+            "please write a note"
+        )
+        time = re.compile(r"^\d{2}:\d{2}$")
+        title = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC-0[78]:00$")
+        for msg in [".turn-msg-user", ".turn-msg-agent"]:
+            at = transcript.locator(f"{msg} .turn-time").first
+            expect(at).to_have_text(time)
+            expect(at).to_have_attribute("title", title)
+
+        # Agent text fills the transcript's width; the prompt's row hugs
+        # its right edge.
+        box = transcript.bounding_box()
+        agent = transcript.locator(".turn-msg-agent").first.bounding_box()
+        user = transcript.locator(".turn-msg-user").first.bounding_box()
+        assert box and agent and user
+        self.assertAlmostEqual(agent["x"], box["x"], delta=1)
+        self.assertAlmostEqual(agent["width"], box["width"], delta=1)
+        self.assertAlmostEqual(
+            user["x"] + user["width"], box["x"] + box["width"], delta=1
+        )
+        self.delete_session()
 
     def test_denied_approval_marks_the_row(self) -> None:
         # A denied request leaves no card behind: its mark and the
@@ -5142,6 +6040,49 @@ class AgentTest(ServerTestCase):
         finished_name_box = tool.locator(".tool-name").bounding_box()
         assert finished_name_box
         self.assertAlmostEqual(finished_name_box["x"], name_box["x"], delta=0.5)
+        self.delete_session()
+
+    def test_tool_rows_can_show_descriptions(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        picker = self.page.get_by_label("Tool summaries")
+        expect(picker).to_have_value("input")
+        picker.select_option("description")
+        self.page.keyboard.press("Escape")
+
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("describe")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+        # The approval card shows what runs.
+        transcript = self.page.locator(".transcript")
+        approval = transcript.locator(".approval")
+        expect(approval.locator("code")).to_have_text("ls -la")
+
+        # The row shows the description, with the command as its tooltip.
+        tools = transcript.locator("details.tool")
+        described = tools.nth(0).locator("summary")
+        expect(described.locator(".tool-description")).to_have_text("List the files")
+        expect(described.locator(".tool-description")).to_have_attribute(
+            "title", "ls -la"
+        )
+        expect(described.locator("code")).to_have_count(0)
+        approval.get_by_role("button", name="Allow").click()
+
+        # A call without a description shows its input.
+        expect(tools).to_have_count(2)
+        expect(tools.nth(1).locator("summary code")).to_have_text("pwd")
+        expect(tools.nth(1).locator(".tool-description")).to_have_count(0)
+
+        # The choice survives a reload, and switching back shows the input.
+        self.page.reload()
+        expect(described.locator(".tool-description")).to_have_text("List the files")
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        picker.select_option("input")
+        expect(described.locator("code")).to_have_text("ls -la")
+        expect(described.locator(".tool-description")).to_have_count(0)
+        self.page.keyboard.press("Escape")
         self.delete_session()
 
     def test_a_request_nobody_waits_for_expires(self) -> None:
@@ -5180,6 +6121,32 @@ class AgentTest(ServerTestCase):
             headers={"Origin": self.url.rstrip("/")},
         )
         urllib.request.urlopen(req).close()
+
+    def test_a_started_session_is_listed_before_the_list_is_refetched(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        # The sections only show once the list has arrived. From here on, it
+        # stays as it was before the start.
+        expect(self.section(self.OTHER_REPO)).to_be_visible()
+        self.page.route(
+            "**/api/agents",
+            lambda route: route.continue_() if route.request.method == "POST" else None,
+        )
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        session_url = self.page.url
+        expect(self.section(self.OTHER_REPO).locator("a.agent-item")).to_have_attribute(
+            "href", "#" + session_url.split("#")[1]
+        )
+
+        # The Agents tab goes back to it rather than to a new draft.
+        tabs = self.page.locator(".topbar-tabs a")
+        tabs.filter(has_text="Inboxes").click()
+        agents = tabs.filter(has_text="Agents")
+        expect(self.page.locator(".inboxes")).to_be_visible()
+        agents.click()
+        expect(self.page).to_have_url(session_url)
 
     def test_tabs_remember_their_last_page(self) -> None:
         pr_a = self.open_pr("Tab memory A")
@@ -5369,6 +6336,7 @@ class AgentTest(ServerTestCase):
         # The session starts as the user edits it.
         card.get_by_label("Prompt").fill("say goodbye")
         card.get_by_label("Permissions").select_option(label="Ask for everything")
+        card.get_by_label("Model").select_option("haiku")
         card.get_by_role("button", name="Start").click()
         expect(transcript.locator(".approval.pending")).to_have_count(0)
         expect(transcript.locator(".approval")).to_contain_text("Handed off: say hello")
@@ -5387,6 +6355,10 @@ class AgentTest(ServerTestCase):
         expect(child.locator(".turn-end.muted")).to_have_count(1)
         # Its follow-ups go on in the mode the user started it in.
         expect(self.page.locator(".composer .agent-mode")).to_have_value("manual")
+        # And with the model it started with.
+        expect(self.page.locator(".composer .agent-model-select")).to_have_value(
+            "haiku"
+        )
         origin = self.page.locator(".handed-off-from")
         expect(origin).to_have_text("Handed off from hand off say hello")
         origin.get_by_role("link").click()
@@ -5412,6 +6384,86 @@ class AgentTest(ServerTestCase):
             "The user declined the handoff: Not now"
         )
         expect(handed_off).to_have_count(1)
+
+    def test_user_handoff(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(scenarios.REPO)
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hello")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        parent = self.page.url
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
+
+        # The user asks for a handoff, which a job writes from the
+        # transcript without a turn in the session.
+        self.page.get_by_role("button", name="Hand off", exact=True).click()
+        self.page.get_by_label("What the new session should do").fill("write the docs")
+        self.page.get_by_role("button", name="Write handoff").click()
+        expect(self.page.get_by_role("button", name="Write handoff")).to_have_count(0)
+        expect(transcript.locator(".handoff-requested")).to_have_text(
+            "Asked for a handoff: write the docs"
+        )
+        card = transcript.locator(".approval.pending")
+        expect(card).to_contain_text("Hand off to a new session")
+        # Below what the job wrote is where the old session's work is.
+        written = re.compile(
+            r"^Carry on: write the docs\n\n# The session this was handed off from\n"
+            r"[\s\S]*\n- Worktree: `\S+`\n- Branch: `\S+`\n- Commit: `[0-9a-f]{40}`\n"
+            r"- Uncommitted changes: none\n- Commits that aren't on GitHub: none\n$"
+        )
+        expect(card.get_by_label("Prompt")).to_have_value(written)
+        expect(card.get_by_label("Repository")).to_have_value(scenarios.REPO)
+        expect(card.get_by_label("Permissions")).to_have_value("auto")
+        # No agent waits to hear why not.
+        expect(card.get_by_label("Why not")).to_have_count(0)
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
+
+        # Nobody waits for the answer, so the proposal stays open.
+        self.page.reload()
+        expect(card.get_by_label("Prompt")).to_have_value(written)
+
+        # The session starts as the user edits it.
+        card.get_by_label("Prompt").fill("say goodbye")
+        card.get_by_role("button", name="Start").click()
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        expect(transcript.locator(".approval")).to_contain_text(
+            "Handed off: Carry on: write the docs"
+        )
+        handed_off = transcript.locator(".handed-off")
+        expect(handed_off).to_have_text("Handed off to say goodbye")
+
+        # Each session links to the other.
+        handed_off.get_by_role("link").click()
+        expect(self.page).not_to_have_url(parent)
+        child = self.page.locator(".transcript")
+        expect(child.locator(".turn-prompt").first).to_have_text("say goodbye")
+        expect(self.page.locator(".composer .agent-mode")).to_have_value("auto")
+        origin = self.page.locator(".handed-off-from")
+        expect(origin).to_have_text("Handed off from say hello")
+        origin.get_by_role("link").click()
+        expect(self.page).to_have_url(parent)
+        expect(self.page.locator(".agent-header h1")).to_have_text("say hello")
+
+        # Without an instruction the new session goes on with the work,
+        # and a declined proposal starts nothing.
+        self.page.get_by_role("button", name="Hand off", exact=True).click()
+        self.page.get_by_role("button", name="Write handoff").click()
+        card = transcript.locator(".approval.pending")
+        expect(card.get_by_label("Prompt")).to_have_value(
+            re.compile(r"^Carry on with it\n")
+        )
+        expect(transcript.locator(".handoff-requested").last).to_have_text(
+            "Asked for a handoff"
+        )
+        card.get_by_role("button", name="Decline").click()
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        expect(transcript.locator(".approval").last).to_contain_text(
+            "Declined handoff: Carry on with it"
+        )
+        expect(handed_off).to_have_count(1)
+        expect(transcript.locator(".turn-end.muted")).to_have_count(1)
 
     def test_images(self) -> None:
         self.page.goto(self.url + "#/agents")
@@ -5607,6 +6659,203 @@ class AgentTest(ServerTestCase):
         self.page.reload()
         expect(thumbnails).to_have_count(0)
 
+    def test_attached_files_go_with_the_prompt(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # Picked files show as chips once they're uploaded; images Claude
+        # takes still go in the prompt as thumbnails.
+        picker = self.page.locator(".composer input[type=file]")
+        picker.set_input_files(
+            [
+                {"name": "notes.txt", "mimeType": "text/plain", "buffer": b"hello"},
+                {
+                    "name": "report.pdf",
+                    "mimeType": "application/pdf",
+                    "buffer": b"%PDF-1.4",
+                },
+                {
+                    "name": "dot.png",
+                    "mimeType": "image/png",
+                    "buffer": base64.b64decode(PNG),
+                },
+            ]
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(2)
+        expect(chips.filter(has_text="notes.txt")).to_contain_text("5 B")
+        expect(self.page.locator(".prompt-image img")).to_have_count(1)
+        self.page.get_by_role("button", name="Remove report.pdf").click()
+        expect(chips).to_have_count(1)
+
+        # A file alone can be the prompt. Claude gets its path, which it
+        # may read, and the transcript offers it for download.
+        self.page.get_by_role("button", name="Remove the image").click()
+        send = self.page.get_by_role("button", name="Send")
+        expect(send).to_be_enabled()
+        send.click()
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(transcript).to_contain_text("I read notes.txt: 5 bytes, readable: True.")
+        expect(chips).to_have_count(0)
+        sent = transcript.locator(".turn-files .file-chip")
+        expect(sent).to_have_count(1)
+        expect(sent).to_contain_text("notes.txt")
+        download = self.page.request.get(
+            self.url + sent.get_attribute("href").lstrip("/")
+        )
+        self.assertEqual(download.body(), b"hello")
+        self.page.reload()
+        expect(sent).to_have_count(1)
+
+    def test_text_pasted_with_a_picture_of_it_is_pasted_as_text(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        box = self.page.get_by_label("Prompt")
+        # Some apps put a picture of the text on the clipboard in a format
+        # that doesn't go inline; it's still the text that's pasted. A
+        # file of that format alone is attached.
+        paste = """async ([box, text]) => {
+            const data = new DataTransfer();
+            if (text) data.setData("text/plain", "a1\tb1");
+            data.items.add(new File(["II*"], "cells.tiff", {type: "image/tiff"}));
+            return box.dispatchEvent(new ClipboardEvent("paste", {clipboardData: data, bubbles: true, cancelable: true}));
+        }"""
+        handle = box.element_handle()
+        self.assertTrue(self.page.evaluate(paste, [handle, True]))
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(0)
+        self.assertFalse(self.page.evaluate(paste, [handle, False]))
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("cells.tiff")
+
+    def test_too_many_files_are_refused_right_away(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("say hi")
+        picker = self.page.locator(".agent-form input[type=file]")
+        picker.set_input_files(
+            [
+                {"name": f"{i}.log", "mimeType": "text/plain", "buffer": b"x"}
+                for i in range(21)
+            ]
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_have_count(21)
+        expect(chips.filter(has_text="1 B")).to_have_count(20)
+        # The one too many isn't uploaded, and can't be retried.
+        extra = chips.filter(has_text="20.log")
+        expect(extra).to_contain_text("Too many; a prompt can have at most 20 files")
+        expect(extra.get_by_role("button", name="Retry")).to_have_count(0)
+        start = self.page.get_by_role("button", name="Start")
+        expect(start).to_be_disabled()
+        self.page.get_by_role("button", name="Remove 20.log").click()
+        expect(start).to_be_enabled()
+
+    def test_files_attached_meanwhile_stay_with_the_draft(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say hi")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        picker = self.page.locator(".composer input[type=file]")
+        chips = self.page.locator(".prompt-file")
+        send = self.page.get_by_role("button", name="Send")
+
+        # An upload still going when the session is left shows again when
+        # it's back, and lands in its draft.
+        held: list = []
+        uploads = re.compile(r"/api/uploads\?name=")
+        self.page.route(uploads, lambda route: held.append(route))
+        picker.set_input_files(
+            {"name": "a.log", "mimeType": "text/plain", "buffer": b"one"}
+        )
+        expect(chips.filter(has_text="a.log")).to_contain_text("Uploading")
+        expect(send).to_be_disabled()
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        expect(chips).to_have_count(0)
+        self.page.go_back()
+        expect(chips.filter(has_text="a.log")).to_contain_text("Uploading")
+        for route in held:
+            route.continue_()
+        self.page.unroute(uploads)
+        expect(chips.filter(has_text="a.log")).to_contain_text("3 B")
+        self.page.reload()
+        expect(chips.filter(has_text="a.log")).to_contain_text("3 B")
+
+        # A file attached while the prompt is on its way stays for the
+        # next one.
+        held.clear()
+        messages = re.compile(r"/api/agents/[^/]+/messages$")
+        self.page.route(messages, lambda route: held.append(route))
+        with self.page.expect_request(messages):
+            send.click()
+        picker.set_input_files(
+            {"name": "b.log", "mimeType": "text/plain", "buffer": b"two!"}
+        )
+        expect(chips.filter(has_text="b.log")).to_contain_text("4 B")
+        for route in held:
+            route.continue_()
+        self.page.unroute(messages)
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+        expect(transcript).to_contain_text("I read a.log: 3 bytes, readable: True.")
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("b.log")
+        self.page.reload()
+        expect(chips).to_have_count(1)
+        expect(chips).to_contain_text("b.log")
+
+    def test_new_session_files_survive_leaving_the_form(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        prompt.fill("say hi")
+        picker = self.page.locator(".agent-form input[type=file]")
+        picker.set_input_files(
+            {"name": "a.log", "mimeType": "text/plain", "buffer": b"one"}
+        )
+        chips = self.page.locator(".prompt-file")
+        expect(chips).to_contain_text("3 B")
+
+        # A reload keeps the file.
+        self.page.reload()
+        expect(chips).to_contain_text("3 B")
+
+        # One that expired on the server holds the start until it's
+        # taken off.
+        picker.set_input_files(
+            {"name": "b.log", "mimeType": "text/plain", "buffer": b"two!"}
+        )
+        expect(chips.filter(has_text="b.log")).to_contain_text("4 B")
+        self.page.evaluate("""async () => {
+            const key = Object.keys(localStorage).find((k) => k.startsWith("prompt-files.new-session."));
+            const b = JSON.parse(localStorage.getItem(key)).find((u) => u.name === "b.log");
+            await fetch(`/api/uploads/${b.id}`, {method: "DELETE"});
+        }""")
+        self.page.reload()
+        expect(chips.filter(has_text="b.log")).to_contain_text("Expired")
+        start = self.page.get_by_role("button", name="Start")
+        expect(start).to_be_disabled()
+        self.page.get_by_role("button", name="Remove b.log").click()
+        expect(start).to_be_enabled()
+
+        # The file goes with the started session's prompt.
+        start.click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        expect(transcript).to_contain_text("I read a.log: 3 bytes, readable: True.")
+        expect(transcript.locator(".turn-files .file-chip")).to_have_count(1)
+
+        # A fresh form has no files.
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(chips).to_have_count(0)
+
     def test_new_session_drafts_survive_switching(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
@@ -5752,7 +7001,7 @@ class AgentTest(ServerTestCase):
             if held:
                 return
             self.page.wait_for_timeout(50)
-        self.fail("no session start reached the server")
+        self.fail("the page didn't make the request to hold")
 
     def test_starting_a_draft_leaves_you_where_you_went(self) -> None:
         # A session to go to while the draft's start is in flight.
@@ -5817,6 +7066,198 @@ class AgentTest(ServerTestCase):
         expect(entries.filter(has_text="say held")).to_have_count(1)
         expect(draft).to_have_count(0)
 
+    def test_sidebar_entries_stay_their_sessions(self) -> None:
+        # When a session is listed above another, an entry must not turn
+        # into the other's: a click or the focus on it would go along.
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        session = self.page.url.rsplit("/", 1)[1]
+        links = self.section(self.OTHER_REPO).locator("a.agent-item")
+        link = self.page.locator(f'a.agent-item[href="#/agents/{session}"]')
+        entry = self.page.locator(".agent-entry").filter(has=link)
+        delete = entry.get_by_role("button", name="Delete session")
+        status = link.locator(".agent-status")
+        expect(status).to_have_text("idle")
+        parts = [link, link.locator(".agent-title"), status, delete]
+        for part in parts:
+            part.evaluate("el => { el.__kept = true; }")
+        delete.focus()
+
+        def post(path: str, data: dict) -> None:
+            resp = self.page.request.post(
+                f"{self.url}api/agents{path}",
+                headers={"Origin": self.url.rstrip("/")},
+                data=data,
+            )
+            self.assertTrue(resp.ok, resp.text())
+
+        def expect_kept() -> None:
+            for part in parts:
+                self.assertTrue(part.evaluate("el => el.__kept === true"))
+            expect(delete).to_be_focused()
+
+        # A turn of its own changes the entry in place.
+        post(
+            f"/{session}/messages",
+            {"prompt": "say more", "permission_mode": "auto"},
+        )
+        expect(link).to_contain_text("$0.02")
+        expect(status).to_have_text("idle")
+        expect_kept()
+
+        # Another session takes its place in the list.
+        post(
+            "",
+            {
+                "backend": "claude",
+                "repo": self.OTHER_REPO,
+                "prompt": "say two",
+                "permission_mode": "auto",
+            },
+        )
+        expect(links).to_have_count(2)
+        expect(links.last).to_have_attribute("href", f"#/agents/{session}")
+        expect_kept()
+
+    def test_leaving_a_form_while_its_start_fetches_the_settings(self) -> None:
+        # A start asked for before the repository's settings arrived
+        # fetches them itself; leaving the form meanwhile doesn't stop it.
+        held: list[Route] = []
+        arriving = threading.Event()
+
+        def hold(route: Route) -> None:
+            if arriving.is_set():
+                route.continue_()
+            else:
+                held.append(route)
+
+        self.page.route(f"**/api/repos/{scenarios.REPO}/settings", hold)
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say held")
+        self.page.get_by_role("button", name="Start").click()
+        draft = self.page.locator(".agent-draft", has_text="say held")
+        expect(draft.locator(".agent-status")).to_have_text("Starting…")
+        self.wait_held(held)
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(self.page.get_by_label("Prompt")).to_have_value("")
+
+        arriving.set()
+        for route in held:
+            route.continue_()
+        entries = self.section(scenarios.REPO).locator(".agent-entry")
+        expect(
+            entries.filter(has=self.page.locator("a.agent-item")).filter(
+                has_text="say held"
+            )
+        ).to_have_count(1)
+        expect(draft).to_have_count(0)
+
+    def test_leaving_a_session_while_its_follow_up_is_sent(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # The session's page is gone by the time the send is answered.
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(follow_up).to_have_count(0)
+        held[0].continue_()
+
+        # The follow-up went, so it's no draft anymore, though the box
+        # that held it is gone.
+        self.page.wait_for_function(
+            "() => !Object.values(localStorage).includes('say later')"
+        )
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        expect(follow_up).to_have_value("")
+
+    def test_returning_to_a_session_while_its_follow_up_is_sent(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # Back on the session, its new box starts out with the draft that
+        # is still being sent.
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(follow_up).to_have_count(0)
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        expect(follow_up).to_have_value("say later")
+        held[0].continue_()
+
+        # The answer empties that box too. Otherwise it would go on
+        # offering the sent follow-up, and a keystroke would keep it as
+        # a draft again.
+        expect(follow_up).to_have_value("")
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        self.assertNotIn("say later", self.page.evaluate("Object.values(localStorage)"))
+
+    def test_text_typed_while_a_follow_up_is_sent_stays(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # The next follow-up is written before the first one is answered.
+        follow_up.fill("say last")
+        held[0].continue_()
+
+        # The answer takes only the sent text out of the box.
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        expect(follow_up).to_have_value("say last")
+        self.assertIn("say last", self.page.evaluate("Object.values(localStorage)"))
+
     def test_a_session_opened_before_its_start_answers_keeps_its_mode(self) -> None:
         held = self.hold_agent_answers()
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
@@ -5834,6 +7275,44 @@ class AgentTest(ServerTestCase):
         expect(permissions).to_have_value("acceptEdits")
         self.page.reload()
         expect(permissions).to_have_value("acceptEdits")
+
+    def test_a_session_started_on_the_default_model_stays_on_its_own(
+        self,
+    ) -> None:
+        # A session the server started from a draft the sidebar doesn't
+        # have, e.g. a handoff's, is adopted by its own page. A start on
+        # the backend's default, which a session's picker doesn't offer,
+        # shows as staying on the session's model.
+        resp = self.page.request.post(
+            f"{self.url}api/agents",
+            headers={"Origin": self.url.rstrip("/")},
+            data={
+                "backend": "claude",
+                "repo": scenarios.REPO,
+                "prompt": "say default",
+                "permission_mode": "auto",
+                "draft": "defaultdraft1",
+            },
+        )
+        self.assertEqual(resp.status, 200, resp.text())
+        session_id = resp.json()["id"]
+        self.page.goto(self.url + "#/agents")
+        self.page.evaluate(
+            "() => {"
+            " localStorage.setItem('grenadine.agent-start-mode.defaultdraft1', 'auto');"
+            " localStorage.setItem('grenadine.agent-start-model.defaultdraft1', 'default');"
+            " }"
+        )
+        self.page.goto(f"{self.url}#/agents/{session_id}")
+        model = self.page.locator(".composer .agent-model-select")
+        expect(model).to_have_value("")
+        expect(model.locator("option:checked")).to_have_text(re.compile(r"^Current\b"))
+        # The page took the start over.
+        start = self.page.evaluate(
+            "() => localStorage.getItem('grenadine.agent-start-model.defaultdraft1')"
+        )
+        self.assertIsNone(start)
+        self.delete_session()
 
     def test_a_draft_whose_session_started_is_cleaned_up(self) -> None:
         # The server can start a draft's session without the page seeing
@@ -5957,6 +7436,124 @@ class AgentTest(ServerTestCase):
         self.page.set_viewport_size({"width": 1800, "height": 900})
         expect(files.locator(".path")).to_have_text(["README", "notes.txt"])
 
+    def changes_pane(self) -> Locator:
+        return self.page.locator(".changes-pane")
+
+    def session_page(self, width: int) -> None:
+        """Starts a session at a window width, without a saved pane
+        width or collapse."""
+        self.page.set_viewport_size({"width": width, "height": 900})
+        self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("write a note")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        self.page.evaluate(
+            "() => {"
+            "localStorage.removeItem('grenadine.changes-pane-width');"
+            "localStorage.removeItem('changes-pane-collapsed');"
+            "}"
+        )
+        self.page.reload()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+    def drag_changes_pane(self, dx: float) -> None:
+        """Drags the changes pane's divider `dx` pixels to the right."""
+        divider = self.page.locator(".changes-pane .sidebar-divider")
+        expect(divider).to_be_visible()
+        box = divider.bounding_box()
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        self.page.mouse.move(x, y)
+        self.page.mouse.down()
+        self.page.mouse.move(max(0.0, x + dx), y)
+        self.page.mouse.up()
+
+    def assert_changes_pane_width(self, expected: float, delta: float = 5) -> None:
+        """Waits for the changes pane's width to reach `expected` pixels."""
+        expect(self.changes_pane()).to_have_css("width", f"{expected}px")
+        self.assertAlmostEqual(
+            self.changes_pane().bounding_box()["width"], expected, delta=delta
+        )
+
+    def test_changes_pane_overlays_on_narrow_windows(self) -> None:
+        self.session_page(1200)
+
+        toggle = self.page.locator(".sidebar-toggle")
+        pane = self.changes_pane()
+        expect(pane).to_have_count(0)
+        toggle.click()
+        expect(pane).to_have_count(1)
+        expect(pane).to_have_class(re.compile(r"\boverlay\b"))
+        expect(pane.locator("section.file .path")).to_have_text(["notes.txt"])
+        # The overlay floats over the transcript; the terminal panel
+        # under it stays visible.
+        expect(self.page.locator(".terminal-bar")).to_be_visible()
+
+        # Escape closes the overlay.
+        self.page.keyboard.press("Escape")
+        expect(pane).to_have_count(0)
+
+        # So does a click outside it, on the transcript.
+        toggle.click()
+        expect(pane).to_have_count(1)
+        self.page.locator(".transcript").click(position={"x": 20, "y": 20})
+        expect(pane).to_have_count(0)
+
+        # And so does the toggle itself.
+        toggle.click()
+        expect(pane).to_have_count(1)
+        toggle.click()
+        expect(pane).to_have_count(0)
+
+    def test_changes_pane_collapses_and_stays_collapsed(self) -> None:
+        self.session_page(1800)
+
+        toggle = self.page.locator(".sidebar-toggle")
+        pane = self.changes_pane()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        toggle.click()
+        expect(pane).to_have_count(0)
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        self.page.reload()
+        expect(pane).to_have_count(0)
+        self.page.locator(".sidebar-toggle").click()
+        expect(pane).to_have_count(1)
+
+    def test_changes_pane_drags_and_remembers(self) -> None:
+        self.session_page(1800)
+        # The panes' row is the 1800px window minus the session list's
+        # 300; the pane defaults to what's left of the transcript's 960.
+        self.assert_changes_pane_width(540)
+
+        self.drag_changes_pane(-100)
+        self.assert_changes_pane_width(640)
+
+        # The width survives a reload.
+        self.page.reload()
+        expect(self.changes_pane()).to_be_visible()
+        self.assert_changes_pane_width(640)
+
+        # A double-click on the divider restores the default split.
+        self.page.locator(".changes-pane .sidebar-divider").dblclick()
+        self.assert_changes_pane_width(540)
+        self.page.reload()
+        self.assert_changes_pane_width(540)
+
+    def test_changes_pane_drags_wider_on_stacked_windows(self) -> None:
+        # Below 800px the session list stacks above the transcript, so
+        # the panes' row is the full window width; the overlay still
+        # leaves it a sliver at its widest.
+        self.session_page(700)
+
+        self.page.locator(".sidebar-toggle").click()
+        self.assert_changes_pane_width(480)
+
+        # The overlay may grow to 652px (the page minus a 48px sliver).
+        self.drag_changes_pane(-150)
+        self.assert_changes_pane_width(630)
+
     def test_terminals(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{self.OTHER_REPO}")
         self.page.get_by_label("Permissions").select_option(label="Auto")
@@ -5964,7 +7561,7 @@ class AgentTest(ServerTestCase):
         self.page.get_by_role("button", name="Start").click()
         expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
         session = Path(self.page.locator(".agent-worktree").inner_text()).name
-        tabs = self.page.get_by_role("tab")
+        tabs = self.page.get_by_role("tab", name=re.compile("^Terminal"))
         screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
 
         def wait_for_shell(tab: Locator) -> None:
@@ -6078,6 +7675,159 @@ class AgentTest(ServerTestCase):
         self.assertEqual(handshake("http://evil.example"), 403)
         self.assertEqual(handshake(f"http://127.0.0.1:{port}"), 101)
 
+    def test_processes(self) -> None:
+        self.session_page(1200)
+        toggle = self.page.get_by_role("button", name="Terminal", exact=True)
+        tab = self.page.get_by_role("tab", name="Processes")
+        terminals = self.page.get_by_role("tab", name=re.compile("^Terminal"))
+        pane = self.page.locator(".processes")
+        rows = pane.locator("tbody tr")
+        no_systemd = pane.get_by_text("needs a systemd user manager")
+
+        # The tab opens the panel without starting a shell, and so does the
+        # toggle while the tab is selected. A reload comes back to it.
+        tab.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(
+            no_systemd.or_(pane.get_by_text("No processes are running.")).or_(
+                rows.first
+            )
+        ).to_be_visible()
+        toggle.click()
+        expect(pane).to_be_hidden()
+        toggle.click()
+        expect(pane).to_be_visible()
+        self.page.reload()
+        expect(tab).to_have_attribute("aria-selected", "true")
+        expect(pane).to_be_visible()
+        expect(terminals).to_have_count(0)
+
+        # What a terminal runs is below its shell until it ends. Slices
+        # need a systemd user manager; without one a note stands in.
+        self.page.get_by_role("button", name="New terminal").click()
+        expect(terminals).to_have_attribute("aria-busy", "false")
+        screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+        expect(screen).to_contain_text(re.compile(r"[$#]"))
+        self.page.keyboard.type("sleep 98765\n")
+        tab.click()
+        shell = rows.filter(has_text="Terminal 1: ")
+        sleep = rows.filter(has_text=re.compile(r"sleep 98765$"))
+        expect(no_systemd.or_(sleep)).to_be_visible()
+        if no_systemd.count() == 0:
+            expect(shell).to_have_count(1)
+            shell.get_by_role("button").click()
+            expect(shell).to_contain_text("(1 hidden)")
+            expect(sleep).to_have_count(0)
+            shell.get_by_role("button").click()
+            expect(sleep).to_have_count(1)
+            terminals.click()
+            # The click on the tab doesn't reach the shell.
+            self.page.locator(".terminal-host:not([hidden])").click()
+            self.page.keyboard.press("Control+C")
+            tab.click()
+            expect(sleep).to_have_count(0)
+
+        # The panel stays open on the tab as the last shell closes.
+        self.page.get_by_role("button", name="Close terminal 1").click()
+        expect(terminals).to_have_count(0)
+        expect(pane).to_be_visible()
+
+    def test_processes_tree(self) -> None:
+        self.session_page(1200)
+        now_ms = 10_000_000
+
+        def process(pid: int, ppid: int, command: str, **kwargs: object) -> dict:
+            return {
+                "pid": pid,
+                "ppid": ppid,
+                "started_ms": 9_000_000 + pid,
+                "cpu_ms": 0,
+                "rss_bytes": 5 << 20,
+                "command": command,
+                "terminal": None,
+                **kwargs,
+            }
+
+        snapshot: dict = {
+            "now_ms": now_ms,
+            "processes": [
+                process(300, 1, "bazel(made-up)"),
+                process(301, 300, "linux-sandbox test"),
+                process(100, 2, "claude " + "x" * 4000),
+                process(101, 100, "bash -c build"),
+                process(102, 101, "bazel build"),
+                process(200, 2, "/bin/sh -l", terminal=1),
+            ],
+        }
+        status = 200
+        polls = 0
+
+        def answer(route: Route) -> None:
+            nonlocal polls
+            polls += 1
+            if status != 200:
+                route.fulfill(status=status, body="made-up failure")
+                return
+            route.fulfill(json=snapshot)
+
+        self.page.route("**/api/agents/*/processes", answer)
+        self.page.get_by_role("tab", name="Processes").click()
+        pane = self.page.locator(".processes")
+        pids = pane.locator("tbody tr td:first-child")
+        expect(pids).to_have_text(["100", "101", "102", "200", "300", "301"])
+        indents = pane.locator(".process-command").evaluate_all(
+            "es => es.map(e => parseFloat(e.style.paddingLeft) / 1.4)"
+        )
+        self.assertEqual([round(i) for i in indents], [0, 1, 2, 0, 0, 1])
+        row = pane.locator("tr[data-pid='300']")
+        expect(row.locator("td")).to_have_text(
+            ["300", "", "5 MiB", "16:39", re.compile(r"bazel\(made-up\)")]
+        )
+        expect(pane.locator("tr[data-pid='200']")).to_contain_text(
+            "Terminal 1: /bin/sh -l"
+        )
+        # A long command doesn't widen the table past the panel.
+        self.assertTrue(pane.evaluate("e => e.scrollWidth <= e.clientWidth"))
+
+        # A collapsed process stays so across updates, which show the CPU
+        # used since the last one.
+        toggle = pane.locator("tr[data-pid='100']").get_by_role("button")
+        toggle.click()
+        expect(pids).to_have_text(["100", "200", "300", "301"])
+        expect(pane.locator("tr[data-pid='100']")).to_contain_text("(2 hidden)")
+        snapshot = {
+            "now_ms": now_ms + 2000,
+            "processes": [
+                {**p, "cpu_ms": 3000 if p["pid"] == 300 else 0}
+                for p in snapshot["processes"]
+                if p["pid"] != 301
+            ],
+        }
+        expect(row.locator("td").nth(1)).to_have_text("150%")
+        expect(pids).to_have_text(["100", "200", "300"])
+        expect(toggle).to_have_attribute("aria-expanded", "false")
+
+        # A failed update keeps the tree.
+        status = 500
+        expect(pane.locator(".error")).to_contain_text("made-up failure")
+        expect(pids).to_have_text(["100", "200", "300"])
+        status = 200
+        expect(pane.locator(".error")).to_have_count(0)
+
+        # Collapsing the panel stops the polls.
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        self.page.wait_for_timeout(500)
+        before = polls
+        self.page.wait_for_timeout(3000)
+        self.assertEqual(polls, before)
+
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        snapshot = {"now_ms": now_ms, "processes": []}
+        expect(pane).to_contain_text("No processes are running.")
+        snapshot = {"now_ms": now_ms, "processes": None}
+        expect(pane).to_contain_text("needs a systemd user manager")
+
     def pr_page(self) -> Locator:
         """The PR page's agents panel, in a window wide enough for the sidebar."""
         self.page.set_viewport_size({"width": 1800, "height": 900})
@@ -6133,7 +7883,7 @@ class AgentTest(ServerTestCase):
         expect(self.page).to_have_url(
             re.compile(f"#/{scenarios.REPO}/{self.panel_pr.number}$")
         )
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(1)
         expect(tabs.first).to_have_attribute("aria-selected", "true")
         transcript = panel.locator(".transcript")
@@ -6152,7 +7902,7 @@ class AgentTest(ServerTestCase):
 
         panel = self.pr_page()
         panel.locator(".pr-agents-toggle").click()
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(2)
         # Oldest first, and the oldest is the one opened.
         expect(tabs.first).to_contain_text("say one")
@@ -6162,6 +7912,129 @@ class AgentTest(ServerTestCase):
         # The other tab shows its own transcript.
         tabs.nth(1).click()
         expect(transcript.locator(".turn-prompt")).to_have_text(["say two"])
+
+    def hold_pr_sessions(self) -> tuple[list[Route], Callable[[], None]]:
+        """Stashes the routes of the requests for the PR's sessions; calling
+        the second value lets them and any later ones through."""
+        held: list[Route] = []
+        arriving = threading.Event()
+
+        def hold(route: Route) -> None:
+            if arriving.is_set():
+                route.continue_()
+            else:
+                held.append(route)
+
+        def release() -> None:
+            arriving.set()
+            for route in held:
+                route.continue_()
+
+        self.page.route(
+            f"**/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents", hold
+        )
+        return held, release
+
+    def test_pr_agents_panel_expanded_before_its_sessions_load(self) -> None:
+        self.start_pr_session("say one")
+
+        # The session list arrives only after the panel is expanded.
+        held, release = self.hold_pr_sessions()
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        self.wait_held(held)
+        # Not knowing the sessions isn't having none.
+        expect(panel.locator(".pr-agents-tabs").get_by_role("tab")).to_have_count(0)
+        expect(panel.locator(".agent-form")).to_have_count(0)
+
+        release()
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
+        expect(tabs).to_have_count(1)
+        expect(tabs.first).to_contain_text("say one")
+        expect(tabs.first).to_have_attribute("aria-selected", "true")
+        expect(panel.locator(".transcript .turn-prompt")).to_have_text(["say one"])
+
+    def test_pr_agents_panel_expanded_before_an_empty_list_loads(self) -> None:
+        held, release = self.hold_pr_sessions()
+        panel = self.pr_page()
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        self.wait_held(held)
+        expect(panel.locator(".agent-form")).to_have_count(0)
+
+        # Once it's known that there are no sessions, the form opens.
+        release()
+        expect(panel.locator(".agent-form")).to_be_visible()
+
+    def fail_pr_sessions(self) -> threading.Event:
+        """Fails the requests for the PR's sessions while the event is set."""
+        failing = threading.Event()
+
+        def answer(route: Route) -> None:
+            if failing.is_set():
+                route.fulfill(status=500, body="made-up failure")
+            else:
+                route.continue_()
+
+        self.page.route(
+            f"**/api/pr/{scenarios.REPO}/{self.panel_pr.number}/agents", answer
+        )
+        return failing
+
+    def change_sessions(self) -> None:
+        """Starts a session in another repository, so the page refetches its
+        sessions."""
+        resp = self.page.request.post(
+            f"{self.url}api/agents",
+            headers={"Origin": self.url.rstrip("/")},
+            data={
+                "backend": "claude",
+                "repo": self.OTHER_REPO,
+                "prompt": "say elsewhere",
+                "permission_mode": "auto",
+            },
+        )
+        self.assertTrue(resp.ok, resp.text())
+
+    def test_pr_agents_panel_whose_sessions_fail_to_load(self) -> None:
+        failing = self.fail_pr_sessions()
+        failing.set()
+        panel = self.pr_page()
+        error = panel.locator(".pr-agents-bar .error")
+        expect(error).to_contain_text("made-up failure")
+        # Not knowing the sessions isn't having none, but a new one can
+        # still be asked for.
+        toggle = panel.locator(".pr-agents-toggle")
+        toggle.click()
+        expect(toggle).to_have_attribute("aria-expanded", "true")
+        expect(panel.locator(".agent-form")).to_have_count(0)
+        panel.locator(".pr-agents-new").click()
+        expect(panel.locator(".agent-form")).to_be_visible()
+
+        # The error goes once the sessions arrive.
+        failing.clear()
+        self.change_sessions()
+        expect(error).to_have_count(0)
+
+    def test_pr_agents_panel_whose_sessions_fail_to_refetch(self) -> None:
+        failing = self.fail_pr_sessions()
+        with self.page.expect_response(
+            lambda r: r.url.endswith(f"/{self.panel_pr.number}/agents")
+        ) as first:
+            panel = self.pr_page()
+        first.value.finished()
+        failing.set()
+        self.change_sessions()
+        expect(panel.locator(".pr-agents-bar .error")).to_contain_text(
+            "made-up failure"
+        )
+
+        # There were no sessions, as far as is known.
+        panel.locator(".pr-agents-toggle").click()
+        expect(panel.locator(".agent-form")).to_be_visible()
 
     def test_pr_agents_panel_survives_reload_and_sync(self) -> None:
         self.start_pr_session("say one")
@@ -6205,7 +8078,7 @@ class AgentTest(ServerTestCase):
         # The expansion and the selected tab survive a reload.
         self.page.reload()
         expect(toggle).to_have_attribute("aria-expanded", "true")
-        tabs = panel.get_by_role("tab")
+        tabs = panel.locator(".pr-agents-tabs").get_by_role("tab")
         expect(tabs).to_have_count(1)
         expect(tabs.first).to_have_attribute("aria-selected", "true")
         expect(transcript.locator(".turn-prompt")).to_have_text(["say one"])
@@ -6220,7 +8093,7 @@ class AgentTest(ServerTestCase):
         expect(panel.locator(".transcript .turn-end")).to_have_count(1)
         terminals = panel.locator(".terminal-panel")
         toggle = terminals.get_by_role("button", name="Terminal", exact=True)
-        tabs = terminals.get_by_role("tab")
+        tabs = terminals.get_by_role("tab", name=re.compile("^Terminal"))
         screen = terminals.locator(".terminal-host:not([hidden]) .xterm-rows")
 
         # The session's terminal panel starts collapsed under its chat;
@@ -6250,7 +8123,9 @@ class AgentTest(ServerTestCase):
 
         # It's the same shell the session's own page shows.
         self.page.get_by_role("link", name="Open in Agents tab").click()
-        page_tabs = self.page.locator(".terminal-panel").get_by_role("tab")
+        page_tabs = self.page.locator(".terminal-panel").get_by_role(
+            "tab", name=re.compile("^Terminal")
+        )
         expect(page_tabs).to_have_text(["Terminal 1"])
         expect(
             self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
@@ -6345,7 +8220,8 @@ class AgentTest(ServerTestCase):
         follow_up = self.page.get_by_label("Follow-up")
         follow_up.fill("write more")
         follow_up.press("Enter")
-        expect(transcript.locator(".turn-end")).to_have_count(3)
+        # Three turns and the landing.
+        expect(transcript.locator(".turn-end")).to_have_count(4)
         actions.get_by_role("button", name="Open PR").click()
         opened = transcript.locator(".wrapped-up").nth(1)
         expect(opened).to_contain_text(re.compile(r"Opened PR #\d+"))
@@ -6951,6 +8827,100 @@ class AgentTest(ServerTestCase):
         entry.get_by_role("button", name="Delete session").click()
         expect(entry).to_have_count(0)
 
+    def test_links_navigate_without_hash_navigations(self) -> None:
+        """WebKit on iOS reloads the page after a hash navigation, so the
+        app's links mustn't cause any. Only the browser's own hashchange
+        events are trusted."""
+        self.page.add_init_script(
+            """
+            window.hashNavigations = 0;
+            addEventListener("hashchange", (e) => {
+              if (e.isTrusted) window.hashNavigations++;
+            });
+            """
+        )
+        new = self.page.get_by_role("link", name="+ New session")
+        header = self.page.locator(".agent-header h1")
+        session_url = re.compile(r"#/agents/[0-9a-f-]{36}$")
+
+        def start(prompt: str) -> str:
+            self.page.get_by_label("Repository").select_option(self.OTHER_REPO)
+            self.page.get_by_label("Prompt").fill(prompt)
+            self.page.get_by_role("button", name="Start").click()
+            expect(self.page).to_have_url(session_url)
+            expect(header).to_have_text(prompt)
+            return self.page.url
+
+        self.page.goto(self.url)
+        self.page.get_by_role("link", name="Agents", exact=True).click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        first = start("first look")
+        new.click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        pr_url = f"https://github.com/{self.OTHER_REPO}/pull/1"
+        second = start(f"look at {pr_url}")
+
+        def entry(url: str) -> Locator:
+            return self.page.locator(f'a.agent-item[href="#{url.split("#")[1]}"]')
+
+        entry(first).click()
+        expect(header).to_have_text("first look")
+        self.assertEqual(self.page.url, first)
+        entry(second).click()
+        expect(header).to_contain_text("look at")
+        link = self.page.locator(".transcript .turn-text a").filter(has_text=pr_url)
+        link.click()
+        expect(self.page).to_have_url(re.compile(f"#/{self.OTHER_REPO}/1$"))
+        expect(self.page.locator(".agents-page")).to_have_count(0)
+        self.assertEqual(self.page.evaluate("window.hashNavigations"), 0)
+
+        # Each page is one step in the history; a link to the page that
+        # shows adds none.
+        self.page.go_back()
+        expect(self.page).to_have_url(second)
+        expect(header).to_contain_text("look at")
+        self.page.go_back()
+        expect(self.page).to_have_url(first)
+        expect(header).to_have_text("first look")
+        length = self.page.evaluate("history.length")
+        entry(first).click()
+        self.assertEqual(self.page.evaluate("history.length"), length)
+        self.page.go_forward()
+        expect(self.page).to_have_url(second)
+        expect(header).to_contain_text("look at")
+
+        # A click with a modifier is the browser's, as when Ctrl-click
+        # opens a new tab. The test's own listener, which runs after the
+        # app's, keeps the browser from opening one.
+        length = self.page.evaluate("history.length")
+        prevented = entry(first).evaluate(
+            """(link) => {
+              let prevented;
+              const check = (e) => {
+                prevented = e.defaultPrevented;
+                e.preventDefault();
+              };
+              addEventListener("click", check);
+              link.dispatchEvent(new MouseEvent("click", {
+                bubbles: true, cancelable: true, ctrlKey: true,
+              }));
+              removeEventListener("click", check);
+              return prevented;
+            }"""
+        )
+        self.assertIs(prevented, False)
+        self.assertEqual(self.page.url, second)
+        self.assertEqual(self.page.evaluate("history.length"), length)
+
+        # Deleting the open session goes to a new draft.
+        navigations = self.page.evaluate("window.hashNavigations")
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.locator(".agent-entry").filter(has=entry(second)).get_by_role(
+            "button", name="Delete session"
+        ).click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+        self.assertEqual(self.page.evaluate("window.hashNavigations"), navigations)
+
     def test_transcript_pr_links_open_in_grenadine(self) -> None:
         self.page.context.route(
             "https://github.com/**",
@@ -7025,12 +8995,15 @@ class AgentTest(ServerTestCase):
         plans.get_by_role("button", name="Keep planning").click()
         expect(plans).to_have_count(2)
         expect(plans.first).to_contain_text("Plan sent back")
+        expect(plans.first.locator(".ask-times")).to_have_text(
+            re.compile(r"^Asked \d{2}:\d{2} · Sent back \d{2}:\d{2}$")
+        )
         # The feedback stays in the transcript, between the two plans.
-        feedback = transcript.locator(".approval.plan ~ .turn-prompt")
+        feedback = transcript.locator(".approval.plan ~ .turn-msg .turn-prompt")
         expect(feedback).to_have_text("Add a title")
-        expect(transcript.locator(".turn-prompt ~ .approval.plan")).to_have_count(2)
+        expect(transcript.locator(".turn-msg-user ~ .approval.plan")).to_have_count(2)
         expect(
-            transcript.locator(".approval.plan ~ .turn-prompt ~ .approval.plan")
+            transcript.locator(".approval.plan ~ .turn-msg-user ~ .approval.plan")
         ).to_have_count(1)
         revised = plans.nth(1)
         expect(revised.locator(".plan-text")).to_contain_text("Also: Add a title")
@@ -7041,6 +9014,9 @@ class AgentTest(ServerTestCase):
         after.select_option(label="Accept edits")
         revised.get_by_role("button", name="Approve plan").click()
         expect(revised).to_contain_text("Plan approved")
+        expect(revised.locator(".ask-times")).to_have_text(
+            re.compile(r"^Asked \d{2}:\d{2} · Approved \d{2}:\d{2}$")
+        )
         expect(transcript.locator(".turn-end")).to_have_text(["Done · $0.01"])
         worktree = Path(self.page.locator(".agent-worktree").inner_text())
         self.assertEqual((worktree / "todo.txt").read_text(), "acceptEdits")
@@ -7078,6 +9054,140 @@ class AgentTest(ServerTestCase):
         # Reloaded, the stored events still hold the answer.
         self.page.reload()
         expect(transcript.locator(".question-answer")).to_have_text("Go ahead")
+
+    def test_question_times(self) -> None:
+        asked = r"Asked \d{2}:\d{2}"
+        title = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d{2}:\d{2}$")
+        question = self.page.locator(".transcript .approval.questions")
+        times = question.locator(".ask-times")
+
+        def ask() -> None:
+            self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+            self.page.get_by_label("Permissions").select_option(
+                label="Ask for everything"
+            )
+            self.page.get_by_label("Prompt").fill("question the plan")
+            self.page.get_by_role("button", name="Start").click()
+            expect(question).to_contain_text("Claude asks")
+
+        # A question that waits only has the time it was asked.
+        ask()
+        expect(times).to_have_text(re.compile(f"^{asked}$"))
+        question.get_by_label("Go ahead").check()
+        question.get_by_role("button", name="Answer").click()
+        answered = re.compile(rf"^{asked} · Answered \d{{2}}:\d{{2}}$")
+        expect(times).to_have_text(answered)
+        for i in range(2):
+            expect(times.locator("time").nth(i)).to_have_attribute("title", title)
+        self.page.reload()
+        expect(times).to_have_text(answered)
+
+        # Without an answer, the time it was skipped shows.
+        ask()
+        question.get_by_role("button", name="Skip").click()
+        expect(question).to_contain_text("Not answered")
+        expect(times).to_have_text(re.compile(rf"^{asked} · Closed \d{{2}}:\d{{2}}$"))
+
+        # A question that expired with the server doesn't say when.
+        ask()
+        self.stop_server()
+        self.start_server()
+        self.page.reload()
+        expect(question).to_contain_text("Not answered")
+        expect(times).to_have_text(re.compile(f"^{asked}$"))
+
+    def test_session_references_are_links(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("the other one")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+        other = self.page.url.split("/")[-1]
+        short = other[:8]
+
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill(f"refer to {other}")
+        self.page.get_by_role("button", name="Start").click()
+        question = transcript.locator(".approval.questions")
+        expect(question).to_contain_text("Claude asks")
+        session = self.page.url
+
+        # What the agent says links to the session, named in the tooltip.
+        link = f'a.session-link[href="#/agents/{other}"]'
+        mentions = transcript.locator(".turn-text").last.locator(link)
+        expect(mentions).to_have_text([short, short])
+        expect(mentions.first).to_have_attribute("title", re.compile(r"\S"))
+        # The prompt doesn't.
+        expect(transcript.locator(f".turn-prompt {link}")).to_have_count(0)
+
+        # So does the question: its title, body and options.
+        expect(question.locator(f"legend {link}")).to_have_count(1)
+        expect(question.locator(f".question-body {link}")).to_have_count(1)
+        options = question.locator(f".question-option {link}")
+        expect(options).to_have_count(2)
+
+        # Following an option's link doesn't pick the option.
+        options.last.click()
+        expect(self.page).to_have_url(re.compile(f"#/agents/{other}$"))
+        expect(transcript).to_contain_text("the other one")
+        self.page.goto(session)
+        expect(question.get_by_role("radio")).to_have_count(2)
+        for radio in question.get_by_role("radio").all():
+            expect(radio).not_to_be_checked()
+
+        question.get_by_role("radio").last.check()
+        question.get_by_role("button", name="Answer").click()
+        expect(question).to_contain_text("Answered")
+        expect(question.locator(f"p.muted {link}")).to_have_count(1)
+        expect(question.locator(f".question-answer {link}")).to_have_count(1)
+
+        # Once the session is gone, its ID isn't a link to it any more.
+        self.delete_session_via_api(other)
+        expect(transcript.locator(link)).to_have_count(0)
+        expect(question.locator(".question-answer")).to_have_text(
+            f"Leave it with {short}"
+        )
+
+    def test_half_answered_question_survives_leaving_the_session(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Ask for everything")
+        self.page.get_by_label("Prompt").fill("question the plan")
+        self.page.get_by_role("button", name="Start").click()
+        transcript = self.page.locator(".transcript")
+        question = transcript.locator(".approval.questions")
+        other = question.get_by_label("Something else")
+        expect(question).to_contain_text("Claude asks")
+        session = self.page.url
+
+        # What's written comes back after going to another page and back.
+        other.fill("Change two things")
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(self.page.get_by_label("Prompt")).to_be_visible()
+        self.page.goto(session)
+        expect(other).to_have_value("Change two things")
+
+        # So does what's picked, also after a reload.
+        question.get_by_label("Go ahead").check()
+        expect(other).to_have_value("")
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        expect(self.page.get_by_label("Prompt")).to_be_visible()
+        self.page.goto(session)
+        expect(question.get_by_label("Go ahead")).to_be_checked()
+        self.page.reload()
+        expect(question.get_by_label("Go ahead")).to_be_checked()
+        expect(question.get_by_label("Not yet")).not_to_be_checked()
+
+        # Once answered, nothing is kept for the question any more.
+        question.get_by_role("button", name="Answer").click()
+        expect(question).to_contain_text("Answered")
+        expect(question.locator(".question-answer")).to_have_text("Go ahead")
+        kept = self.page.evaluate(
+            "Object.keys(localStorage)"
+            ".filter(k => k.startsWith('grenadine.agent-question.'))"
+        )
+        self.assertEqual(kept, [])
 
     def test_approved_mode_survives_leaving_the_session(self) -> None:
         self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
@@ -7134,6 +9244,76 @@ class AgentTest(ServerTestCase):
         expect(plan).to_contain_text("Unanswered plan")
         expect(plan.get_by_role("button", name="Approve plan")).to_have_count(0)
 
+    def test_waiting_on_a_background_task(self) -> None:
+        tab = self.page.locator(".topbar-tabs a").filter(has_text="Agents")
+        count = tab.locator(".count")
+        # Sessions left waiting by earlier tests may already count.
+        with urllib.request.urlopen(f"{self.url}api/agents") as resp:
+            base = sum(
+                1
+                for s in json.load(resp)
+                if s["kind"] == "interactive"
+                and s["status"]
+                in {"idle", "awaiting_approval", "interrupted", "failed", "background"}
+            )
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("background 8")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".turn-end")).to_have_text(["Done · $0.01"])
+
+        # Answered, but its process is still holding a background task.
+        status = self.page.locator(".agent-status-line .agent-status")
+        expect(status).to_have_text("waiting on background task", timeout=10_000)
+        # The line says which call it waits for and leads to its row,
+        # which shows the task still running rather than a finished call.
+        transcript = self.page.locator(".transcript")
+        row = transcript.locator(".tool").filter(has_text="sleep 8")
+        expect(row.get_by_role("img", name="Running in background")).to_be_visible()
+        expect(row.locator(".tool-status")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
+        activity = self.page.locator(".activity")
+        expect(activity).to_contain_text(
+            re.compile(r"Waiting on Bash sleep 8\s*· \d+s")
+        )
+        self.page.evaluate("window.scrollTo(0, 0)")
+        activity.get_by_role("button", name="Waiting on Bash sleep 8").click()
+        expect(row).to_be_in_viewport()
+        # Nothing that sticks to an edge of the page covers its summary.
+        self.assertTrue(
+            row.locator("summary").evaluate(
+                """el => {
+                    const box = el.getBoundingClientRect();
+                    const top = document.elementFromPoint(
+                        box.left + 4, box.top + box.height / 2);
+                    return el.contains(top);
+                }"""
+            )
+        )
+        expect(count).to_have_text(str(base + 1))
+        follow_up = self.page.get_by_label("Follow-up")
+        expect(follow_up).to_have_attribute(
+            "placeholder",
+            re.compile("^Queue a follow-up for when the background task finishes"),
+        )
+        expect(self.page.get_by_role("button", name="Stop")).to_be_visible()
+
+        # A follow-up waits for the process, then runs.
+        follow_up.fill("after it")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-prompt").last).to_have_text(
+            "after it", timeout=20_000
+        )
+        # The task is over, and its row says how it went.
+        expect(row.get_by_role("img", name="Succeeded")).to_be_visible()
+        expect(row.locator(".spinner")).to_have_count(0)
+        expect(row.locator("summary")).to_contain_text(re.compile(r"background · \d+s"))
+        expect(status).to_have_text("idle", timeout=20_000)
+        expect(self.page.locator(".turn-end")).to_have_text(
+            ["Done · $0.01", "Done · $0.01"]
+        )
+
     def test_tab_counts_waiting_sessions(self) -> None:
         tab = self.page.locator(".topbar-tabs a").filter(has_text="Agents")
         count = tab.locator(".count")
@@ -7144,7 +9324,7 @@ class AgentTest(ServerTestCase):
                 for s in json.load(resp)
                 if s["kind"] == "interactive"
                 and s["status"]
-                in {"idle", "awaiting_approval", "interrupted", "failed"}
+                in {"idle", "awaiting_approval", "interrupted", "failed", "background"}
             )
         self.page.goto(self.url + "#/agents")
         expect_tab_count(count, base)
@@ -7300,7 +9480,7 @@ class AutoReviewTest(ServerTestCase):
         expect(box.locator(".agent-status")).to_have_text("working…")
         expect(box.get_by_role("button", name=re.compile("Review"))).to_have_count(0)
         expect(box.get_by_role("link", name="Open session")).to_have_attribute(
-            "href", re.compile(r"^#/auto-reviews/[0-9a-f-]{36}$")
+            "href", re.compile(r"^#/auto-reviews/review/\d+$")
         )
         conflict = self.api(
             "POST", f"/api/pr/{self.MANUAL_REPO}/{pr.number}/auto-reviews"
@@ -7369,6 +9549,15 @@ class AutoReviewTest(ServerTestCase):
         expect(box.locator(".agent-status")).to_have_text("queued")
         expect(box).to_contain_text("Waits for one of the running reviews to end.")
         expect(box.get_by_role("link", name="Open session")).to_have_count(0)
+        # Its page in the Auto-reviews tab says so, rather than showing the
+        # PR.
+        self.page.get_by_role("link", name="Auto-reviews").click()
+        self.review_entry("Slow queued 3").locator("a.agent-item").click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
+        expect(self.page.locator(".agent-header .agent-status")).to_have_text("queued")
+        expect(self.page.locator(".agent-header")).to_contain_text(
+            "Waits to start until one of the running reviews ends."
+        )
 
         # Cancelling a running one starts it.
         self.page.goto(f"{self.url}#/{self.MANUAL_REPO}/{prs[0].number}")
@@ -7389,20 +9578,66 @@ class AutoReviewTest(ServerTestCase):
         self.page.get_by_role("button", name=f"Settings for {slug}").click()
         return self.page.get_by_role("dialog", name=f"{slug} settings")
 
-    def test_a_posted_review_deletes_its_session(self) -> None:
-        pr = self.open_pr(scenarios.REPO, "Add the feature")
+    def test_a_posted_review_keeps_its_transcript(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Paced feature")
         self.page.goto(self.url + "#/auto-reviews")
-        entry = self.review_entry("Add the feature")
+        entry = self.review_entry("Paced feature")
+        # While it runs, its page shows its session.
+        entry.locator("a.agent-item").click()
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
+        expect(self.page.locator(".agent-actions")).to_contain_text(
+            "This review runs unattended"
+        )
         expect(entry.locator(".agent-status")).to_have_text("posted", timeout=30_000)
         self.assertEqual([c.body for c in pr.issue_comments], ["Looks good."])
-        # Its session is gone, and the entry links to the PR instead,
-        # with an icon that opens it on GitHub.
-        expect(entry.locator("a.agent-item")).to_have_attribute(
-            "href", f"#/{scenarios.REPO}/{pr.number}"
-        )
+
+        # Its session is gone, and the page that was open shows what the
+        # session said, with nothing left to stop or delete.
+        def shows_the_transcript() -> None:
+            header = self.page.locator(".agent-header")
+            expect(header.locator("h1")).to_have_text(
+                f"Review #{pr.number}: Paced feature"
+            )
+            expect(header.locator(".agent-status")).to_have_text("posted")
+            expect(
+                header.get_by_role("link", name=f"{scenarios.REPO}#{pr.number}")
+            ).to_have_attribute("href", f"#/{scenarios.REPO}/{pr.number}")
+            expect(self.page.locator(".transcript")).to_contain_text(
+                f"Review pull request {pr.url}"
+            )
+            expect(self.page.get_by_role("button", name="Delete")).to_have_count(0)
+            expect(self.page.get_by_label("Follow-up")).to_have_count(0)
+            expect(entry.locator("a.agent-item")).to_have_class(
+                re.compile(r"\bselected\b")
+            )
+
+        shows_the_transcript()
         expect(entry.get_by_role("link", name="Open on GitHub")).to_have_attribute(
             "href", pr.url
         )
+        # So does a reload, which no longer has the session to go by.
+        self.page.reload()
+        shows_the_transcript()
+
+        # The kept transcript can't change, so other sessions' changes
+        # don't fetch it again.
+        review = self.page.url.rsplit("/", 1)[1]
+        fetches: list[str] = []
+        self.page.on(
+            "request",
+            lambda r: (
+                fetches.append(r.url)
+                if r.url.endswith(f"/api/auto-reviews/{review}")
+                else None
+            ),
+        )
+        self.open_pr(scenarios.REPO, "Another feature")
+        expect(
+            self.review_entry("Another feature").locator(".agent-status")
+        ).to_have_text("posted", timeout=30_000)
+        self.assertEqual(fetches, [])
+        shows_the_transcript()
+
         self.page.get_by_role("link", name="Agents").click()
         expect(self.page.locator(".agent-sidebar")).not_to_contain_text("Review #")
 
@@ -7446,7 +9681,7 @@ class AutoReviewTest(ServerTestCase):
 
         # Its page shows the prompt, with the skill, and takes none.
         entry.locator("a.agent-item").click()
-        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/[0-9a-f-]{36}$"))
+        expect(self.page).to_have_url(re.compile(r"#/auto-reviews/review/\d+$"))
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"/code-review Review pull request {pr.url}")
         expect(transcript).to_contain_text("Quiet change")
@@ -7464,6 +9699,21 @@ class AutoReviewTest(ServerTestCase):
         self.page.once("dialog", lambda dialog: dialog.accept())
         self.page.get_by_role("button", name="Delete", exact=True).click()
         expect(self.page).to_have_url(re.compile(r"#/auto-reviews$"))
+
+    def test_a_review_that_posts_when_asked_again(self) -> None:
+        pr = self.open_pr(scenarios.REPO, "Retried change")
+        self.page.goto(self.url + "#/auto-reviews")
+        entry = self.review_entry("Retried change")
+        expect(entry.locator(".agent-status")).to_have_text("posted", timeout=60_000)
+        self.assertEqual(len(pr.issue_comments), 1)
+        # What it was asked is in its transcript.
+        entry.locator("a.agent-item").click()
+        expect(
+            self.page.locator(
+                ".transcript .turn-prompt",
+                has_text="Your review isn't on the pull request.",
+            )
+        ).to_have_count(1)
 
     def test_a_devin_review(self) -> None:
         dialog = self.settings(self.DEVIN_REPO)
@@ -7494,14 +9744,67 @@ class AutoReviewTest(ServerTestCase):
         entry.locator("a.agent-item").click()
         transcript = self.page.locator(".transcript")
         expect(transcript).to_contain_text(f"Review pull request {pr.url}")
-        expect(transcript.locator(".turn-end")).to_have_text(["Done · 0.050 ACU"])
+        expect(transcript.locator(".turn-end").first).to_have_text("Done · 0.050 ACU")
+        # It was asked to post again before grenadine gave up.
+        expect(
+            transcript.locator(
+                ".turn-prompt", has_text="Your review isn't on the pull request."
+            )
+        ).to_have_count(2)
+
+    def test_review_with_lists_only_installed_backends(self) -> None:
+        # With only Devin installed, it's the only backend offered. The
+        # stored Claude stays picked, marked and disabled, so it isn't
+        # silently changed.
+        self.page.route(
+            "**/api/agents/backends",
+            lambda route: route.fulfill(
+                json=[
+                    {
+                        "backend": "devin",
+                        "models": [
+                            {"value": "swe-2", "displayName": "SWE-2"},
+                            {"value": "swe-2-high", "displayName": "SWE-2 High"},
+                        ],
+                    }
+                ]
+            ),
+        )
+        dialog = self.settings(self.OFF_REPO)
+        review_with = dialog.get_by_label("Review with")
+        expect(review_with).to_have_value("claude")
+        options = review_with.locator("option")
+        expect(options).to_have_text(["Claude Code (not installed)", "Devin"])
+        expect(options.nth(0)).to_have_attribute("disabled", "")
+        expect(options.nth(1)).not_to_have_attribute("disabled", "")
+        expect(
+            dialog.locator(
+                ".hint",
+                has_text="Claude Code isn't installed on the server",
+            )
+        ).to_be_visible()
+        # New sessions offers permissions only for installed backends.
+        expect(dialog.get_by_label("Devin permissions")).to_be_visible()
+        expect(dialog.get_by_label("Claude permissions")).to_have_count(0)
+
+        # Picking an installed backend saves.
+        review_with.select_option(label="Devin")
+        dialog.get_by_role("button", name="Save").click()
+        expect(dialog).to_have_count(0)
+        dialog = self.settings(self.OFF_REPO)
+        expect(dialog.get_by_label("Review with")).to_have_value("devin")
+        self.page.keyboard.press("Escape")
+        self.page.unroute("**/api/agents/backends")
 
     def test_reviews_can_be_turned_off(self) -> None:
         dialog = self.settings(self.OFF_REPO)
         dialog.get_by_label("Review my pull requests").select_option(label="Never")
-        expect(dialog.get_by_label("Review with")).to_be_disabled()
-        expect(dialog.get_by_label("Review model")).to_be_disabled()
-        expect(dialog.get_by_label("Review skill")).to_be_disabled()
+        # The fields stay editable: a review asked for from a PR's page
+        # still uses them.
+        expect(dialog.get_by_label("Review with")).to_be_enabled()
+        expect(dialog.get_by_label("Review model")).to_be_enabled()
+        expect(dialog.get_by_label("Review skill")).to_be_enabled()
+        expect(dialog.get_by_label("Review again after new pushes")).to_be_disabled()
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
         self.open_pr(self.OFF_REPO, "Unreviewed change")

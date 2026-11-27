@@ -85,7 +85,9 @@ fn agents_waiting(sessions: &[AgentSession]) -> usize {
                     AgentStatus::Idle
                     | AgentStatus::AwaitingApproval
                     | AgentStatus::Interrupted
-                    | AgentStatus::Failed => true,
+                    | AgentStatus::Failed
+                    // It has answered, though its process isn't done.
+                    | AgentStatus::Background => true,
                     AgentStatus::Creating | AgentStatus::Running => false,
                 }
         })
@@ -340,6 +342,7 @@ mod tests {
             AgentStatus::AwaitingApproval,
             AgentStatus::Interrupted,
             AgentStatus::Failed,
+            AgentStatus::Background,
         ] {
             assert_eq!(agents_waiting(&[session(status)]), 1, "{status:?}");
         }

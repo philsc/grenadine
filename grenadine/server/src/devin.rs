@@ -18,8 +18,8 @@ use base64::Engine as _;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
-    AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind, ApprovalOption,
-    PermissionMode, SessionKind,
+    AgentBackend, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, ApprovalKind,
+    ApprovalOption, PermissionMode, SessionKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,8 @@ pub struct DevinConfig {
     pub exe: PathBuf,
     /// The model summaries and cleanup scans run on.
     pub job_model: String,
-    /// The model checks for stale cleanup items run on.
+    /// The model checks for stale cleanup items run on, and handoffs
+    /// written from a session's transcript.
     pub prune_model: String,
 }
 
@@ -77,7 +78,7 @@ impl Devin {
     fn job_model(&self, kind: JobKind) -> &str {
         match kind {
             JobKind::Summary | JobKind::Scan => &self.config.job_model,
-            JobKind::Prune => &self.config.prune_model,
+            JobKind::Prune | JobKind::Handoff => &self.config.prune_model,
         }
     }
 }
@@ -214,6 +215,12 @@ enum SessionUpdate {
     ToolCall(ToolCall),
     ToolCallUpdate(ToolCallUpdate),
     UsageUpdate(UsageUpdate),
+    /// The commands a prompt can start with, which ACP agents send
+    /// whenever they change.
+    #[serde(rename_all = "camelCase")]
+    AvailableCommandsUpdate {
+        available_commands: Vec<AvailableCommand>,
+    },
     /// Plans, mode changes and whatever else the transcript doesn't show.
     #[serde(other)]
     Other,
@@ -227,7 +234,7 @@ impl SessionUpdate {
             SessionUpdate::ToolCall(c) => Some(&c.meta),
             SessionUpdate::ToolCallUpdate(u) => Some(&u.meta),
             SessionUpdate::UsageUpdate(u) => Some(&u.meta),
-            SessionUpdate::Other => None,
+            SessionUpdate::AvailableCommandsUpdate { .. } | SessionUpdate::Other => None,
         }
     }
 
@@ -236,6 +243,12 @@ impl SessionUpdate {
     fn subagent(&self) -> Option<&str> {
         self.meta().and_then(subagent_of)
     }
+}
+
+/// One of `available_commands_update`'s commands.
+#[derive(Debug, Deserialize)]
+struct AvailableCommand {
+    name: String,
 }
 
 /// A piece of content; only text is shown.
@@ -935,6 +948,7 @@ impl Updates {
             }
             SessionUpdate::AgentMessageChunk { .. }
             | SessionUpdate::AgentThoughtChunk { .. }
+            | SessionUpdate::AvailableCommandsUpdate { .. }
             | SessionUpdate::Other => Vec::new(),
         }
     }
@@ -969,7 +983,15 @@ impl TurnCtx<'_, '_> {
                         return Ok(());
                     }
                 };
-                if !self.loading {
+                // The commands count even while a load replays the
+                // conversation, which is when devin may send them.
+                if let SessionUpdate::AvailableCommandsUpdate { available_commands } = &n.update {
+                    let mut names: Vec<String> =
+                        available_commands.iter().map(|c| c.name.clone()).collect();
+                    names.sort();
+                    names.dedup();
+                    self.sink.commands(AgentBackend::Devin, &names)?;
+                } else if !self.loading {
                     for e in self.updates.update(&n.update) {
                         self.sink.event(e)?;
                     }
@@ -1180,8 +1202,8 @@ async fn run_turn(
         return Ok(Prompted::No);
     }
 
-    // The prompt's blocks: the notes first, then the images, then the
-    // text.
+    // The prompt's blocks: the notes first, then the images, then what
+    // it's told about the attached files, then the text.
     let mut blocks = Vec::new();
     if !t.notes.is_empty() {
         blocks.push(json!({"type": "text", "text": t.notes.join("\n\n")}));
@@ -1195,6 +1217,9 @@ async fn run_turn(
             "mimeType": crate::agent::media_type(name).unwrap_or("image/png"),
             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         }));
+    }
+    if let Some(attached) = t.attached {
+        blocks.push(json!({"type": "text", "text": attached}));
     }
     if !t.prompt.trim().is_empty() {
         blocks.push(json!({"type": "text", "text": t.prompt}));
@@ -1943,6 +1968,15 @@ mod tests {
             update(r#"{"sessionUpdate":"plan","entries":[]}"#),
             SessionUpdate::Other
         ));
+        match update(
+            r#"{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"foo","description":"d","input":null}]}"#,
+        ) {
+            SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+                assert_eq!(available_commands.len(), 1);
+                assert_eq!(available_commands[0].name, "foo");
+            }
+            u => panic!("{u:?}"),
+        }
         assert!(
             serde_json::from_str::<SessionUpdate>(r#"{"sessionUpdate":"tool_call","rawInput":{}}"#)
                 .is_err()

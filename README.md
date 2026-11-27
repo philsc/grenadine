@@ -132,12 +132,12 @@ A new database starts with these inboxes. The ones marked "total" count in the t
 | Drafts                   |       |      | `state:open archived:false draft:true author:@me sort:updated-desc`                                                                                                 |
 | Drafts from others       |       |      | `state:open archived:false draft:true -author:@me user-review-requested:@me gr:sort:title-asc`                                                                      |
 | Waiting for reviewers    |       |      | `state:open archived:false draft:false author:@me -is:queued -gr:review:unapproved-human -gr:changes-requested:unaddressed -review:approved sort:updated-desc`      |
-| All my open PRs          |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                            |
+| All your open PRs        |       |      | `state:open archived:false author:@me sort:updated-desc`                                                                                                            |
 | Waiting for author       |       |      | `state:open archived:false draft:false reviewed-by:@me -author:@me -user-review-requested:@me -is:queued sort:updated-desc`                                         |
-| Merged by me             |       |      | `state:closed archived:false author:@me sort:updated-desc`                                                                                                          |
-| Merged by others         |       |      | `state:closed archived:false -author:@me (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                          |
+| Your merged PRs          |       |      | `state:closed archived:false author:@me is:merged sort:updated-desc`                                                                                                |
+| Merged PRs from others   |       |      | `state:closed archived:false -author:@me is:merged (reviewed-by:@me OR user-review-requested:@me) sort:updated-desc`                                                |
 | All open PRs             |       |      | `state:open archived:false -is:queued sort:updated-desc`                                                                                                            |
-| Unmerged PRs on mine     |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                              |
+| Your unmerged PRs        |       |      | `state:closed archived:false author:@me is:unmerged sort:updated-desc`                                                                                              |
 
 Your open PRs that aren't drafts each appear in exactly one of Returned to you, Approved, Merging and Waiting for reviewers:
 
@@ -165,4 +165,4 @@ The same dialog sets what new sessions in the repository start with:
 
 The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
 
-Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.
+Once grenadine sees the session's review or comment on the PR, it deletes the session. If it doesn't see one once the session is done, it asks the session to post again, after one minute and then after five more. It keeps a session that still didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.

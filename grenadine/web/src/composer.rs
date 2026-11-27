@@ -171,6 +171,19 @@ impl OpenBoxes {
         self.set_error(draft, None);
     }
 
+    /// Moves the box for `from`, and what's written in it, to `to`.
+    pub fn rename(self, from: &str, to: &str) {
+        if let Some(s) = storage()
+            && let Ok(Some(text)) = s.get_item(&comment_draft_key(from))
+        {
+            let _ = s.set_item(&comment_draft_key(to), &text);
+        }
+        let preview = self.preview(from);
+        self.close(from);
+        self.set_preview(to, preview);
+        self.set(to, true);
+    }
+
     /// Closes the boxes whose drafts' names start with `prefix` and that
     /// `keep` doesn't keep, open or only stored, and drops their drafts.
     pub fn close_unless(self, prefix: &str, keep: impl Fn(&str) -> bool) {

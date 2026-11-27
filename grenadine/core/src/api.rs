@@ -128,6 +128,19 @@ pub struct AutoReviewEntry {
     pub error: Option<String>,
 }
 
+/// A review's page: the review, and once its session is deleted, what
+/// the session was and said.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutoReviewDetail {
+    pub review: AutoReviewEntry,
+    /// The deleted session as it was last; `None` while it exists, and
+    /// for reviews whose session was deleted before transcripts were
+    /// kept or that never had one.
+    pub saved: Option<AgentSession>,
+    /// The deleted session's transcript.
+    pub events: Vec<AgentEvent>,
+}
+
 /// Identifies a PR across the configured repositories.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PrKey {
@@ -453,8 +466,16 @@ pub struct NewReply {
 pub struct NewThread {
     pub path: String,
     pub side: Side,
-    /// The 1-based line on `side`; `None` comments on the whole file.
+    /// The 1-based line on `side`; `None` comments on the whole file. A
+    /// multi-line thread's last line.
     pub line: Option<u32>,
+    /// A multi-line thread's first line (1-based) on `start_side`; `None`
+    /// for a single line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    /// The side of `start_line`; `None` means `side`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<Side>,
     pub body: String,
 }
 
@@ -650,6 +671,20 @@ pub struct Check {
     pub url: Option<String>,
 }
 
+/// A run of a check on the PR's head that didn't pass and that a later
+/// run of the same check replaced, e.g. one a workflow's concurrency
+/// group cancelled. Grenadine's checks leave it out, but GitHub can keep
+/// counting it, and then it fails the head's checks until it's re-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRun {
+    /// The check's name.
+    pub name: String,
+    pub url: Option<String>,
+    /// The GitHub Actions workflow run it belongs to, which can be
+    /// re-run; `None` for another app's check.
+    pub run_id: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MergeMethod {
     Merge,
@@ -736,6 +771,10 @@ pub struct MergeInfo {
     /// resolved before merging.
     #[serde(default)]
     pub requires_conversation_resolution: bool,
+    /// The replaced runs that fail the head's checks for GitHub while
+    /// every check that counts for grenadine passed or still runs.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
     /// `Some` when the base branch requires merging through a merge
     /// queue.
     #[serde(default)]
@@ -770,6 +809,12 @@ pub struct StackMergePr {
     pub state: MergeState,
     /// The combined state of its head's checks.
     pub ci: Option<CiStatus>,
+    /// Like `MergeInfo::stale_runs`, for its head.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
+    /// Whether its reviews let it merge, like `ReviewInfo::decision`.
+    #[serde(default)]
+    pub decision: Option<ReviewDecision>,
 }
 
 /// A team asked to review a PR, as GitHub names and addresses it.
@@ -1191,8 +1236,9 @@ pub struct ServerStats {
 pub struct SessionResources {
     pub id: String,
     pub title: String,
-    /// A short summary of the first prompt, written in the background;
-    /// `None` until it's written, or if writing it failed.
+    /// A short summary of the first prompt and, if needed, the PR the
+    /// session started from, written in the background; `None` until it's
+    /// written, or if writing it failed.
     #[serde(default)]
     pub summary: Option<String>,
     pub status: AgentStatus,
@@ -1217,7 +1263,12 @@ pub struct LeftoverResources {
     pub processes: u32,
 }
 
-/// Pushed to the page over server-sent events.
+/// What the server sends among the events to tell the page that its
+/// connection is alive. Pages can't see WebSocket pings, so this is a
+/// message; it isn't JSON, unlike the events.
+pub const PING: &str = "ping";
+
+/// Pushed to the page as JSON text messages over a WebSocket.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerEvent {
     /// The inbox list or the PRs in an inbox changed.
@@ -1246,6 +1297,35 @@ pub enum ServerEvent {
 pub struct TerminalInfo {
     /// Counts up from 1 within the session.
     pub id: u64,
+}
+
+/// What runs in an agent session, for its Processes tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProcesses {
+    /// Milliseconds since boot when the snapshot was taken.
+    pub now_ms: u64,
+    /// `None` when there is no systemd user manager, whose slices tell
+    /// which processes are the session's.
+    pub processes: Option<Vec<ProcessInfo>>,
+}
+
+/// One process of an agent session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    /// The parent, which may be outside the session.
+    pub ppid: u32,
+    /// Milliseconds since boot when it started. Tells it from another
+    /// process that reuses its PID.
+    pub started_ms: u64,
+    /// The CPU time it used so far, in all its threads.
+    pub cpu_ms: u64,
+    pub rss_bytes: u64,
+    /// Its arguments on one line, possibly cut off, or its name in
+    /// brackets if it has none.
+    pub command: String,
+    /// The terminal whose shell it is.
+    pub terminal: Option<u64>,
 }
 
 /// The size a page fits a terminal to, sent as a WebSocket text message.
@@ -1314,6 +1394,10 @@ pub enum AgentStatus {
     Running,
     /// The agent is waiting for the user to allow or deny a tool call.
     AwaitingApproval,
+    /// The agent has answered, but its process is still running and
+    /// waits for a background task, e.g. a long command, to finish.
+    /// Prompts sent meanwhile wait for the process to exit.
+    Background,
     /// The user stopped the last turn, or the server restarted during it.
     Interrupted,
     /// The last turn ended with an error.
@@ -1321,6 +1405,10 @@ pub enum AgentStatus {
 }
 
 /// An agent session working in its own git worktree.
+///
+/// A deleted auto-review session is kept as this, in JSON, so a new
+/// field needs `#[serde(default)]` (or to be an `Option`) for the copies
+/// saved before it to still parse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
     /// The session's ID, a UUID.
@@ -1334,8 +1422,9 @@ pub struct AgentSession {
     pub pr: Option<u64>,
     /// The first line of the first prompt.
     pub title: String,
-    /// A short summary of the first prompt, written in the background;
-    /// `None` until it's written, or if writing it failed.
+    /// A short summary of the first prompt and, if needed, the PR the
+    /// session started from, written in the background; `None` until it's
+    /// written, or if writing it failed.
     #[serde(default)]
     pub summary: Option<String>,
     /// The local branch checked out in the worktree.
@@ -1707,6 +1796,30 @@ pub struct AgentModelInfo {
     pub description: String,
 }
 
+/// A command a prompt can start with, as `/name`: a skill or one of the
+/// backend's own commands, and how many of the repository's prompts have
+/// started with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub name: String,
+    pub uses: u64,
+}
+
+/// Whether `c` can be part of a command's name, e.g. `code-review` or
+/// `plugin:skill`.
+pub fn command_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')
+}
+
+/// The command `prompt` starts with, without its `/`: `/foo bar` runs
+/// `foo`. A path such as `/tmp/x` runs none.
+pub fn leading_command(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty() && name.chars().all(command_char)).then_some(name)
+}
+
 /// The `repo` of the sessions that aren't in any repository, which work in
 /// a plain directory of their own, with no git. Repositories are
 /// `owner/name`, so it can't name one.
@@ -1731,6 +1844,10 @@ pub struct NewAgent {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
     /// The web draft the session starts from, if any. A second start with
     /// the same draft returns the session the first one started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1750,6 +1867,10 @@ pub struct AgentMessage {
     /// Images that go with the prompt, e.g. pasted screenshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PromptImage>,
+    /// The ids of the uploads (see `Upload`) that go with the prompt as
+    /// files the agent reads from disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// An image sent with a prompt.
@@ -1759,6 +1880,48 @@ pub struct PromptImage {
     pub media_type: String,
     /// The image's bytes, base64-encoded.
     pub data: String,
+}
+
+/// A file uploaded to go with a prompt, which `PUT /api/uploads` stored
+/// until a prompt claims it by `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upload {
+    pub id: String,
+    /// The file's name, made safe to use as a path component.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+/// A file sent with a prompt, which the agent reads from disk and
+/// `/api/agents/{id}/attachments/{dir}/{name}` serves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub dir: String,
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+/// The most files one prompt may come with.
+pub const MAX_ATTACHMENTS: usize = 20;
+
+/// The largest file that may be uploaded, in bytes.
+pub const MAX_UPLOAD_BYTES: u64 = 1 << 30;
+
+/// `bytes` for people, e.g. `1.2 MB`.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 /// Where wrapping up a session puts its commits.
@@ -1785,6 +1948,45 @@ pub struct WrapUp {
     /// default.
     #[serde(default)]
     pub model: Option<String>,
+}
+
+/// Asks for a handoff from an agent session to be written without
+/// running a turn in it: a background job reads the session's transcript
+/// and proposes a new session, which shows in the transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteHandoff {
+    /// What the new session should do; empty to go on with what the
+    /// session was working on.
+    #[serde(default)]
+    pub instruction: String,
+    /// The mode the proposed session starts in, one of the session's
+    /// backend's `AgentBackend::modes`.
+    pub permission_mode: PermissionMode,
+    /// The proposed session's model, an `AgentModelInfo::value` of the
+    /// backend; `None` keeps its default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// What the ids of the drafts that hold a handoff proposal start with.
+pub const HANDOFF_DRAFTS: &str = "handoff";
+
+/// The id of the draft that holds the proposal of the handoff request
+/// `tool`, and that the session started from it has. Draft ids are
+/// alphanumeric.
+pub fn handoff_id(tool: &str) -> String {
+    let tool: String = tool.chars().filter(char::is_ascii_alphanumeric).collect();
+    let tool = tool.strip_prefix(HANDOFF_DRAFTS).unwrap_or(&tool);
+    format!("{HANDOFF_DRAFTS}{tool}")
+}
+
+/// The user's answer to a `HandoffProposed` event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerHandoff {
+    /// The session to start, as the user has it in the proposal's form;
+    /// `None` declines the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<NewAgent>,
 }
 
 /// Where a session's work was landed.
@@ -1922,6 +2124,11 @@ impl ApprovalKind {
 }
 
 /// Something that happened in an agent session's transcript.
+///
+/// A deleted auto-review session's events are kept as these, in JSON,
+/// for as long as the review, so a variant shouldn't be removed or
+/// renamed, and a new field needs `#[serde(default)]` (or to be an
+/// `Option`), for the transcripts saved before to still parse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEventKind {
@@ -1930,6 +2137,8 @@ pub enum AgentEventKind {
     /// The images sent with the prompt before it, by their names under
     /// `/api/agents/{id}/images/`.
     Images(Vec<String>),
+    /// The files sent with the prompt before it.
+    Attachments(Vec<Attachment>),
     /// A piece of assistant text while it streams in. Never stored; the
     /// complete `Text` follows.
     TextDelta(String),
@@ -1977,6 +2186,24 @@ pub enum AgentEventKind {
         /// The new session's title.
         title: String,
     },
+    /// The user asked for a handoff to be written from the transcript,
+    /// which a background job is doing now. A `HandoffProposed` or
+    /// `HandoffFailed` with the same id follows.
+    HandoffRequested {
+        id: String,
+        /// What the user wants the new session to do; may be empty.
+        instruction: String,
+    },
+    /// The handoff the user asked for is written: the session it
+    /// proposes waits for the user's `AnswerHandoff`. An
+    /// `ApprovalResolved` with the same id follows once it's answered.
+    HandoffProposed {
+        id: String,
+        /// The proposed session, a `NewAgent` as JSON.
+        input: String,
+    },
+    /// Writing the handoff the user asked for failed; carries why.
+    HandoffFailed { id: String, error: String },
     /// The agent wants to use a tool and waits for the user's `Approval`.
     ApprovalRequested {
         id: String,
@@ -2010,6 +2237,24 @@ pub enum AgentEventKind {
         #[serde(alias = "cost_usd")]
         cost: Option<f64>,
     },
+    /// The backend started a task for tool call `id`, such as a command
+    /// or a subagent. One that's still running after the call's
+    /// `ToolResult` runs in the background. A `TaskEnded` with the same
+    /// `task` follows, unless the turn's process ends first.
+    TaskStarted {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+    },
+    /// A task that a tool call started is over.
+    TaskEnded {
+        /// The tool call's id.
+        id: String,
+        /// The backend's id for the task.
+        task: String,
+        status: TaskStatus,
+    },
     /// How full the context window is. Never stored; the session keeps
     /// the latest values. `None` leaves a value unchanged.
     Usage {
@@ -2025,6 +2270,16 @@ pub enum AgentEventKind {
     Landed(Landed),
     /// Wrapping up stopped; carries why.
     WrapUpFailed(String),
+}
+
+/// How a task that a tool call started went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Completed,
+    Failed,
+    /// Ended before it was done, e.g. by the agent.
+    Stopped,
 }
 
 /// One hunk of the change a file tool made, as the backend reports it.
@@ -2049,6 +2304,15 @@ impl AgentEventKind {
                 | AgentEventKind::Model(_)
         )
     }
+
+    /// Whether the event is about a task that a tool call started,
+    /// rather than something the agent did.
+    pub fn is_task(&self) -> bool {
+        matches!(
+            self,
+            AgentEventKind::TaskStarted { .. } | AgentEventKind::TaskEnded { .. }
+        )
+    }
 }
 
 /// Sent over an agent session's event stream.
@@ -2065,7 +2329,30 @@ pub struct AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_sizes() {
+        use super::human_size;
+        assert_eq!(human_size(12), "12 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(1_258_291), "1.2 MB");
+        assert_eq!(human_size(3 << 30), "3.0 GB");
+    }
+
     use super::*;
+
+    #[test]
+    fn leading_commands() {
+        assert_eq!(leading_command("/foo bar"), Some("foo"));
+        assert_eq!(leading_command("/foo"), Some("foo"));
+        assert_eq!(leading_command("/foo\nbar"), Some("foo"));
+        assert_eq!(leading_command("/plug:a-b_c.d x"), Some("plug:a-b_c.d"));
+        assert_eq!(leading_command("/tmp/x is full"), None);
+        assert_eq!(leading_command("/ foo"), None);
+        assert_eq!(leading_command("/"), None);
+        assert_eq!(leading_command(" /foo"), None);
+        assert_eq!(leading_command("foo"), None);
+    }
 
     #[test]
     fn what_a_review_needs() {

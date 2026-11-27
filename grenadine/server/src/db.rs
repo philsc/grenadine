@@ -10,7 +10,7 @@ use grenadine_core::api::{
     AgentBackend, AgentEvent, AgentEventKind, AgentPr, AgentPrs, AgentSession, AgentStatus,
     AutoReviewEntry, AutoReviewState, CiStatus, CleanupItem, CostUnit, Inbox, InboxEdit, Landed,
     Person, PrDetail, PrKey, PrSummary, RepoSettings, ReviewComment, ReviewDecision, ReviewInfo,
-    SessionKind, Stack, ThreadCounts, Version, VersionKind,
+    SessionKind, SlashCommand, Stack, ThreadCounts, Version, VersionKind, leading_command,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -26,6 +26,9 @@ enum Migration {
     /// edited default keeps it off. Reads DEFAULT_INBOXES so the names
     /// and filters aren't duplicated here.
     BackgroundDefaults,
+    /// Counts the commands that the stored prompts, other than automatic
+    /// reviews', started with into `skill_uses`.
+    BackfillSkillUses,
 }
 
 /// Each entry upgrades the schema by one version.
@@ -474,6 +477,83 @@ const MIGRATIONS: &[Migration] = &[
     CREATE INDEX auto_reviews_pr ON auto_reviews (repo, number);
 "#,
     ),
+    // Installs the default inboxes named in the second person, with
+    // the closed ones split into merged and unmerged.
+    Migration::ResetInboxes,
+    Migration::Sql(
+        r#"
+    -- What a review's session was and said, kept when the session is
+    -- deleted so that the review's page can still show it. saved is the
+    -- api::AgentSession as JSON; NULL while the session exists, and for
+    -- reviews whose session was deleted before these were kept.
+    ALTER TABLE auto_reviews ADD COLUMN saved TEXT;
+    CREATE TABLE auto_review_events (
+        review_id INTEGER NOT NULL REFERENCES auto_reviews (id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event TEXT NOT NULL,
+        at INTEGER,
+        PRIMARY KEY (review_id, seq)
+    );
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- Clears the drift that syncs reading GitHub's stale head right
+    -- after a force push reported: a trailing version re-adding an
+    -- earlier SHA that the next sync dropped. Each such drift_log row
+    -- has old = new || ', vN=SHA' with SHA already in new. A PR keeps
+    -- its drift if any of its rows is something else.
+    UPDATE prs SET drift = NULL
+    WHERE drift IS NOT NULL
+      AND EXISTS (SELECT 1 FROM drift_log d
+                  WHERE d.repo = prs.repo AND d.number = prs.number)
+      AND NOT EXISTS (
+        SELECT 1 FROM (
+            SELECT d.new AS new,
+                   substr(d.old, 1, length(d.new)) AS head,
+                   substr(d.old, length(d.new) + 1, 2) AS sep,
+                   substr(d.old, length(d.new) + 3) AS tail
+            FROM drift_log d
+            WHERE d.repo = prs.repo AND d.number = prs.number
+        )
+        WHERE NOT (
+            new != ''
+            AND head = new
+            AND sep = ', '
+            AND tail LIKE 'v%=%'
+            AND instr(tail, ',') = 0
+            AND instr(new || ',', substr(tail, instr(tail, '=')) || ',') > 0
+        )
+      );
+"#,
+    ),
+    Migration::Sql(
+        r#"
+    -- The commands a prompt can start with, as the backend's latest
+    -- session in the repository listed them: names is a JSON array.
+    CREATE TABLE slash_commands (
+        repo TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        names TEXT NOT NULL,
+        -- Unix seconds.
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, backend)
+    );
+    -- The commands the session's backend listed, as a JSON array; NULL
+    -- until it has.
+    ALTER TABLE agents ADD COLUMN slash_commands TEXT;
+    -- How many of the repository's prompts started with each command.
+    CREATE TABLE skill_uses (
+        repo TEXT NOT NULL,
+        name TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        -- Unix seconds; NULL for uses whose time isn't known.
+        last_used INTEGER,
+        PRIMARY KEY (repo, name)
+    );
+"#,
+    ),
+    Migration::BackfillSkillUses,
 ];
 
 /// Applies migrations up to `target` (a schema version); each runs in
@@ -524,6 +604,7 @@ fn migrate(conn: &mut Connection, target: usize) -> Result<()> {
                 }
             }
             Migration::BackfillAgentPrs => backfill_agent_prs(&tx)?,
+            Migration::BackfillSkillUses => backfill_skill_uses(&tx)?,
             Migration::BackgroundDefaults => {
                 tx.execute_batch(
                     "ALTER TABLE inboxes ADD COLUMN sync_in_background INTEGER NOT NULL DEFAULT 0;",
@@ -570,6 +651,40 @@ fn backfill_agent_prs(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+    Ok(())
+}
+
+fn backfill_skill_uses(conn: &Connection) -> Result<()> {
+    // Events are stored with their kind as the only key, so the prefix
+    // finds these prompts without loading the other events. Their times
+    // are in milliseconds.
+    let prompts: Vec<(String, String, Option<i64>)> = conn
+        .prepare(
+            r#"SELECT a.repo, e.event, e.at / 1000 FROM agent_events e
+             JOIN agents a ON a.id = e.agent_id
+             WHERE a.kind != 'auto_review' AND e.event LIKE '{"prompt":"/%'"#,
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (repo, json, at) in prompts {
+        if let Ok(AgentEventKind::Prompt(prompt)) = serde_json::from_str(&json)
+            && let Some(name) = leading_command(&prompt)
+        {
+            count_skill_use(conn, &repo, name, at)?;
+        }
+    }
+    Ok(())
+}
+
+/// Adds a use of the command `name` in `repo` at `at`.
+fn count_skill_use(conn: &Connection, repo: &str, name: &str, at: Option<i64>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO skill_uses (repo, name, count, last_used) VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT (repo, name) DO UPDATE SET
+             count = count + 1,
+             last_used = MAX(COALESCE(last_used, excluded.last_used), COALESCE(excluded.last_used, last_used))",
+        params![repo, name, at],
+    )?;
     Ok(())
 }
 
@@ -1639,6 +1754,92 @@ impl Db {
         Ok(())
     }
 
+    /// Records the commands the session's backend listed, as the session's
+    /// own and as the latest for its repository and backend. Automatic
+    /// reviews only set their own: they run at their PRs' heads, whose
+    /// skills needn't be the ones a new session gets.
+    pub fn set_slash_commands(
+        &self,
+        id: &str,
+        repo: &str,
+        backend: AgentBackend,
+        names: &[String],
+        at: i64,
+    ) -> Result<()> {
+        let names = serde_json::to_string(names)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE agents SET slash_commands = ? WHERE id = ?",
+            params![names, id],
+        )?;
+        tx.execute(
+            "INSERT INTO slash_commands (repo, backend, names, updated_at)
+             SELECT ?, ?, ?, ?
+             WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ? AND kind = 'auto_review')
+             ON CONFLICT (repo, backend) DO UPDATE SET
+                 names = excluded.names, updated_at = excluded.updated_at",
+            params![repo, backend.as_str(), names, at, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The commands the session's backend listed; `None` until it has.
+    pub fn agent_slash_commands(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let names: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT slash_commands FROM agents WHERE id = ?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(names.and_then(|n| serde_json::from_str(&n).ok()))
+    }
+
+    /// The commands the latest `backend` session in `repo` listed; `None`
+    /// when none has.
+    pub fn repo_slash_commands(
+        &self,
+        repo: &str,
+        backend: AgentBackend,
+    ) -> Result<Option<Vec<String>>> {
+        let names: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT names FROM slash_commands WHERE repo = ? AND backend = ?",
+                params![repo, backend.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(names.and_then(|n| serde_json::from_str(&n).ok()))
+    }
+
+    /// Adds a use of the command `name` by a prompt in `repo` at `at`.
+    pub fn add_skill_use(&self, repo: &str, name: &str, at: i64) -> Result<()> {
+        count_skill_use(&self.conn(), repo, name, Some(at))
+    }
+
+    /// `names` with how many of `repo`'s prompts started with each.
+    pub fn with_uses(&self, repo: &str, names: Vec<String>) -> Result<Vec<SlashCommand>> {
+        let conn = self.conn();
+        let mut uses = conn.prepare("SELECT count FROM skill_uses WHERE repo = ? AND name = ?")?;
+        names
+            .into_iter()
+            .map(|name| {
+                let count: Option<u64> = uses
+                    .query_row(params![repo, name], |r| r.get(0))
+                    .optional()?;
+                Ok(SlashCommand {
+                    name,
+                    uses: count.unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
     /// Records where wrapping up landed the session's work.
     pub fn set_agent_landed(&self, id: &str, landed: &Landed) -> Result<()> {
         self.conn().execute(
@@ -1818,12 +2019,13 @@ impl Db {
     /// interrupted, since their Claude Code processes are gone.
     pub fn interrupt_agents(&self) -> Result<()> {
         self.conn().execute(
-            "UPDATE agents SET status = ? WHERE status IN (?, ?, ?)",
+            "UPDATE agents SET status = ? WHERE status IN (?, ?, ?, ?)",
             params![
                 status_str(AgentStatus::Interrupted),
                 status_str(AgentStatus::Creating),
                 status_str(AgentStatus::Running),
-                status_str(AgentStatus::AwaitingApproval)
+                status_str(AgentStatus::AwaitingApproval),
+                status_str(AgentStatus::Background)
             ],
         )?;
         Ok(())
@@ -1993,18 +2195,90 @@ impl Db {
         Ok(())
     }
 
-    /// Detaches the review of session `agent_id` from it as the session is
-    /// deleted, keeping the session's cost.
-    pub fn auto_review_session_deleted(&self, agent_id: &str) -> Result<()> {
-        self.conn().execute(
+    /// Detaches the review of `session` from it as the session is
+    /// deleted, keeping the session's cost, the session as it is now and
+    /// its transcript.
+    pub fn auto_review_session_deleted(&self, session: &AgentSession) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let saved = serde_json::to_string(session)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO auto_review_events (review_id, seq, event, at)
+             SELECT r.id, e.seq, e.event, e.at
+             FROM agent_events e JOIN auto_reviews r ON r.agent_id = e.agent_id
+             WHERE e.agent_id = ?",
+            [&session.id],
+        )?;
+        tx.execute(
             "UPDATE auto_reviews SET
                 cost = COALESCE((SELECT cost FROM agents WHERE id = ?1), cost),
                 cost_unit = COALESCE((SELECT cost_unit FROM agents WHERE id = ?1), cost_unit),
+                saved = ?2,
                 agent_id = NULL
              WHERE agent_id = ?1",
-            [agent_id],
+            params![session.id, saved],
         )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// What the deleted session of review `id` was and said; `None` while
+    /// the session exists, or when nothing of it was kept.
+    pub fn auto_review_transcript(
+        &self,
+        id: i64,
+    ) -> Result<Option<(AgentSession, Vec<AgentEvent>)>> {
+        let conn = self.conn();
+        let saved: Option<String> = conn
+            .query_row(
+                "SELECT saved FROM auto_reviews WHERE id = ? AND agent_id IS NULL",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(saved) = saved else {
+            return Ok(None);
+        };
+        // A copy saved before a field without a default was added to
+        // `AgentSession` reads as nothing kept, rather than failing the
+        // review's page.
+        let session = match serde_json::from_str(&saved) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!("review {id}'s saved session doesn't parse: {e}");
+                return Ok(None);
+            }
+        };
+        let mut stmt = conn.prepare(
+            "SELECT seq, event, at FROM auto_review_events WHERE review_id = ? ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([id], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, json, at) = row?;
+            // Likewise an event of a kind this build doesn't know, since
+            // a transcript with gaps could misstate what the review said.
+            let kind = match serde_json::from_str(&json) {
+                Ok(kind) => kind,
+                Err(e) => {
+                    tracing::warn!("review {id}'s saved event {seq} doesn't parse: {e}");
+                    return Ok(None);
+                }
+            };
+            events.push(AgentEvent {
+                seq: Some(seq),
+                at,
+                kind,
+            });
+        }
+        Ok(Some((session, events)))
     }
 
     /// Every review, newest first.
@@ -2117,6 +2391,25 @@ impl Db {
         let mut stmt = conn.prepare(
             r#"SELECT agent_id, event FROM agent_events
              WHERE event LIKE '{"approval\_%' ESCAPE '\'
+             ORDER BY agent_id, seq"#,
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (id, json) = row?;
+            Ok((id, serde_json::from_str(&json)?))
+        })
+        .collect()
+    }
+
+    /// The events of the handoffs the user asked for, in every session's
+    /// transcript, by session id and in order: requested, proposed and
+    /// failed.
+    pub fn handoff_events(&self) -> Result<Vec<(String, AgentEventKind)>> {
+        let conn = self.conn();
+        // As in `approval_events`. `handed_off` doesn't match.
+        let mut stmt = conn.prepare(
+            r#"SELECT agent_id, event FROM agent_events
+             WHERE event LIKE '{"handoff\_%' ESCAPE '\'
              ORDER BY agent_id, seq"#,
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -2300,6 +2593,7 @@ fn status_str(s: AgentStatus) -> &'static str {
         AgentStatus::Creating => "creating",
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "running",
+        AgentStatus::Background => "background",
         AgentStatus::AwaitingApproval => "awaiting_approval",
         AgentStatus::Interrupted => "interrupted",
         AgentStatus::Failed => "failed",
@@ -2311,6 +2605,7 @@ fn parse_status(s: &str) -> AgentStatus {
         "creating" => AgentStatus::Creating,
         "idle" => AgentStatus::Idle,
         "running" => AgentStatus::Running,
+        "background" => AgentStatus::Background,
         "awaiting_approval" => AgentStatus::AwaitingApproval,
         "interrupted" => AgentStatus::Interrupted,
         _ => AgentStatus::Failed,
@@ -2624,6 +2919,7 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                stale_runs: vec![],
                 queue: None,
                 stack: None,
             },
@@ -2817,6 +3113,72 @@ mod tests {
         // A search that no longer reports the PR uncovers it again.
         db.set_inbox_results(1, Ok(&[]), None).unwrap();
         assert!(!db.in_background_inbox(&key).unwrap());
+    }
+
+    #[test]
+    fn clears_drift_from_stale_heads() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let clear = MIGRATIONS
+            .iter()
+            .position(
+                |m| matches!(m, Migration::Sql(sql) if sql.contains("UPDATE prs SET drift = NULL")),
+            )
+            .unwrap();
+        migrate(&mut conn, clear).unwrap();
+        for (number, old, new) in [
+            (1, "v1=aaa, v2=bbb, v3=aaa", "v1=aaa, v2=bbb"),
+            (2, "v1=aaa, v2=bbb", "v1=aaa, v2=ccc"),
+            (3, "v1=aaa, v2=bbb, v3=ccc", "v1=aaa, v2=bbb"),
+            // A recomputation that found no versions at all.
+            (5, "v1=aaa", ""),
+        ] {
+            conn.execute(
+                "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
+                                  created_at, updated_at, base_ref, head_ref, head_oid, drift)
+                 VALUES ('o/n', ?, 't', 'b', 'au', 'OPEN', 0, 'u', 'c', 'u', 'main', 'pr', 'h',
+                         'drifted')",
+                [number],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO drift_log (repo, number, at, old, new) VALUES ('o/n', ?, 'now', ?, ?)",
+                params![number, old, new],
+            )
+            .unwrap();
+        }
+        // A PR with a stale-head entry and a real one keeps its drift.
+        conn.execute(
+            "INSERT INTO drift_log (repo, number, at, old, new)
+             VALUES ('o/n', 2, 'then', 'v1=aaa, v2=bbb, v3=aaa', 'v1=aaa, v2=bbb')",
+            [],
+        )
+        .unwrap();
+        // A PR without drift_log rows keeps its drift.
+        conn.execute(
+            "INSERT INTO prs (repo, number, title, body, author, state, is_draft, url,
+                              created_at, updated_at, base_ref, head_ref, head_oid, drift)
+             VALUES ('o/n', 4, 't', 'b', 'au', 'OPEN', 0, 'u', 'c', 'u', 'main', 'pr', 'h',
+                     'drifted')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        let drift = |number: u64| -> Option<String> {
+            conn.query_row("SELECT drift FROM prs WHERE number = ?", [number], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(drift(1), None);
+        assert!(drift(2).is_some());
+        assert!(drift(3).is_some());
+        assert!(drift(4).is_some());
+        assert!(drift(5).is_some());
+        // The log itself stays.
+        let logged: u64 = conn
+            .query_row("SELECT COUNT(*) FROM drift_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logged, 5);
     }
 
     #[test]
@@ -3244,6 +3606,8 @@ mod tests {
             ]
         );
         assert!(all.iter().all(|r| r.cost == 0.5));
+        // Their sessions went before transcripts were kept.
+        assert_eq!(db.auto_review_transcript(1).unwrap(), None);
         assert_eq!(db.queue_auto_review(&key, "a", "t", "u", 6).unwrap(), None);
         db.finish_auto_review(3, AutoReviewState::Posted, None, 7)
             .unwrap();
@@ -3266,6 +3630,92 @@ mod tests {
             created_at: 1,
             ..AgentSession::fixture(id, "o/n")
         }
+    }
+
+    /// A review's deleted session leaves what it was and said on the
+    /// review, until the review is pruned.
+    #[test]
+    fn a_deleted_review_session_keeps_its_transcript() {
+        let db = Db::in_memory();
+        let key = PrKey {
+            repo: "o/n".into(),
+            number: 7,
+        };
+        let review = db
+            .start_auto_review(&key, "a", "t", "u", 1)
+            .unwrap()
+            .unwrap();
+        let session = AgentSession {
+            kind: SessionKind::AutoReview,
+            title: "Review #7: t".into(),
+            ..agent("r", AgentStatus::Idle)
+        };
+        db.create_agent(&session).unwrap();
+        db.set_auto_review_session(review, "r").unwrap();
+        db.append_agent_event("r", &AgentEventKind::Prompt("Review it".into()), 1_000)
+            .unwrap();
+        db.append_agent_event("r", &AgentEventKind::Error("e".into()), 2_000)
+            .unwrap();
+        // Nothing's kept while the session is there.
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+
+        db.auto_review_session_deleted(&session).unwrap();
+        db.delete_agent("r").unwrap();
+        let (saved, events) = db.auto_review_transcript(review).unwrap().unwrap();
+        assert_eq!(saved, session);
+        let kept: Vec<_> = events
+            .iter()
+            .map(|e| (e.seq, e.at, e.kind.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (
+                    Some(1),
+                    Some(1_000),
+                    AgentEventKind::Prompt("Review it".into())
+                ),
+                (Some(2), Some(2_000), AgentEventKind::Error("e".into())),
+            ]
+        );
+        assert_eq!(db.auto_review(review).unwrap().unwrap().session, None);
+
+        // A copy this build can't read, e.g. saved before a field without
+        // a default was added, reads as not kept.
+        db.conn()
+            .execute(
+                "UPDATE auto_reviews SET saved = '{\"id\": \"r\"}' WHERE id = ?",
+                [review],
+            )
+            .unwrap();
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+        // So does one with an event it can't read.
+        db.conn()
+            .execute(
+                "UPDATE auto_reviews SET saved = ? WHERE id = ?",
+                params![serde_json::to_string(&session).unwrap(), review],
+            )
+            .unwrap();
+        assert!(db.auto_review_transcript(review).unwrap().is_some());
+        db.conn()
+            .execute(
+                "UPDATE auto_review_events SET event = '{\"gone\": 1}'
+                 WHERE review_id = ? AND seq = 2",
+                [review],
+            )
+            .unwrap();
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
+
+        // Pruning the review takes its transcript with it.
+        db.finish_auto_review(review, AutoReviewState::Posted, None, 2)
+            .unwrap();
+        assert!(db.prune_auto_reviews(3).unwrap());
+        let left: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM auto_review_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(db.auto_review_transcript(review).unwrap(), None);
     }
 
     /// A row whose backend or cost unit this build doesn't know fails to
@@ -3322,6 +3772,12 @@ mod tests {
             .unwrap();
         db.create_agent(&agent("c", AgentStatus::Failed)).unwrap();
         db.create_agent(&agent("d", AgentStatus::Creating)).unwrap();
+        db.create_agent(&agent("e", AgentStatus::Background))
+            .unwrap();
+        assert_eq!(
+            db.agent("e").unwrap(),
+            Some(agent("e", AgentStatus::Background))
+        );
         assert_eq!(
             db.agent("a").unwrap(),
             Some(agent("a", AgentStatus::Running))
@@ -3380,11 +3836,12 @@ mod tests {
         assert_eq!(db.agent("a").unwrap().unwrap().landed, Some(landed));
 
         db.interrupt_agents().unwrap();
-        // Newest first: d, c, b, a.
+        // Newest first: e, d, c, b, a.
         let statuses: Vec<_> = db.agents().unwrap().iter().map(|a| a.status).collect();
         assert_eq!(
             statuses,
             [
+                AgentStatus::Interrupted,
                 AgentStatus::Interrupted,
                 AgentStatus::Failed,
                 AgentStatus::Interrupted,
@@ -3778,6 +4235,129 @@ mod tests {
         assert!(db.pr(&key).unwrap().unwrap().summary.queued);
         assert!(db.inbox_prs(1).unwrap()[0].queued);
         assert_eq!(db.sync_mark(&key).unwrap().unwrap().queued, Some(true));
+    }
+
+    #[test]
+    fn backfills_skill_uses() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let backfill = MIGRATIONS
+            .iter()
+            .position(|m| matches!(m, Migration::BackfillSkillUses))
+            .unwrap();
+        migrate(&mut conn, backfill).unwrap();
+        for (id, repo, kind) in [
+            ("a", "o/n", "interactive"),
+            ("b", "o/n", "interactive"),
+            ("c", "o/other", "interactive"),
+            ("review", "o/n", "auto_review"),
+        ] {
+            conn.execute(
+                "INSERT INTO agents (id, repo, title, branch, worktree, base_sha, status, created_at, kind)
+                 VALUES (?, ?, 't', 'b', '/w', 's', 'idle', 0, ?)",
+                [id, repo, kind],
+            )
+            .unwrap();
+        }
+        let prompts = [
+            ("review", "/foo Review pull request", Some(30_000)),
+            ("a", "/foo do it", Some(10_000)),
+            ("a", "/foo again", None),
+            ("b", "/foo", Some(5_000)),
+            ("b", "/bar x", Some(7_000)),
+            ("b", "/tmp/x is full", Some(8_000)),
+            ("b", "no command", Some(9_000)),
+            ("c", "/foo", Some(20_000)),
+        ];
+        for (id, prompt, at) in prompts {
+            conn.execute(
+                "INSERT INTO agent_events (agent_id, seq, event, at)
+                 SELECT ?1, COALESCE(MAX(seq) + 1, 1), ?2, ?3 FROM agent_events WHERE agent_id = ?1",
+                params![
+                    id,
+                    serde_json::to_string(&AgentEventKind::Prompt(prompt.into())).unwrap(),
+                    at
+                ],
+            )
+            .unwrap();
+        }
+        migrate(&mut conn, MIGRATIONS.len()).unwrap();
+        let uses: Vec<(String, String, u64, Option<i64>)> = conn
+            .prepare("SELECT repo, name, count, last_used FROM skill_uses ORDER BY repo, name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            uses,
+            [
+                ("o/n".into(), "bar".into(), 1, Some(7)),
+                ("o/n".into(), "foo".into(), 3, Some(10)),
+                ("o/other".into(), "foo".into(), 1, Some(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_slash_commands_and_their_uses() {
+        let db = Db::in_memory();
+        for id in ["a", "b"] {
+            db.create_agent(&AgentSession::fixture(id, "o/n")).unwrap();
+        }
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(db.agent_slash_commands("a").unwrap(), None);
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Claude).unwrap(),
+            None
+        );
+
+        db.set_slash_commands("a", "o/n", AgentBackend::Claude, &names(&["bar", "foo"]), 1)
+            .unwrap();
+        db.set_slash_commands("b", "o/n", AgentBackend::Claude, &names(&["foo"]), 2)
+            .unwrap();
+        assert_eq!(
+            db.agent_slash_commands("a").unwrap(),
+            Some(names(&["bar", "foo"]))
+        );
+        // An automatic review only keeps its own.
+        db.create_agent(&AgentSession {
+            kind: SessionKind::AutoReview,
+            ..AgentSession::fixture("review", "o/n")
+        })
+        .unwrap();
+        db.set_slash_commands("review", "o/n", AgentBackend::Claude, &names(&["old"]), 3)
+            .unwrap();
+        assert_eq!(
+            db.agent_slash_commands("review").unwrap(),
+            Some(names(&["old"]))
+        );
+        // The repository keeps the latest interactive session's.
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Claude).unwrap(),
+            Some(names(&["foo"]))
+        );
+        assert_eq!(
+            db.repo_slash_commands("o/n", AgentBackend::Devin).unwrap(),
+            None
+        );
+
+        db.add_skill_use("o/n", "foo", 3).unwrap();
+        db.add_skill_use("o/n", "foo", 4).unwrap();
+        db.add_skill_use("o/other", "bar", 4).unwrap();
+        assert_eq!(
+            db.with_uses("o/n", names(&["bar", "foo"])).unwrap(),
+            [
+                SlashCommand {
+                    name: "bar".into(),
+                    uses: 0
+                },
+                SlashCommand {
+                    name: "foo".into(),
+                    uses: 2
+                },
+            ]
+        );
     }
 
     #[test]

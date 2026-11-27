@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, Approval, AutoMerge, AutoReviewEntry,
-    Blob, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GitHubUsage,
-    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession,
-    NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage,
-    RepoSettings, ReviewerCandidates, ReviewerChange, SubmitReview, SyncStatus, SystemStats,
-    TerminalInfo, WorktreeChanges, WrapUp,
+    AgentBackend, AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval,
+    AutoMerge, AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress,
+    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
+    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, ReviewerCandidates,
+    ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus, SystemStats,
+    TerminalInfo, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -91,6 +92,23 @@ pub async fn auto_reviews() -> Result<Vec<AutoReviewEntry>> {
         .await?
         .json()
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// The review `id`; `None` when there is no such review.
+pub async fn auto_review(id: i64) -> Result<Option<AutoReviewDetail>> {
+    let resp = Request::get(&format!("/api/auto-reviews/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    check(Ok(resp))
+        .await?
+        .json()
+        .await
+        .map(Some)
         .map_err(|e| e.to_string())
 }
 
@@ -322,6 +340,33 @@ pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     .map_err(|e| e.to_string())
 }
 
+/// The commands a new session's prompt in `repo` can start with.
+pub async fn slash_commands(repo: &str, backend: AgentBackend) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get("/api/slash-commands")
+            .query([("repo", repo), ("backend", backend.as_str())])
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The commands the session's next prompt can start with.
+pub async fn agent_slash_commands(id: &str) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get(&format!("/api/agents/{id}/slash-commands"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// The PRs a session opened, as of the last poll.
 pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
     check(Request::get(&format!("/api/agents/{id}/prs")).send().await)
@@ -329,6 +374,19 @@ pub async fn agent_prs(id: &str) -> Result<Vec<AgentPr>> {
         .json()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// What runs in the session, for its Processes tab.
+pub async fn processes(id: &str) -> Result<SessionProcesses> {
+    check(
+        Request::get(&format!("/api/agents/{id}/processes"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The session's open terminals, oldest first.
@@ -382,6 +440,7 @@ pub async fn send_agent_message(
     id: &str,
     prompt: String,
     images: Vec<PromptImage>,
+    attachments: Vec<String>,
     permission_mode: PermissionMode,
     model: Option<String>,
 ) -> Result<()> {
@@ -391,9 +450,34 @@ pub async fn send_agent_message(
             permission_mode,
             model,
             images,
+            attachments,
         })
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
+}
+
+/// Whether the upload `id` is still waiting for its prompt.
+pub async fn upload_exists(id: &str) -> Result<bool> {
+    let resp = Request::get(&format!("/api/uploads/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(false);
+    }
+    check(Ok(resp)).await.map(|_| true)
+}
+
+/// Deletes an upload no prompt is going to take.
+pub async fn delete_upload(id: &str) -> Result<()> {
+    let resp = Request::delete(&format!("/api/uploads/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Ok(());
+    }
+    check(Ok(resp)).await.map(|_| ())
 }
 
 pub async fn interrupt_agent(id: &str) -> Result<()> {
@@ -458,6 +542,30 @@ pub async fn wrap_up_agent(id: &str, wrap_up: &WrapUp) -> Result<()> {
         .json(wrap_up)
         .map_err(|e| e.to_string())?;
     check(req.send().await).await.map(|_| ())
+}
+
+/// Asks for a handoff to be written from the session's transcript; the
+/// proposal shows up in the transcript.
+pub async fn write_handoff(id: &str, req: &WriteHandoff) -> Result<()> {
+    let req = Request::post(&format!("/api/agents/{id}/handoff"))
+        .json(req)
+        .map_err(|e| e.to_string())?;
+    check(req.send().await).await.map(|_| ())
+}
+
+/// Answers the handoff `proposal` written for the user in the session's
+/// transcript; the server has a 404 for one that was answered already.
+pub async fn answer_handoff(id: &str, proposal: &str, answer: &AnswerHandoff) -> Result<()> {
+    let resp = Request::post(&format!("/api/agents/{id}/handoff/{proposal}"))
+        .json(answer)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status() == 404 {
+        return Err("This handoff isn't waiting anymore.".into());
+    }
+    check(Ok(resp)).await.map(|_| ())
 }
 
 /// Comments on the PR itself.
@@ -594,6 +702,18 @@ pub async fn enqueue(key: &PrKey, e: &Enqueue) -> Result<Option<Merged>> {
 pub async fn dequeue(key: &PrKey) -> Result<()> {
     check(
         Request::delete(&format!("{}/queue", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Re-runs the replaced runs that GitHub still counts against the PR's
+/// checks and those of the PRs below it in its stack.
+pub async fn rerun_checks(key: &PrKey) -> Result<()> {
+    check(
+        Request::post(&format!("{}/rerun-checks", pr_url(key)))
             .send()
             .await,
     )

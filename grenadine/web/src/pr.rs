@@ -19,9 +19,10 @@ use crate::diffview::Commenting;
 use crate::diffview::DiffView;
 use crate::inboxes::{load_flag, save_flag, storage};
 use crate::review::{
-    CheckFolds, MergeChoice, MergeTarget, PrSidebar, ReviewChoice, ReviewPanel, ReviewerEdit,
-    conversation, merge_box, merge_warning,
+    CheckFolds, MergeChoice, MergeTarget, ReviewChoice, ReviewPanel, ReviewerEdit, conversation,
+    merge_box, merge_warning,
 };
+use crate::sidebar::{PR_SIDEBAR, SidePanel, Sidebar};
 use crate::{GithubLink, Updates, api, github_url, hash_for, highlight, markdown};
 
 /// A review comment and its replies.
@@ -75,7 +76,7 @@ pub struct Selection {
     pub head: u32,
 }
 
-fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
+pub(crate) fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
     let mut roots: Vec<Thread> = Vec::new();
     let mut index: HashMap<u64, usize> = HashMap::new();
     for c in comments.iter().filter(|c| c.in_reply_to.is_none()) {
@@ -105,7 +106,8 @@ fn threads(comments: &[ReviewComment]) -> Vec<Thread> {
 /// - inline at GitHub's mapped-forward line, when Head is the latest version;
 /// - on its file, when the diff's files include it (`diff_paths`; `None`
 ///   while the diff hasn't loaded);
-/// - otherwise in the side panel.
+/// - otherwise in the side panel, as are threads on files the loaded diff
+///   doesn't show. While it loads, threads with a line stay inline.
 ///
 /// Left-side comments were made against the PR's base at the time, so they
 /// only go inline when the diff's left side is Head's merge-base.
@@ -179,16 +181,21 @@ pub fn place(
                 .find(|v| v.sha == thread.root.original_commit)
                 .map(|v| v.number)
         };
+        // A file the loaded diff doesn't show, e.g. one hidden as
+        // rebase-only, can't hold the thread at all.
+        let shown = diff_paths.is_none_or(|p| p.contains(&thread.root.path));
         match anchor {
-            Some(anchor) => inline
-                .entry(thread.root.path.clone())
-                .or_default()
-                .push(Placed {
-                    anchor,
-                    start,
-                    fallback: None,
-                    thread,
-                }),
+            Some(anchor) if shown => {
+                inline
+                    .entry(thread.root.path.clone())
+                    .or_default()
+                    .push(Placed {
+                        anchor,
+                        start,
+                        fallback: None,
+                        thread,
+                    })
+            }
             None if diff_paths.is_some_and(|p| p.contains(&thread.root.path)) => inline
                 .entry(thread.root.path.clone())
                 .or_default()
@@ -201,7 +208,7 @@ pub fn place(
                     }),
                     thread,
                 }),
-            None => panel.push(Unplaced {
+            _ => panel.push(Unplaced {
                 version: version(),
                 thread,
             }),
@@ -236,6 +243,28 @@ fn thread_counts(comments: &[ReviewComment], versions: &[Version]) -> HashMap<u3
 pub fn range_label(start: (Side, u32), end: (Side, u32)) -> String {
     let line = |(side, l)| format!("{}{l}", if side == Side::Left { "-" } else { "+" });
     format!("Lines {} to {}", line(start), line(end))
+}
+
+/// The versions the diff compares: `chosen` when it still makes sense,
+/// else Base against `pinned`.
+fn selected(pr: &PrDetail, chosen: Option<Selection>, pinned: u32) -> Selection {
+    let latest = pr.versions.len() as u32;
+    let default = Selection {
+        base: 0,
+        head: pinned.clamp(1, latest.max(1)),
+    };
+    match chosen {
+        Some(s)
+            if s.head >= 1
+                && s.head <= latest
+                && s.base < s.head
+                && !pr.versions[s.head as usize - 1].missing
+                && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
+        {
+            s
+        }
+        _ => default,
+    }
 }
 
 fn short(sha: &str) -> &str {
@@ -300,121 +329,28 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         error: RwSignal::new(None),
     });
     provide_context(OpenBoxes::new());
+    provide_context(ThreadJump(RwSignal::new(None)));
     provide_context(ReviewChoice::new());
     provide_context(MergeChoice::new());
+    // The page's clock, ticking so the relative times stay fresh.
+    let now = RwSignal::new((js_sys::Date::now() / 1000.0) as i64);
+    let clock = set_interval_with_handle(
+        move || now.set((js_sys::Date::now() / 1000.0) as i64),
+        Duration::from_secs(30),
+    );
+    on_cleanup(move || {
+        if let Ok(h) = clock {
+            h.clear();
+        }
+    });
+    provide_context(Now(now));
 
     // The sidebar is a resizable column on wide windows, which is
     // remembered, and an overlay the button opens on narrow ones, which
     // isn't.
-    let page = page_width();
-    let wide = Memo::new(move |_| page.get() >= DIFF_MIN + SIDEBAR_MIN);
-    let collapsed = RwSignal::new(load_flag("pr-sidebar-collapsed", false));
-    let open = RwSignal::new(false);
-    Effect::new(move |_| {
-        if wide.get() {
-            open.set(false);
-        }
-    });
-    let shown = move || {
-        if wide.get() {
-            !collapsed.get()
-        } else {
-            open.get()
-        }
-    };
-    let toggle = move |_| {
-        if wide.get_untracked() {
-            collapsed.update(|c| *c = !*c);
-            save_flag("pr-sidebar-collapsed", collapsed.get_untracked());
-        } else {
-            open.update(|o| *o = !*o);
-        }
-    };
-    // The width the divider last dragged to, shared by all PRs; `None` is
-    // the default split. It's written when a drag ends, so a window too
-    // narrow for it shows it clamped rather than losing it.
-    let saved = RwSignal::new(saved_width());
-    let width = Signal::derive(move || sidebar_width(saved.get(), page.get(), wide.get()));
-    // The click the browser fires on the common ancestor when a drag ends
-    // away from the divider would close the overlay, so the next click
-    // after a drag is ignored here.
-    let dragged = StoredValue::new_local(false);
-    let drag = StoredValue::new_local(None::<(WindowListenerHandle, WindowListenerHandle)>);
-    let on_resize_start = Callback::new(move |e: web_sys::MouseEvent| {
-        e.prevent_default();
-        let (x, w) = (
-            e.client_x() as f64,
-            sidebar_width(
-                saved.get_untracked(),
-                page.get_untracked(),
-                wide.get_untracked(),
-            ),
-        );
-        if let Some(body) = document().body() {
-            let _ = body.class_list().add_1("resizing-sidebar");
-        }
-        let on_move = window_event_listener(leptos::ev::mousemove, move |e| {
-            saved.set(Some(sidebar_width(
-                Some(w + x - e.client_x() as f64),
-                page.get_untracked(),
-                wide.get_untracked(),
-            )));
-        });
-        let on_up = window_event_listener(leptos::ev::mouseup, move |_| {
-            if let (Some(s), Some(w)) = (storage(), saved.get_untracked()) {
-                let _ = s.set_item(WIDTH_KEY, &w.to_string());
-            }
-            if let Some(body) = document().body() {
-                let _ = body.class_list().remove_1("resizing-sidebar");
-            }
-            drag.update_value(|d| {
-                if let Some((a, b)) = d.take() {
-                    a.remove();
-                    b.remove();
-                }
-            });
-            dragged.set_value(true);
-            // The click that follows the mouseup is dispatched before
-            // timers run; releasing the mouse outside the window fires
-            // none, so the flag resets itself for the next click.
-            set_timeout(move || dragged.set_value(false), Duration::ZERO);
-        });
-        drag.set_value(Some((on_move, on_up)));
-    });
-    let on_resize_reset = Callback::new(move |_: web_sys::MouseEvent| {
-        saved.set(None);
-        if let Some(s) = storage() {
-            let _ = s.remove_item(WIDTH_KEY);
-        }
-    });
-    // Escape and clicks outside the overlay's sidebar close it.
-    let on_key = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" {
-            open.set(false);
-        }
-    });
-    let on_click = window_event_listener(leptos::ev::click, move |ev| {
-        if dragged.get_value() {
-            dragged.set_value(false);
-            return;
-        }
-        if !open.get_untracked() || wide.get_untracked() {
-            return;
-        }
-        let inside = ev
-            .target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            .and_then(|t| t.closest(".pr-sidebar, .sidebar-toggle").ok().flatten())
-            .is_some();
-        if !inside {
-            open.set(false);
-        }
-    });
-    on_cleanup(move || {
-        on_key.remove();
-        on_click.remove();
-    });
-
+    // `.pr-page` is the row the sidebar sits in; it measures it.
+    let page = NodeRef::<leptos::html::Div>::new();
+    let sidebar = Sidebar::new(&PR_SIDEBAR, page);
     // The PR's detail once it's ready. A Memo, so a refetch that holds
     // the same data — most syncs change nothing a page shows — fires
     // nothing downstream.
@@ -431,32 +367,8 @@ pub fn PrView(key: PrKey) -> impl IntoView {
             prefetch(&d);
         }
     });
-    // While the sidebar shows, its toggle sits in the sidebar's header;
-    // while hidden, it floats clear of `.main`'s scrollbar at the page's
-    // top-right.
-    let button = move |floating: bool| {
-        view! {
-            <button type="button" class="sidebar-toggle" class:floating=floating
-                aria-label=move || if shown() { "Hide sidebar" } else { "Show sidebar" }
-                aria-expanded=move || shown().to_string()
-                on:click=toggle>
-                <svg
-                    viewBox="0 0 16 16"
-                    width="14"
-                    height="14"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                >
-                    <path d=move || if shown() { "M6 4l4 4-4 4" } else { "M10 4l-4 4 4 4" } />
-                </svg>
-            </button>
-        }
-    };
     let panel_key = key.clone();
+    let threads_key = key.clone();
     let review_key = key.clone();
     let auto_review_key = key.clone();
     // The viewer's own open PR, which gets an Auto-review section.
@@ -484,14 +396,29 @@ pub fn PrView(key: PrKey) -> impl IntoView {
     });
     // The latest detail, for PrBody: while it stays mounted a refetch
     // that leaves the PR unready keeps the last one rather than a gap.
-    let current = Memo::new(move |prev| {
-        detail
-            .get()
-            .or_else(|| prev.cloned())
-            .expect("PrBody only mounts once the PR is ready")
+    let last = Memo::new(move |prev: Option<&Option<Arc<PrDetail>>>| {
+        detail.get().or_else(|| prev.cloned().flatten())
+    });
+    let current = Memo::new(move |_| last.get().expect("PrBody only mounts once the PR is ready"));
+    // Selections that no longer make sense fall back to the default.
+    let selection = Memo::new(move |prev: Option<&Selection>| {
+        last.with(|pr| match pr {
+            Some(pr) => selected(pr, chosen.get(), pinned.get()),
+            None => prev.copied().unwrap_or(Selection { base: 0, head: 1 }),
+        })
+    });
+    provide_context(VersionJump { chosen, selection });
+    // Which sidebar tab shows: Overview or Threads.
+    let threads_tab = RwSignal::new(load_flag("pr-sidebar-threads", false));
+    let open_threads = Memo::new(move |_| {
+        last.with(|d| {
+            d.as_ref()
+                .map_or(0, |d| crate::pr_threads::counts(&d.comments)[0])
+        })
     });
 
     view! {
+        <div class="pr-page" node_ref=page>
         // `.main` outlives the states the PR moves through; unmounting
         // it would lose the scroll position.
         <main class="main">
@@ -521,27 +448,53 @@ pub fn PrView(key: PrKey) -> impl IntoView {
         {move || {
             ready.get().then(|| {
                 view! {
-                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older pinned=pinned sidebar=Signal::derive(shown) />
+                    <PrBody pr=current.into() chosen=chosen side_by_side=side_by_side inline_changes=inline_changes rebase_older=rebase_older pinned=pinned selection=selection sidebar=sidebar.shown_signal() />
                 }
             })
         }}
         </main>
         {move || {
             let panel_key = panel_key.clone();
+            let threads_key = threads_key.clone();
             let review_key = review_key.clone();
             let auto_review_key = auto_review_key.clone();
             if !ready.get() {
                 ().into_any()
-            } else if shown() {
+            } else if sidebar.shown() {
                 view! {
-                    <PrSidebar overlay=Signal::derive(move || !wide.get())
-                        width=width
-                        on_resize_start=on_resize_start
-                        on_resize_reset=on_resize_reset>
-                        <div class="pr-sidebar-body">
-                            <div class="sidebar-head">
-                                {button(false)}
+                    <SidePanel sidebar=sidebar class="pr-sidebar">
+                        <div class="sidebar-head pr-sidebar-head">
+                            <div class="pr-sidebar-tabs" role="tablist">
+                                <button
+                                    type="button"
+                                    role="tab"
+                                    class="pr-sidebar-tab"
+                                    class:selected=move || !threads_tab.get()
+                                    aria-selected=move || (!threads_tab.get()).to_string()
+                                    on:click=move |_| {
+                                        threads_tab.set(false);
+                                        save_flag("pr-sidebar-threads", false);
+                                    }
+                                >
+                                    "Overview"
+                                </button>
+                                <button
+                                    type="button"
+                                    role="tab"
+                                    class="pr-sidebar-tab"
+                                    class:selected=move || threads_tab.get()
+                                    aria-selected=move || (threads_tab.get()).to_string()
+                                    on:click=move |_| {
+                                        threads_tab.set(true);
+                                        save_flag("pr-sidebar-threads", true);
+                                    }
+                                >
+                                    "Threads " <span class="pr-sidebar-tab-count">{move || open_threads.get()}</span>
+                                </button>
                             </div>
+                            {sidebar.button(false)}
+                        </div>
+                        <div class="pr-sidebar-body pr-overview" role="tabpanel" hidden=move || threads_tab.get()>
                             // Up top, so merging after a review needs no
                             // scrolling back up. Merging is the only thing
                             // here that needs `ReviewTarget`; provided
@@ -580,76 +533,47 @@ pub fn PrView(key: PrKey) -> impl IntoView {
                                 _ => ().into_any(),
                             }}
                         </div>
+                        <div class="pr-sidebar-body pr-threads" role="tabpanel" hidden=move || !threads_tab.get()>
+                            <crate::pr_threads::ThreadsTab key=threads_key detail=last sidebar=sidebar />
+                        </div>
                         <crate::pr_agents::PrAgentPanel key=panel_key />
-                    </PrSidebar>
+                    </SidePanel>
                 }
                 .into_any()
             } else {
-                button(true).into_any()
+                sidebar.button(true).into_any()
             }
         }}
+        </div>
     }
-}
-
-/// The narrowest the diff is allowed to get by the sidebar widening.
-const DIFF_MIN: f64 = 1180.0;
-/// The narrowest the sidebar is allowed to get, on column and overlay
-/// alike.
-const SIDEBAR_MIN: f64 = 320.0;
-/// The diff's width before a drag moves it; the sidebar's default is the
-/// rest of the page.
-const DIFF_DEFAULT: f64 = 1600.0;
-/// The sliver of the page the overlay's sidebar leaves visible at its
-/// widest.
-const OVERLAY_GAP: f64 = 48.0;
-/// Where the dragged sidebar width is kept, for all PRs.
-const WIDTH_KEY: &str = "grenadine.pr-sidebar-width";
-
-/// The window's width, kept current. It decides both whether the
-/// sidebar's a column or an overlay and how wide it may get. The PR page
-/// comes and goes, so the listener is removed on unmount.
-fn page_width() -> RwSignal<f64> {
-    let width = || {
-        window()
-            .inner_width()
-            .ok()
-            .and_then(|w| w.as_f64())
-            .unwrap_or(0.0)
-    };
-    let page = RwSignal::new(width());
-    let on_resize = window_event_listener_untyped("resize", move |_| page.set(width()));
-    on_cleanup(move || on_resize.remove());
-    page
-}
-
-/// The sidebar width kept from the last drag; `None` is the default
-/// split.
-fn saved_width() -> Option<f64> {
-    storage()
-        .and_then(|s| s.get_item(WIDTH_KEY).ok().flatten())
-        .and_then(|w| w.parse().ok())
-}
-
-/// The width the sidebar shows at. A `wide` page clamps it to what the
-/// diff's minimum leaves, an overlay to the page minus a sliver, and the
-/// minimum wins where even that isn't room. `saved` too wide is clamped
-/// rather than dropped, so widening the window brings it back.
-fn sidebar_width(saved: Option<f64>, page: f64, wide: bool) -> f64 {
-    let max = if wide {
-        page - DIFF_MIN
-    } else {
-        page - OVERLAY_GAP
-    };
-    saved
-        .unwrap_or(page - DIFF_DEFAULT)
-        .min(max)
-        .max(SIDEBAR_MIN)
 }
 
 /// Threads the user folded or unfolded, by root comment ID. Threads not in
 /// here are folded exactly when they're resolved.
 #[derive(Clone, Copy)]
-struct Folded(RwSignal<HashMap<u64, bool>>);
+pub(crate) struct Folded(pub(crate) RwSignal<HashMap<u64, bool>>);
+
+/// The thread, by root comment ID, the main column is to show: set by the
+/// sidebar's Threads tab, cleared once the diff scrolled to it or gave up.
+#[derive(Clone, Copy)]
+pub(crate) struct ThreadJump(pub(crate) RwSignal<Option<u64>>);
+
+/// What the names of the reply and edit boxes of the threads below start
+/// with. A thread shows both in the diff and in the sidebar's Threads
+/// tab; each place gets its own boxes. Missing in the diff.
+#[derive(Clone, Copy)]
+pub(crate) struct DraftScope(pub(crate) &'static str);
+
+/// The prefix `DraftScope` gives the boxes below, if any.
+fn draft_scope() -> &'static str {
+    use_context::<DraftScope>().map_or("", |s| s.0)
+}
+
+/// The DOM id of the thread whose root comment is `id`, where the diff or
+/// the panel of threads it doesn't show has it.
+pub(crate) fn thread_dom_id(id: u64) -> String {
+    format!("thread-{id}")
+}
 
 /// What the markdown of one PR needs: its repo for links.
 #[derive(Clone)]
@@ -716,6 +640,9 @@ fn PrBody(
     /// The version the right side stays on while the user picks none.
     /// `PrView` holds it so the sidebar's merge box can merge it too.
     pinned: RwSignal<u32>,
+    /// The versions the diff compares. `PrView` holds it so the sidebar's
+    /// threads can jump to a version too.
+    selection: Memo<Selection>,
     /// The sidebar shows, and with it the merge box; the main column
     /// shows the merge box only while it's hidden.
     sidebar: Signal<bool>,
@@ -809,33 +736,16 @@ fn PrBody(
             .filter(|c| c.pending)
             .map(|c| edit_draft(&pr.summary.key, c.id))
             .collect();
-        expect_context::<OpenBoxes>()
-            .close_unless(&edit_prefix(&pr.summary.key), |d| pending.contains(d));
+        let boxes = expect_context::<OpenBoxes>();
+        for scope in ["", crate::pr_threads::DRAFT_SCOPE] {
+            boxes.close_unless(&format!("{scope}{}", edit_prefix(&pr.summary.key)), |d| {
+                d.strip_prefix(scope).is_some_and(|d| pending.contains(d))
+            });
+        }
     });
     // The version the right side stays on while the user picks none, so
     // a later push doesn't move the diff they're reading.
     pinned.set(first.versions.len() as u32);
-    let selection = Memo::new(move |_| {
-        let pr = pr.get();
-        let latest = pr.versions.len() as u32;
-        let default = Selection {
-            base: 0,
-            head: pinned.get().clamp(1, latest.max(1)),
-        };
-        match chosen.get() {
-            // Selections that no longer make sense fall back to the default.
-            Some(s)
-                if s.head >= 1
-                    && s.head <= latest
-                    && s.base < s.head
-                    && !pr.versions[s.head as usize - 1].missing
-                    && (s.base == 0 || !pr.versions[s.base as usize - 1].missing) =>
-            {
-                s
-            }
-            _ => default,
-        }
-    });
     // Only when both sides sit on different bases does a rebase bring in
     // upstream changes.
     let upstream = Memo::new(move |_| {
@@ -871,7 +781,6 @@ fn PrBody(
         };
         left.map(|left| (left, head.sha.clone(), upstream.get()))
     });
-    provide_context(VersionJump { chosen, selection });
     // The paths of the files the loaded diff shows, set by DiffView;
     // `None` until it has loaded them.
     let diff_paths = RwSignal::new(None::<Arc<HashSet<String>>>);
@@ -891,6 +800,83 @@ fn PrBody(
     });
     let inline = Memo::new(move |_| Arc::new(placed.get().0));
     let panel = Memo::new(move |_| placed.get().1);
+    // A thread the sidebar jumps to: one the selected diff can't show
+    // switches to the version it was made on, like its "on vN" button.
+    // Then it unfolds and the main column scrolls to it.
+    let jump = expect_context::<ThreadJump>().0;
+    let Folded(folded) = expect_context::<Folded>();
+    // The jump that switched versions and the one that is scrolling, so
+    // that each happens once per jump.
+    let switched = StoredValue::new(None::<u64>);
+    let scrolling = StoredValue::new(None::<u64>);
+    Effect::new(move |_| {
+        let Some(id) = jump.get() else {
+            scrolling.set_value(None);
+            switched.set_value(None);
+            return;
+        };
+        let (inline, panel) = placed.with(|(inline, panel)| {
+            (
+                inline.values().flatten().any(|p| p.thread.root.id == id),
+                panel
+                    .iter()
+                    .find(|u| u.thread.root.id == id)
+                    .map(|u| u.version),
+            )
+        });
+        if !inline {
+            // Until the diff loaded, threads on its files sit in the panel.
+            // (A diff that fails to load never does: the effect below
+            // drops the jump once the user picks other versions.)
+            if diff_paths.with(Option::is_none) {
+                return;
+            }
+            match panel {
+                // The thread is gone.
+                None => {
+                    jump.set(None);
+                    return;
+                }
+                Some(Some(v)) if switched.get_value() != Some(id) => {
+                    switched.set_value(Some(id));
+                    let s = selection.get_untracked();
+                    if s.head != v {
+                        let base = if s.base < v { s.base } else { 0 };
+                        chosen.set(Some(Selection { base, head: v }));
+                        return;
+                    }
+                }
+                // On no known version, or still not in the diff of its
+                // own: it stays in the panel.
+                _ => {}
+            }
+        }
+        if scrolling.get_value() == Some(id) {
+            return;
+        }
+        scrolling.set_value(Some(id));
+        folded.update(|m| {
+            m.insert(id, false);
+        });
+        crate::diffview::scroll_to_element(thread_dom_id(id), move || {
+            if jump.try_get_untracked() == Some(Some(id)) {
+                jump.set(None);
+            }
+        });
+    });
+    // Versions picked by hand while a jump waits end it, so that it
+    // can't later switch the diff back, e.g. after a diff that failed to
+    // load. The jump's own switch is the one change it expects.
+    Effect::new(move |prev: Option<Selection>| {
+        let s = selection.get();
+        if prev.is_some_and(|p| p != s)
+            && let Some(id) = jump.get_untracked()
+            && !(switched.get_value() == Some(id) && chosen.get_untracked() == Some(s))
+        {
+            jump.set(None);
+        }
+        s
+    });
     // GitHub anchors new comments to the PR's diff from the merge base
     // to the head, and refuses lines outside it. Against an earlier
     // version, a line can be changed in the diff shown but not in
@@ -1186,7 +1172,10 @@ fn PrBody(
                     .into_any()
                 }
             }}
-            {move || pr.with(|p| p.review.clone()).map(|info| conversation(&info).into_any())}
+            {move || {
+                let (review, versions) = pr.with(|p| (p.review.clone(), p.versions.clone()));
+                review.map(|info| conversation(&info, &versions).into_any())
+            }}
             {move || (!sidebar.get()).then(|| view! {
                 {move || merge_section(&pr.get(), pinned.get(), false)}
                 {merge_warning()}
@@ -1478,10 +1467,57 @@ fn utc_prefix(t: &str) -> Option<&str> {
     t.get(..19)
 }
 
-/// The number of the latest version the viewer reviewed. The version
-/// whose SHA is the review's commit wins when it was pushed at or before
-/// the review. When the commit points at a version pushed after the
-/// review, the newest version pushed before the review wins instead.
+/// The number of the version that was the PR's head at `at`: the newest
+/// version pushed at or before it. `None` when no version was pushed by
+/// then, or when a version after that one has no push time, so it may
+/// have been pushed before `at` too. Versions are numbered in the order
+/// they were pushed. The version the PR was opened with counts as pushed
+/// before anything said on the PR, even without a push time.
+pub(crate) fn version_at(versions: &[Version], at: &str) -> Option<u32> {
+    let t = utc_prefix(at)?;
+    let mut head = None;
+    // An unknown push time since `head` leaves the head at `at` open.
+    let mut unsure = false;
+    for v in versions {
+        match v.pushed_at.as_deref().and_then(utc_prefix) {
+            Some(p) if p <= t => {
+                head = Some(v.number);
+                unsure = false;
+            }
+            Some(_) => break,
+            None if v.kind == VersionKind::Initial => head = Some(v.number),
+            None => unsure = true,
+        }
+    }
+    head.filter(|_| !unsure)
+}
+
+/// The number of the version `r` was submitted on, judged by its commit.
+/// The version whose SHA is the commit wins when it was pushed at or
+/// before the review. When it was pushed after the review, the version
+/// that was the head when the review was submitted wins instead. `None`
+/// when the commit isn't a version, or that head is unknown.
+fn reviewed_version(versions: &[Version], r: &Review) -> Option<u32> {
+    let commit = r.commit.as_deref()?;
+    let v = versions.iter().find(|v| v.sha == commit)?;
+    let submitted = utc_prefix(&r.submitted_at);
+    let pushed = v.pushed_at.as_deref().and_then(utc_prefix);
+    match (pushed, submitted) {
+        (Some(p), Some(s)) if p > s => version_at(versions, &r.submitted_at),
+        _ => Some(v.number),
+    }
+}
+
+/// The number of the version `r` was submitted on: the one its commit
+/// names (see `reviewed_version`), else the head when it was submitted.
+/// The fallback is for reviews without a commit or whose commit isn't a
+/// version.
+pub(crate) fn review_version(versions: &[Version], r: &Review) -> Option<u32> {
+    reviewed_version(versions, r).or_else(|| version_at(versions, &r.submitted_at))
+}
+
+/// The number of the latest version the viewer reviewed, from their
+/// newest review whose commit is a version (see `reviewed_version`).
 fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u32> {
     let info = review?;
     let mut mine: Vec<&Review> = info
@@ -1491,34 +1527,7 @@ fn last_reviewed(versions: &[Version], review: Option<&ReviewInfo>) -> Option<u3
         .collect();
     // RFC 3339 strings sort chronologically.
     mine.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
-    for r in mine {
-        let Some(commit) = r.commit.as_deref() else {
-            continue;
-        };
-        let Some(v) = versions.iter().find(|v| v.sha == commit) else {
-            continue;
-        };
-        let submitted = utc_prefix(&r.submitted_at);
-        let pushed = v.pushed_at.as_deref().and_then(utc_prefix);
-        match (pushed, submitted) {
-            (Some(p), Some(s)) if p > s => {
-                let fallback = versions
-                    .iter()
-                    .filter(|v| {
-                        v.pushed_at
-                            .as_deref()
-                            .and_then(utc_prefix)
-                            .is_some_and(|p| p <= s)
-                    })
-                    .max_by_key(|v| v.number);
-                if let Some(v) = fallback {
-                    return Some(v.number);
-                }
-            }
-            _ => return Some(v.number),
-        }
-    }
-    None
+    mine.into_iter().find_map(|r| reviewed_version(versions, r))
 }
 
 #[component]
@@ -1630,7 +1639,7 @@ fn VersionPicker(
                                     " "
                                     <code title=v.sha.clone()>{short(&v.sha).to_owned()}</code>
                                     <span class="muted vkind">{kind_label(v)}</span>
-                                    {v.pushed_at.clone().map(|t| view! { <span class="muted vtime">{t.replace('T', " ").trim_end_matches("+00:00").to_owned()}</span> })}
+                                    {v.pushed_at.clone().map(|t| view! { <RelTime at=t class="muted vtime" /> })}
                                     {(reviewed == Some(n)).then(|| view! { <span class="vreviewed" title="The latest version you reviewed">"last reviewed"</span> })}
                                     {v.missing.then(|| view! { <span class="error">"missing"</span> })}
                                 }.into_any(),
@@ -1655,9 +1664,30 @@ fn VersionPicker(
     }
 }
 
-/// A comment's RFC 3339 time in UTC as shown, e.g. "2026-01-02 03:04:05".
-fn comment_time(ts: &str) -> String {
-    ts.replace('T', " ").trim_end_matches('Z').to_owned()
+/// The page's clock, provided by `PrView` so the relative times on it
+/// tick together.
+#[derive(Clone, Copy)]
+pub(crate) struct Now(pub RwSignal<i64>);
+
+/// `at`, an RFC 3339 timestamp, as a relative time like "5m ago" that
+/// ticks with the page's clock, and its local time for a title. `None`
+/// when `at` isn't a timestamp, like a pending comment's empty time.
+fn rel(at: &str) -> Option<(impl Fn() -> String + Clone + use<>, String)> {
+    let secs = crate::rfc3339_secs(at)?;
+    let clock = use_context::<Now>();
+    let text = move || {
+        let now = clock.map_or_else(|| (js_sys::Date::now() / 1000.0) as i64, |n| n.0.get());
+        crate::ago(now, secs)
+    };
+    Some((text, crate::local_datetime(secs)))
+}
+
+/// `at`, an RFC 3339 timestamp, shown as a relative time like "5m ago"
+/// with its local time as the title. Renders nothing when `at` isn't a
+/// timestamp.
+#[component]
+pub(crate) fn RelTime(at: String, #[prop(optional)] class: &'static str) -> impl IntoView {
+    rel(&at).map(|(text, title)| view! { <span class=class title=title>{text}</span> })
 }
 
 /// A comment: its author (the children), its time linked to the comment
@@ -1674,8 +1704,22 @@ pub(crate) fn CommentFrame(
     #[prop(optional)] pending: bool,
     #[prop(optional)] actions: Option<AnyView>,
     #[prop(optional)] editor: Option<(Signal<bool>, ViewFn)>,
+    // The version it was written on and the PR's latest version.
+    #[prop(default = None)] version: Option<(u32, u32)>,
 ) -> impl IntoView {
     let links = expect_context::<PrLinks>();
+    let time = rel(&at);
+    let version = version.map(|(n, latest)| {
+        let title = if n < latest {
+            format!("Written on v{n}; the PR is now at v{latest}")
+        } else {
+            format!("Written on v{n}, the latest version")
+        };
+        view! {
+            " "
+            <span class="comment-version" class:old=n < latest title=title>{format!("on v{n}")}</span>
+        }
+    });
     let html = (!body.trim().is_empty()).then(|| markdown::to_html(&body, &links.repo));
     let body = move || match editor.as_ref().filter(|(on, _)| on.get()) {
         Some((_, view)) => Some(view.run()),
@@ -1690,8 +1734,11 @@ pub(crate) fn CommentFrame(
         <div class="comment" class:pending=pending>
             <div class="comment-meta">
                 {children()}
+                {version}
                 " "
-                <a class="muted" href=url target="_blank" rel="noopener">{comment_time(&at)}</a>
+                {time.map(|(text, title)| view! {
+                    <a class="muted" href=url target="_blank" rel="noopener" title=title>{text}</a>
+                })}
                 {actions}
             </div>
             {body}
@@ -1765,7 +1812,7 @@ pub fn CommentBody(comment: ReviewComment) -> impl IntoView {
     // Open while the comment is being edited, in the same set as the boxes
     // for new comments so that a refetch doesn't close it.
     let boxes = expect_context::<OpenBoxes>();
-    let draft = edit_draft(&target.key, comment.id);
+    let draft = format!("{}{}", draft_scope(), edit_draft(&target.key, comment.id));
     let editing = {
         let draft = draft.clone();
         Signal::derive(move || boxes.is_open(&draft))
@@ -1879,7 +1926,7 @@ pub fn ThreadView(
         }
     };
     view! {
-        <div class="thread" class:resolved=resolved class:collapsed=collapsed>
+        <div class="thread" id=thread_dom_id(id) class:resolved=resolved class:collapsed=collapsed>
             <button
                 type="button"
                 class="thread-header"
@@ -1906,7 +1953,7 @@ pub fn ThreadView(
 /// Replying to a thread and resolving it, under its comments. Not for a
 /// thread of the viewer's pending review, which isn't on the PR yet.
 #[component]
-fn ThreadActions(root: ReviewComment) -> impl IntoView {
+pub(crate) fn ThreadActions(root: ReviewComment) -> impl IntoView {
     let (Some(target), Some(thread)) = (use_context::<ReviewTarget>(), root.thread_id) else {
         return ().into_any();
     };
@@ -1945,6 +1992,7 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
         }
     };
     let can_resolve = root.can_resolve;
+    let scope = draft_scope();
     view! {
         <div class="thread-actions">
             {move || {
@@ -1964,7 +2012,7 @@ fn ThreadActions(root: ReviewComment) -> impl IntoView {
                     )
                 };
                 view! {
-                    <ComposerToggle draft=format!("reply.{thread}") label="Reply" placeholder="Reply…"
+                    <ComposerToggle draft=format!("{scope}reply.{thread}") label="Reply" placeholder="Reply…"
                         send_label=label send=send alt=alt>
                         {can_resolve.then(|| view! {
                             <button type="button" disabled=move || busy.get() on:click=move |e| toggle.run(e)>
@@ -1991,7 +2039,8 @@ struct VersionJump {
 /// What a thread shown away from its lines says about where it was made:
 /// `children` — its path, line or range — followed by an "on vN" button
 /// that diffs vN against the current base (or Base), or "on an unknown
-/// version" when no version has its commit. The side panel and the
+/// version" when no version has its commit. On the version the diff
+/// already shows, "on vN" is plain text: the button would do nothing. The side panel and the
 /// file-level fallback threads share it.
 #[component]
 pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl IntoView {
@@ -2000,7 +2049,9 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
         {children()}
         " "
         {match version {
-            Some(v) => view! {
+            Some(v) => (move || if jump.selection.get().head == v {
+                view! { <span>{format!("on v{v}")}</span> }.into_any()
+            } else { view! {
                 <button
                     class="link"
                     on:click=move |_| {
@@ -2012,6 +2063,7 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
                     {format!("on v{v}")}
                 </button>
             }
+            .into_any() })
             .into_any(),
             None => view! { <span class="muted">"on an unknown version"</span> }.into_any(),
         }}
@@ -2020,6 +2072,16 @@ pub(crate) fn ThreadWhere(version: Option<u32>, children: Children) -> impl Into
 
 #[component]
 fn CommentPanel(threads: Memo<Vec<Unplaced>>) -> impl IntoView {
+    // A thread the sidebar jumps to shows: the panel opens.
+    let details = NodeRef::<leptos::html::Details>::new();
+    let jump = expect_context::<ThreadJump>().0;
+    Effect::new(move |_| {
+        if let (Some(id), Some(d)) = (jump.get(), details.get())
+            && threads.with(|t| t.iter().any(|u| u.thread.root.id == id))
+        {
+            d.set_open(true);
+        }
+    });
     move || {
         let threads = threads.get();
         if threads.is_empty() {
@@ -2054,8 +2116,8 @@ fn CommentPanel(threads: Memo<Vec<Unplaced>>) -> impl IntoView {
             })
             .collect_view();
         view! {
-            <details class="comment-panel">
-                <summary>{format!("{count} comment threads on other versions")}</summary>
+            <details class="comment-panel" node_ref=details>
+                <summary>{format!("{count} comment threads the diff doesn't show")}</summary>
                 <ul>{items}</ul>
             </details>
         }
@@ -2151,6 +2213,7 @@ mod tests {
                 delete_branch_on_merge: false,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                stale_runs: vec![],
                 queue: None,
                 stack: None,
             },
@@ -2377,6 +2440,31 @@ mod tests {
     }
 
     #[test]
+    fn placement_skips_files_the_diff_does_not_show() {
+        let versions = [version(1, "a"), version(2, "b")];
+        // Made on the head, so it has a line to go on.
+        let comments = [comment(1, "b", Side::Right, 10, Some(10))];
+        let sel = Selection { base: 0, head: 2 };
+
+        // Its file is hidden, e.g. as rebase-only: the side panel, with
+        // its version.
+        let (inline, panel) = place(
+            &comments,
+            &versions,
+            sel,
+            Some(&HashSet::from(["other.rs".to_owned()])),
+        );
+        assert!(inline.is_empty());
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].version, Some(2));
+
+        // While the diff loads, it stays on its line.
+        let (inline, panel) = place(&comments, &versions, sel, None);
+        assert_eq!(inline["f.rs"][0].anchor, Anchor::Line(Side::Right, 10));
+        assert!(panel.is_empty());
+    }
+
+    #[test]
     fn placement_fallback_is_outdated_only_without_a_mapped_line() {
         let versions = [version(1, "a"), version(2, "b"), version(3, "c")];
         let paths = HashSet::from(["f.rs".to_owned()]);
@@ -2554,10 +2642,116 @@ mod tests {
     }
 
     #[test]
+    fn last_reviewed_skips_a_review_whose_head_is_unsure() {
+        // The newest review's commit came after it, and v3's unknown push
+        // time leaves the head at the review open: v2 or v3. Rather than
+        // guess v2, the older review decides.
+        let versions = [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+            version(3, "c"),
+            version_pushed(4, "d", Some("2026-01-04T10:00:00+00:00")),
+        ];
+        let info = review_info(vec![
+            review("me", "2026-01-01T12:00:00Z", Some("a")),
+            review("me", "2026-01-03T12:00:00Z", Some("d")),
+        ]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(1));
+    }
+
+    #[test]
+    fn last_reviewed_falls_back_to_the_opening_version_without_a_push_time() {
+        let mut versions = [
+            version(1, "a"),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+        ];
+        versions[0].kind = VersionKind::Initial;
+        // The review's commit came after it; the PR was still at v1.
+        let info = review_info(vec![review("me", "2026-01-01T12:00:00Z", Some("b"))]);
+        assert_eq!(last_reviewed(&versions, Some(&info)), Some(1));
+    }
+
+    #[test]
     fn last_reviewed_trusts_the_commit_without_a_push_time() {
         let versions = [version(1, "a"), version(2, "b")];
         let info = review_info(vec![review("me", "2026-01-01T00:00:00Z", Some("b"))]);
         assert_eq!(last_reviewed(&versions, Some(&info)), Some(2));
+    }
+
+    fn pushed_versions() -> [Version; 3] {
+        [
+            version_pushed(1, "a", Some("2026-01-01T10:00:00+00:00")),
+            version_pushed(2, "b", Some("2026-01-02T10:00:00+00:00")),
+            version_pushed(3, "c", Some("2026-01-03T10:00:00+00:00")),
+        ]
+    }
+
+    #[test]
+    fn version_at_is_the_head_at_the_time() {
+        let versions = pushed_versions();
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), Some(2));
+        assert_eq!(version_at(&versions, "2026-01-05T00:00:00Z"), Some(3));
+        // A push in the same second counts.
+        assert_eq!(version_at(&versions, "2026-01-02T10:00:00Z"), Some(2));
+        // Before the first push, or with no time.
+        assert_eq!(version_at(&versions, "2025-12-31T00:00:00Z"), None);
+        assert_eq!(version_at(&versions, ""), None);
+    }
+
+    #[test]
+    fn version_at_is_none_when_an_unknown_push_may_come_first() {
+        let mut versions = pushed_versions();
+        versions[1].pushed_at = None;
+        // v2 may have been pushed before or after.
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), None);
+        // v3 came after v2, so v2 came before this.
+        assert_eq!(version_at(&versions, "2026-01-04T00:00:00Z"), Some(3));
+        // Before v1's push nothing was pushed yet.
+        assert_eq!(version_at(&versions, "2025-12-31T00:00:00Z"), None);
+        let unknown = [version(1, "a"), version(2, "b")];
+        assert_eq!(version_at(&unknown, "2026-01-02T12:00:00Z"), None);
+    }
+
+    #[test]
+    fn version_at_counts_the_opening_version_without_a_push_time() {
+        // Without the activity log, the version the PR was opened with
+        // has no push time, but it came before every comment.
+        let mut versions = pushed_versions();
+        versions[0].kind = VersionKind::Initial;
+        versions[0].pushed_at = None;
+        assert_eq!(version_at(&versions, "2026-01-01T12:00:00Z"), Some(1));
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), Some(2));
+        assert_eq!(version_at(&versions[..1], "2026-01-05T00:00:00Z"), Some(1));
+        // An unknown push time on a later version still leaves it open.
+        versions[1].pushed_at = None;
+        assert_eq!(version_at(&versions, "2026-01-02T12:00:00Z"), None);
+        // A pushed version doesn't count as the opening one.
+        let unknown = [version(1, "a")];
+        assert_eq!(version_at(&unknown, "2026-01-02T12:00:00Z"), None);
+    }
+
+    #[test]
+    fn review_version_trusts_a_commit_pushed_before_it() {
+        let versions = pushed_versions();
+        let r = review("other", "2026-01-03T12:00:00Z", Some("a"));
+        assert_eq!(review_version(&versions, &r), Some(1));
+        // Without push times the commit is all there is.
+        let unknown = [version(1, "a"), version(2, "b")];
+        let r = review("other", "2026-01-01T00:00:00Z", Some("b"));
+        assert_eq!(review_version(&unknown, &r), Some(2));
+    }
+
+    #[test]
+    fn review_version_falls_back_to_the_head_at_the_time() {
+        let versions = pushed_versions();
+        // The commit was pushed after the review.
+        let r = review("other", "2026-01-02T12:00:00Z", Some("c"));
+        assert_eq!(review_version(&versions, &r), Some(2));
+        // The commit isn't a version, or there is none.
+        let r = review("other", "2026-01-02T12:00:00Z", Some("x"));
+        assert_eq!(review_version(&versions, &r), Some(2));
+        let r = review("other", "2026-01-03T12:00:00Z", None);
+        assert_eq!(review_version(&versions, &r), Some(3));
     }
 
     #[test]
@@ -2604,27 +2798,5 @@ mod tests {
             pending_message(&key, Some(t), t + 1),
             "o/r#7 hasn't synced yet"
         );
-    }
-
-    #[test]
-    fn sidebar_width_defaults_to_the_split() {
-        assert_eq!(sidebar_width(None, 2400.0, true), 800.0);
-        assert_eq!(sidebar_width(None, 1280.0, false), 320.0);
-    }
-
-    #[test]
-    fn sidebar_width_clamps_the_column() {
-        assert_eq!(sidebar_width(Some(100.0), 2400.0, true), 320.0);
-        assert_eq!(sidebar_width(Some(2000.0), 2400.0, true), 1220.0);
-        // A window too narrow for the saved width clamps it rather than
-        // dropping it.
-        assert_eq!(sidebar_width(Some(1000.0), 1600.0, true), 420.0);
-    }
-
-    #[test]
-    fn sidebar_width_clamps_the_overlay() {
-        assert_eq!(sidebar_width(Some(5000.0), 1280.0, false), 1232.0);
-        // The minimum wins even on a page narrower than it.
-        assert_eq!(sidebar_width(None, 300.0, false), 320.0);
     }
 }

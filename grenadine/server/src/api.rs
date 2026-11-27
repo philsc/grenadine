@@ -1,34 +1,35 @@
 //! The HTTP API used by the web UI, and the UI's static files.
 
-use std::convert::Infallible;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State as AxState};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::Stream;
 use grenadine_core::api::{
-    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, Approval, AutoMerge,
-    AutoReviewEntry, BlobsRequest, BlobsResponse, Changes, CleanupState, EditPr, Enqueue, GENERAL,
-    InboxEdit, InboxWithPrs, MergeProgress, MergeRequest, MergeStatus, Merged, NewAgent,
-    NewCleanupSession, NewComment, NewReply, NewThread, PermissionMode, PrDetail, PrKey, PrMissing,
-    RepoSettings, ReviewerCandidates, ReviewerChange, ServerEvent, SubmitReview, WorktreeChanges,
-    WrapUp, submit_blocker,
+    AgentBackendInfo, AgentEvent, AgentMessage, AgentSession, AgentStatus, AnswerHandoff, Approval,
+    AutoMerge, AutoReviewDetail, AutoReviewEntry, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, EditPr, Enqueue, GENERAL, InboxEdit, InboxWithPrs, MergeProgress, MergeRequest,
+    MergeStatus, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread, PING,
+    PermissionMode, PrDetail, PrKey, PrMissing, RepoSettings, ReviewerCandidates, ReviewerChange,
+    ServerEvent, Side, SubmitReview, WorktreeChanges, WrapUp, WriteHandoff, submit_blocker,
 };
 use serde::Deserialize;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 
 use crate::agent::{self, Decision};
+use crate::attachments;
 use crate::github::{MergeAsync, ReviewItem};
 use crate::sync::State;
-use crate::{assets, auto_review, cleanup, mcp, terminal};
+use crate::{assets, auto_review, cleanup, handoff, mcp, terminal};
 
 type St = AxState<Arc<State>>;
 
@@ -101,6 +102,10 @@ fn api_routes() -> Router<Arc<State>> {
         )
         .route("/api/pr/{owner}/{name}/{number}/merge", post(merge))
         .route(
+            "/api/pr/{owner}/{name}/{number}/rerun-checks",
+            post(rerun_checks),
+        )
+        .route(
             "/api/pr/{owner}/{name}/{number}/merge/{uuid}",
             get(merge_progress),
         )
@@ -139,7 +144,7 @@ fn api_routes() -> Router<Arc<State>> {
         .route("/api/auto-reviews", get(auto_reviews))
         .route(
             "/api/auto-reviews/{id}",
-            axum::routing::delete(cancel_auto_review),
+            get(auto_review).delete(cancel_auto_review),
         )
         .route(
             "/api/agents",
@@ -148,22 +153,40 @@ fn api_routes() -> Router<Arc<State>> {
                 .layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/backends", get(agent_backends))
+        .route("/api/slash-commands", get(slash_commands))
         .route("/api/agents/{id}", get(agent).delete(delete_agent))
         .route(
             "/api/agents/{id}/messages",
             post(agent_message).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/{id}/images/{name}", get(agent_image))
+        .route(
+            "/api/agents/{id}/attachments/{dir}/{name}",
+            get(agent_attachment),
+        )
+        .route(
+            "/api/uploads",
+            // The upload checks the size itself, as the file streams in.
+            put(upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/uploads/{id}", get(uploaded).delete(delete_upload))
         .route("/api/agents/{id}/interrupt", post(interrupt_agent))
         .route(
             "/api/agents/{id}/approvals",
             post(approve).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
         )
         .route("/api/agents/{id}/wrap-up", post(wrap_up_agent))
+        .route("/api/agents/{id}/handoff", post(write_handoff))
+        .route(
+            "/api/agents/{id}/handoff/{proposal}",
+            post(answer_handoff).layer(DefaultBodyLimit::max(PROMPT_BODY_LIMIT)),
+        )
         .route("/api/agents/{id}/events", get(agent_events))
         .route("/api/agents/{id}/changes", get(agent_changes))
         .route("/api/agents/{id}/prs", get(agent_prs))
+        .route("/api/agents/{id}/slash-commands", get(agent_slash_commands))
         .route("/api/images/{id}", get(image))
+        .route("/api/agents/{id}/processes", get(processes))
         .route(
             "/api/agents/{id}/terminals",
             get(terminals).post(open_terminal),
@@ -442,13 +465,35 @@ fn require_thread_place(t: &NewThread) -> ApiResult<()> {
     if t.path.is_empty() {
         return Err(refuse(StatusCode::BAD_REQUEST, "the path is empty".into()));
     }
-    if t.line == Some(0) {
+    if t.line == Some(0) || t.start_line == Some(0) {
         return Err(refuse(
             StatusCode::BAD_REQUEST,
             "lines are numbered from 1".into(),
         ));
     }
-    Ok(())
+    match (t.start_line, t.line) {
+        (None, _) if t.start_side.is_some() => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "a start side needs a start line".into(),
+        )),
+        (Some(_), None) => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            "a comment on the whole file has no start line".into(),
+        )),
+        (Some(_), Some(_)) if t.start_side == Some(Side::Right) && t.side == Side::Left => {
+            Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "a range can't go from the new side to the old one".into(),
+            ))
+        }
+        (Some(start), Some(end)) if t.start_side.unwrap_or(t.side) == t.side && start >= end => {
+            Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "the start line must come before the line".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Refuses `comment` unless it's the GraphQL ID of one of the viewer's
@@ -672,6 +717,57 @@ async fn merge(
     state.resync(key.clone());
     let uuid = remember_merge(&state, key, delete, merged?);
     Ok(Json(Merged { uuid }))
+}
+
+/// Re-runs the replaced runs that fail the checks for GitHub alone, on
+/// the PR's head and on the heads of the open PRs below it in its GitHub
+/// stack, which merging it merges too. The runs are read from GitHub
+/// again, since the page's may be re-running already.
+async fn rerun_checks(
+    AxState(state): St,
+    Path((owner, name, number)): Path<(String, String, u64)>,
+) -> ApiResult<Response> {
+    let key = writable(owner, name, number, &state)?;
+    let pr = state.github.pr(&key).await?;
+    let merge = pr.review.map(|r| r.merge);
+    let below: Vec<_> = merge
+        .iter()
+        .flat_map(|m| m.stack.iter().flat_map(|s| &s.below))
+        .collect();
+    let runs: BTreeSet<u64> = merge
+        .iter()
+        .flat_map(|m| &m.stale_runs)
+        .chain(below.iter().flat_map(|p| &p.stale_runs))
+        .filter_map(|r| r.run_id)
+        .collect();
+    // The PRs below whose runs are re-run, which their own pages and
+    // inbox rows show.
+    let rerun_below: Vec<PrKey> = below
+        .iter()
+        .filter(|p| p.stale_runs.iter().any(|r| r.run_id.is_some()))
+        .map(|p| PrKey {
+            repo: key.repo.clone(),
+            number: p.number,
+        })
+        .collect();
+    let mut done = Ok(());
+    for (i, &run) in runs.iter().enumerate() {
+        done = state.github.rerun_workflow(&key.repo, run).await;
+        if let Err(e) = done {
+            // The runs re-run already stay re-run, which the error says.
+            done = Err(match i {
+                0 => e,
+                _ => e.context(format!("Re-ran {i} of {} runs, then", runs.len())),
+            });
+            break;
+        }
+    }
+    state.resync(key);
+    for below in rerun_below {
+        state.resync(below);
+    }
+    done?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// How the merge GitHub runs as `uuid` is doing. A merged merge's
@@ -938,21 +1034,58 @@ async fn system_stats(AxState(state): St) -> ApiResult<Json<grenadine_core::api:
     Ok(Json(stats))
 }
 
-/// Keep-alives as a named "ping" event rather than a comment, so that the
-/// page sees them and can tell a quiet stream from a dead connection.
-fn keep_alive() -> KeepAlive {
-    KeepAlive::new().event(Event::default().event("ping"))
+/// How often a socket of events gets a [`PING`].
+const PING_EVERY: Duration = Duration::from_secs(15);
+
+/// `events` with a [`PING`] every `every` among them; it ends when
+/// `events` does.
+fn with_pings(events: impl Stream<Item = String>, every: Duration) -> impl Stream<Item = String> {
+    let start = tokio::time::Instant::now() + every;
+    let pings =
+        IntervalStream::new(tokio::time::interval_at(start, every)).map(|_| Some(PING.to_owned()));
+    events
+        .map(Some)
+        .chain(tokio_stream::once(None))
+        .merge(pings)
+        .map_while(|message| message)
 }
 
-/// The SSE stream of server events; it ends on shutdown so that open
+/// Sends the page each of `events` as a text message, with pings among
+/// them, until the events end or the page goes away. The event streams
+/// are WebSockets because a browser only keeps six HTTP connections to a
+/// server: as server-sent events, three tabs' streams took them all and
+/// every further request waited forever.
+async fn send_events(mut socket: WebSocket, events: impl Stream<Item = String>) {
+    let mut messages = std::pin::pin!(with_pings(events, PING_EVERY));
+    loop {
+        tokio::select! {
+            message = messages.next() => {
+                let Some(text) = message else { break };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            received = socket.recv() => match received {
+                // The page sends nothing; axum answers pings itself.
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+const CROSS_ORIGIN_EVENTS: &str = "cross-origin events connection";
+
+/// The server's events as JSON; the stream ends on shutdown so that open
 /// connections don't block the server's graceful shutdown.
-fn event_stream(state: &State) -> impl Stream<Item = Result<Event, Infallible>> + use<> {
+fn event_stream(state: &State) -> impl Stream<Item = String> + use<> {
     let shutdown = state.shutdown.clone();
     futures::StreamExt::take_until(
         BroadcastStream::new(state.events.subscribe()).filter_map(|e| {
             // A lagging receiver misses events; tell it to refetch everything.
             let e = e.unwrap_or(grenadine_core::api::ServerEvent::InboxesChanged);
-            Event::default().json_data(e).ok().map(Ok)
+            serde_json::to_string(&e).ok()
         }),
         shutdown.cancelled_owned(),
     )
@@ -976,15 +1109,16 @@ fn watch_keys(state: &State, query: &[(String, String)]) -> Vec<PrKey> {
         .collect()
 }
 
-/// The SSE stream of server events. `watch` parameters register the PRs
-/// the page is showing for the life of the stream; a watched PR the
-/// background inboxes don't cover gets a sync, however often it synced
-/// before, and the polls keep it fresh while it's watched.
-async fn events(
-    AxState(state): St,
-    Query(query): Query<Vec<(String, String)>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let keys = watch_keys(&state, &query);
+/// The server's events from now on, and a watch on the PRs that `query`
+/// names for as long as the caller keeps it: its `watch` parameters are
+/// the PRs the page is showing. A watched PR the background inboxes
+/// don't cover gets a sync, however often it synced before, and the
+/// polls keep it fresh while it's watched.
+fn watch_events(
+    state: &Arc<State>,
+    query: &[(String, String)],
+) -> (crate::sync::Watch, impl Stream<Item = String> + use<>) {
+    let keys = watch_keys(state, query);
     for key in &keys {
         // A database error doesn't block the stream; it only skips the
         // watch's sync.
@@ -992,14 +1126,25 @@ async fn events(
             state.sync_once(key.clone());
         }
     }
-    // The guard lives in the stream's map closure, so a dropped
-    // connection, a closed tab or a reload unregisters the watch.
-    let watch = state.watch(keys);
-    let stream = event_stream(&state).map(move |event| {
-        let _guard = &watch;
-        event
-    });
-    Sse::new(stream).keep_alive(keep_alive())
+    (state.watch(keys), event_stream(state))
+}
+
+async fn events(
+    AxState(state): St,
+    Query(query): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, CROSS_ORIGIN_EVENTS).into_response();
+    }
+    let (watch, events) = watch_events(&state, &query);
+    // The socket's task holds the watch, so a dropped connection, a
+    // closed tab or a reload unregisters it.
+    ws.on_upgrade(move |socket| async move {
+        send_events(socket, events).await;
+        drop(watch);
+    })
 }
 
 /// The configured repositories, for the page's repository pickers.
@@ -1032,6 +1177,15 @@ async fn set_repo_settings(
         Ok(s) => s,
         Err(e) => return Ok((StatusCode::BAD_REQUEST, e).into_response()),
     };
+    if settings.review_backend != old.review_backend
+        && !state.agents.offered(settings.review_backend).await
+    {
+        let message = format!(
+            "{} isn't installed on the server",
+            settings.review_backend.label()
+        );
+        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+    }
     for (b, m) in &settings.review_models {
         if !state.agents.offers(*b, Some(m)).await {
             let message = format!("{} doesn't offer that model", b.label());
@@ -1047,6 +1201,23 @@ async fn set_repo_settings(
 
 async fn auto_reviews(AxState(state): St) -> ApiResult<Json<Vec<AutoReviewEntry>>> {
     Ok(Json(state.db.auto_reviews()?))
+}
+
+/// The review `id`, with what its session said once it's deleted.
+async fn auto_review(AxState(state): St, Path(id): Path<i64>) -> ApiResult<Response> {
+    let Some(review) = state.db.auto_review(id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let (saved, events) = match state.db.auto_review_transcript(id)? {
+        Some((saved, events)) => (Some(saved), events),
+        None => (None, Vec::new()),
+    };
+    Ok(Json(AutoReviewDetail {
+        review,
+        saved,
+        events,
+    })
+    .into_response())
 }
 
 /// The PR's auto-reviews, newest first.
@@ -1126,6 +1297,35 @@ async fn offers(
     None
 }
 
+#[derive(Deserialize)]
+struct SlashCommandsQuery {
+    repo: String,
+    backend: grenadine_core::api::AgentBackend,
+}
+
+/// The commands a new session's prompt in the repository can start with.
+async fn slash_commands(
+    AxState(state): St,
+    Query(q): Query<SlashCommandsQuery>,
+) -> ApiResult<Response> {
+    if !can_start_in(&state, &q.repo) {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(Json(crate::slash_commands::list(
+        &state, &q.repo, q.backend, None,
+    )?)
+    .into_response())
+}
+
+/// The commands the session's next prompt can start with.
+async fn agent_slash_commands(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let list = crate::slash_commands::list(&state, &session.repo, session.backend, Some(&id))?;
+    Ok(Json(list).into_response())
+}
+
 /// Whether sessions can start in `repo`: a configured repository, or
 /// none for a general session.
 fn can_start_in(state: &State, repo: &str) -> bool {
@@ -1153,6 +1353,21 @@ async fn check_new_agent(state: &Arc<State>, req: &NewAgent) -> Option<Response>
     if let Some(e) = agent::check_images(&req.images) {
         return Some((StatusCode::BAD_REQUEST, e).into_response());
     }
+    // A repeated start of a draft returns the session the first start
+    // started, which claimed the uploads. Checked while no start is
+    // claiming, so a start that's halfway doesn't look like gone uploads.
+    let starting = state.agents.starting.lock().await;
+    let started = || {
+        req.draft
+            .as_ref()
+            .is_some_and(|d| state.db.agent_by_draft(d).ok().flatten().is_some())
+    };
+    if let Some(e) = attachments::check(state.agents.uploads(), &req.attachments)
+        && !started()
+    {
+        return Some((StatusCode::BAD_REQUEST, e).into_response());
+    }
+    drop(starting);
     if let Some(r) = offers(
         state,
         req.backend,
@@ -1268,6 +1483,19 @@ async fn agent_prs(AxState(state): St, Path(id): Path<String>) -> ApiResult<Resp
     Ok(Json(state.db.agent_pr_list(&id)?).into_response())
 }
 
+/// What runs in the session, for its Processes tab.
+async fn processes(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    if find_agent(&state, &id)?.is_none() {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let cgroup = crate::system::agent_cgroup(&state).await;
+    let processes = tokio::task::spawn_blocking(move || {
+        crate::system::session_processes(&state, &id, cgroup.as_deref())
+    })
+    .await?;
+    Ok(Json(processes).into_response())
+}
+
 async fn terminals(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
@@ -1364,11 +1592,14 @@ async fn agent_message(
     let Some(session) = find_agent(&state, &id)? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    // An image can say it all.
-    if msg.prompt.trim().is_empty() && msg.images.is_empty() {
+    // An image or a file can say it all.
+    if msg.prompt.trim().is_empty() && msg.images.is_empty() && msg.attachments.is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "the prompt is empty").into_response());
     }
     if let Some(e) = agent::check_images(&msg.images) {
+        return Ok((StatusCode::BAD_REQUEST, e).into_response());
+    }
+    if let Some(e) = attachments::check(state.agents.uploads(), &msg.attachments) {
         return Ok((StatusCode::BAD_REQUEST, e).into_response());
     }
     if let Some(r) = offers(
@@ -1382,15 +1613,127 @@ async fn agent_message(
         return Ok(r);
     }
     let images = agent::save_images(&state, &id, &msg.images).await?;
-    agent::send_with_images(
+    let files = attachments::claim(
+        state.agents.uploads(),
+        state.agents.attachments(),
+        &id,
+        &msg.attachments,
+    )
+    .await?;
+    agent::send_with_files(
         &state,
         &id,
         msg.prompt,
         images,
+        files,
         msg.permission_mode,
         msg.model,
     );
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+}
+
+/// Stores a file to go with a prompt that's being written; sending the
+/// prompt with the upload's id claims it.
+async fn upload(
+    AxState(state): St,
+    Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> ApiResult<Response> {
+    let Some(name) = attachments::safe_name(&q.name) else {
+        return Ok((StatusCode::BAD_REQUEST, "not a usable file name").into_response());
+    };
+    let too_big = || {
+        let limit = attachments::human_size(attachments::MAX_UPLOAD_BYTES);
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("files can be at most {limit}"),
+        )
+            .into_response()
+    };
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if length.is_some_and(|n| n > attachments::MAX_UPLOAD_BYTES) {
+        return Ok(too_big());
+    }
+    match attachments::store(state.agents.uploads(), &name, body.into_data_stream()).await? {
+        Some(up) => Ok(Json(up).into_response()),
+        None => Ok(too_big()),
+    }
+}
+
+/// An upload that's waiting for its prompt; 404 once it's gone, e.g.
+/// because it expired.
+async fn uploaded(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+    Ok(match attachments::upload(state.agents.uploads(), &id) {
+        Some(up) => Json(up).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    })
+}
+
+/// Deletes an upload that was taken off its prompt.
+async fn delete_upload(AxState(state): St, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    Ok(if attachments::delete(state.agents.uploads(), &id).await? {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// A file sent with one of the session's prompts, as a download. They
+/// never change.
+async fn agent_attachment(
+    AxState(state): St,
+    Path((id, dir, name)): Path<(String, String, String)>,
+) -> ApiResult<Response> {
+    let Some(path) = attachments::file(state.agents.attachments(), &id, &dir, &name) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let size = file.metadata().await?.len();
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    Ok(immutable((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, size.to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition(&name)),
+        ],
+        body,
+    )))
+}
+
+/// A `Content-Disposition` that downloads a file as `name`: a plain ASCII
+/// fallback and the UTF-8 name percent-encoded (RFC 6266).
+fn content_disposition(name: &str) -> String {
+    let ascii: String = name
+        .chars()
+        .map(|c| match c {
+            ' '..='~' if c != '"' && c != '\\' => c,
+            _ => '_',
+        })
+        .collect();
+    let encoded: String = name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
 /// An image sent with one of the session's prompts. Images never change.
@@ -1451,6 +1794,72 @@ async fn wrap_up_agent(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Has a background job write a handoff from the session's transcript,
+/// without a turn in the session; the proposal shows up in its
+/// transcript. 409 while the session runs a turn or a handoff is being
+/// written already.
+async fn write_handoff(
+    AxState(state): St,
+    Path(id): Path<String>,
+    Json(req): Json<WriteHandoff>,
+) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    if let Some(why) = handoff::refusal(&session) {
+        return Ok((StatusCode::BAD_REQUEST, why).into_response());
+    }
+    if let Some(r) = offers(
+        &state,
+        session.backend,
+        req.model.as_deref(),
+        &req.permission_mode,
+    )
+    .await
+    {
+        return Ok(r);
+    }
+    if !state.agents.offered(session.backend).await {
+        let message = format!("{} isn't installed on the server", session.backend.label());
+        return Ok((StatusCode::BAD_REQUEST, message).into_response());
+    }
+    if !handoff::start(&state, &session, req)? {
+        return Ok((
+            StatusCode::CONFLICT,
+            "the session is busy: wait for its turn or the handoff being written",
+        )
+            .into_response());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Answers a handoff proposal written for the user: starts the session
+/// as the form has it and returns it, or declines the proposal. 404
+/// when it isn't waiting for an answer.
+async fn answer_handoff(
+    AxState(state): St,
+    Path((id, proposal)): Path<(String, String)>,
+    Json(answer): Json<AnswerHandoff>,
+) -> ApiResult<Response> {
+    let Some(session) = find_agent(&state, &id)? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    // Checked as the form's start would be, so a session that can't
+    // start doesn't use up the proposal.
+    if let Some(req) = &answer.start
+        && let Some(r) = check_new_agent(&state, req).await
+    {
+        return Ok(r);
+    }
+    Ok(
+        match handoff::answer(&state, &session, &proposal, answer).await? {
+            handoff::Answered::NotFound => StatusCode::NOT_FOUND.into_response(),
+            handoff::Answered::Declined => StatusCode::NO_CONTENT.into_response(),
+            handoff::Answered::Started(child) => Json(*child).into_response(),
+        },
+    )
+}
+
 /// Answers a permission request; 404 when it isn't waiting anymore.
 async fn approve(
     AxState(state): St,
@@ -1497,13 +1906,10 @@ async fn approve(
     })
 }
 
-/// The session's transcript so far, then its new events as they happen.
-/// The stream ends when the page falls behind; the browser reconnects and
-/// gets the whole transcript again.
-fn agent_event_stream(
-    state: &State,
-    id: &str,
-) -> ApiResult<impl Stream<Item = Result<Event, Infallible>> + use<>> {
+/// The session's transcript so far, then its new events as they happen,
+/// as JSON. The stream ends when the page falls behind; the page
+/// reconnects and gets the whole transcript again.
+fn agent_event_stream(state: &State, id: &str) -> ApiResult<impl Stream<Item = String> + use<>> {
     // Subscribe first so that nothing falls between the stored events and
     // the live ones; live events that were stored already are skipped.
     let live = state.agents.subscribe(id);
@@ -1514,20 +1920,27 @@ fn agent_event_stream(
         .filter(move |e: &AgentEvent| e.seq.is_none_or(|s| s > last));
     let events = tokio_stream::iter(past)
         .chain(live)
-        .filter_map(|e| Event::default().json_data(e).ok().map(Ok));
+        .filter_map(|e| serde_json::to_string(&e).ok());
     Ok(futures::StreamExt::take_until(
         events,
         state.shutdown.clone().cancelled_owned(),
     ))
 }
 
-async fn agent_events(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response> {
+async fn agent_events(
+    AxState(state): St,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    if !same_origin(&headers) {
+        return Ok((StatusCode::FORBIDDEN, CROSS_ORIGIN_EVENTS).into_response());
+    }
     if find_agent(&state, &id)?.is_none() {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    Ok(Sse::new(agent_event_stream(&state, &id)?)
-        .keep_alive(keep_alive())
-        .into_response())
+    let events = agent_event_stream(&state, &id)?;
+    Ok(ws.on_upgrade(move |socket| send_events(socket, events)))
 }
 
 /// An image of a session's transcript. Images never change once stored.
@@ -1541,6 +1954,37 @@ async fn image(AxState(state): St, Path(id): Path<String>) -> ApiResult<Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grenadine_core::api::Side;
+
+    #[test]
+    fn thread_places_github_would_refuse_are_refused() {
+        let thread = |start_side, start_line, line| NewThread {
+            path: "src/lib.rs".into(),
+            side: Side::Right,
+            line,
+            start_line,
+            start_side,
+            body: "Comment".into(),
+        };
+        let ok = |t: NewThread| require_thread_place(&t).is_ok();
+        assert!(ok(thread(None, None, Some(4))));
+        assert!(ok(thread(None, None, None)));
+        assert!(ok(thread(None, Some(2), Some(4))));
+        assert!(ok(thread(Some(Side::Right), Some(2), Some(4))));
+        // Across the sides, the old line may have any number.
+        assert!(ok(thread(Some(Side::Left), Some(9), Some(4))));
+        assert!(!ok(thread(None, Some(0), Some(4))));
+        assert!(!ok(thread(None, Some(4), Some(4))));
+        assert!(!ok(thread(None, Some(5), Some(4))));
+        assert!(!ok(thread(None, Some(2), None)));
+        assert!(!ok(thread(Some(Side::Left), None, Some(4))));
+        // GitHub only takes ranges that cross from the old side to the new.
+        let back = NewThread {
+            side: Side::Left,
+            ..thread(Some(Side::Right), Some(2), Some(4))
+        };
+        assert!(!ok(back));
+    }
 
     #[test]
     fn terminals_only_open_from_the_servers_pages() {
@@ -1604,6 +2048,91 @@ mod tests {
         assert_eq!(status(inboxes).await, StatusCode::OK);
     }
 
+    /// An upload waits under its id until a prompt claims it or it's
+    /// deleted; a prompt with an upload that's gone is refused.
+    #[tokio::test]
+    async fn uploads_wait_for_their_prompt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+        let http = reqwest::Client::new();
+        let origin = format!("http://{addr}");
+
+        let response = http
+            .put(format!(
+                "http://{addr}/api/uploads?name=..%2Fsome%20notes.txt"
+            ))
+            .header("Origin", &origin)
+            .body("hello")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let up: grenadine_core::api::Upload = response.json().await.unwrap();
+        assert_eq!((up.name.as_str(), up.size), ("some notes.txt", 5));
+        let url = format!("http://{addr}/api/uploads/{}", up.id);
+        let got: grenadine_core::api::Upload =
+            http.get(&url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(got, up);
+
+        let unnamed = http
+            .put(format!("http://{addr}/api/uploads?name=.."))
+            .header("Origin", &origin)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+
+        let delete = || http.delete(&url).header("Origin", &origin).send();
+        assert_eq!(delete().await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(delete().await.unwrap().status(), StatusCode::NOT_FOUND);
+        let gone = http.get(&url).send().await.unwrap();
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+
+        let start = http
+            .post(format!("http://{addr}/api/agents"))
+            .header("Origin", &origin)
+            .json(&serde_json::json!({
+                "repo": GENERAL,
+                "pr": null,
+                "prompt": "read it",
+                "permission_mode": "plan",
+                "attachments": [up.id],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            start
+                .text()
+                .await
+                .unwrap()
+                .contains("attach the file again")
+        );
+
+        let bogus = format!(
+            "http://{addr}/api/agents/{}/attachments/..%2F..%2Fetc/passwd",
+            agent::uuid()
+        );
+        let bogus = http.get(bogus).send().await.unwrap();
+        assert_eq!(bogus.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn attachments_download_under_their_names() {
+        assert_eq!(
+            content_disposition("a b.pdf"),
+            "attachment; filename=\"a b.pdf\"; filename*=UTF-8''a%20b.pdf"
+        );
+        assert_eq!(
+            content_disposition("ü\"x.txt"),
+            "attachment; filename=\"__x.txt\"; filename*=UTF-8''%C3%BC%22x.txt"
+        );
+    }
+
     #[tokio::test]
     async fn events_stream_ends_on_shutdown() {
         let state = crate::sync::test_state();
@@ -1611,6 +2140,147 @@ mod tests {
         state.shutdown.cancel();
         let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next()).await;
         assert!(matches!(next, Ok(None)));
+    }
+
+    /// Asks for `path` as a WebSocket from a page at `origin`.
+    async fn open_socket(
+        addr: std::net::SocketAddr,
+        path: &str,
+        origin: &str,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("http://{addr}{path}"))
+            .header("Origin", origin)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The next frame the server sent: its opcode and payload. The
+    /// server's frames aren't masked.
+    async fn frame(io: &mut (impl tokio::io::AsyncRead + Unpin)) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let read = async {
+            let opcode = io.read_u8().await.unwrap() & 0x0f;
+            let len = match io.read_u8().await.unwrap() {
+                126 => io.read_u16().await.unwrap() as usize,
+                127 => io.read_u64().await.unwrap() as usize,
+                n => n as usize,
+            };
+            let mut payload = vec![0; len];
+            io.read_exact(&mut payload).await.unwrap();
+            (opcode, payload)
+        };
+        tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("no frame")
+    }
+
+    const TEXT: u8 = 1;
+    const CLOSE: u8 = 8;
+
+    #[tokio::test]
+    async fn a_session_socket_replays_the_transcript_then_follows_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+        let origin = format!("http://{addr}");
+        let id = agent::uuid();
+        state
+            .db
+            .create_agent(&AgentSession::fixture(&id, "o/n"))
+            .unwrap();
+        let text = |t: &str| grenadine_core::api::AgentEventKind::Text(t.into());
+        agent::emit(&state, &id, text("stored")).unwrap();
+        let path = format!("/api/agents/{id}/events");
+
+        // Any website could otherwise read the transcript.
+        let evil = open_socket(addr, &path, "http://evil.example").await;
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+        let unknown = format!("/api/agents/{}/events", agent::uuid());
+        let unknown = open_socket(addr, &unknown, &origin).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let response = open_socket(addr, &path, &origin).await;
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut io = response.upgrade().await.unwrap();
+        let mut event = async || {
+            let (opcode, payload) = frame(&mut io).await;
+            assert_eq!(opcode, TEXT);
+            serde_json::from_slice::<AgentEvent>(&payload).unwrap()
+        };
+        let stored = event().await;
+        assert_eq!((stored.seq, stored.kind), (Some(1), text("stored")));
+        agent::emit(&state, &id, text("live")).unwrap();
+        let live = event().await;
+        assert_eq!((live.seq, live.kind), (Some(2), text("live")));
+
+        // Open sockets don't hold up the server's shutdown.
+        state.shutdown.cancel();
+        assert_eq!(frame(&mut io).await.0, CLOSE);
+    }
+
+    #[tokio::test]
+    async fn the_events_socket_sends_server_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = crate::sync::test_state();
+        tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+
+        let evil = open_socket(addr, "/api/events", "http://evil.example").await;
+        assert_eq!(evil.status(), StatusCode::FORBIDDEN);
+
+        let response = open_socket(addr, "/api/events", &format!("http://{addr}")).await;
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let mut io = response.upgrade().await.unwrap();
+        state.send(ServerEvent::CleanupChanged);
+        let (opcode, payload) = frame(&mut io).await;
+        assert_eq!(opcode, TEXT);
+        assert!(matches!(
+            serde_json::from_slice(&payload).unwrap(),
+            ServerEvent::CleanupChanged
+        ));
+    }
+
+    /// A quiet stream still says something, so that the page can tell a
+    /// dead connection from one with nothing to say.
+    #[tokio::test]
+    async fn quiet_event_streams_are_pinged() {
+        let (events, quiet) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let quiet = tokio_stream::wrappers::UnboundedReceiverStream::new(quiet);
+        let every = Duration::from_millis(20);
+        // Before the pings start counting, or a pause in between would
+        // make the first one look early.
+        let start = tokio::time::Instant::now();
+        let mut messages = std::pin::pin!(with_pings(quiet, every));
+        assert_eq!(messages.next().await.as_deref(), Some(PING));
+        assert!(start.elapsed() >= every);
+        // On a slow machine another ping may be due before what's
+        // expected next, so the pings in between are passed over.
+        events.send("{}".into()).unwrap();
+        let event = loop {
+            match messages.next().await {
+                Some(message) if message == PING => {}
+                other => break other,
+            }
+        };
+        assert_eq!(event.as_deref(), Some("{}"));
+        assert_eq!(messages.next().await.as_deref(), Some(PING));
+        // The pings don't keep an ended stream going.
+        drop(events);
+        let ended = async {
+            while let Some(message) = messages.next().await {
+                assert_eq!(message, PING);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), ended)
+            .await
+            .expect("the stream ends once its events do");
     }
 
     /// A watch registers while its stream lives and unregisters when the
@@ -1629,9 +2299,9 @@ mod tests {
             repo: "owner/name".into(),
             number: 7,
         };
-        let query = || Query(vec![("watch".to_owned(), "pr/owner/name/7".to_owned())]);
-        let one = events(AxState(state.clone()), query()).await;
-        let two = events(AxState(state.clone()), query()).await;
+        let query = [("watch".to_owned(), "pr/owner/name/7".to_owned())];
+        let one = watch_events(&state, &query);
+        let two = watch_events(&state, &query);
         assert_eq!(
             state.watched(),
             std::collections::BTreeSet::from([key.clone()])
@@ -1653,17 +2323,16 @@ mod tests {
         });
         let state =
             crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
-        let stream = events(
-            AxState(state.clone()),
-            Query(vec![
+        let stream = watch_events(
+            &state,
+            &[
                 ("watch".into(), "bogus".into()),
                 ("watch".into(), "pr/owner/name".into()),
                 ("watch".into(), "pr/owner/name/abc".into()),
                 ("watch".into(), "pr/other/repo/7".into()),
                 ("other".into(), "pr/owner/name/7".into()),
-            ]),
-        )
-        .await;
+            ],
+        );
         assert!(state.watched().is_empty());
         drop(stream);
     }
@@ -2090,6 +2759,96 @@ mod tests {
         assert_eq!(body(response).await, "Claude Code doesn't offer that model");
     }
 
+    /// A review backend that isn't installed can't be picked.
+    #[tokio::test]
+    async fn repo_settings_check_the_review_backend() {
+        use grenadine_core::api::AgentBackend;
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        let settings = |backend: AgentBackend| {
+            Json(RepoSettings {
+                review_backend: backend,
+                ..RepoSettings::default()
+            })
+        };
+
+        // Whichever backend isn't installed can't be switched to.
+        let missing = if state.agents.offered(AgentBackend::Devin).await {
+            let response = set_repo_settings(
+                AxState(state.clone()),
+                path(),
+                settings(AgentBackend::Devin),
+            )
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            AgentBackend::Claude
+        } else {
+            AgentBackend::Devin
+        };
+        let stored = state
+            .db
+            .repo_settings(&fx.clone.slug)
+            .unwrap()
+            .review_backend;
+        let response = set_repo_settings(AxState(state.clone()), path(), settings(missing))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await,
+            format!("{} isn't installed on the server", missing.label())
+        );
+        // The rejected pick wasn't stored.
+        assert_eq!(
+            state
+                .db
+                .repo_settings(&fx.clone.slug)
+                .unwrap()
+                .review_backend,
+            stored
+        );
+    }
+
+    /// The stored backend being uninstalled doesn't keep other fields
+    /// from saving; only picking an uninstalled one is refused.
+    #[tokio::test]
+    async fn repo_settings_save_with_a_missing_backend() {
+        let fx = crate::git::tests::fixture();
+        let cloned = Arc::new(crate::sync::ClonedRepo {
+            repo: fx.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let state =
+            crate::sync::test_state_with([(fx.clone.slug.clone(), cloned)].into_iter().collect());
+        let (owner, name) = fx.clone.slug.split_once('/').unwrap();
+        let path = || Path((owner.to_owned(), name.to_owned()));
+        // The stored default is Claude Code, which test_state doesn't offer.
+        let response = set_repo_settings(
+            AxState(state.clone()),
+            path(),
+            Json(RepoSettings {
+                review_skill: Some("review".into()),
+                ..RepoSettings::default()
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let saved = state.db.repo_settings(&fx.clone.slug).unwrap();
+        assert_eq!(saved.review_skill.as_deref(), Some("review"));
+    }
+
     #[tokio::test]
     async fn unconfigured_repo_is_not_configured() {
         let state = crate::sync::test_state();
@@ -2451,6 +3210,7 @@ mod tests {
             permission_mode: mode.into(),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let response = create_agent(AxState(state.clone()), Json(req("nonsense")))
@@ -2478,6 +3238,7 @@ mod tests {
             permission_mode: "auto".into(),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let response = create_agent(AxState(state), Json(req))

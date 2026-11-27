@@ -2,15 +2,18 @@
 //! starts one, and a session's page with its live transcript, permission
 //! requests and a box for follow-up prompts.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
-    AgentSession, AgentStatus, Approval, ApprovalKind, ApprovalOption, CiStatus, CleanupState,
-    CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk, PermissionMode, PrKey,
-    RepoSettings, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
+    AgentSession, AgentStatus, AnswerHandoff, Approval, ApprovalKind, ApprovalOption, CiStatus,
+    CleanupState, CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk,
+    PermissionMode, PrKey, RepoSettings, SessionKind, TaskStatus, WorktreeFile, WrapUp,
+    WrapUpTarget, WriteHandoff,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -21,10 +24,16 @@ use wasm_bindgen::prelude::*;
 use crate::composer::draft_signal;
 use crate::diffview::{EditDiff, WorktreeDiff};
 use crate::drafts::{self, Draft, Drafts};
+use crate::files::{self, FileChips, Files};
+use crate::global_settings::GlobalSettings;
 use crate::image_drafts;
-use crate::images::{self, AttachButton, Attachments};
+use crate::images::{self, AttachButton, Attached, Attachments};
 use crate::inboxes::{load_flag, save_flag, storage};
+use crate::markdown::SessionRef;
 use crate::settings::{Settings, SettingsButton};
+use crate::sidebar::{CHANGES_SIDEBAR, SidePanel, Sidebar};
+use crate::slash::{self, SlashList, Suggest};
+use crate::tool_summaries::{self, ToolSummaries};
 use crate::{GithubLink, Route, Updates, api, github_url, hash_for, highlight, markdown};
 
 fn agent_hash(id: &str) -> String {
@@ -40,7 +49,7 @@ pub fn session_hash(id: &str, kind: SessionKind) -> String {
 }
 
 pub fn go(hash: &str) {
-    let _ = window().location().set_hash(hash);
+    crate::navigate::push(hash);
 }
 
 pub fn status_label(s: AgentStatus) -> &'static str {
@@ -49,6 +58,7 @@ pub fn status_label(s: AgentStatus) -> &'static str {
         AgentStatus::Idle => "idle",
         AgentStatus::Running => "working…",
         AgentStatus::AwaitingApproval => "needs approval",
+        AgentStatus::Background => "waiting on background task",
         AgentStatus::Interrupted => "interrupted",
         AgentStatus::Failed => "failed",
     }
@@ -60,6 +70,7 @@ pub fn status_class(s: AgentStatus) -> &'static str {
         AgentStatus::Idle => "agent-status",
         AgentStatus::Running => "agent-status running",
         AgentStatus::AwaitingApproval => "agent-status waiting",
+        AgentStatus::Background => "agent-status waiting",
         AgentStatus::Interrupted => "agent-status",
         AgentStatus::Failed => "agent-status failed",
     }
@@ -82,6 +93,75 @@ pub(crate) fn backends() -> LocalResource<api::Result<Vec<AgentBackendInfo>>> {
 /// The sessions, refetched when they change.
 pub(crate) fn sessions() -> LocalResource<api::Result<Vec<AgentSession>>> {
     expect_context()
+}
+
+/// Lists `session`, which was just started, without waiting for the list
+/// to be refetched; until it's listed, it counts as deleted.
+fn list_started(
+    sessions: LocalResource<api::Result<Vec<AgentSession>>>,
+    updates: Updates,
+    session: &AgentSession,
+) {
+    let listed = sessions
+        .with_untracked(|l| matches!(l, Some(Ok(l)) if l.iter().any(|s| s.id == session.id)));
+    if listed {
+        return;
+    }
+    // The newest session comes first. This drops the answer of a refetch
+    // on its way, which may predate the session, so ask for another.
+    sessions.update(|l| {
+        if let Some(Ok(l)) = l {
+            l.insert(0, session.clone());
+        }
+    });
+    updates.agents.update(|n| *n += 1);
+}
+
+/// The sessions that text in the transcript of session `own` may refer to.
+/// Doesn't change with what only the sessions' pages show, like a status.
+fn session_refs(own: String) -> Memo<Vec<SessionRef>> {
+    let sessions = sessions();
+    Memo::new(move |prev: Option<&Vec<SessionRef>>| match sessions.get() {
+        Some(Ok(list)) => list
+            .into_iter()
+            .map(|s| SessionRef {
+                hash: session_hash(&s.id, s.kind),
+                own: s.id == own,
+                title: s.summary.unwrap_or(s.title),
+                id: s.id,
+            })
+            .collect(),
+        _ => prev.cloned().unwrap_or_default(),
+    })
+}
+
+/// The ones of `known` that `text` may refer to, so that only text that
+/// does is rendered again when they change.
+fn refs_in(text: &str, known: Memo<Vec<SessionRef>>) -> Memo<Vec<SessionRef>> {
+    let text = text.to_owned();
+    Memo::new(move |_| known.with(|k| k.iter().filter(|s| s.may_be_in(&text)).cloned().collect()))
+}
+
+/// Markdown of a transcript as HTML, with the sessions it refers to linked.
+fn linked_markdown(
+    text: &str,
+    repo: &str,
+    known: Memo<Vec<SessionRef>>,
+) -> impl Fn() -> String + Clone + Send + Sync + 'static + use<> {
+    let refs = refs_in(text, known);
+    let (text, repo) = (text.to_owned(), repo.to_owned());
+    move || refs.with(|r| markdown::to_html_with_sessions(&text, &repo, r))
+}
+
+/// Plain text of a transcript as HTML, with the sessions it refers to
+/// linked.
+fn linked_text(
+    text: &str,
+    known: Memo<Vec<SessionRef>>,
+) -> impl Fn() -> String + Clone + Send + Sync + 'static + use<> {
+    let refs = refs_in(text, known);
+    let text = text.to_owned();
+    move || refs.with(|r| markdown::text_to_html(&text, r))
 }
 
 /// The models `backend` offers: `None` until the backends are in, an
@@ -205,9 +285,12 @@ pub fn delete_session(
                 if let Some(s) = storage() {
                     let _ = s.remove_item(&draft_key(&id));
                     let _ = s.remove_item(&mode_key(&id));
+                    let _ = s.remove_item(&session_model_key(&id));
                 }
+                forget_question_drafts(&id);
                 crate::terminal::forget(&id);
                 image_drafts::forget(&image_drafts::agent_key(&id));
+                files::forget(&image_drafts::agent_key(&id));
                 deleted()
             }
             Err(e) => failed(e),
@@ -346,6 +429,7 @@ fn StatusBadge(status: AgentStatus) -> impl IntoView {
 
 /// A repository's section in the sidebar: the ids of the drafts in it,
 /// then its sessions.
+#[derive(Clone, PartialEq)]
 struct RepoGroup {
     repo: String,
     drafts: Vec<String>,
@@ -420,6 +504,29 @@ pub fn Sidebar(
             drafts.listed(open)
         })
     });
+    let loaded = Memo::new(move |_| match (repos.get(), sessions.get()) {
+        (Some(Err(e)), _) | (_, Some(Err(e))) => Some(Err(e)),
+        (Some(Ok(repos)), Some(Ok(sessions))) => {
+            Some(Ok(by_repo(with_general(repos), sessions, listed.get())))
+        }
+        _ => None,
+    });
+    // Whether the sections show. They stay while only what's in them
+    // changes, so that a click or the focus in one isn't lost.
+    let state = Memo::new(move |_| {
+        loaded.with(|l| {
+            l.as_ref()
+                .map(|r| r.as_ref().map(|_| ()).map_err(String::clone))
+        })
+    });
+    let groups = Memo::new(move |_| {
+        loaded.with(|l| match l {
+            Some(Ok(groups)) => groups.clone(),
+            _ => Vec::new(),
+        })
+    });
+    let names =
+        Memo::new(move |_| groups.with(|g| g.iter().map(|g| g.repo.clone()).collect::<Vec<_>>()));
     // Deleting from the sidebar failed.
     let error = RwSignal::new(None::<String>);
     // The repository whose settings are open.
@@ -436,7 +543,7 @@ pub fn Sidebar(
                 continue;
             }
             let open = route.with_untracked(|r| matches!(r, Route::Draft(x) if *x == *d));
-            adopt_start_mode(d, &s.id);
+            adopt_start(d, &s.id);
             drafts.remove(d);
             if open {
                 go(&agent_hash(&s.id));
@@ -448,16 +555,18 @@ pub fn Sidebar(
         <aside class="agent-sidebar">
             <a class="agent-new" href="#/agents">"+ New session"</a>
             {move || error.get().map(|e| view! { <p class="error pad">{e}</p> })}
-            {move || match (repos.get(), sessions.get()) {
-                (Some(Err(e)), _) | (_, Some(Err(e))) => {
-                    view! { <p class="error pad">{e}</p> }.into_any()
-                }
-                (Some(Ok(repos)), Some(Ok(sessions))) => by_repo(with_general(repos), sessions, listed.get())
-                    .into_iter()
-                    .map(|g| view! { <RepoSessions group=g route=route error=error settings=settings /> })
-                    .collect_view()
-                    .into_any(),
-                _ => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
+            {move || match state.get() {
+                None => view! { <p class="muted pad">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error pad">{e}</p> }.into_any(),
+                Some(Ok(())) => view! {
+                    <For
+                        each=move || names.get()
+                        key=|r| r.clone()
+                        let:repo
+                    >
+                        <RepoSessions repo groups route error settings />
+                    </For>
+                }.into_any(),
             }}
             <CleanupSection route=route />
             <Settings open=settings />
@@ -518,6 +627,50 @@ fn CleanupSection(route: Signal<Route>) -> impl IntoView {
     }
 }
 
+/// A muted local time under a transcript message, when the event has
+/// one.
+fn turn_time(at: Option<i64>) -> Option<impl IntoView> {
+    at.map(|ms| {
+        let secs = ms.div_euclid(1000);
+        let now = (js_sys::Date::now() / 1000.0) as i64;
+        view! {
+            <time
+                class="turn-time"
+                datetime=crate::iso_datetime(secs)
+                title=crate::local_datetime(secs)
+            >
+                {crate::short_local_time(now, secs)}
+            </time>
+        }
+    })
+}
+
+/// The last line of a question's or a plan's card: when the agent asked,
+/// and when and how that ended. `outcome` words the ending; it is `None`
+/// when its time shouldn't show.
+#[component]
+fn AskTimes(
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
+    /// When it ended, in Unix milliseconds.
+    #[prop(into)]
+    ended: Signal<Option<i64>>,
+    #[prop(into)] outcome: Signal<Option<&'static str>>,
+) -> impl IntoView {
+    move || {
+        let end = outcome.get().zip(ended.get());
+        (asked.is_some() || end.is_some()).then(|| {
+            view! {
+                <p class="ask-times">
+                    {asked.map(|at| view! { "Asked " {turn_time(Some(at))} })}
+                    {(asked.is_some() && end.is_some()).then_some(" · ")}
+                    {end.map(|(outcome, at)| view! { {outcome} " " {turn_time(Some(at))} })}
+                </p>
+            }
+        })
+    }
+}
+
 /// A day, as the browser writes dates.
 fn date(unix_seconds: i64) -> String {
     js_sys::Date::new(&JsValue::from_f64(unix_seconds as f64 * 1000.0))
@@ -529,6 +682,8 @@ fn date(unix_seconds: i64) -> String {
 /// picked and handed off to a new session that plans how to clean them up.
 #[component]
 pub fn CleanupView() -> impl IntoView {
+    let updates = expect_context::<Updates>();
+    let listed = sessions();
     let cleanup = cleanup_resource();
     let repos = LocalResource::new(api::repos);
     let picked = RwSignal::new(Vec::<i64>::new());
@@ -567,6 +722,7 @@ pub fn CleanupView() -> impl IntoView {
         if busy.get_untracked() || ids.is_empty() {
             return;
         }
+        let picked = model.get_untracked();
         let req = NewCleanupSession {
             ids,
             repo: repo.get_untracked(),
@@ -578,10 +734,13 @@ pub fn CleanupView() -> impl IntoView {
         spawn_local(async move {
             match api::create_cleanup_session(&req).await {
                 Ok(session) => {
-                    // The server starts it out planning.
+                    // The server starts it out planning, with the model
+                    // picked here.
                     if let Some(s) = storage() {
                         let _ = s.set_item(&mode_key(&session.id), PermissionMode::plan().as_str());
+                        let _ = s.set_item(&session_model_key(&session.id), &picked);
                     }
+                    list_started(listed, updates, &session);
                     go(&agent_hash(&session.id));
                 }
                 Err(e) => error.set(Some(e)),
@@ -703,16 +862,12 @@ pub fn CleanupView() -> impl IntoView {
 /// A repository's drafts, then its sessions.
 #[component]
 fn RepoSessions(
-    group: RepoGroup,
+    repo: String,
+    groups: Memo<Vec<RepoGroup>>,
     route: Signal<Route>,
     error: RwSignal<Option<String>>,
     settings: RwSignal<Option<String>>,
 ) -> impl IntoView {
-    let RepoGroup {
-        repo,
-        drafts,
-        sessions: list,
-    } = group;
     let new = format!("#/agents/new/{repo}");
     let (title, none) = if repo == GENERAL {
         (
@@ -726,6 +881,19 @@ fn RepoSessions(
         )
     };
     let configurable = repo != GENERAL;
+    let group = {
+        let repo = repo.clone();
+        Memo::new(move |_| groups.with(|g| g.iter().find(|g| g.repo == repo).cloned()))
+    };
+    let drafts = move || group.with(|g| g.as_ref().map(|g| g.drafts.clone()).unwrap_or_default());
+    let sessions =
+        move || group.with(|g| g.as_ref().map(|g| g.sessions.clone()).unwrap_or_default());
+    let empty = Memo::new(move |_| {
+        group.with(|g| {
+            g.as_ref()
+                .is_none_or(|g| g.drafts.is_empty() && g.sessions.is_empty())
+        })
+    });
     view! {
         <section class="agent-repo">
             <h2 class="agent-repo-name">
@@ -733,71 +901,111 @@ fn RepoSessions(
                 {configurable.then(|| view! { <SettingsButton repo=repo.clone() open=settings /> })}
                 <a href=new.clone() title=title>"+"</a>
             </h2>
-            {if list.is_empty() && drafts.is_empty() {
+            {move || if empty.get() {
                 view! {
-                    <p class="agent-none muted">{none} <a href=new>"Start one"</a></p>
+                    <p class="agent-none muted">{none} <a href=new.clone()>"Start one"</a></p>
                 }.into_any()
             } else {
                 view! {
                     <ul class="agent-list">
-                        {drafts.into_iter().map(|id| view! { <DraftEntry id=id route=route /> }).collect_view()}
-                        {list.into_iter().map(|a| {
-                            let id = a.id.clone();
-                            let is_open = move |id: &str| {
-                                route.with_untracked(|r| matches!(r, Route::Agent(s) if s == id))
-                            };
-                            let selected = {
-                                let id = id.clone();
-                                move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
-                            };
-                            let delete = {
-                                let session = a.clone();
-                                move |_| {
-                                    error.set(None);
-                                    // Its page can't show it any more.
-                                    let leave = is_open(&id);
-                                    delete_session(
-                                        &session,
-                                        move || if leave { go("#/agents") },
-                                        move |e| error.set(Some(e)),
-                                    );
-                                }
-                            };
-                            let label = a.summary.clone().unwrap_or_else(|| a.title.clone());
-                            let mut meta: Vec<String> = vec![cost(a.cost, a.cost_unit)];
-                            if let Some(n) = a.pr {
-                                meta.insert(0, format!("#{n}"));
+                        <For each=drafts key=|id| id.clone() let:id>
+                            <DraftEntry id route />
+                        </For>
+                        <For
+                            each=sessions
+                            key=|s| s.id.clone()
+                            children=move |s| {
+                                // What was last listed; once it isn't any
+                                // more, the entry is about to go.
+                                let current = Memo::new(move |prev: Option<&AgentSession>| {
+                                    group
+                                        .with(|g| {
+                                            let all = &g.as_ref()?.sessions;
+                                            all.iter().find(|x| x.id == s.id).cloned()
+                                        })
+                                        .unwrap_or_else(|| prev.unwrap_or(&s).clone())
+                                });
+                                view! { <SessionEntry session=current route error /> }
                             }
-                            // The PR count covers a wrap-up's PR.
-                            if let Some(landed @ Landed::Checkout { .. }) = &a.landed {
-                                meta.push(landed_label(landed));
-                            }
-                            view! {
-                                <li class="agent-entry">
-                                    <a class="agent-item" class:selected=selected href=agent_hash(&a.id)>
-                                        <span class="agent-title" title=a.title.clone()>{label}</span>
-                                        <span class="agent-status-line">
-                                            <StatusBadge status=a.status />
-                                            {(a.unstaged > 0).then(|| view! { <UnstagedCount count=a.unstaged /> })}
-                                            {a.prs.map(|prs| view! { <PrCount prs /> })}
-                                            <span class="agent-meta muted">{meta.join(" · ")}</span>
-                                        </span>
-                                    </a>
-                                    <button
-                                        class="icon agent-delete"
-                                        title="Delete session"
-                                        aria-label="Delete session"
-                                        on:click=delete
-                                    >
-                                        <TrashIcon />
-                                    </button>
-                                </li>
-                            }
-                        }).collect_view()}
+                        />
                     </ul>
                 }.into_any()
             }}
         </section>
+    }
+}
+
+/// A session's entry in the sidebar. It changes in place, so that what the
+/// pointer or the focus is on stays. If one update lists several sessions
+/// above it, though, `For` takes the entry out of the page and puts it back,
+/// which loses the focus.
+#[component]
+fn SessionEntry(
+    session: Memo<AgentSession>,
+    route: Signal<Route>,
+    error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let id = session.with_untracked(|s| s.id.clone());
+    let href = agent_hash(&id);
+    let selected = {
+        let id = id.clone();
+        move || route.with(|r| matches!(r, Route::Agent(s) if *s == id))
+    };
+    let delete = move |_| {
+        error.set(None);
+        // Its page can't show it any more.
+        let leave = route.with_untracked(|r| matches!(r, Route::Agent(s) if *s == id));
+        delete_session(
+            &session.get_untracked(),
+            move || {
+                if leave {
+                    go("#/agents")
+                }
+            },
+            move |e| error.set(Some(e)),
+        );
+    };
+    let title = Memo::new(move |_| session.with(|s| s.title.clone()));
+    let label =
+        Memo::new(move |_| session.with(|s| s.summary.clone().unwrap_or_else(|| s.title.clone())));
+    let status = Memo::new(move |_| session.with(|s| s.status));
+    let unstaged = Memo::new(move |_| session.with(|s| s.unstaged));
+    let prs = Memo::new(move |_| session.with(|s| s.prs));
+    let meta = Memo::new(move |_| {
+        session.with(|s| {
+            let mut meta: Vec<String> = vec![cost(s.cost, s.cost_unit)];
+            if let Some(n) = s.pr {
+                meta.insert(0, format!("#{n}"));
+            }
+            // The PR count covers a wrap-up's PR.
+            if let Some(landed @ Landed::Checkout { .. }) = &s.landed {
+                meta.push(landed_label(landed));
+            }
+            meta.join(" · ")
+        })
+    });
+    view! {
+        <li class="agent-entry">
+            <a class="agent-item" class:selected=selected href=href>
+                <span class="agent-title" title=move || title.get()>{move || label.get()}</span>
+                <span class="agent-status-line">
+                    <span class=move || status_class(status.get())>
+                        {move || status_label(status.get())}
+                    </span>
+                    {move || (unstaged.get() > 0).then(|| view! { <UnstagedCount count=unstaged.get() /> })}
+                    {move || prs.get().map(|prs| view! { <PrCount prs /> })}
+                    <span class="agent-meta muted">{move || meta.get()}</span>
+                </span>
+            </a>
+            <button
+                class="icon agent-delete"
+                title="Delete session"
+                aria-label="Delete session"
+                on:click=delete
+            >
+                <TrashIcon />
+            </button>
+        </li>
     }
 }
 
@@ -891,6 +1099,65 @@ fn mode_key(id: &str) -> String {
     format!("grenadine.agent-permission-mode.{id}")
 }
 
+/// What the keys of a session's half-answered questions start with.
+fn question_draft_prefix(session: &str) -> String {
+    format!("grenadine.agent-question.{session}.")
+}
+
+/// Where the half-answered question card of the request `tool` in
+/// `session` is kept, so it survives switching to another session and
+/// back.
+fn question_draft_key(session: &str, tool: &str) -> String {
+    format!("{}{tool}", question_draft_prefix(session))
+}
+
+/// Drops every half-answered question card kept for `session`.
+fn forget_question_drafts(session: &str) {
+    let Some(s) = storage() else { return };
+    let prefix = question_draft_prefix(session);
+    let keys: Vec<String> = (0..s.length().unwrap_or(0))
+        .filter_map(|i| s.key(i).ok().flatten())
+        .filter(|k| k.starts_with(&prefix))
+        .collect();
+    for k in keys {
+        let _ = s.remove_item(&k);
+    }
+}
+
+/// What the user has picked and written so far for one of a card's
+/// questions.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+struct QuestionDraft {
+    picked: Vec<String>,
+    other: String,
+}
+
+impl QuestionDraft {
+    fn is_empty(&self) -> bool {
+        self.picked.is_empty() && self.other.is_empty()
+    }
+}
+
+/// The half-answered card kept under `key` for `questions`, one entry per
+/// question. Nothing is restored if it doesn't fit the questions any more,
+/// and picks that aren't among a question's options are dropped.
+fn load_question_draft(key: &str, questions: &[Question]) -> Vec<QuestionDraft> {
+    let stored: Option<Vec<QuestionDraft>> = storage()
+        .and_then(|s| s.get_item(key).ok().flatten())
+        .and_then(|v| serde_json::from_str(&v).ok());
+    match stored {
+        Some(list) if list.len() == questions.len() => questions
+            .iter()
+            .zip(list)
+            .map(|(q, mut d)| {
+                d.picked.retain(|p| q.options.iter().any(|o| o.label == *p));
+                d
+            })
+            .collect(),
+        _ => vec![QuestionDraft::default(); questions.len()],
+    }
+}
+
 /// Where a session's "Show thinking" pick is kept. Each session has its
 /// own.
 fn show_thinking_key(id: &str) -> String {
@@ -904,16 +1171,46 @@ fn start_mode_key(draft: &str) -> String {
     format!("grenadine.agent-start-mode.{draft}")
 }
 
-/// Moves a draft's start mode onto the session it became, once: a
-/// second call finds no start key and leaves what the page has stored
-/// since alone.
-fn adopt_start_mode(draft: &str, session: &str) {
-    if let Some(s) = storage()
-        && let Ok(Some(mode)) = s.get_item(&start_mode_key(draft))
-    {
+/// The model a draft's session starts with, kept like its start mode.
+fn start_model_key(draft: &str) -> String {
+    format!("grenadine.agent-start-model.{draft}")
+}
+
+/// Keeps the mode and model a draft's session starts with until its page
+/// takes them over.
+fn save_start(draft: &str, mode: &PermissionMode, model: &str) {
+    if let Some(s) = storage() {
+        let _ = s.set_item(&start_mode_key(draft), mode.as_str());
+        let _ = s.set_item(&start_model_key(draft), model);
+    }
+}
+
+/// Drops a draft's start mode and model, for a start that didn't happen.
+fn forget_start(draft: &str) {
+    if let Some(s) = storage() {
+        let _ = s.remove_item(&start_mode_key(draft));
+        let _ = s.remove_item(&start_model_key(draft));
+    }
+}
+
+/// Moves a draft's start mode and model onto the session it became,
+/// once: a second call finds no start keys and leaves what the page has
+/// stored since alone.
+fn adopt_start(draft: &str, session: &str) {
+    let Some(s) = storage() else { return };
+    if let Ok(Some(mode)) = s.get_item(&start_mode_key(draft)) {
         let _ = s.set_item(&mode_key(session), &mode);
         let _ = s.remove_item(&start_mode_key(draft));
     }
+    if let Ok(Some(model)) = s.get_item(&start_model_key(draft)) {
+        let _ = s.set_item(&session_model_key(session), &model);
+        let _ = s.remove_item(&start_model_key(draft));
+    }
+}
+
+/// The mode stored under `key`, if any.
+fn stored_mode(key: &str) -> Option<String> {
+    storage().and_then(|s| s.get_item(key).ok().flatten())
 }
 
 /// The mode a prompt to `backend` goes with when `stored` was picked
@@ -928,26 +1225,57 @@ fn offered_mode(backend: AgentBackend, stored: Option<&str>) -> PermissionMode {
 /// The permission mode the session's next prompt goes with: the last
 /// one picked for it, or the backend's default mode. `backend` is `None`
 /// until the session is in; until then the stored mode is neither checked
-/// nor stored again.
-fn mode_signal(id: &str, backend: Signal<Option<AgentBackend>>) -> RwSignal<PermissionMode> {
+/// nor stored again. A session started from `draft`, e.g. by an agent's
+/// handoff, takes the mode the draft started it in.
+fn mode_signal(
+    id: &str,
+    backend: Signal<Option<AgentBackend>>,
+    draft: Memo<Option<String>>,
+) -> RwSignal<PermissionMode> {
     let key = mode_key(id);
-    let stored = storage().and_then(|s| s.get_item(&key).ok().flatten());
+    let stored = stored_mode(&key);
     let mode = RwSignal::new(match (backend.get_untracked(), stored) {
         (Some(b), stored) => offered_mode(b, stored.as_deref()),
         (None, Some(stored)) => PermissionMode::new(stored),
         (None, None) => offered_mode(AgentBackend::default(), None),
     });
-    Effect::new(move |_| {
-        let Some(backend) = backend.get() else { return };
-        let m = mode.get_untracked();
-        let offered = offered_mode(backend, Some(m.as_str()));
-        if offered != m {
-            mode.set(offered);
+    // A session that wasn't in yet is looked up again once it is, and so
+    // is one whose draft shows up: the sidebar may have moved the draft's
+    // start mode onto it meanwhile, which the mode read above mustn't
+    // replace. The draft's start keys are moved here too, right before
+    // the mode is read, so the sidebar's `adopt_start`, whether it runs
+    // before or after this, can't come between the two.
+    let stale = StoredValue::new(backend.get_untracked().is_none());
+    Effect::new({
+        let (id, key) = (id.to_owned(), key.clone());
+        move |seen: Option<Option<String>>| {
+            let seen = seen.flatten();
+            let Some(backend) = backend.get() else {
+                return seen;
+            };
+            let draft = draft.get();
+            let arrived = draft.is_some() && draft != seen;
+            if arrived && let Some(d) = &draft {
+                adopt_start(d, &id);
+            }
+            let mut m = mode.get_untracked();
+            if stale.get_value() || arrived {
+                stale.set_value(false);
+                if let Some(stored) = stored_mode(&key) {
+                    m = PermissionMode::new(stored);
+                }
+            }
+            let offered = offered_mode(backend, Some(m.as_str()));
+            if offered != mode.get_untracked() {
+                mode.set(offered);
+            }
+            draft
         }
     });
     Effect::new(move |_| {
         let mode = mode.get();
         if backend.with(Option::is_some)
+            && !stale.get_value()
             && let Some(s) = storage()
         {
             let _ = s.set_item(&key, mode.as_str());
@@ -1001,6 +1329,12 @@ const BACKEND_KEY: &str = "grenadine.agent-backend";
 /// What the model picker shows for the backend's configured default.
 pub(crate) const DEFAULT_MODEL: &str = "default";
 
+/// What a session's model picker shows for the model the session runs
+/// now. Its prompts ask for no model, which a resumed session takes as
+/// staying on its own, with all of its name: the name it reports may be
+/// missing parts of it, e.g. Claude Code's `[1m]`.
+const CURRENT_MODEL: &str = "";
+
 /// The models a picker of `backend`'s models offers: `models`, a
 /// "Default" entry first unless the list has one, and `picked` marked
 /// "(not listed)" when the list doesn't have it.
@@ -1019,7 +1353,7 @@ pub(crate) fn model_options(
             },
         );
     }
-    if !options.iter().any(|m| m.value == picked) {
+    if picked != CURRENT_MODEL && !options.iter().any(|m| m.value == picked) {
         options.push(AgentModelInfo {
             display_name: format!("{picked} (not listed)"),
             description: format!("{} didn't list this model", backend.label()),
@@ -1049,6 +1383,18 @@ fn save_model(backend: AgentBackend, model: &str) {
     }
 }
 
+/// Where the model a session's next prompt goes with is kept. Each
+/// session has its own, apart from the backend's last pick that new
+/// sessions start with, so that picking one for a session doesn't move
+/// the others onto it.
+fn session_model_key(id: &str) -> String {
+    format!("{MODEL_KEY}.session.{id}")
+}
+
+fn stored_session_model(id: &str) -> Option<String> {
+    storage().and_then(|s| s.get_item(&session_model_key(id)).ok().flatten())
+}
+
 /// The backend picked last; the default at first.
 pub(crate) fn last_backend() -> AgentBackend {
     storage()
@@ -1063,9 +1409,9 @@ fn save_backend(backend: AgentBackend) {
     }
 }
 
-/// The model the next prompt goes with: the last one picked for the
+/// The model a new session starts with: the last one picked for the
 /// backend, again whenever the backend changes. `ModelSelect` saves the
-/// picks.
+/// picks. A session's page has its own, `session_model_signal`.
 fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
     let model = RwSignal::new(last_model(backend.get_untracked()));
     Effect::watch(
@@ -1076,47 +1422,110 @@ fn model_signal(backend: Signal<AgentBackend>) -> RwSignal<String> {
     model
 }
 
+/// The model session `id`'s next prompt goes with: the one picked for it
+/// last, or else the one it runs now. A pick lives in this browser only,
+/// so a session started elsewhere, or before picks were kept per
+/// session, stays on its model. A session started with the backend's
+/// default runs that, so staying on its model is the same. `ModelSelect`
+/// saves the picks.
+fn session_model_signal(id: &str) -> RwSignal<String> {
+    RwSignal::new(session_pick(stored_session_model(id)))
+}
+
+/// What a session's picker shows for `stored`, the model picked for it
+/// or for the draft it started from: the backend's default, which a
+/// session's picker doesn't offer, and no pick both stay on the model
+/// the session runs.
+fn session_pick(stored: Option<String>) -> String {
+    stored
+        .filter(|m| m != DEFAULT_MODEL)
+        .unwrap_or_else(|| CURRENT_MODEL.to_owned())
+}
+
+/// On a session's page, the session `ModelSelect`'s picks are kept for,
+/// and the model it reported running, which the picker's entry for
+/// staying on it names.
+#[derive(Clone, Copy)]
+struct SessionPick {
+    id: StoredValue<String>,
+    reported: Signal<Option<String>>,
+}
+
 /// Where a session's half-written follow-up is kept, so it survives
 /// switching to another session and back.
 fn draft_key(id: &str) -> String {
     format!("grenadine.agent-draft.{id}")
 }
 
-/// The model a request asks for; `None` leaves it to the backend's
-/// default.
+/// The model a request asks for; `None` leaves it to the backend: its
+/// default for a new session, a resumed one's own model.
 fn model_arg(model: RwSignal<String>) -> Option<String> {
-    Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL)
+    Some(model.get_untracked()).filter(|m| m != DEFAULT_MODEL && m != CURRENT_MODEL)
 }
 
 /// Picks one of `backend`'s models. Until they're listed, or when they
 /// can't be, its configured default is offered, and the model picked
-/// last stays, marked as not listed.
+/// last stays, marked as not listed. The picks are saved for `session`,
+/// or else as the backend's last pick.
 #[component]
-fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl IntoView {
+fn ModelSelect(
+    model: RwSignal<String>,
+    backend: Signal<AgentBackend>,
+    #[prop(optional)] session: Option<SessionPick>,
+) -> impl IntoView {
     let models = listed_models(backend);
     // Models that couldn't be listed when the page loaded may be now.
     if models.get_untracked().is_some_and(|m| m.is_empty()) {
         backends().refetch();
     }
     let options = Memo::new(move |_| {
-        model_options(
+        let mut options = model_options(
             models.get().unwrap_or_default(),
             backend.get(),
             &model.get(),
-        )
+        );
+        // A session can always stay on the model it runs. It can't go
+        // back to the backend's default: asking for no model keeps a
+        // resumed session on its own, and what the default resolves to
+        // isn't known here.
+        if let Some(s) = session {
+            options.retain(|m| m.value != DEFAULT_MODEL);
+            let name = s.reported.get();
+            options.insert(
+                0,
+                AgentModelInfo {
+                    value: CURRENT_MODEL.into(),
+                    display_name: match &name {
+                        Some(n) => format!("Current ({n})"),
+                        None => "Current".into(),
+                    },
+                    description: "The model the session runs now".into(),
+                },
+            );
+        }
+        options
     });
-    // A pick that's no longer offered goes back to the default. Without
-    // a list there's no telling, and the pick stays.
+    // A pick that's no longer offered goes back to the default, or on a
+    // session's page to the model the session runs. Without a list
+    // there's no telling, and the pick stays.
+    let fallback = if session.is_some() {
+        CURRENT_MODEL
+    } else {
+        DEFAULT_MODEL
+    };
     Effect::new(move |_| {
         let stale = models.with(|ms| {
             ms.as_ref().is_some_and(|ms| {
                 !ms.is_empty()
-                    && model
-                        .with_untracked(|m| m != DEFAULT_MODEL && !ms.iter().any(|i| &i.value == m))
+                    && model.with_untracked(|m| {
+                        m != DEFAULT_MODEL
+                            && m != CURRENT_MODEL
+                            && !ms.iter().any(|i| &i.value == m)
+                    })
             })
         });
         if stale {
-            model.set(DEFAULT_MODEL.into());
+            model.set(fallback.into());
         }
     });
     view! {
@@ -1126,11 +1535,19 @@ fn ModelSelect(model: RwSignal<String>, backend: Signal<AgentBackend>) -> impl I
             title=move || format!("The model {} runs with", backend.get().agent_name())
             prop:value=move || model.get()
             on:change=move |ev| {
-                // Only a pick is saved, under the backend it was picked
-                // for; a model reset because the backend doesn't offer it
-                // isn't, so it can't overwrite another backend's pick.
+                // Only a pick is saved, for the session or under the
+                // backend it was picked for; a model reset because the
+                // backend doesn't offer it isn't, so it can't overwrite
+                // another backend's pick.
                 let picked = event_target_value(&ev);
-                save_model(backend.get_untracked(), &picked);
+                match session {
+                    Some(s) => {
+                        if let Some(st) = storage() {
+                            let _ = st.set_item(&session_model_key(&s.id.get_value()), &picked);
+                        }
+                    }
+                    None => save_model(backend.get_untracked(), &picked),
+                }
                 model.set(picked);
             }
         >
@@ -1185,20 +1602,46 @@ fn repo_default_mode(settings: Option<&RepoSettings>, backend: AgentBackend) -> 
         .unwrap_or_else(PermissionMode::plan)
 }
 
-/// The agent's `handoff` request a `NewSession` form answers: the
-/// session `agent` asked, and the request's tool use id `tool`.
+/// The handoff proposal a `NewSession` form answers: the session
+/// `agent` it's in, and the id `tool` of the agent's `handoff` request
+/// or of the proposal written for the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffRequest {
     pub agent: String,
     pub tool: String,
+    /// Whether the user asked for the handoff, so no agent waits for the
+    /// answer.
+    pub by_user: bool,
+}
+
+impl HandoffRequest {
+    /// Starts `req`, or declines the proposal without one, telling a
+    /// waiting agent `reason`.
+    async fn answer(&self, req: Option<NewAgent>, reason: Option<String>) -> Result<(), String> {
+        if self.by_user {
+            return api::answer_handoff(&self.agent, &self.tool, &AnswerHandoff { start: req })
+                .await;
+        }
+        let approval = Approval {
+            id: self.tool.clone(),
+            allow: req.is_some(),
+            message: reason,
+            mode: None,
+            option: None,
+            answers: None,
+            handoff: req,
+        };
+        api::approve(&self.agent, &approval).await
+    }
 }
 
 /// The form that starts a session, filled in from the draft with id
 /// `draft` and kept in it as it changes. With `pr`, the session is
 /// locked to that PR: its repository and "Start from PR" aren't offered,
 /// and the draft takes them whatever it held. With `handoff`, the form
-/// is an agent's proposal, in its transcript: starting it allows the
-/// request with the session as the form has it, and it can be declined.
+/// is a handoff proposal in a session's transcript, the agent's or one
+/// written for the user: starting it answers the proposal with the
+/// session as the form has it, and it can be declined.
 #[component]
 pub fn NewSession(
     draft: String,
@@ -1208,6 +1651,7 @@ pub fn NewSession(
     let drafts = expect_context::<Drafts>();
     let updates = expect_context::<Updates>();
     let repos = LocalResource::new(api::repos);
+    let listed = sessions();
     let saved = drafts.open(&draft);
     // Drafts saved before they defaulted to `GENERAL` have no repository.
     let repo = RwSignal::new(match &pr {
@@ -1289,8 +1733,11 @@ pub fn NewSession(
     // The draft's model goes until the backend changes.
     let model = model_signal(backend.into());
     model.set(saved.model);
-    // The images pasted so far, kept with the draft in IndexedDB.
+    // The images pasted so far, kept with the draft in IndexedDB, and the
+    // other files, kept in localStorage.
     let images = image_drafts::draft_images(image_drafts::new_session_key(&draft));
+    let files = Files::draft(image_drafts::new_session_key(&draft));
+    let attached = Attached { images, files };
     let error = RwSignal::new(None::<String>);
     let textarea = NodeRef::<leptos::html::Textarea>::new();
     // The prompt gets the focus, with the caret at the end of any draft
@@ -1303,6 +1750,14 @@ pub fn NewSession(
             let _ = t.set_selection_range(end, end);
         }
     });
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Repo {
+            repo: repo.get(),
+            backend: backend.get(),
+        }),
+    );
     let id = StoredValue::new(draft.clone());
 
     Effect::new(move |_| {
@@ -1325,6 +1780,7 @@ pub fn NewSession(
                 mode_picked,
                 model,
                 has_images: images.with(|i| !i.is_empty()),
+                has_files: !files.is_empty(),
                 ..d.clone()
             }
         });
@@ -1343,7 +1799,11 @@ pub fn NewSession(
 
     let handoff = StoredValue::new(handoff);
     let start = move || {
-        if busy() || none_installed() || prompt.with_untracked(|p| p.trim().is_empty()) {
+        if busy()
+            || none_installed()
+            || prompt.with_untracked(|p| p.trim().is_empty())
+            || files.pending_untracked()
+        {
             return;
         }
         let pr = match number.get_untracked().trim() {
@@ -1363,9 +1823,13 @@ pub fn NewSession(
         let mode = mode.get_untracked();
         let mode_picked = mode_picked.get_untracked();
         let raw_prompt = prompt.get_untracked();
+        let picked = model.get_untracked();
         let model = model_arg(model);
         let images = images.get_untracked();
+        let attachments = files.ids();
         let id = id.get_value();
+        // Read here because the task outlives the form, which owns it.
+        let handoff = handoff.get_value();
         drafts.set_starting(&id, true);
         // The last attempt's error doesn't carry into this one.
         drafts.set_start_error(&id, None);
@@ -1395,46 +1859,35 @@ pub fn NewSession(
                 },
                 model,
                 images,
+                attachments,
                 draft: Some(id.clone()),
             };
             // A proposal starts once its request is allowed with it. Its
             // draft stays until the session shows up, when the sidebar
             // moves the start mode onto it and removes the draft, as it
             // does for a start whose answer the page missed.
-            if let Some(h) = handoff.get_value() {
-                if let Some(s) = storage() {
-                    let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
-                }
-                let approval = Approval {
-                    id: h.tool,
-                    allow: true,
-                    message: None,
-                    mode: None,
-                    option: None,
-                    answers: None,
-                    handoff: Some(req),
-                };
-                if let Err(e) = api::approve(&h.agent, &approval).await {
-                    if let Some(s) = storage() {
-                        let _ = s.remove_item(&start_mode_key(&id));
-                    }
+            if let Some(h) = handoff {
+                save_start(&id, &req.permission_mode, &picked);
+                if let Err(e) = h.answer(Some(req), None).await {
+                    forget_start(&id);
                     drafts.set_start_error(&id, Some(e));
                 }
                 drafts.set_starting(&id, false);
                 return;
             }
             // The session shows before this answer arrives, and its page
-            // would lose the mode it starts in without the start key.
-            if let Some(s) = storage() {
-                let _ = s.set_item(&start_mode_key(&id), req.permission_mode.as_str());
-            }
+            // would lose the mode and model it starts with without the
+            // start keys.
+            save_start(&id, &req.permission_mode, &picked);
             // The form may be unmounted by the time the start answers, so
             // only what outlives it is touched here.
             match api::create_agent(&req).await {
                 Ok(session) => {
                     drafts.remove(&id);
-                    // Its follow-ups go on in the mode it started in.
-                    adopt_start_mode(&id, &session.id);
+                    // Its follow-ups go on in the mode and with the model
+                    // it started with.
+                    adopt_start(&id, &session.id);
+                    list_started(listed, updates, &session);
                     // Go to the session only while its draft is still
                     // open; the user may have moved on while it started.
                     if crate::current_hash() == drafts::hash(&id) {
@@ -1442,9 +1895,7 @@ pub fn NewSession(
                     }
                 }
                 Err(e) => {
-                    if let Some(s) = storage() {
-                        let _ = s.remove_item(&start_mode_key(&id));
-                    }
+                    forget_start(&id);
                     drafts.set_start_error(&id, Some(e));
                 }
             }
@@ -1456,24 +1907,17 @@ pub fn NewSession(
     // behind a summary.
     let proposed = handoff.with_value(Option::is_some);
     let locked = pr.is_some() || proposed;
-    // Why the user declines a proposal, told to the agent.
+    // Why the user declines a proposal, told to the agent that made it.
     let reason = RwSignal::new(String::new());
+    let asks_why = handoff.with_value(|h| h.as_ref().is_some_and(|h| !h.by_user));
     let declining = RwSignal::new(false);
     let decline = move |_| {
         let Some(h) = handoff.get_value() else { return };
-        let approval = Approval {
-            id: h.tool,
-            allow: false,
-            message: Some(reason.get_untracked()).filter(|r| !r.trim().is_empty()),
-            mode: None,
-            option: None,
-            answers: None,
-            handoff: None,
-        };
+        let why = Some(reason.get_untracked()).filter(|r| !r.trim().is_empty());
         let id = id.get_value();
         declining.set(true);
         spawn_local(async move {
-            match api::approve(&h.agent, &approval).await {
+            match h.answer(None, why).await {
                 Ok(()) => drafts.remove(&id),
                 Err(e) => drafts.set_start_error(&id, Some(e)),
             }
@@ -1490,7 +1934,7 @@ pub fn NewSession(
                     start();
                 }
                 on:dragover=images::drag_over
-                on:drop=move |ev| images::drop(ev, images, error)
+                on:drop=move |ev| images::drop(ev, attached)
             >
                 <h2>{if proposed { "Hand off to a new session" } else { "New session" }}</h2>
                 {pr.clone().map(|key| view! {
@@ -1551,23 +1995,36 @@ pub fn NewSession(
                     </label>
                     <label>"Model" <ModelSelect model=model backend=backend.into() /></label>
                 </div>
-                <textarea
-                    node_ref=textarea
-                    class="agent-prompt"
-                    rows="5"
-                    placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
-                    aria-label="Prompt"
-                    prop:value=move || prompt.get()
-                    on:input=move |ev| prompt.set(event_target_value(&ev))
-                    on:paste=move |ev| images::paste(ev, images, error)
-                    on:keydown=move |ev| {
-                        if submits(&ev) {
-                            ev.prevent_default();
-                            start();
+                <div class="slash-anchor">
+                    <textarea
+                        node_ref=textarea
+                        class="agent-prompt"
+                        rows="5"
+                        placeholder=move || format!("What should {} do? (Enter starts, Shift+Enter for a new line)", backend.get().agent_name())
+                        aria-label="Prompt"
+                        prop:value=move || prompt.get()
+                        on:input=move |ev| {
+                            prompt.set(event_target_value(&ev));
+                            suggest.input();
                         }
-                    }
-                ></textarea>
+                        on:paste=move |ev| images::paste(ev, attached)
+                        on:keydown=move |ev| {
+                            if suggest.keydown(&ev) {
+                                return;
+                            }
+                            if submits(&ev) {
+                                ev.prevent_default();
+                                start();
+                            }
+                        }
+                        on:keyup=move |ev| suggest.keyup(&ev)
+                        on:click=move |_| suggest.clicked()
+                        on:blur=move |_| suggest.blur()
+                    ></textarea>
+                    <SlashList suggest=suggest />
+                </div>
                 <Attachments images=images />
+                <FileChips files=files />
                 {move || {
                     let hints = view! {
                         <p class="hint muted">{move || if general.get() { "The session gets an empty directory of its own, in no repository, for questions that aren't about one." } else { "The session gets its own git worktree on a new branch." }} {move || permissions_hint(backend.get())}</p>
@@ -1609,12 +2066,12 @@ pub fn NewSession(
                     <button
                         type="submit"
                         class="primary"
-                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty())
+                        disabled=move || busy() || none_installed() || prompt.with(|p| p.trim().is_empty()) || files.pending()
                     >
                         {move || if busy() { "Starting…" } else { "Start" }}
                     </button>
-                    <AttachButton images=images error=error />
-                    {proposed.then(|| view! {
+                    <AttachButton attached=attached />
+                    {asks_why.then(|| view! {
                         <input
                             type="text"
                             class="handoff-reason"
@@ -1623,8 +2080,11 @@ pub fn NewSession(
                             prop:value=move || reason.get()
                             on:input=move |ev| reason.set(event_target_value(&ev))
                         />
+                    })}
+                    {proposed.then(|| view! {
                         <button
                             type="button"
+                            class:handoff-decline=!asks_why
                             disabled=move || busy() || declining.get()
                             on:click=decline
                         >"Decline"</button>
@@ -1810,44 +2270,63 @@ fn follow(
     );
 }
 
-/// `command` without a leading `cd` into `worktree`, which changes nothing
-/// because commands already run there.
-fn strip_cd<'a>(command: &'a str, worktree: &str) -> &'a str {
+/// `command` with a leading `cd` into `worktree` or a directory inside it
+/// shortened. A `cd` into `worktree` itself is dropped, because commands
+/// already run there; a `cd` into a directory inside it names that directory
+/// relative to `worktree`, keeping its quotes and the `&&` or `;` after it.
+/// Agents often prefix every command with an absolute `cd`, which would
+/// otherwise fill a one-line summary.
+fn shorten_cd<'a>(command: &'a str, worktree: &str) -> Cow<'a, str> {
+    let unchanged = Cow::Borrowed(command);
     if worktree.is_empty() {
-        return command;
+        return unchanged;
     }
     let Some(rest) = command.trim_start().strip_prefix("cd") else {
-        return command;
+        return unchanged;
     };
     if !rest.starts_with(char::is_whitespace) {
-        return command;
+        return unchanged;
     }
     let rest = rest.trim_start();
-    let (dir, rest) = if let Some(r) = rest.strip_prefix('"') {
+    let (quote, dir, rest) = if let Some(r) = rest.strip_prefix('"') {
         match r.split_once('"') {
-            Some(parts) => parts,
-            None => return command,
+            Some((dir, rest)) => ("\"", dir, rest),
+            None => return unchanged,
         }
     } else if let Some(r) = rest.strip_prefix('\'') {
         match r.split_once('\'') {
-            Some(parts) => parts,
-            None => return command,
+            Some((dir, rest)) => ("'", dir, rest),
+            None => return unchanged,
         }
     } else {
-        match rest.find(|c: char| c.is_whitespace() || c == ';' || c == '&') {
+        let (dir, rest) = match rest.find(|c: char| c.is_whitespace() || c == ';' || c == '&') {
             Some(i) => rest.split_at(i),
             None => (rest, ""),
-        }
+        };
+        ("", dir, rest)
     };
-    if dir != worktree && dir.strip_suffix('/') != Some(worktree) {
-        return command;
+    let relative = relative_to(dir, worktree);
+    if relative == dir {
+        return unchanged;
     }
+    let relative = relative.trim_end_matches('/');
     let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix("&&").or_else(|| rest.strip_prefix(';')) else {
-        return command;
+    if rest.is_empty() && relative != "." {
+        return Cow::Owned(format!("cd {quote}{relative}{quote}"));
+    }
+    let (separator, rest) = match rest.strip_prefix("&&") {
+        Some(rest) => (" &&", rest),
+        None => match rest.strip_prefix(';') {
+            Some(rest) => (";", rest),
+            None => return unchanged,
+        },
     };
     let rest = rest.trim_start();
-    if rest.is_empty() { command } else { rest }
+    match (rest.is_empty(), relative) {
+        (true, _) => unchanged,
+        (false, ".") => Cow::Borrowed(rest),
+        (false, _) => Cow::Owned(format!("cd {quote}{relative}{quote}{separator} {rest}")),
+    }
 }
 
 /// `path` relative to `worktree` when it is inside it, or the path unchanged.
@@ -1886,7 +2365,7 @@ fn summary_title(input: &serde_json::Value, summary: &str) -> Option<String> {
 }
 
 /// A one-line summary of a tool call's input, e.g. the command or the path.
-/// `worktree` hides a redundant leading `cd` into it in a `Bash` command and
+/// `worktree` shortens a leading `cd` into it in a `Bash` command and
 /// shortens a file tool's or a search tool's path inside it.
 fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -> String {
     let field = match name {
@@ -1940,9 +2419,9 @@ fn tool_summary(name: &str, input: &serde_json::Value, worktree: Option<&str>) -
     match input.get(field).and_then(|v| v.as_str()) {
         Some(s) => {
             let s = match worktree {
-                Some(worktree) if name == "Bash" => strip_cd(s, worktree),
-                Some(worktree) if field == "file_path" => relative_to(s, worktree),
-                _ => s,
+                Some(worktree) if name == "Bash" => shorten_cd(s, worktree),
+                Some(worktree) if field == "file_path" => Cow::Borrowed(relative_to(s, worktree)),
+                _ => Cow::Borrowed(s),
             };
             s.lines().next().unwrap_or_default().to_owned()
         }
@@ -2132,23 +2611,30 @@ pub fn AgentView(
     });
     // Approving a plan also picks the mode the follow-ups go with.
     let backend = Signal::derive(move || current.with(|s| s.as_ref().map(|s| s.backend)));
-    let mode = mode_signal(&id, backend);
     // A session the page didn't start itself, e.g. one an agent's handoff
-    // started, takes the mode its draft started it in once the session
-    // says which draft that was. The sidebar may get there first.
+    // started, takes the mode and model its draft started it with once
+    // the session says which draft that was. The sidebar may get there
+    // first.
     let draft = Memo::new(move |_| current.with(|s| s.as_ref().and_then(|s| s.draft.clone())));
+    let mode = mode_signal(&id, backend, draft);
+    // The model the session last said it runs; the stream's is newer
+    // than the loaded session's.
+    let reported = Signal::derive(move || {
+        live_model
+            .get()
+            .or_else(|| current.with(|s| s.as_ref().and_then(|s| s.model.clone())))
+    });
+    let model = session_model_signal(&id);
+    // Like the mode, the model is read again once the draft shows up,
+    // right after its start keys are moved, whoever moves them.
     Effect::new({
         let id = id.clone();
         move |_| {
             let Some(d) = draft.get() else { return };
-            let started = storage().and_then(|s| s.get_item(&start_mode_key(&d)).ok().flatten());
-            if let Some(m) = started {
-                adopt_start_mode(&d, &id);
-                mode.set(PermissionMode::new(m));
-            }
+            adopt_start(&d, &id);
+            model.set(session_pick(stored_session_model(&id)));
         }
     });
-    let model = model_signal(Signal::derive(move || backend.get().unwrap_or_default()));
     // Whether the session is a general one, so the pane below only
     // remounts when that flips, not on every session update.
     let general =
@@ -2158,6 +2644,11 @@ pub fn AgentView(
     let repo = Memo::new(move |_| {
         current.with(|s| s.as_ref().map(|s| s.repo.clone()).unwrap_or_default())
     });
+    // `.agent-panes` is the row the changes pane's sidebar sits in; it
+    // measures it. A compact view has no room for the pane.
+    let panes = NodeRef::<leptos::html::Div>::new();
+    let changes_sidebar = (!compact).then(|| Sidebar::new(&CHANGES_SIDEBAR, panes));
+    let pane_id = StoredValue::new_local(id.clone());
 
     // The latest prompt starts the current turn: the activity bar times
     // it and the transcript's timers cover only calls after it. The
@@ -2187,7 +2678,10 @@ pub fn AgentView(
             s.as_ref().is_some_and(|s| {
                 matches!(
                     s.status,
-                    AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                    AgentStatus::Creating
+                        | AgentStatus::Running
+                        | AgentStatus::AwaitingApproval
+                        | AgentStatus::Background
                 )
             })
         });
@@ -2213,14 +2707,14 @@ pub fn AgentView(
         if let Some(s) = current.get() {
             let review = s.kind == SessionKind::AutoReview;
             if review != read_only {
-                let _ = window().location().replace(&session_hash(&s.id, s.kind));
+                crate::navigate::replace(&session_hash(&s.id, s.kind));
             }
         }
     });
     let terminal_id = id.clone();
     view! {
         <div class="agent-page" class:compact=compact>
-            <div class="agent-panes">
+            <div class="agent-panes" node_ref=panes>
                 <main class="main">
                     <div class="agent">
                         {move || match load.get() {
@@ -2237,9 +2731,8 @@ pub fn AgentView(
                                     let (tokens, window) = live_usage.get();
                                     session.with(|s| (tokens.or(s.context_tokens), window.or(s.context_window)))
                                 });
-                                let active_model = Signal::derive(move || {
-                                    live_model.get().or_else(|| session.with(|s| s.model.clone()))
-                                });
+                                let active_model = reported;
+                                let writing_handoff = Memo::new(move |_| events.with(|e| writes_handoff(e)));
                                 view! {
                                     {if compact {
                                         view! {
@@ -2270,8 +2763,8 @@ pub fn AgentView(
                                             view! { <ReviewActions session=session /> }.into_any()
                                         } else {
                                             view! {
-                                                <Composer session=session usage=usage active_model=active_model mode=mode model=model />
-                                                <AgentActions session=session mode=mode model=model show_thinking=show_thinking compact=compact />
+                                                <Composer session=session usage=usage active_model=active_model mode=mode model=model writing_handoff=writing_handoff.into() />
+                                                <AgentActions session=session mode=mode model=model show_thinking=show_thinking compact=compact writing_handoff=writing_handoff.into() />
                                             }.into_any()
                                         }}
                                     </div>
@@ -2283,14 +2776,31 @@ pub fn AgentView(
                 // A general session's directory isn't a git worktree, and a
                 // compact view has no room for the changes.
                 {move || {
-                    (load.get() == Load::Ready && !general.get() && !compact).then(|| view! {
-                        <ChangesPane
-                            id=id.clone()
-                            repo=repo.get_untracked()
-                            events=events
-                            creating=Signal::derive(move || current.with(|s| s.as_ref().is_some_and(|s| s.status == AgentStatus::Creating)))
-                        />
-                    })
+                    let Some(sidebar) = changes_sidebar else {
+                        return ().into_any();
+                    };
+                    if load.get() != Load::Ready || general.get() {
+                        ().into_any()
+                    } else if sidebar.shown() {
+                        view! {
+                            <SidePanel sidebar=sidebar class="changes-pane">
+                                <div class="changes-body">
+                                    <div class="sidebar-head">
+                                        {sidebar.button(false)}
+                                    </div>
+                                    <ChangesPane
+                                        id=pane_id.get_value()
+                                        repo=repo.get_untracked()
+                                        events=events
+                                        creating=Signal::derive(move || current.with(|s| s.as_ref().is_some_and(|s| s.status == AgentStatus::Creating)))
+                                    />
+                                </div>
+                            </SidePanel>
+                        }
+                        .into_any()
+                    } else {
+                        sidebar.button(true).into_any()
+                    }
                 }}
             </div>
             {move || (load.get() == Load::Ready).then(|| view! {
@@ -2300,24 +2810,13 @@ pub fn AgentView(
     }
 }
 
-/// The window width from which the worktree's changes fit next to the
-/// transcript; `.changes-pane` in style.css uses the same.
-const CHANGES_PANE_QUERY: &str = "(min-width: 1500px)";
-
 /// How often at most the pane refetches while events stream in.
 const CHANGES_THROTTLE: Duration = Duration::from_millis(500);
 
-fn wide_enough() -> bool {
-    window()
-        .match_media(CHANGES_PANE_QUERY)
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.matches())
-}
-
-/// The unstaged changes in the session's worktree, next to the transcript
-/// when the window has room for them. They are refetched as the session's
-/// events come in, since those are when the agent changes files.
+/// The unstaged changes in the session's worktree, in the sidebar next
+/// to the transcript. They are refetched as the session's events come
+/// in, since those are when the agent changes files. The pane unmounts
+/// while the sidebar is hidden, so nothing fetches then.
 #[component]
 fn ChangesPane(
     id: String,
@@ -2329,14 +2828,6 @@ fn ChangesPane(
     // A StoredValue so the reactive blocks below can copy it in; the id
     // never changes for the pane's lifetime.
     let session = StoredValue::new(id.clone());
-    let wide = RwSignal::new(wide_enough());
-    let on_resize = window_event_listener_untyped("resize", move |_| {
-        let w = wide_enough();
-        if wide.get_untracked() != w {
-            wide.set(w);
-        }
-    });
-    on_cleanup(move || on_resize.remove());
 
     let tick = RwSignal::new(0u32);
     let pending = StoredValue::new(false);
@@ -2356,20 +2847,14 @@ fn ChangesPane(
     });
     let changes = LocalResource::new(move || {
         tick.track();
-        let (id, wide) = (id.clone(), wide.get());
-        async move {
-            match wide {
-                true => api::agent_changes(&id).await.map(|c| Some(c.files)),
-                false => Ok(None),
-            }
-        }
+        let id = id.clone();
+        async move { api::agent_changes(&id).await.map(|c| c.files) }
     });
     // Keeps the last changes while refetching so that the files don't
     // flicker.
     let loaded = Memo::new(
         move |prev: Option<&Option<Result<Vec<WorktreeFile>, String>>>| match changes.get() {
-            Some(Ok(None)) => None,
-            Some(r) => Some(r.map(Option::unwrap_or_default)),
+            Some(r) => Some(r),
             None => prev.cloned().flatten(),
         },
     );
@@ -2382,35 +2867,29 @@ fn ChangesPane(
         })
     });
 
-    move || {
-        wide.get().then(|| {
-            view! {
-                <aside class="changes-pane">
-                    <AssociatedPrs id=session.get_value() repo=repo.clone() />
-                    <h2>"Unstaged changes"</h2>
-                    {move || {
-                        if creating.get() {
-                            return view! { <p class="muted">"Creating worktree…"</p> }.into_any();
-                        }
-                        match loaded.get() {
-                            None => view! { <p class="muted">"Loading…"</p> }.into_any(),
-                            Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
-                            Some(Ok(f)) if f.is_empty() => {
-                                view! { <p class="muted">"No unstaged changes."</p> }.into_any()
-                            }
-                            Some(Ok(f)) => view! {
-                                <p class="muted">{format!("{} files changed", f.len())}</p>
-                            }.into_any(),
-                        }
-                    }}
-                    {move || {
-                        (!creating.get()).then(move || {
-                            view! { <WorktreeDiff files=files session=session.get_value() /> }
-                        })
-                    }}
-                </aside>
+    view! {
+        <AssociatedPrs id=session.get_value() repo=repo.clone() />
+        <h2>"Unstaged changes"</h2>
+        {move || {
+            if creating.get() {
+                return view! { <p class="muted">"Creating worktree…"</p> }.into_any();
             }
-        })
+            match loaded.get() {
+                None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="error">{e}</p> }.into_any(),
+                Some(Ok(f)) if f.is_empty() => {
+                    view! { <p class="muted">"No unstaged changes."</p> }.into_any()
+                }
+                Some(Ok(f)) => view! {
+                    <p class="muted">{format!("{} files changed", f.len())}</p>
+                }.into_any(),
+            }
+        }}
+        {move || {
+            (!creating.get()).then(move || {
+                view! { <WorktreeDiff files=files session=session.get_value() /> }
+            })
+        }}
     }
 }
 
@@ -2580,6 +3059,8 @@ fn AgentActions(
     /// mustn't navigate that page away.
     #[prop(optional)]
     compact: bool,
+    /// Whether a handoff the user asked for is being written.
+    writing_handoff: Signal<bool>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     // A wrap-up asked for during a turn waits for the turn, so the buttons
@@ -2603,6 +3084,46 @@ fn AgentActions(
             wrapping.set(false);
         });
     };
+    // The box that asks what a handoff written from the transcript
+    // should have the new session do.
+    let handing_off = RwSignal::new(false);
+    let instruction = RwSignal::new(String::new());
+    let asking = RwSignal::new(false);
+    // A turn would change the transcript under the job that reads it,
+    // and the agent can hand off itself then. The server refuses a second
+    // handoff while one is being written too.
+    let working = move || {
+        writing_handoff.get()
+            || session.with(|s| {
+                matches!(
+                    s.status,
+                    AgentStatus::Creating
+                        | AgentStatus::Running
+                        | AgentStatus::AwaitingApproval
+                        | AgentStatus::Background
+                )
+            })
+    };
+    let write_handoff = move || {
+        let id = session.with_untracked(|s| s.id.clone());
+        let req = WriteHandoff {
+            instruction: instruction.get_untracked(),
+            permission_mode: mode.get_untracked(),
+            model: model_arg(model),
+        };
+        asking.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match api::write_handoff(&id, &req).await {
+                Ok(()) => {
+                    handing_off.set(false);
+                    instruction.set(String::new());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+            asking.set(false);
+        });
+    };
     let delete = move |_| {
         session.with_untracked(|s| {
             if compact {
@@ -2614,7 +3135,40 @@ fn AgentActions(
     };
     view! {
         {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+        <Show when=move || handing_off.get()>
+            <form
+                class="handoff-ask"
+                on:submit=move |ev| {
+                    ev.prevent_default();
+                    write_handoff();
+                }
+            >
+                <p class="hint">
+                    "Writes a new session's first prompt from this transcript, without a turn \
+                     in this session. You can change it before it starts."
+                </p>
+                <textarea
+                    rows="2"
+                    placeholder="What should the new session do? (optional)"
+                    aria-label="What the new session should do"
+                    prop:value=move || instruction.get()
+                    on:input=move |ev| instruction.set(event_target_value(&ev))
+                />
+                <div class="form-buttons">
+                    <button type="submit" class="primary" disabled=move || asking.get() || working()>
+                        "Write handoff"
+                    </button>
+                    <button type="button" on:click=move |_| handing_off.set(false)>"Cancel"</button>
+                </div>
+            </form>
+        </Show>
         <div class="agent-actions">
+            <button
+                class="link"
+                title="Have a new session take over from here: its first prompt is written from this transcript, without a turn in this session"
+                disabled=working
+                on:click=move |_| handing_off.update(|h| *h = !*h)
+            >"Hand off"</button>
             // A general session has nothing to land.
             <Show when=move || session.with(|s| s.repo != GENERAL)>
                 <button
@@ -2652,7 +3206,10 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     };
@@ -2687,6 +3244,40 @@ fn ReviewActions(session: Signal<AgentSession>) -> impl IntoView {
     }
 }
 
+/// The transcript of a deleted session, as the server kept it: nothing
+/// streams in and nothing can be answered. It sits in a `.agent`, after
+/// the page's header.
+#[component]
+pub fn SavedTranscript(session: AgentSession, events: Vec<AgentEvent>) -> impl IntoView {
+    let session = Signal::stored(session);
+    let events = RwSignal::new(events.into_iter().map(Arc::new).collect::<Vec<_>>());
+    // Only answers use these, and nothing here can be answered.
+    let mode = RwSignal::new(offered_mode(session.with_untracked(|s| s.backend), None));
+    let model = RwSignal::new(String::new());
+    let turn = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+                .cloned()
+        })
+    });
+    view! {
+        <Transcript
+            session=session
+            events=events
+            streaming=RwSignal::new(String::new())
+            thinking_streaming=RwSignal::new(String::new())
+            show_thinking=Signal::stored(false)
+            mode=mode
+            model=model
+            turn=turn
+            now=RwSignal::new(js_sys::Date::now() as i64)
+        />
+    }
+}
+
 /// The events to show, without the repeated ends of a turn that older
 /// servers stored: one for each background task that finished after the
 /// answer.
@@ -2701,6 +3292,26 @@ fn shown(events: &[Arc<AgentEvent>]) -> Vec<Arc<AgentEvent>> {
                 && ended(&events[i - 1]))
         })
         .map(|(_, e)| e.clone())
+        .collect()
+}
+
+/// The seqs of prompts whose images or files come in the next event, and
+/// of images whose prompt's files do. A message's time goes under its
+/// last piece, which is the images or the files there.
+fn pieces_followed_by_more(events: &[Arc<AgentEvent>]) -> HashSet<u64> {
+    events
+        .iter()
+        .zip(events.iter().skip(1))
+        .filter(|(e, next)| {
+            matches!(
+                (&e.kind, &next.kind),
+                (
+                    AgentEventKind::Prompt(_),
+                    AgentEventKind::Images(_) | AgentEventKind::Attachments(_),
+                ) | (AgentEventKind::Images(_), AgentEventKind::Attachments(_))
+            )
+        })
+        .filter_map(|(e, _)| e.seq)
         .collect()
 }
 
@@ -2739,6 +3350,113 @@ fn tool_duration(start: Option<i64>, end: Option<i64>) -> Option<i64> {
     (took >= 10_000).then_some(took)
 }
 
+/// How the task of a tool call stands, for a task that went on after the
+/// call's result came: one that runs in the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundTask {
+    /// Not over, as far as the transcript says. It only still runs while
+    /// the turn's process does. `since` is when the task started, in Unix
+    /// milliseconds: later than the call when that waited for an approval.
+    Running { since: Option<i64> },
+    /// Over; it ran from `since` to `at`, in Unix milliseconds.
+    Ended {
+        status: TaskStatus,
+        since: Option<i64>,
+        at: Option<i64>,
+    },
+    /// Its turn's process was over before the task reported an end.
+    Lost,
+}
+
+/// The tasks that run, or ran, in the background, by their tool call's
+/// id. A task that ends before its call's result is a foreground one,
+/// such as a subagent the agent waits for, and isn't listed. A prompt
+/// starts a new process, which the tasks of the one before don't outlive.
+fn background_tasks(events: &[Arc<AgentEvent>]) -> HashMap<String, BackgroundTask> {
+    // The tasks that haven't ended, with when each started.
+    let mut started = HashMap::new();
+    let mut results = HashSet::new();
+    let mut tasks = HashMap::new();
+    for e in events {
+        match &e.kind {
+            AgentEventKind::Prompt(_) => {
+                started.clear();
+                for task in tasks.values_mut() {
+                    if matches!(task, BackgroundTask::Running { .. }) {
+                        *task = BackgroundTask::Lost;
+                    }
+                }
+            }
+            AgentEventKind::TaskStarted { id, .. } => {
+                started.insert(id.as_str(), e.at);
+                if results.contains(id.as_str()) {
+                    tasks.insert(id.clone(), BackgroundTask::Running { since: e.at });
+                }
+            }
+            AgentEventKind::ToolResult { id, .. } => {
+                results.insert(id.as_str());
+                if let Some(since) = started.get(id.as_str()) {
+                    tasks.insert(id.clone(), BackgroundTask::Running { since: *since });
+                }
+            }
+            AgentEventKind::TaskEnded { id, status, .. } => {
+                started.remove(id.as_str());
+                if let Some(task) = tasks.get_mut(id)
+                    && let BackgroundTask::Running { since } = *task
+                {
+                    *task = BackgroundTask::Ended {
+                        status: *status,
+                        since,
+                        at: e.at,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    tasks
+}
+
+/// The tool calls whose tasks still run in the background, oldest first,
+/// each with when its task started.
+fn running_in_background(events: &[Arc<AgentEvent>]) -> Vec<(Arc<AgentEvent>, Option<i64>)> {
+    let tasks = background_tasks(events);
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::ToolUse {
+                id, parent: None, ..
+            } => match tasks.get(id) {
+                Some(BackgroundTask::Running { since }) => Some((e.clone(), *since)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scrolls `id`'s element to the middle of what scrolls it, clear of
+/// headers and footers that stick to the edges.
+fn scroll_to_center(id: &str) {
+    let Some(el) = document().get_element_by_id(id) else {
+        return;
+    };
+    // Called by name, as the options' types aren't among the `web-sys`
+    // features this crate builds.
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&options, &"block".into(), &"center".into());
+    if let Ok(scroll) = js_sys::Reflect::get(&el, &"scrollIntoView".into())
+        && let Some(scroll) = scroll.dyn_ref::<js_sys::Function>()
+    {
+        let _ = scroll.call1(&el, &options);
+    }
+}
+
+/// The id of a tool call's row in the transcript.
+fn tool_row_id(tool: &str) -> String {
+    format!("tool-{tool}")
+}
+
 /// What the activity bar shows the agent doing.
 #[derive(Clone, Debug, PartialEq)]
 enum Activity {
@@ -2766,7 +3484,8 @@ enum Activity {
 /// newest stored event's time. `worktree` hides a redundant leading `cd`
 /// into it in `Bash` summaries. Only calls since the latest prompt count
 /// as the turn's; a subagent's calls never get results, so they can't be
-/// unfinished `Tool`s.
+/// unfinished `Tool`s. Task events aren't the agent's doing, so the
+/// newest event is the newest other one.
 fn current_activity(
     events: &[Arc<AgentEvent>],
     streaming: bool,
@@ -2813,7 +3532,8 @@ fn current_activity(
     if streaming {
         return Activity::Writing { since: last_event };
     }
-    if let Some(e) = events.last()
+    let mut newest = events.iter().rev().filter(|e| !e.kind.is_task());
+    if let Some(e) = newest.clone().next()
         && let AgentEventKind::ToolUse {
             name,
             input,
@@ -2828,12 +3548,12 @@ fn current_activity(
         };
     }
     Activity::Thinking {
-        since: events.iter().rev().find_map(|e| e.at).or(last_event),
+        since: newest.find_map(|e| e.at).or(last_event),
     }
 }
 
 /// The line above the composer that shows what the agent is doing, while
-/// it works or waits for an approval. Everything it reads from the
+/// it works or waits for an approval or a background task. Everything it reads from the
 /// transcript sits behind a memo, so the `now` tick only reformats the
 /// times rather than rescanning it.
 #[component]
@@ -2848,7 +3568,15 @@ fn ActivityBar(
     // Whether text is streaming in; a delta alone doesn't recompute the
     // activity below.
     let streaming_text = Memo::new(move |_| streaming.with(|s| !s.is_empty()));
-    let stored_at = Memo::new(move |_| events.with(|e| e.last().and_then(|e| e.at)));
+    // When the agent last did something; a task's start or end isn't that.
+    let stored_at = Memo::new(move |_| {
+        events.with(|e| {
+            e.iter()
+                .rev()
+                .find(|e| !e.kind.is_task())
+                .and_then(|e| e.at)
+        })
+    });
     let activity = Memo::new(move |_| {
         let worktree = session.with(|s| s.worktree.clone());
         events.with(|e| current_activity(e, streaming_text.get(), stored_at.get(), &worktree))
@@ -2863,6 +3591,41 @@ fn ActivityBar(
         })
     });
     let turn_at = Signal::derive(move || turn.get().and_then(|e| e.at));
+    let summary_choice = expect_context::<GlobalSettings>().tool_summaries;
+    // The calls still running in the background: each one's id, what its
+    // row says and when its task started.
+    let background = Memo::new(move |_| {
+        let worktree = session.with(|s| s.worktree.clone());
+        let describe = summary_choice.get() == ToolSummaries::Description;
+        events.with(|events| {
+            running_in_background(events)
+                .iter()
+                .filter_map(|(e, since)| {
+                    let AgentEventKind::ToolUse {
+                        id, name, input, ..
+                    } = &e.kind
+                    else {
+                        return None;
+                    };
+                    let value = serde_json::from_str(input).unwrap_or_default();
+                    let summary = tool_summaries::description(name, &value)
+                        .filter(|_| describe)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| tool_summary(name, &value, Some(&worktree)));
+                    Some((id.clone(), format!("{name} {summary}"), *since))
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+    let answered_at = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|e| matches!(e.kind, AgentEventKind::TurnEnded { .. }))
+                .and_then(|e| e.at)
+        })
+    });
     view! {
         {move || {
             match session.with(|s| s.status) {
@@ -2880,6 +3643,43 @@ fn ActivityBar(
                         <p class="activity waiting">
                             "Waiting for your approval"
                             {waited.map(|d| format!(" · {d}"))}
+                        </p>
+                    }.into_any()
+                }
+                AgentStatus::Background => {
+                    let title = "The agent has answered, and its process keeps running until a background task it started finishes. Stop ends the task too.";
+                    let running = background.get();
+                    // One task shows how long it has run, like its row;
+                    // several, or none the backend named, how long the
+                    // wait has been.
+                    let since = match running.as_slice() {
+                        [(_, _, at)] => *at,
+                        _ => answered_at.get(),
+                    };
+                    let waited = since.map(|at| elapsed(now.get() - at));
+                    let task = running.first().map(|(id, label, _)| {
+                        let (text, hint) = match running.len() {
+                            1 => (
+                                format!("Waiting on {}", label.trim_end()),
+                                "Show the tool call",
+                            ),
+                            n => (
+                                format!("Waiting on {n} background tasks"),
+                                "Show the oldest tool call",
+                            ),
+                        };
+                        let row = tool_row_id(id);
+                        view! {
+                            <button type="button" class="link activity-task" title=hint on:click=move |_| scroll_to_center(&row)>{text}</button>
+                        }
+                    });
+                    view! {
+                        <p class="activity waiting" title=title>
+                            {match task {
+                                Some(task) => task.into_any(),
+                                None => "Waiting on a background task".into_any(),
+                            }}
+                            {waited.map(|d| view! { <span class="activity-time">{format!("· {d}")}</span> })}
                         </p>
                     }.into_any()
                 }
@@ -2954,6 +3754,7 @@ fn Transcript(
     turn: Memo<Option<Arc<AgentEvent>>>,
     now: RwSignal<i64>,
 ) -> impl IntoView {
+    let summary_choice = expect_context::<GlobalSettings>().tool_summaries;
     // Tool results and approval answers are shown with the event they
     // belong to. The map compares by pointer rather than by content, so a
     // rebuild doesn't re-read every result's text.
@@ -2979,6 +3780,19 @@ fn Transcript(
             _ => true,
         },
     );
+    // The handoffs the user asked for that are written, or failed.
+    let handoffs_written = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::HandoffProposed { id, .. }
+                    | AgentEventKind::HandoffFailed { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>()
+        })
+    });
     let resolved = Memo::new(move |_| {
         events.with(|events| {
             events
@@ -2992,6 +3806,21 @@ fn Transcript(
                 .collect::<HashMap<_, _>>()
         })
     });
+    // When each request was resolved, in Unix milliseconds.
+    let resolved_at = Memo::new(move |_| {
+        events.with(|events| {
+            events
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    AgentEventKind::ApprovalResolved { id, .. } => Some((id.clone(), e.at?)),
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+    });
+    // A prompt with images gets its time under the images, the last
+    // piece of the message.
+    let more_follows = Memo::new(move |_| events.with(|e| pieces_followed_by_more(e)));
     // The `AskUserQuestion` answers the user gave, by tool use id.
     let given_answers = Memo::new(move |_| {
         events.with(|events| {
@@ -3040,6 +3869,8 @@ fn Transcript(
             })
         })
     });
+    // The calls whose tasks outlived their results.
+    let tasks = Memo::new(move |_| events.with(|e| background_tasks(e)));
     // Calls from before the current turn that have no result belong to
     // interrupted turns, so they don't get a running timer.
     let turn_start = Signal::derive(move || turn.get().and_then(|e| e.seq));
@@ -3048,7 +3879,10 @@ fn Transcript(
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     });
@@ -3061,6 +3895,7 @@ fn Transcript(
             s.worktree.clone(),
         )
     });
+    let known = session_refs(id.clone());
 
     // Keeps the newest output in view, starting with the bottom of the
     // transcript, until the user scrolls up. Scrolling back down follows
@@ -3208,26 +4043,58 @@ fn Transcript(
                         // A prompt can be only images.
                         AgentEventKind::Prompt(p) if p.trim().is_empty() => ().into_any(),
                         AgentEventKind::Prompt(p)
-                        | AgentEventKind::ApprovalResolved { message: Some(p), .. } => view! {
-                            <div class="turn-prompt">{p.clone()}</div>
+                        | AgentEventKind::ApprovalResolved { message: Some(p), .. } => {
+                            let timed = move || !seq.is_some_and(|s| more_follows.with(|set| set.contains(&s)));
+                            view! {
+                                <div class="turn-msg turn-msg-user">
+                                    <div class="turn-prompt">{p.clone()}</div>
+                                    {move || turn_time(at.filter(|_| timed()))}
+                                </div>
+                            }.into_any()
+                        }
+                        AgentEventKind::Attachments(sent) => view! {
+                            <div class="turn-msg turn-msg-user">
+                                <div class="turn-files">
+                                    {sent.iter().map(|f| {
+                                        let url = format!(
+                                            "/api/agents/{id}/attachments/{}/{}",
+                                            f.dir,
+                                            js_sys::encode_uri_component(&f.name),
+                                        );
+                                        view! {
+                                            <a class="file-chip" href=url download=f.name.clone() title="Download the file">
+                                                <span class="prompt-file-name">{f.name.clone()}</span>
+                                                <span class="prompt-file-status">{files::human_size(f.size)}</span>
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                                {turn_time(at)}
+                            </div>
                         }.into_any(),
                         AgentEventKind::Images(names) => view! {
-                            <div class="turn-images">
-                                {names.iter().map(|name| {
-                                    let url = format!("/api/agents/{id}/images/{name}");
-                                    view! {
-                                        <a href=url.clone() target="_blank" rel="noopener">
-                                            <img src=url.clone() alt="Image sent with the prompt" />
-                                        </a>
-                                    }
-                                }).collect_view()}
+                            <div class="turn-msg turn-msg-user">
+                                <div class="turn-images">
+                                    {names.iter().map(|name| {
+                                        let url = format!("/api/agents/{id}/images/{name}");
+                                        view! {
+                                            <a href=url.clone() target="_blank" rel="noopener">
+                                                <img src=url.clone() alt="Image sent with the prompt" />
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                                {move || turn_time(at.filter(|_| !seq.is_some_and(|s| more_follows.with(|set| set.contains(&s)))))}
                             </div>
                         }.into_any(),
                         AgentEventKind::Text(t) => view! {
-                            <div class="turn-text markdown" inner_html=markdown::to_html(t, &repo)></div>
+                            <div class="turn-msg turn-msg-agent">
+                                <div class="turn-text markdown" inner_html=linked_markdown(t, &repo, known)></div>
+                                {turn_time(at)}
+                            </div>
                         }.into_any(),
                         AgentEventKind::Thinking(t) => {
-                            let html = markdown::to_html(t, &repo);
+                            let html = linked_markdown(t, &repo, known);
                             view! {
                                 {move || show_thinking.get().then(|| view! {
                                     <div class="turn-thinking">
@@ -3242,8 +4109,24 @@ fn Transcript(
                             let value: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
                             let summary = tool_summary(name, &value, Some(&worktree));
                             let title = summary_title(&value, &summary);
+                            let description = tool_summaries::description(name, &value).map(str::to_owned);
+                            let summary_view = move || match description.clone() {
+                                Some(d) if summary_choice.get() == ToolSummaries::Description => {
+                                    // Task and Agent summaries already are the
+                                    // description, which needs no tooltip.
+                                    let title = (!summary.is_empty() && summary != d)
+                                        .then(|| summary.clone());
+                                    view! { <span class="tool-description" title=title>{d}</span> }.into_any()
+                                }
+                                _ => view! { <code title=title.clone()>{summary.clone()}</code> }.into_any(),
+                            };
                             let tool = tool.clone();
                             let approval_id = tool.clone();
+                            let row_id = tool_row_id(&tool);
+                            let task = Memo::new({
+                                let tool = tool.clone();
+                                move |_| tasks.with(|t| t.get(&tool).copied())
+                            });
                             let result = Memo::new_with_compare(
                                 move |_| results.with(|r| r.get(&tool).cloned()),
                                 |prev, cur| match (prev, cur) {
@@ -3269,7 +4152,7 @@ fn Transcript(
                                 }
                             };
                             view! {
-                                <details class="tool">
+                                <details class="tool" id=row_id>
                                     <summary>
                                         {move || {
                                             let done = result.with(|r| {
@@ -3278,6 +4161,27 @@ fn Transcript(
                                                         .map(|(_, is_error, _, _)| is_error)
                                                 })
                                             });
+                                            // The call returned, but what it
+                                            // started may still run, and says
+                                            // itself how it went.
+                                            if done.is_some() && let Some(task) = task.get() {
+                                                let (class, label) = match task {
+                                                    BackgroundTask::Running { .. } if waiting.get() => {
+                                                        return view! {
+                                                            <span class="spinner background" role="img" aria-label="Running in background" title="Running in background"></span>
+                                                        }
+                                                        .into_any();
+                                                    }
+                                                    BackgroundTask::Running { .. } | BackgroundTask::Lost => ("interrupted", "Interrupted"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Completed, .. } => ("ok", "Succeeded"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Failed, .. } => ("error", "Failed"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Stopped, .. } => ("interrupted", "Stopped"),
+                                                };
+                                                return view! {
+                                                    <span class=format!("tool-status {class}") role="img" aria-label=label title=label></span>
+                                                }
+                                                .into_any();
+                                            }
                                             // Still running, in this turn: a
                                             // spinner. Done or interrupted: a
                                             // dot in the same spot.
@@ -3307,7 +4211,7 @@ fn Transcript(
                                             }
                                         }}
                                         " " <span class="tool-name">{name.clone()}</span>
-                                        " " <code title=title>{summary}</code>
+                                        " " {summary_view}
                                         {move || {
                                             resolved.with(|r| r.get(&approval_id).copied()).map(|allow| {
                                                 let (class, label, mark) = match allow {
@@ -3330,6 +4234,27 @@ fn Transcript(
                                                     )
                                                 })
                                             });
+                                            // A background task's time runs
+                                            // from the task's start, not the
+                                            // call's, to its end.
+                                            if done.is_some() && let Some(task) = task.get() {
+                                                let took = match task {
+                                                    BackgroundTask::Running { since } if waiting.get() => {
+                                                        since.map(|at| now.get() - at)
+                                                    }
+                                                    BackgroundTask::Ended { since, at: Some(end), .. } => {
+                                                        since.map(|at| end - at)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                return view! {
+                                                    <span class="muted tool-background">
+                                                        " · background"
+                                                        {took.map(|d| format!(" · {}", elapsed(d)))}
+                                                    </span>
+                                                }
+                                                .into_any();
+                                            }
                                             match done {
                                                 // For a running call, how long it
                                                 // has taken when the call is timed.
@@ -3391,9 +4316,11 @@ fn Transcript(
                                 <PlanCard
                                     agent=id
                                     tool=tool.clone()
-                                    plan=markdown::to_html(plan, &repo)
+                                    plan=Signal::derive(linked_markdown(plan, &repo, known))
                                     backend=backend
+                                    asked=at
                                     resolved=resolved
+                                    resolved_at=resolved_at
                                     open=open
                                     waiting=waiting
                                     mode=mode
@@ -3411,8 +4338,11 @@ fn Transcript(
                                     tool=tool.clone()
                                     backend=backend
                                     repo=repo.clone()
+                                    known=known
                                     questions=questions
+                                    asked=at
                                     resolved=resolved
+                                    resolved_at=resolved_at
                                     answers=given_answers
                                     waiting=waiting
                                 />
@@ -3426,6 +4356,36 @@ fn Transcript(
                                 resolved=resolved
                                 waiting=waiting
                             />
+                        }.into_any(),
+                        AgentEventKind::HandoffRequested { id: request, instruction } => {
+                            let request = request.clone();
+                            let writing = Signal::derive(move || {
+                                !handoffs_written.with(|w| w.contains(&request))
+                            });
+                            let instruction = instruction.clone();
+                            view! {
+                                <p class="turn-end handoff-requested" class:writing=writing>
+                                    {move || if writing.get() { "Writing a handoff…" } else { "Asked for a handoff" }}
+                                    {(!instruction.is_empty()).then(|| view! {
+                                        ": " <span class="handoff-instruction">{instruction.clone()}</span>
+                                    })}
+                                </p>
+                            }.into_any()
+                        }
+                        AgentEventKind::HandoffProposed { id: proposal, input } => view! {
+                            <HandoffCard
+                                agent=id
+                                tool=proposal.clone()
+                                input=input.clone()
+                                resolved=resolved
+                                waiting=waiting
+                                by_user=true
+                            />
+                        }.into_any(),
+                        AgentEventKind::HandoffFailed { error, .. } => view! {
+                            <p class="turn-end error handoff-failed">
+                                {format!("Writing the handoff failed: {error}")}
+                            </p>
                         }.into_any(),
                         AgentEventKind::HandedOff { id: child, title } => view! {
                             <p class="turn-end handed-off">
@@ -3510,6 +4470,8 @@ fn Transcript(
                             <pre class="turn-error">{format!("Couldn't wrap up: {e}")}</pre>
                         }.into_any(),
                         AgentEventKind::ToolResult { .. }
+                        | AgentEventKind::TaskStarted { .. }
+                        | AgentEventKind::TaskEnded { .. }
                         | AgentEventKind::ApprovalResolved { .. }
                         | AgentEventKind::TextDelta(_)
                         | AgentEventKind::ThinkingDelta(_)
@@ -3593,10 +4555,14 @@ fn PlanCard(
     agent: String,
     tool: String,
     /// The plan as HTML.
-    plan: String,
+    plan: Signal<String>,
     /// The session's backend, for the modes the turn can go on in.
     backend: AgentBackend,
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
     resolved: Memo<HashMap<String, Answer>>,
+    /// When each request was resolved, in Unix milliseconds.
+    resolved_at: Memo<HashMap<String, i64>>,
     /// Whether this is the plan the last turn ended on, still unanswered.
     open: Signal<bool>,
     waiting: Signal<bool>,
@@ -3610,6 +4576,7 @@ fn PlanCard(
     let feedback = RwSignal::new(String::new());
     // The mode the backend prefers the turn to go on in.
     let then = RwSignal::new(PermissionMode::new(backend.plan_default_mode()));
+    let name = StoredValue::new(tool.clone());
     let state = {
         let tool = tool.clone();
         Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)))
@@ -3654,13 +4621,26 @@ fn PlanCard(
         busy.set(true);
         error.set(None);
         spawn_local(async move {
-            if let Err(e) = api::send_agent_message(&agent, prompt, Vec::new(), next, model).await {
+            if let Err(e) =
+                api::send_agent_message(&agent, prompt, Vec::new(), Vec::new(), next, model).await
+            {
                 error.set(Some(e));
             }
             busy.set(false);
         });
     };
     let answer = StoredValue::new(answer);
+    let ended =
+        Signal::derive(move || resolved_at.with(|r| name.with_value(|n| r.get(n).copied())));
+    // An expired request's time can be the server's restart, long after
+    // the agent stopped waiting.
+    let outcome = Signal::derive(move || {
+        match resolved.with(|r| name.with_value(|n| r.get(n).copied()))? {
+            Answer::Allowed => Some("Approved"),
+            Answer::Denied => Some("Sent back"),
+            Answer::Expired => None,
+        }
+    });
     let pending = move || state.get().is_none() && open.get();
     view! {
         <div class="approval plan" class:pending=pending>
@@ -3673,7 +4653,7 @@ fn PlanCard(
                     None => "The turn ended before the plan was answered. Answering it continues the session.".to_owned(),
                 }}
             </p>
-            <div class="plan-text markdown" inner_html=plan></div>
+            <div class="plan-text markdown" inner_html=move || plan.get()></div>
             {move || pending().then(|| view! {
                 <textarea
                     class="plan-feedback"
@@ -3690,6 +4670,7 @@ fn PlanCard(
                 </div>
             })}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <AskTimes asked=asked ended=ended outcome=outcome />
         </div>
     }
 }
@@ -3748,19 +4729,28 @@ fn QuestionCard(
     backend: AgentBackend,
     /// The session's repository, for links in a question's Markdown.
     repo: String,
+    /// The sessions a question may refer to.
+    known: Memo<Vec<SessionRef>>,
     questions: Vec<Question>,
+    /// When the agent asked, in Unix milliseconds.
+    asked: Option<i64>,
     resolved: Memo<HashMap<String, Answer>>,
+    /// When each request was resolved, in Unix milliseconds.
+    resolved_at: Memo<HashMap<String, i64>>,
     /// The answers the user gave, by tool use id.
     answers: Memo<HashMap<String, BTreeMap<String, Vec<String>>>>,
     waiting: Signal<bool>,
 ) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
-    // The options picked and the text written for each question.
-    let picks: Vec<(RwSignal<Vec<String>>, RwSignal<String>)> = questions
-        .iter()
-        .map(|_| (RwSignal::new(Vec::new()), RwSignal::new(String::new())))
-        .collect();
+    // The options picked and the text written for each question, kept in
+    // local storage until the question is resolved.
+    let key = StoredValue::new(question_draft_key(&agent, &tool));
+    let picks: Vec<(RwSignal<Vec<String>>, RwSignal<String>)> =
+        load_question_draft(&key.get_value(), &questions)
+            .into_iter()
+            .map(|d| (RwSignal::new(d.picked), RwSignal::new(d.other)))
+            .collect();
     let questions = StoredValue::new(questions);
     let picks = StoredValue::new(picks);
     let collect_answers = move || {
@@ -3796,7 +4786,44 @@ fn QuestionCard(
     let name = StoredValue::new(tool.clone());
     let state =
         Signal::derive(move || resolved.with(|r| r.get(&tool).map(|a| *a == Answer::Allowed)));
+    let ended =
+        Signal::derive(move || resolved_at.with(|r| name.with_value(|n| r.get(n).copied())));
+    // An expired request's time can be the server's restart, long after
+    // the agent stopped waiting.
+    let outcome = Signal::derive(move || {
+        match resolved.with(|r| name.with_value(|n| r.get(n).copied()))? {
+            Answer::Allowed => Some("Answered"),
+            Answer::Denied => Some("Closed"),
+            Answer::Expired => None,
+        }
+    });
     let pending = move || state.get().is_none() && waiting.get();
+    // Keeps what's picked and written while the form is shown, and drops
+    // it otherwise: once the question is answered or skipped, here or
+    // elsewhere, or once nobody waits for an answer any more, e.g. after
+    // the session stopped (the server then expires the question). The
+    // picks stay in memory, so a status that's only late to say the
+    // session waits stores them again once it does.
+    Effect::new(move |_| {
+        let draft: Vec<QuestionDraft> = picks.with_value(|ps| {
+            ps.iter()
+                .map(|(picked, other)| QuestionDraft {
+                    picked: picked.get(),
+                    other: other.get(),
+                })
+                .collect()
+        });
+        let Some(s) = storage() else { return };
+        let key = key.get_value();
+        let _ = if !pending() || draft.iter().all(QuestionDraft::is_empty) {
+            s.remove_item(&key)
+        } else {
+            match serde_json::to_string(&draft) {
+                Ok(v) => s.set_item(&key, &v),
+                Err(_) => Ok(()),
+            }
+        };
+    });
     view! {
         <div class="approval questions" class:pending=pending>
             <p>
@@ -3837,20 +4864,20 @@ fn QuestionCard(
                                     prop:checked=checked
                                     on:change=toggle
                                 />
-                                " " <span>{o.label}</span>
+                                " " <span inner_html=linked_text(&o.label, known)></span>
                                 {(!o.description.is_empty()).then(|| view! {
-                                    <span class="muted">{format!(" – {}", o.description)}</span>
+                                    <span class="muted" inner_html=linked_text(&format!(" – {}", o.description), known)></span>
                                 })}
                             </label>
                         }
                     }).collect_view();
                     let (title, body) = question_parts(&q.question);
-                    let body = body.map(|b| markdown::to_html(b, &repo));
+                    let body = body.map(|b| linked_markdown(b, &repo, known));
                     view! {
                         <fieldset class="question">
                             <legend>
                                 {(!q.header.is_empty()).then(|| view! { <span class="badge">{q.header}</span> " " })}
-                                {title.to_owned()}
+                                <span inner_html=linked_text(title, known)></span>
                             </legend>
                             {body.map(|html| view! {
                                 <div class="question-body markdown" inner_html=html></div>
@@ -3889,30 +4916,32 @@ fn QuestionCard(
             } else {
                 questions.with_value(|qs| qs.iter().map(|q| {
                     let (title, body) = question_parts(&q.question);
-                    let body = body.map(|b| markdown::to_html(b, &repo));
+                    let body = body.map(|b| linked_markdown(b, &repo, known));
                     let given = answers.with(|a| {
                         a.get(&name.get_value())
                             .and_then(|m| m.get(&q.question))
                             .cloned()
                     });
                     view! {
-                        <p class="muted">{title.to_owned()}</p>
+                        <p class="muted" inner_html=linked_text(title, known)></p>
                         {body.map(|html| view! {
                             <div class="question-body markdown" inner_html=html></div>
                         })}
                         {given.filter(|v| !v.is_empty()).map(|v| view! {
-                            <p class="question-answer"><strong>{v.join(", ")}</strong></p>
+                            <p class="question-answer"><strong inner_html=linked_text(&v.join(", "), known)></strong></p>
                         })}
                     }
                 }).collect_view()).into_any()
             }}
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
+            <AskTimes asked=asked ended=ended outcome=outcome />
         </div>
     }
 }
 
-/// `handoff`: the session the agent proposes to start, in a `NewSession`
-/// form the user can change it in before starting it, or decline it.
+/// A handoff proposal, the agent's `handoff` request or one written for
+/// the user: the session it proposes to start, in a `NewSession` form
+/// the user can change it in before starting it, or decline it.
 #[component]
 fn HandoffCard(
     agent: String,
@@ -3921,8 +4950,12 @@ fn HandoffCard(
     input: String,
     resolved: Memo<HashMap<String, Answer>>,
     /// Whether the backend is running and so may wait for an answer;
-    /// requests from before a restart stay unanswered.
+    /// an agent's requests from before a restart stay unanswered.
     waiting: Signal<bool>,
+    /// Whether the user asked for the handoff: no agent waits for the
+    /// answer, so the proposal stays open until it's answered.
+    #[prop(optional)]
+    by_user: bool,
 ) -> impl IntoView {
     let drafts = expect_context::<Drafts>();
     let draft = drafts::handoff_id(&tool);
@@ -3933,7 +4966,7 @@ fn HandoffCard(
     };
     // Only whether the form shows, so that it isn't rebuilt, losing what
     // the user typed, whenever something else changes.
-    let open = Memo::new(move |_| state.get().is_none() && waiting.get());
+    let open = Memo::new(move |_| state.get().is_none() && (by_user || waiting.get()));
     // A proposal that didn't start leaves nothing to keep. An allowed
     // one's draft goes once the sidebar moved its start mode onto the
     // new session.
@@ -3942,9 +4975,7 @@ fn HandoffCard(
         Effect::new(move |_| {
             if matches!(state.get(), Some(Answer::Denied | Answer::Expired)) {
                 drafts.remove(&draft);
-                if let Some(s) = storage() {
-                    let _ = s.remove_item(&start_mode_key(&draft));
-                }
+                forget_start(&draft);
             }
         });
     }
@@ -3962,6 +4993,7 @@ fn HandoffCard(
                 let request = HandoffRequest {
                     agent: agent.clone(),
                     tool: tool.clone(),
+                    by_user,
                 };
                 return view! {
                     <div class="approval pending">
@@ -4098,6 +5130,34 @@ fn ApprovalCard(
     }
 }
 
+/// Whether the transcript `events` has a handoff the user asked for
+/// that's still being written: a turn would change the transcript the
+/// job reads.
+fn writes_handoff(events: &[Arc<AgentEvent>]) -> bool {
+    let mut writing = HashSet::new();
+    for e in events {
+        match &e.kind {
+            AgentEventKind::HandoffRequested { id, .. } => {
+                writing.insert(id.as_str());
+            }
+            AgentEventKind::HandoffProposed { id, .. }
+            | AgentEventKind::HandoffFailed { id, .. } => {
+                writing.remove(id.as_str());
+            }
+            _ => {}
+        }
+    }
+    !writing.is_empty()
+}
+
+thread_local! {
+    /// The follow-up box on the page for each session that has one, so
+    /// that a send that outlives its box can empty the one that took its
+    /// place; see `Composer`'s `send`.
+    static COMPOSERS: RefCell<HashMap<String, (RwSignal<String>, Attached)>> =
+        RefCell::default();
+}
+
 #[component]
 fn Composer(
     session: Signal<AgentSession>,
@@ -4105,38 +5165,108 @@ fn Composer(
     active_model: Signal<Option<String>>,
     mode: RwSignal<PermissionMode>,
     model: RwSignal<String>,
+    /// Whether a handoff the user asked for is being written; follow-ups
+    /// wait until it is.
+    writing_handoff: Signal<bool>,
 ) -> impl IntoView {
     let id = StoredValue::new(session.with_untracked(|s| s.id.clone()));
     let backend = Signal::derive(move || session.with(|s| s.backend));
     // The follow-up being written in this session.
     let prompt = id.with_value(|id| draft_signal(draft_key(id)));
-    // The images pasted so far, kept with the draft in IndexedDB.
+    let textarea = NodeRef::<leptos::html::Textarea>::new();
+    let suggest = Suggest::new(
+        textarea,
+        prompt,
+        Signal::derive(move || slash::Source::Session(id.get_value())),
+    );
+    // The images pasted so far, kept with the draft in IndexedDB, and the
+    // other files, kept in localStorage.
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
+    let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
+    let attached = Attached { images, files };
+    let session_id = id.get_value();
+    COMPOSERS.with(|c| {
+        c.borrow_mut()
+            .insert(session_id.clone(), (prompt, attached))
+    });
+    on_cleanup(move || {
+        COMPOSERS.with(|c| {
+            let mut composers = c.borrow_mut();
+            // Unless the session's next box is on the page already.
+            if composers
+                .get(&session_id)
+                .is_some_and(|(p, _)| *p == prompt)
+            {
+                composers.remove(&session_id);
+            }
+        });
+    });
     let error = RwSignal::new(None::<String>);
-    let blank = move || prompt.with(|p| p.trim().is_empty()) && images.with(Vec::is_empty);
+    let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
         session.with(|s| {
             matches!(
                 s.status,
-                AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+                AgentStatus::Creating
+                    | AgentStatus::Running
+                    | AgentStatus::AwaitingApproval
+                    | AgentStatus::Background
             )
         })
     };
 
     let send = move || {
-        if blank() {
+        if blank() || files.pending_untracked() || writing_handoff.get_untracked() {
             return;
         }
         let text = prompt.get_untracked();
-        let attached = images.get_untracked();
+        let sent_images = images.get_untracked();
+        let ids = files.ids();
         let mode = mode.get_untracked();
         let model = model_arg(model);
+        // Read here because the task outlives the composer, which owns it.
+        let id = id.get_value();
         spawn_local(async move {
-            match api::send_agent_message(&id.get_value(), text, attached, mode, model).await {
+            let sent = text.clone();
+            match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
-                    prompt.set(String::new());
-                    images.set(Vec::new());
-                    image_drafts::forget(&image_drafts::agent_key(&id.get_value()));
+                    // The session may have been left by now. This box's
+                    // signals are gone then, and with them what keeps the
+                    // draft in step, so the kept draft is emptied here as
+                    // well. If the session was come back to meanwhile,
+                    // its new box read the draft before it was emptied
+                    // and would go on offering it: that box is the one to
+                    // empty. Like this one, it doesn't know of the send
+                    // until then, so Enter in it before the answer sends
+                    // the follow-up twice.
+                    let (prompt, attached) = COMPOSERS
+                        .with(|c| c.borrow().get(&id).copied())
+                        .unwrap_or((prompt, attached));
+                    // Only the sent text goes: what the box holds
+                    // instead by now was typed since and is the next
+                    // draft. A box that is gone answers `None`, and the
+                    // kept draft is then all there is to look at.
+                    match prompt.try_with_untracked(|p| *p == sent) {
+                        Some(true) => {
+                            prompt.set(String::new());
+                            if let Some(s) = storage() {
+                                let _ = s.remove_item(&draft_key(&id));
+                            }
+                        }
+                        Some(false) => {}
+                        None => {
+                            let key = draft_key(&id);
+                            if let Some(s) = storage()
+                                && s.get_item(&key).ok().flatten().as_deref() == Some(&*sent)
+                            {
+                                let _ = s.remove_item(&key);
+                            }
+                        }
+                    }
+                    attached.images.set(Vec::new());
+                    let key = image_drafts::agent_key(&id);
+                    image_drafts::forget(&key);
+                    attached.files.sent(&key, &ids);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
@@ -4159,29 +5289,43 @@ fn Composer(
                 send();
             }
             on:dragover=images::drag_over
-            on:drop=move |ev| images::drop(ev, images, error)
+            on:drop=move |ev| images::drop(ev, attached)
         >
+            <div class="slash-anchor">
             <textarea
+                node_ref=textarea
                 rows="3"
                 aria-label="Follow-up"
-                placeholder=move || if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
+                placeholder=move || if writing_handoff.get() { "Writing a handoff… You can reply once it's written.".to_owned() } else if session.with(|s| s.status == AgentStatus::Background) { "Queue a follow-up for when the background task finishes… (Enter sends, Shift+Enter for a new line)".to_owned() } else if working() { "Queue a follow-up… (Enter sends, Shift+Enter for a new line)".to_owned() } else { format!("Reply to {}… (Enter sends, Shift+Enter for a new line)", backend.get().agent_name()) }
                 prop:value=move || prompt.get()
-                on:input=move |ev| prompt.set(event_target_value(&ev))
-                on:paste=move |ev| images::paste(ev, images, error)
+                on:input=move |ev| {
+                    prompt.set(event_target_value(&ev));
+                    suggest.input();
+                }
+                on:paste=move |ev| images::paste(ev, attached)
                 on:keydown=move |ev| {
+                    if suggest.keydown(&ev) {
+                        return;
+                    }
                     if submits(&ev) {
                         ev.prevent_default();
                         send();
                     }
                 }
+                on:keyup=move |ev| suggest.keyup(&ev)
+                on:click=move |_| suggest.clicked()
+                on:blur=move |_| suggest.blur()
             ></textarea>
+            <SlashList suggest=suggest above=true />
+            </div>
             <Attachments images=images />
+            <FileChips files=files />
             {move || error.get().map(|e| view! { <p class="error">{e}</p> })}
             <div class="form-buttons">
                 <ModeSelect mode=mode backend=backend />
-                <ModelSelect model=model backend=backend />
-                <button type="submit" class="primary" disabled=blank>"Send"</button>
-                <AttachButton images=images error=error />
+                <ModelSelect model=model backend=backend session=SessionPick { id, reported: active_model } />
+                <button type="submit" class="primary" disabled=move || blank() || files.pending() || writing_handoff.get()>"Send"</button>
+                <AttachButton attached=attached />
                 {move || working().then(|| view! { <button type="button" on:click=stop>"Stop"</button> })}
                 <div class="composer-status">
                     {move || active_model.get().map(|m| view! { <span class="agent-model" title="Model">{m}</span> })}
@@ -4290,6 +5434,34 @@ mod tests {
         .map(Arc::new);
         let seqs: Vec<_> = shown(&events).iter().filter_map(|e| e.seq).collect();
         assert_eq!(seqs, [1, 2, 4, 6, 7]);
+    }
+
+    #[test]
+    fn pieces_followed_by_more_marks_all_but_the_last() {
+        let event = |seq, kind| {
+            Arc::new(AgentEvent {
+                seq: Some(seq),
+                at: None,
+                kind,
+            })
+        };
+        let events = [
+            event(1, AgentEventKind::Prompt("hi".into())),
+            event(2, AgentEventKind::Images(vec!["a.png".into()])),
+            event(3, AgentEventKind::Prompt("bye".into())),
+            event(4, AgentEventKind::Text("on it".into())),
+            event(5, AgentEventKind::Images(vec!["b.png".into()])),
+            event(6, AgentEventKind::Prompt("later".into())),
+            event(7, AgentEventKind::Prompt("read it".into())),
+            event(8, AgentEventKind::Images(vec!["c.png".into()])),
+            event(9, AgentEventKind::Attachments(Vec::new())),
+            event(10, AgentEventKind::Prompt("and this".into())),
+            event(11, AgentEventKind::Attachments(Vec::new())),
+        ];
+        assert_eq!(
+            pieces_followed_by_more(&events),
+            HashSet::from([1, 7, 8, 10])
+        );
     }
 
     fn event(seq: Option<u64>, kind: AgentEventKind) -> Incoming {
@@ -4524,10 +5696,29 @@ mod tests {
             "cd /w/t&& x",
             "cd /w/t/; x",
         ] {
-            assert_eq!(strip_cd(command, "/w/t"), "x", "{command}");
+            assert_eq!(shorten_cd(command, "/w/t"), "x", "{command}");
+        }
+        for (command, shortened) in [
+            ("cd /w/t/sub && x", "cd sub && x"),
+            ("cd /w/t/a/b && x", "cd a/b && x"),
+            ("cd /w/t/sub/ && x", "cd sub && x"),
+            ("  cd /w/t/sub   &&   x", "cd sub && x"),
+            ("cd /w/t/sub&& x", "cd sub && x"),
+            ("cd /w/t/sub; x", "cd sub; x"),
+            ("cd /w/t/sub;x", "cd sub; x"),
+            (r#"cd "/w/t/a b" && x"#, r#"cd "a b" && x"#),
+            ("cd '/w/t/a b'; x", "cd 'a b'; x"),
+            ("cd /w/t/sub", "cd sub"),
+            ("cd /w/t/sub/", "cd sub"),
+        ] {
+            assert_eq!(shorten_cd(command, "/w/t"), shortened, "{command}");
+            assert_eq!(shorten_cd(command, "/w/t/"), shortened, "{command}");
         }
         for command in [
-            "cd /w/t/sub && x",
+            "cd sub && x",
+            "cd /w/t/sub && ",
+            "cd /w/t/sub& x",
+            "cd /w/t-other/x && y",
             "cd /other && x",
             "cd /w/t",
             "cd /w/t && ",
@@ -4536,9 +5727,10 @@ mod tests {
             "cd /w/t& x",
             "cd /w/t;",
         ] {
-            assert_eq!(strip_cd(command, "/w/t"), command, "{command}");
+            assert_eq!(shorten_cd(command, "/w/t"), command, "{command}");
         }
-        assert_eq!(strip_cd("cd /w/t && x", ""), "cd /w/t && x");
+        assert_eq!(shorten_cd("cd /w/t && x", ""), "cd /w/t && x");
+        assert_eq!(shorten_cd("cd /w/t/sub && x", ""), "cd /w/t/sub && x");
     }
 
     #[test]
@@ -4559,6 +5751,8 @@ mod tests {
         let input = serde_json::json!({"command": "cd /w/t && ls\nmore"});
         assert_eq!(tool_summary("Bash", &input, Some("/w/t")), "ls");
         assert_eq!(tool_summary("Bash", &input, None), "cd /w/t && ls");
+        let input = serde_json::json!({"command": "cd /w/t/sub && ls\nmore"});
+        assert_eq!(tool_summary("Bash", &input, Some("/w/t")), "cd sub && ls");
         let input = serde_json::json!({"file_path": "/w/a.rs"});
         assert_eq!(tool_summary("Edit", &input, None), "/w/a.rs");
         assert_eq!(tool_summary("mcp__x__y", &input, None), "");
@@ -4803,6 +5997,153 @@ mod tests {
     }
 
     #[test]
+    fn a_handoff_is_written_until_proposed_or_failed() {
+        let event = |kind| {
+            Arc::new(AgentEvent {
+                seq: None,
+                at: None,
+                kind,
+            })
+        };
+        let requested = |id: &str| {
+            event(AgentEventKind::HandoffRequested {
+                id: id.into(),
+                instruction: String::new(),
+            })
+        };
+        let mut events = vec![requested("handoff-1")];
+        assert!(writes_handoff(&events));
+        events.push(event(AgentEventKind::HandoffProposed {
+            id: "handoff-1".into(),
+            input: "{}".into(),
+        }));
+        assert!(!writes_handoff(&events));
+        events.push(requested("handoff-2"));
+        assert!(writes_handoff(&events));
+        events.push(event(AgentEventKind::HandoffFailed {
+            id: "handoff-2".into(),
+            error: "no".into(),
+        }));
+        assert!(!writes_handoff(&events));
+    }
+
+    #[test]
+    fn finds_the_tasks_in_the_background() {
+        let event = |seq: u64, kind| {
+            Arc::new(AgentEvent {
+                seq: Some(seq),
+                at: Some(seq as i64 * 1_000),
+                kind,
+            })
+        };
+        let prompt = |seq| event(seq, AgentEventKind::Prompt("go".into()));
+        let call = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::ToolUse {
+                    id: id.into(),
+                    name: "Bash".into(),
+                    input: "{}".into(),
+                    parent: None,
+                },
+            )
+        };
+        let started = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::TaskStarted {
+                    id: id.into(),
+                    task: format!("task-{id}"),
+                },
+            )
+        };
+        let result = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::ToolResult {
+                    id: id.into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    patch: Vec::new(),
+                    images: Vec::new(),
+                },
+            )
+        };
+        let ended = |seq, id: &str, status| {
+            event(
+                seq,
+                AgentEventKind::TaskEnded {
+                    id: id.into(),
+                    task: format!("task-{id}"),
+                    status,
+                },
+            )
+        };
+        let running = |events: &[Arc<AgentEvent>]| -> Vec<u64> {
+            running_in_background(events)
+                .iter()
+                .filter_map(|(e, _)| e.seq)
+                .collect()
+        };
+
+        // A call without a task, and one whose task is over before its
+        // result, such as a subagent the agent waits for: neither is in
+        // the background.
+        let mut events = vec![
+            prompt(1),
+            call(2, "plain"),
+            result(3, "plain"),
+            call(4, "sub"),
+            started(5, "sub"),
+            ended(6, "sub", TaskStatus::Completed),
+            result(7, "sub"),
+        ];
+        assert_eq!(background_tasks(&events), HashMap::new());
+
+        // A task that's still going when its call returns is. A task
+        // that hasn't returned yet isn't, whatever order they came in.
+        events.extend([
+            call(8, "a"),
+            call(9, "b"),
+            call(10, "c"),
+            started(11, "a"),
+            result(12, "a"),
+            started(13, "b"),
+            result(14, "b"),
+            started(15, "c"),
+        ]);
+        assert_eq!(running(&events), [8, 9]);
+        // Each runs since its task started, not since its call.
+        assert_eq!(
+            running_in_background(&events)
+                .iter()
+                .map(|(_, since)| *since)
+                .collect::<Vec<_>>(),
+            [Some(11_000), Some(13_000)]
+        );
+
+        events.push(ended(16, "a", TaskStatus::Failed));
+        assert_eq!(running(&events), [9]);
+        assert_eq!(
+            background_tasks(&events)["a"],
+            BackgroundTask::Ended {
+                status: TaskStatus::Failed,
+                since: Some(11_000),
+                at: Some(16_000),
+            }
+        );
+
+        // The next prompt starts a new process, so what was running is
+        // lost, and what had ended stays as it was.
+        events.push(prompt(17));
+        assert!(running(&events).is_empty());
+        let tasks = background_tasks(&events);
+        assert_eq!(tasks["b"], BackgroundTask::Lost);
+        assert!(matches!(tasks["a"], BackgroundTask::Ended { .. }));
+        assert!(!tasks.contains_key("c"));
+    }
+
+    #[test]
     fn picks_the_current_activity() {
         let prompt = || AgentEvent {
             seq: Some(1),
@@ -4908,6 +6249,31 @@ mod tests {
         assert_eq!(
             current_activity(&events.map(Arc::new), false, Some(3_000), ""),
             Activity::Thinking { since: Some(3_000) }
+        );
+
+        // A task's start or end isn't the agent's doing: it neither
+        // restarts the time spent thinking nor hides a subagent's call.
+        let task = |seq| AgentEvent {
+            seq: Some(seq),
+            at: Some(seq as i64 * 1_000),
+            kind: AgentEventKind::TaskStarted {
+                id: "a".into(),
+                task: "task-a".into(),
+            },
+        };
+        let events = [prompt(), result(3, "a"), task(4)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(3_000), ""),
+            Activity::Thinking { since: Some(3_000) }
+        );
+        let events = [prompt(), call(2, "sub", Some("task".into())), task(3)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000), ""),
+            Activity::Subagent {
+                name: "Bash".into(),
+                summary: "cmd sub".into(),
+                since: Some(2_000),
+            }
         );
 
         // Calls from before the latest prompt are finished business.

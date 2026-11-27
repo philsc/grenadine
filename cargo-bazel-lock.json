@@ -1,5 +1,5 @@
 {
-  "checksum": "79b069bde92add27c42632e3287cfb4e2dbd535a9d52674b9456802fa881d7a2",
+  "checksum": "57adeffa294b4738db8b9262cb7c145a56a39a218133b84b4b17cdf19289a760",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16728,6 +16728,9 @@
             "WritableStream",
             "WritableStreamDefaultController",
             "WritableStreamDefaultWriter",
+            "XmlHttpRequest",
+            "XmlHttpRequestEventTarget",
+            "XmlHttpRequestUpload",
             "console",
             "default",
             "std"

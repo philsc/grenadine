@@ -3,7 +3,8 @@
 //! back, or a reload, until its session starts or it's discarded. The
 //! draft's images are kept in IndexedDB (see `image_drafts`).
 
-use grenadine_core::api::{AgentBackend, GENERAL, NewAgent, PermissionMode};
+pub use grenadine_core::api::handoff_id;
+use grenadine_core::api::{AgentBackend, GENERAL, HANDOFF_DRAFTS, NewAgent, PermissionMode};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,10 @@ pub struct Draft {
     /// worth keeping even without text.
     #[serde(default)]
     pub has_images: bool,
+    /// Whether files are attached to the draft (see `files`), which make
+    /// it worth keeping too.
+    #[serde(default)]
+    pub has_files: bool,
     /// Which agent backend runs the session's turns.
     #[serde(default)]
     pub backend: AgentBackend,
@@ -40,7 +45,7 @@ pub struct Draft {
 
 impl Draft {
     pub fn is_blank(&self) -> bool {
-        self.prompt.trim().is_empty() && !self.has_images
+        self.prompt.trim().is_empty() && !self.has_images && !self.has_files
     }
 }
 
@@ -48,22 +53,10 @@ pub fn hash(id: &str) -> String {
     format!("#/agents/draft/{id}")
 }
 
-/// What the ids of the drafts that hold an agent's handoff proposal
-/// start with.
-const HANDOFF: &str = "handoff";
-
-/// The id of the draft that holds the proposal of the handoff request
-/// `tool`. Draft ids are alphanumeric.
-pub fn handoff_id(tool: &str) -> String {
-    let tool: String = tool.chars().filter(char::is_ascii_alphanumeric).collect();
-    let tool = tool.strip_prefix(HANDOFF).unwrap_or(&tool);
-    format!("{HANDOFF}{tool}")
-}
-
 /// Whether the draft `id` holds a handoff proposal, which shows in its
 /// request's card rather than as a draft of its own.
 fn is_handoff(id: &str) -> bool {
-    id.starts_with(HANDOFF)
+    id.starts_with(HANDOFF_DRAFTS)
 }
 
 /// The drafts worth keeping when the page loads: the blank ones were left
@@ -153,6 +146,7 @@ impl Drafts {
                 pr: pr.map(|n| n.to_string()).unwrap_or_default(),
                 prompt: String::new(),
                 has_images: false,
+                has_files: false,
                 backend,
                 // New sessions start out planning, whatever the others go
                 // on with.
@@ -181,6 +175,7 @@ impl Drafts {
             pr: String::new(),
             prompt: String::new(),
             has_images: false,
+            has_files: false,
             backend,
             mode: PermissionMode::plan(),
             mode_picked: false,
@@ -203,6 +198,7 @@ impl Drafts {
             pr: req.pr.map(|n| n.to_string()).unwrap_or_default(),
             prompt: req.prompt.clone(),
             has_images: false,
+            has_files: false,
             backend: req.backend,
             mode: req.permission_mode.clone(),
             // The agent picked it, so it doesn't follow the repository's
@@ -277,6 +273,7 @@ impl Drafts {
         self.set_starting(id, false);
         self.set_start_error(id, None);
         crate::image_drafts::forget(&crate::image_drafts::new_session_key(id));
+        crate::files::forget(&crate::image_drafts::new_session_key(id));
     }
 
     /// Drops the draft `id` if nothing was written in it.
@@ -303,6 +300,7 @@ mod tests {
             pr: String::new(),
             prompt: prompt.into(),
             has_images: false,
+            has_files: false,
             backend: AgentBackend::Claude,
             mode: PermissionMode::plan(),
             mode_picked: false,
@@ -337,6 +335,13 @@ mod tests {
         // A draft with only images survives the load-time prune.
         let ids: Vec<String> = prune(vec![d], None).into_iter().map(|d| d.id).collect();
         assert_eq!(ids, ["a"]);
+    }
+
+    #[test]
+    fn files_make_a_draft_not_blank() {
+        let mut d = draft("a", "o/n", "", 1.0);
+        d.has_files = true;
+        assert!(!d.is_blank());
     }
 
     #[test]

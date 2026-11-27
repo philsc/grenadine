@@ -6,19 +6,23 @@
 mod agent;
 mod api;
 pub mod assets;
+mod attachments;
 mod auto_review;
 mod claude;
+mod claude_update;
 mod cleanup;
 mod db;
 mod devin;
 mod git;
 mod github;
+mod handoff;
 mod inbox_search;
 mod inboxes;
 mod mcp;
 mod pr_plan;
 mod ratelimit;
 mod reflow;
+mod slash_commands;
 mod stack;
 mod summary;
 mod sync;
@@ -112,9 +116,19 @@ struct Args {
     #[arg(long, hide = true, value_delimiter = ',', default_value = "0,5,20")]
     review_post_checks: Vec<u64>,
 
+    /// Seconds before each time the session of a review that isn't on
+    /// GitHub is asked again to post it. Tests shorten them.
+    #[arg(long, hide = true, value_delimiter = ',', default_value = "60,300")]
+    review_post_retries: Vec<u64>,
+
     /// The Claude Code executable that agent sessions run.
     #[arg(long, default_value = "claude")]
     claude: PathBuf,
+
+    /// Hours between runs of `claude update`, the first at startup. Claude
+    /// Code doesn't update itself under `claude -p`. 0 turns it off.
+    #[arg(long, default_value_t = 6)]
+    claude_update_hours: u64,
 
     /// The Devin executable that agent sessions run.
     #[arg(long, default_value = "devin")]
@@ -128,7 +142,8 @@ struct Args {
     )]
     devin_job_model: String,
 
-    /// The model the checks of Devin sessions' cleanup items run on.
+    /// The model the checks of Devin sessions' cleanup items run on, and
+    /// the handoffs written from Devin sessions' transcripts.
     #[arg(long, default_value = "claude-sonnet-5-5-medium")]
     devin_prune_model: String,
 
@@ -246,6 +261,10 @@ pub async fn run() -> Result<()> {
         tracing::warn!(
             "no systemd user manager: deleting a session only stops the processes still in its worktree"
         );
+    } else if let Err(e) = agent::lower_agents_cpu_weight() {
+        tracing::warn!("can't lower the sessions' CPU weight: {e:#}");
+    } else if let Some(why) = agent::cpu_weight_caveat() {
+        tracing::warn!("{why}");
     }
     // Before serving, since a session being created has a worktree but no
     // row yet. The output bases of what it removes go next.
@@ -257,6 +276,7 @@ pub async fn run() -> Result<()> {
         let worktrees = worktrees.clone();
         move || agent::remove_orphaned_output_bases(&worktrees)
     });
+    let claude = args.claude.clone();
     let mut agents = agent::Agents::new(
         &db,
         args.claude,
@@ -274,8 +294,13 @@ pub async fn run() -> Result<()> {
     if let Some(shell) = args.shell {
         agents.terminals = terminal::Terminals::new(shell);
     }
-    if let Err(e) = agent::remove_orphaned_images(&db, agents.images()) {
-        tracing::warn!("can't remove orphaned images: {e:#}");
+    for (what, dir) in [
+        ("images", agents.images()),
+        ("attachments", agents.attachments()),
+    ] {
+        if let Err(e) = agent::remove_orphaned_session_dirs(&db, dir) {
+            tracing::warn!("can't remove orphaned {what}: {e:#}");
+        }
     }
 
     if let Err(e) = auto_review::start_watching(&db, repos.keys(), agent::now()) {
@@ -301,6 +326,11 @@ pub async fn run() -> Result<()> {
             .iter()
             .map(|&s| Duration::from_secs(s))
             .collect(),
+        post_retries: args
+            .review_post_retries
+            .iter()
+            .map(|&s| Duration::from_secs(s))
+            .collect(),
         inbox_searches: std::sync::Mutex::new(sync::InboxSearches::default()),
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
@@ -314,14 +344,27 @@ pub async fn run() -> Result<()> {
     if let Err(e) = agent::expire_orphaned_approvals(&state) {
         tracing::warn!("can't expire the permission requests left open: {e:#}");
     }
+    // Nor is any handoff from before it still being written.
+    if let Err(e) = handoff::fail_orphaned(&state) {
+        tracing::warn!("can't fail the handoffs left being written: {e:#}");
+    }
     let sync_task = tokio::spawn(sync::run(
         state.clone(),
         Duration::from_secs(args.poll_interval.max(1)),
     ));
     // Shutting down doesn't wait for it; dropping it kills its claude.
     tokio::spawn(cleanup::prune_loop(state.clone()));
+    tokio::spawn(attachments::sweep_loop(state.agents.uploads().to_owned()));
     // Counts the sessions' unstaged changes off the request path.
     tokio::spawn(unstaged::run(state.clone()));
+    // Shutting down doesn't wait for it; dropping it kills its claude.
+    if args.claude_update_hours > 0 {
+        tokio::spawn(claude_update::run(
+            claude,
+            Duration::from_secs(args.claude_update_hours.saturating_mul(3600)),
+            shutdown.clone(),
+        ));
+    }
     // Listing the backends' models can take a while, so it starts now
     // rather than with the first page or prompt.
     tokio::spawn({

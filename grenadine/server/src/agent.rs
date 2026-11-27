@@ -6,7 +6,7 @@
 //! its own, and the user answers on the page.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,8 +18,8 @@ use base64::Engine as _;
 use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
-    AgentStatus, ApprovalOption, GENERAL, Landed, LandedPr, NewAgent, PermissionMode, PrDetail,
-    PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    AgentStatus, ApprovalOption, Attachment, GENERAL, Landed, LandedPr, NewAgent, PermissionMode,
+    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget, leading_command,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -36,7 +36,7 @@ use crate::reflow::reflow;
 use crate::sync::State;
 
 /// The ref the trunk's tip is fetched into before a session branches off it.
-const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
+pub(crate) const TRUNK_REF: &str = "refs/grenadine/agent/trunk";
 /// The ref a pull request's target branch is fetched into while a session's
 /// commits are pushed. One ref per repository is enough because pushing
 /// holds the repository's git lock.
@@ -170,6 +170,9 @@ pub trait Backend: Send + Sync {
 pub struct Turn<'a> {
     pub prompt: &'a str,
     pub images: &'a [String],
+    /// What the agent is told about the files attached to the prompt, if
+    /// any; it goes in the prompt, before its text.
+    pub attached: Option<&'a str>,
     pub mode: &'a PermissionMode,
     /// `None` or `default` keeps the backend's default.
     pub model: Option<String>,
@@ -190,6 +193,8 @@ pub enum JobKind {
     Scan,
     /// Which cleanup items are stale.
     Prune,
+    /// A handoff from a session's transcript, for the user.
+    Handoff,
 }
 
 impl JobKind {
@@ -199,6 +204,7 @@ impl JobKind {
             JobKind::Summary => "summary",
             JobKind::Scan => "scan",
             JobKind::Prune => "prune",
+            JobKind::Handoff => "handoff",
         }
     }
 }
@@ -373,7 +379,11 @@ impl ModelList {
             Err(e) => {
                 let missing = is_missing(&e);
                 let error = format!("{e:#}");
-                tracing::warn!("listing {name}'s models: {error}");
+                if missing {
+                    tracing::debug!("listing {name}'s models: {error}");
+                } else {
+                    tracing::warn!("listing {name}'s models: {error}");
+                }
                 *listing = Some(Listing::Failed {
                     at: Instant::now(),
                     error: error.clone(),
@@ -511,6 +521,15 @@ pub struct Agents {
     /// The images sent with prompts go to `<dir>/<id>/<name>`, where `dir`
     /// is `images` next to `worktrees`.
     images: PathBuf,
+    /// Files uploaded for prompts that aren't sent yet, `uploads` next to
+    /// `worktrees`; see `attachments`.
+    uploads: PathBuf,
+    /// The files sent with prompts, `attachments` next to `worktrees`.
+    attachments: PathBuf,
+    /// Held from a new session's draft lookup until its row is inserted,
+    /// so a second start of the same draft waits for the first one's
+    /// claim of its uploads and then finds its session.
+    pub starting: tokio::sync::Mutex<()>,
     /// Where Claude Code reaches this server, e.g. `http://127.0.0.1:8765`.
     base_url: String,
     /// Whether each session's processes go into their own systemd user
@@ -549,6 +568,9 @@ struct Live {
     stopper: Option<Stopper>,
     /// The user stopped the current turn.
     interrupted: bool,
+    /// The agent has answered, and its process goes on for a background
+    /// task. A resolved permission request goes back to this wait.
+    background: bool,
     /// Permission requests by tool use ID.
     pending: HashMap<String, PendingRequest>,
     /// The mode and model the running turn goes with, for follow-ups a
@@ -560,13 +582,19 @@ struct Live {
     /// work. Devin sends a tool call again when it runs over 120 s, so a
     /// second call must not land the same work at the same time.
     landing: bool,
+    /// A background job is writing a handoff the user asked for.
+    writing_handoff: bool,
+    /// The user's handoff proposals being answered or answered since the
+    /// server started, so that one starts at most one session.
+    answered_handoffs: HashSet<String>,
 }
 
-/// A prompt with the names of its images, and the mode and model its turn
-/// goes with.
+/// A prompt with the names of its images and its attached files, and the
+/// mode and model its turn goes with.
 struct Queued {
     prompt: String,
     images: Vec<String>,
+    attachments: Vec<Attachment>,
     mode: PermissionMode,
     model: Option<String>,
 }
@@ -580,10 +608,13 @@ impl Live {
             running: false,
             stopper: None,
             interrupted: false,
+            background: false,
             pending: HashMap::new(),
             turn: None,
             wrap_up: None,
             landing: false,
+            writing_handoff: false,
+            answered_handoffs: HashSet::new(),
         }
     }
 }
@@ -597,7 +628,7 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
-fn random_hex(n: usize) -> String {
+pub(crate) fn random_hex(n: usize) -> String {
     random_bytes::<32>()[..n]
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -665,6 +696,94 @@ pub fn systemd_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// The slice that holds the sessions and sits right below the user's
+/// systemd manager. It's two levels above a session's slice, since the
+/// dashes in [`slice`]'s names nest them: `grenadine.slice` holds
+/// `grenadine-agent.slice`, which holds the sessions' slices. The weight
+/// has to be on this one: `grenadine-agent.slice` has no siblings to be
+/// ranked among, and its parent would still compete at the default.
+const AGENTS_SLICE: &str = "grenadine.slice";
+
+/// The sessions' share of a busy CPU, against systemd's default of 100
+/// for what else runs under the user's systemd manager, e.g. its
+/// services and the scopes of a desktop's or tmux's programs. A few
+/// sessions building and testing at once otherwise make a server that
+/// runs there slow to answer the page. A session's terminals run in its
+/// slice too, so what the user starts in one has the same share.
+const AGENTS_CPU_WEIGHT: u32 = 20;
+
+/// Makes the sessions' processes yield the CPU to what else runs under
+/// the user's systemd manager when it is busy; with idle cores they run
+/// as fast as before. The weight is on the slice above them all because
+/// a weight only ranks a slice among its siblings: one on each session's
+/// slice or scope would rank the sessions among themselves.
+///
+/// For the same reason it doesn't reach outside the manager. A login
+/// session's scope is a sibling of the whole manager, which keeps its
+/// own weight, and the system's services are further out still, so
+/// against them the sessions still get all of the manager's share; see
+/// [`cpu_weight_caveat`].
+///
+/// The setting is the manager's, so it lasts until the manager stops, at
+/// the latest the next boot; every start of the server sets it again.
+/// That also replaces a weight the user gave the slice themselves with
+/// `systemctl --user set-property`: there is no setting yet to pick
+/// another weight or none.
+pub fn lower_agents_cpu_weight() -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
+        .arg(format!("CPUWeight={AGENTS_CPU_WEIGHT}"))
+        .stdin(Stdio::null())
+        .output()
+        .context("can't run systemctl")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Why [`lower_agents_cpu_weight`]'s setting doesn't put this process
+/// ahead of the sessions, if something says it doesn't.
+///
+/// A server started from a plain SSH or console login isn't under the
+/// user's systemd manager: it is in the login session's scope, beside the
+/// manager. And systemd accepts a weight that does nothing when the
+/// manager wasn't given the `cpu` controller, as older systemds' weren't by
+/// default.
+pub fn cpu_weight_caveat() -> Option<&'static str> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let Some(manager) = user_manager_cgroup(&own) else {
+        return Some(
+            "the server runs outside the systemd user manager, so busy sessions can still slow it down; start it with `systemd-run --user --scope` to put it ahead of them",
+        );
+    };
+    let controllers = Path::new("/sys/fs/cgroup")
+        .join(manager.trim_start_matches('/'))
+        .join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(controllers).ok()?;
+    (!controllers.split_whitespace().any(|c| c == "cpu")).then_some(
+        "the systemd user manager doesn't control the CPU, so the sessions' lower CPU weight does nothing; delegate `cpu` to user@.service to let it",
+    )
+}
+
+/// The cgroup of the systemd user manager, `user@<uid>.service`, that
+/// `/proc/<pid>/cgroup`'s text names a cgroup inside of, if it does.
+fn user_manager_cgroup(cgroups: &str) -> Option<&str> {
+    cgroups
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .find_map(|path| {
+            let mut end = 0;
+            for part in path.split('/').skip(1) {
+                end += 1 + part.len();
+                if part.starts_with("user@") && part.ends_with(".service") {
+                    return Some(&path[..end]);
+                }
+            }
+            None
+        })
 }
 
 /// The systemd user slice the session's processes run in. A cgroup holds on
@@ -958,6 +1077,9 @@ impl Agents {
             claude: claude::Claude::new(claude),
             devin: devin::Devin::new(devin),
             images: worktrees.with_file_name("images"),
+            uploads: worktrees.with_file_name("uploads"),
+            attachments: worktrees.with_file_name("attachments"),
+            starting: tokio::sync::Mutex::default(),
             worktrees,
             base_url,
             slices,
@@ -999,10 +1121,32 @@ impl Agents {
         &self.images
     }
 
+    /// Where files uploaded for prompts wait to be sent.
+    pub fn uploads(&self) -> &Path {
+        &self.uploads
+    }
+
+    /// Where the files sent with prompts go, in a directory per session.
+    pub fn attachments(&self) -> &Path {
+        &self.attachments
+    }
+
     /// Runs `f` on the session's live state, creating it if needed.
     fn with_live<T>(&self, id: &str, f: impl FnOnce(&mut Live) -> T) -> T {
         let mut live = self.live.lock().unwrap();
         f(live.entry(id.to_owned()).or_insert_with(Live::new))
+    }
+
+    /// Whether the session has live state.
+    #[cfg(test)]
+    pub fn has_live(&self, id: &str) -> bool {
+        self.live.lock().unwrap().contains_key(id)
+    }
+
+    /// Runs `f` on the session's live state if it has any, e.g. not once
+    /// the session is deleted.
+    fn with_existing_live<T>(&self, id: &str, f: impl FnOnce(&mut Live) -> T) -> Option<T> {
+        self.live.lock().unwrap().get_mut(id).map(f)
     }
 
     /// Lets `interrupt` stop the current turn with `stopper`. An
@@ -1179,23 +1323,40 @@ pub async fn create_session(
         draft: req.draft.clone(),
         handed_off_from: handed_off_from.map(str::to_owned),
     };
+    let starting = state.agents.starting.lock().await;
     // A second start with the same draft returns the first one's session.
     if let Some(d) = &req.draft
         && let Some(session) = state.db.agent_by_draft(d)?
     {
         return Ok(session);
     }
-    match state.db.create_agent(&session) {
-        Ok(()) => {}
-        Err(e) if req.draft.is_some() && unique_violation(&e) => {
-            // An insert that raced this one claimed the draft.
-            return state
-                .db
-                .agent_by_draft(req.draft.as_deref().unwrap())?
-                .ok_or(e);
+    // Claimed before the session shows up: the page drops a started
+    // draft's uploads once it sees the draft's session.
+    let attachments = crate::attachments::claim(
+        &state.agents.uploads,
+        &state.agents.attachments,
+        &id,
+        &req.attachments,
+    )
+    .await?;
+    if let Err(e) = state.db.create_agent(&session) {
+        crate::attachments::unclaim(
+            &state.agents.uploads,
+            &state.agents.attachments,
+            &id,
+            &attachments,
+        )
+        .await;
+        // Should an insert the lock didn't keep out have claimed the
+        // draft, its session is the one.
+        if let Some(d) = &req.draft
+            && unique_violation(&e)
+        {
+            return state.db.agent_by_draft(d)?.ok_or(e);
         }
-        Err(e) => return Err(e),
+        return Err(e);
     }
+    drop(starting);
     if session.pr.is_some() {
         if let Err(e) = take_stack_on_start(state, &session) {
             tracing::warn!("agent {id}: can't take over the PRs stacked on its PR: {e:#}");
@@ -1206,13 +1367,18 @@ pub async fn create_session(
     state.send(ServerEvent::AgentsChanged);
     let images = save_images(state, &id, &req.images).await?;
     if kind == SessionKind::Interactive {
-        crate::summary::start(state, &id, session.backend, &req.prompt);
+        let pr = session.pr.map(|number| PrKey {
+            repo: session.repo.clone(),
+            number,
+        });
+        crate::summary::start(state, &id, session.backend, &req.prompt, pr.as_ref());
     }
-    send_with_images(
+    send_with_files(
         state,
         &id,
         req.prompt,
         images,
+        attachments,
         req.permission_mode,
         req.model,
     );
@@ -1384,15 +1550,58 @@ pub fn send(
     mode: PermissionMode,
     model: Option<String>,
 ) {
-    send_with_images(state, id, prompt, Vec::new(), mode, model);
+    send_with_files(state, id, prompt, Vec::new(), Vec::new(), mode, model);
 }
 
-/// Queues a prompt with the images `save_images` saved for it.
-pub fn send_with_images(
+/// Sends `prompt` like `send`, but only to a session with no turn running
+/// or queued. Returns whether it sent it; a deleted session gets nothing.
+pub fn send_if_idle(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    mode: PermissionMode,
+    model: Option<String>,
+) -> bool {
+    let start = state.agents.with_existing_live(id, |l| {
+        if l.running || !l.queue.is_empty() || l.writing_handoff {
+            return false;
+        }
+        l.queue.push_back(Queued {
+            prompt,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            mode,
+            model,
+        });
+        l.running = true;
+        true
+    }) == Some(true);
+    if start {
+        tokio::spawn(run(state.clone(), id.to_owned()));
+    }
+    start
+}
+
+/// Whether the session has a turn running or queued. A deleted session
+/// has none.
+pub fn is_busy(state: &State, id: &str) -> bool {
+    state
+        .agents
+        .with_existing_live(id, |l| {
+            l.running || !l.queue.is_empty() || l.writing_handoff
+        })
+        .unwrap_or(false)
+}
+
+/// Queues a prompt with the images `save_images` saved for it and the
+/// files `attachments::claim` claimed for it. While a handoff is being
+/// written, it waits for the handoff.
+pub fn send_with_files(
     state: &Arc<State>,
     id: &str,
     prompt: String,
     images: Vec<String>,
+    attachments: Vec<Attachment>,
     mode: PermissionMode,
     model: Option<String>,
 ) {
@@ -1400,10 +1609,15 @@ pub fn send_with_images(
         l.queue.push_back(Queued {
             prompt,
             images,
+            attachments,
             mode,
             model,
         });
-        !std::mem::replace(&mut l.running, true)
+        if l.running || l.writing_handoff {
+            return false;
+        }
+        l.running = true;
+        true
     });
     if start {
         tokio::spawn(run(state.clone(), id.to_owned()));
@@ -1476,10 +1690,10 @@ pub fn image_file(state: &State, id: &str, name: &str) -> Option<(PathBuf, &'sta
     Some((state.agents.images.join(id).join(name), media_type(name)?))
 }
 
-/// Removes the images of sessions that are gone, e.g. those of sessions
-/// deleted while the server was down.
-pub fn remove_orphaned_images(db: &crate::db::Db, images: &Path) -> Result<()> {
-    let Ok(dirs) = std::fs::read_dir(images) else {
+/// Removes the directories in `dir` of sessions that are gone, e.g. the
+/// images or attachments of sessions deleted while the server was down.
+pub fn remove_orphaned_session_dirs(db: &crate::db::Db, dir: &Path) -> Result<()> {
+    let Ok(dirs) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     let owned: std::collections::BTreeSet<String> = db
@@ -1598,6 +1812,7 @@ pub fn queue_next(state: &State, id: &str, prompt: String, mode: Option<Permissi
         l.queue.push_front(Queued {
             prompt,
             images: Vec::new(),
+            attachments: Vec::new(),
             mode: mode.clone().unwrap_or(turn_mode),
             model,
         });
@@ -1620,6 +1835,17 @@ fn expires(tool_name: &str) -> bool {
     tool_name != "ExitPlanMode"
 }
 
+/// The status of a session whose turn is going on with no permission
+/// request left: still waiting on a background task after an answer,
+/// e.g. when the task is a subagent that asked, or else working.
+fn working(state: &State, id: &str) -> AgentStatus {
+    if state.agents.with_live(id, |l| l.background) {
+        AgentStatus::Background
+    } else {
+        AgentStatus::Running
+    }
+}
+
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         // `approve` and `interrupt` take the request out before they
@@ -1639,7 +1865,7 @@ impl Drop for PendingGuard<'_> {
             Ok(Some(s)) if s.status == AgentStatus::AwaitingApproval
         );
         if waiting && !still_pending {
-            set_status(self.state, self.id, AgentStatus::Running);
+            set_status(self.state, self.id, working(self.state, self.id));
         }
     }
 }
@@ -1797,7 +2023,7 @@ pub fn approve(state: &State, id: &str, tool_use: &str, decision: Decision) -> R
         },
     )?;
     if !still_pending {
-        set_status(state, id, AgentStatus::Running);
+        set_status(state, id, working(state, id));
     }
     Ok(true)
 }
@@ -1887,14 +2113,33 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
             workspace.starts_with(&worktree)
         }))
     });
-    match tokio::fs::remove_dir_all(state.agents.images.join(id)).await {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            tracing::warn!("can't remove the images of agent {id}: {e}");
+    for (what, dir) in [
+        ("images", &state.agents.images),
+        ("attachments", &state.agents.attachments),
+    ] {
+        match tokio::fs::remove_dir_all(dir.join(id)).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("can't remove the {what} of agent {id}: {e}");
+            }
+            _ => {}
         }
-        _ => {}
     }
     if reviewing {
-        state.db.auto_review_session_deleted(id)?;
+        // The review's page shows the session as it is now, with its
+        // latest cost; a turn that was interrupted above may not have
+        // recorded that it ended.
+        let mut saved = match state.db.agent_unchecked(id)? {
+            Some((s, _)) => s,
+            None => scanned.clone(),
+        };
+        if matches!(
+            saved.status,
+            AgentStatus::Creating | AgentStatus::Running | AgentStatus::AwaitingApproval
+        ) {
+            saved.status = AgentStatus::Interrupted;
+        }
+        saved.unstaged = 0;
+        state.db.auto_review_session_deleted(&saved)?;
     }
     state.db.delete_agent(id)?;
     state.agents.live.lock().unwrap().remove(id);
@@ -1917,6 +2162,7 @@ pub async fn delete(state: &Arc<State>, id: &str) -> Result<bool> {
 /// then goes on with a wrap-up that waited for them.
 async fn run(state: Arc<State>, id: String) {
     let mut last = AgentStatus::Idle;
+    let mut last_turn = None;
     loop {
         // Only a wrap-up that waited for this task is the task's to go on
         // with; one that comes once it stops running is wrap_up's.
@@ -1924,12 +2170,13 @@ async fn run(state: Arc<State>, id: String) {
             let prompt = l.queue.pop_front();
             l.running = prompt.is_some();
             l.interrupted = false;
+            l.background = false;
             l.turn = prompt.as_ref().map(|q| (q.mode.clone(), q.model.clone()));
             (prompt, l.wrap_up.is_some())
         });
         let Some(queued) = prompt else {
             if !waiting {
-                crate::auto_review::session_done(&state, &id, last);
+                crate::auto_review::session_done(&state, &id, last, last_turn);
                 return;
             }
             if last == AgentStatus::Idle {
@@ -1947,6 +2194,7 @@ async fn run(state: Arc<State>, id: String) {
             }
             return;
         };
+        last_turn = Some((queued.mode.clone(), queued.model.clone()));
         let status = match turn(&state, &id, queued).await {
             Ok(status) => status,
             Err(e) => {
@@ -1958,6 +2206,7 @@ async fn run(state: Arc<State>, id: String) {
         let interrupted = state.agents.with_live(&id, |l| {
             l.stopper = None;
             l.turn = None;
+            l.background = false;
             l.interrupted
         });
         let status = if interrupted {
@@ -2105,6 +2354,50 @@ impl Drop for Landing {
 /// between turns.
 pub fn turn_settings(state: &State, id: &str) -> Option<(PermissionMode, Option<String>)> {
     state.agents.with_live(id, |l| l.turn.clone())
+}
+
+/// Marks the session as having a handoff written for the user. False,
+/// without marking it, while a turn runs or is queued or a handoff is
+/// being written already.
+pub fn begin_handoff(state: &State, id: &str) -> bool {
+    state.agents.with_live(id, |l| {
+        if l.running || !l.queue.is_empty() || l.writing_handoff {
+            return false;
+        }
+        l.writing_handoff = true;
+        true
+    })
+}
+
+/// Takes back `begin_handoff`'s mark and starts the prompts queued
+/// meanwhile. A deleted session is left alone.
+pub fn end_handoff(state: &Arc<State>, id: &str) {
+    let start = state.agents.with_existing_live(id, |l| {
+        l.writing_handoff = false;
+        if l.running || l.queue.is_empty() {
+            return false;
+        }
+        l.running = true;
+        true
+    });
+    if start == Some(true) {
+        tokio::spawn(run(state.clone(), id.to_owned()));
+    }
+}
+
+/// Claims the answer to the session's handoff `proposal`; false when
+/// it's claimed already.
+pub fn claim_handoff(state: &State, id: &str, proposal: &str) -> bool {
+    state
+        .agents
+        .with_live(id, |l| l.answered_handoffs.insert(proposal.to_owned()))
+}
+
+/// Gives `claim_handoff`'s claim back, for an answer that failed.
+pub fn release_handoff(state: &State, id: &str, proposal: &str) {
+    state.agents.with_live(id, |l| {
+        l.answered_handoffs.remove(proposal);
+    });
 }
 
 /// Makes `turn_settings` say `turn`, as a running turn would.
@@ -3850,6 +4143,7 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     let Queued {
         prompt,
         images,
+        attachments,
         mode,
         model,
     } = queued;
@@ -3858,8 +4152,17 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
+    // Reviews' prompts are written by the server, not the user.
+    if session.kind != SessionKind::AutoReview
+        && let Some(name) = leading_command(&prompt)
+    {
+        state.db.add_skill_use(&session.repo, name, now())?;
+    }
     if !images.is_empty() {
         emit(state, id, AgentEventKind::Images(images.clone()))?;
+    }
+    if !attachments.is_empty() {
+        emit(state, id, AgentEventKind::Attachments(attachments.clone()))?;
     }
     // Nothing of a general session's is lost with its directory, so one
     // that went away comes back. A repo session's worktree is made here,
@@ -3900,10 +4203,12 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
     .into_iter()
     .flatten()
     .collect();
+    let attached = crate::attachments::note(&state.agents.attachments, id, &attachments);
     let sink = TurnSink::new(state, id, &session.repo);
     let turn = Turn {
         prompt: &prompt,
         images: &images,
+        attached: attached.as_deref(),
         mode: &mode,
         model,
         mcp_url: &mcp_url,
@@ -3979,6 +4284,13 @@ impl<'a> TurnSink<'a> {
         Ok(())
     }
 
+    /// The backend listed the commands a prompt can start with.
+    pub fn commands(&mut self, backend: AgentBackend, names: &[String]) -> Result<()> {
+        self.state
+            .db
+            .set_slash_commands(self.id, self.repo, backend, names, now())
+    }
+
     /// Stores `kind` in the transcript the way a turn's events are kept:
     /// images into the database, usage into the session's row, costs
     /// billed and repeated turn ends suppressed.
@@ -3988,6 +4300,25 @@ impl<'a> TurnSink<'a> {
             _ => None,
         };
         store_images(self.state, self.id, worktree, &mut kind)?;
+        // A background task that finishes wakes the agent up again, even
+        // for a message that only reports usage. A result's window and
+        // end don't, and neither does the task's own start or end: the
+        // agent's answer to it follows. A permission request still
+        // waiting keeps its status.
+        let wakes = !kind.is_task()
+            && !matches!(
+                kind,
+                AgentEventKind::TurnEnded { .. } | AgentEventKind::Usage { tokens: None, .. }
+            );
+        if wakes {
+            let woken = self.state.agents.with_live(self.id, |l| {
+                let woken = std::mem::take(&mut l.background);
+                (woken, l.pending.is_empty())
+            });
+            if woken == (true, true) {
+                set_status(self.state, self.id, AgentStatus::Running);
+            }
+        }
         if let AgentEventKind::Usage { tokens, window } = kind {
             return record_usage(self.state, self.id, tokens, window);
         }
@@ -4003,10 +4334,31 @@ impl<'a> TurnSink<'a> {
                 return Ok(());
             }
         }
-        self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        // A task's end between two results doesn't make the second one
+        // a new answer.
+        if !kind.is_task() {
+            self.last_was_end = matches!(kind, AgentEventKind::TurnEnded { .. });
+        }
         let opened = self.prs.see(self.repo, &kind);
         emit(self.state, self.id, kind)?;
         record_prs(self.state, self.id, &opened)
+    }
+
+    /// The agent answered, but its process goes on running for a
+    /// background task. Its next event shows it working again. A
+    /// permission request waiting meanwhile, e.g. from a subagent in the
+    /// background, keeps its status until it's answered.
+    pub fn background(&mut self) {
+        if self.ended != Some(true) {
+            return;
+        }
+        let show = self.state.agents.with_live(self.id, |l| {
+            let started = !std::mem::replace(&mut l.background, true);
+            started && l.pending.is_empty()
+        });
+        if show {
+            set_status(self.state, self.id, AgentStatus::Background);
+        }
     }
 
     /// Adds what the turn's process has cost since it was last billed to
@@ -4311,6 +4663,34 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn only_cgroups_below_a_user_manager_name_it() {
+        let manager = Some("/user.slice/user-1000.slice/user@1000.service");
+        // A service or scope the manager started, and a session's shell.
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
+            ),
+            manager
+        );
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
+            ),
+            manager
+        );
+        // A login session is beside the manager, and so is the system's.
+        assert_eq!(
+            user_manager_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
+        );
+        assert_eq!(
+            user_manager_cgroup("0::/system.slice/grenadine.service\n"),
+            None
+        );
+        assert_eq!(user_manager_cgroup(""), None);
+    }
+
+    #[test]
     fn uuids() {
         let id = uuid();
         assert!(valid_id(&id), "{id}");
@@ -4352,12 +4732,18 @@ pub(crate) mod tests {
     }
 
     /// Two starts with the same draft return the first one's session and
-    /// create only one; a different draft, or none, starts one each.
+    /// create only one, even when the first claims an upload while the
+    /// second starts; a different draft, or none, starts one each.
     #[tokio::test]
     async fn a_draft_starts_one_session() {
         let dir = tempfile::tempdir().unwrap();
         let state = state_without_repos(dir.path());
-        let req = |draft: Option<&str>| NewAgent {
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(axum::body::Bytes::from("a"))]);
+        let up = crate::attachments::store(state.agents.uploads(), "a.log", bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let req = |draft: Option<&str>, attachments: Vec<String>| NewAgent {
             draft: draft.map(str::to_owned),
             backend: AgentBackend::Claude,
             repo: GENERAL.into(),
@@ -4366,15 +4752,17 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments,
         };
         let (a, b) = tokio::join!(
-            create(&state, req(Some("d1"))),
-            create(&state, req(Some("d1"))),
+            create(&state, req(Some("d1"), vec![up.id.clone()])),
+            create(&state, req(Some("d1"), vec![up.id.clone()])),
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_eq!(a.id, b.id);
         assert_eq!(a.draft.as_deref(), Some("d1"));
         assert_eq!(state.db.agents().unwrap().len(), 1);
+        assert!(state.agents.attachments().join(&a.id).join(&up.id).is_dir());
         // The first turn makes the general session's directory.
         let dir = state.agents.worktrees.join(GENERAL);
         for _ in 0..100 {
@@ -4385,8 +4773,8 @@ pub(crate) mod tests {
         }
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
 
-        let c = create(&state, req(Some("d2"))).await.unwrap();
-        let d = create(&state, req(None)).await.unwrap();
+        let c = create(&state, req(Some("d2"), Vec::new())).await.unwrap();
+        let d = create(&state, req(None, Vec::new())).await.unwrap();
         assert_ne!(a.id, c.id);
         assert_ne!(a.id, d.id);
         assert_eq!(c.draft.as_deref(), Some("d2"));
@@ -4409,6 +4797,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         }
     }
@@ -4683,11 +5072,12 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         };
         assert!(check_images(&[bmp]).is_some());
         let names = save_images(&state, id, &[png]).await.unwrap();
-        send_with_images(
+        send_with_files(
             &state,
             id,
             "what's this?".into(),
             names.clone(),
+            Vec::new(),
             PermissionMode::from("auto"),
             None,
         );
@@ -4721,6 +5111,90 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         assert!(image_file(&state, id, "../../etc/passwd").is_none());
         assert!(delete(&state, id).await.unwrap());
         assert!(!file.exists());
+    }
+
+    /// A prompt's attached files move to the session's attachments, which
+    /// claude may read, and it's told where they are in the prompt. They
+    /// stay for the transcript and go with the session.
+    #[tokio::test]
+    async fn sends_attachments() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> {log}
+cat >> {log}
+echo '{{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+"#,
+            log = log.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        let session = start(&state, "plain text").await;
+        let id = &session.id;
+        let first = std::fs::read_to_string(&log).unwrap();
+        // Without attachments, claude may read nothing beyond its own
+        // directory.
+        assert!(!first.contains("Read(/"), "{first}");
+        std::fs::remove_file(&log).unwrap();
+
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"%PDF-1.4"),
+        )]);
+        let up = crate::attachments::store(state.agents.uploads(), "report.pdf", bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let files = crate::attachments::claim(
+            state.agents.uploads(),
+            state.agents.attachments(),
+            id,
+            std::slice::from_ref(&up.id),
+        )
+        .await
+        .unwrap();
+        send_with_files(
+            &state,
+            id,
+            "summarize it".into(),
+            Vec::new(),
+            files.clone(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        let events = wait_for_turns(&state, id, 2).await;
+        assert!(
+            events.contains(&AgentEventKind::Attachments(files.clone())),
+            "{events:?}"
+        );
+
+        // The notes in --append-system-prompt carry newlines of their
+        // own, so the arguments span lines up to the input message.
+        let log = std::fs::read_to_string(&log).unwrap();
+        let dir = state.agents.attachments().join(id);
+        // Reading them doesn't ask; changing them still does.
+        assert!(
+            log.contains(&format!("--allowedTools Read(/{}/**)", dir.display())),
+            "{log}"
+        );
+        assert!(!log.contains("--add-dir"), "{log}");
+        let message: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        let path = dir.join(&up.id).join("report.pdf");
+        assert_eq!(
+            message["message"]["content"],
+            json!([
+                {"type": "text", "text": format!(
+                    "The user attached these files to this message. Read them with your \
+                     tools as needed:\n- {} (8 B)",
+                    path.display()
+                )},
+                {"type": "text", "text": "summarize it"},
+            ])
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.4");
+        assert!(delete(&state, id).await.unwrap());
+        assert!(!dir.exists());
     }
 
     /// Reads the prompt's text from the stream-json message on stdin into
@@ -4757,6 +5231,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
                 permission_mode: PermissionMode::from("auto"),
                 model: Some("sonnet".into()),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -4831,6 +5306,10 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"Hi there"
             "{log}"
         );
         assert!(second.trim_end().ends_with(" | second | 1"), "{log}");
+        for call in [first, second.as_str()] {
+            assert!(call.contains(&images_note()), "{log}");
+            assert!(call.contains(crate::claude::DESCRIPTION_NOTE), "{log}");
+        }
 
         // Pages get the stored events and the streamed text.
         let mut live = Vec::new();
@@ -4885,6 +5364,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -4911,6 +5391,299 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         assert_eq!(session.cost, 0.5);
     }
 
+    /// A turn keeps the commands claude lists, for the session and its
+    /// repository, and counts the one its prompt starts with, unless
+    /// it's an automatic review's.
+    #[tokio::test]
+    async fn keeps_the_commands_claude_lists() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test","slash_commands":["foo","doctor"],"skills":["foo","bar"],"terminal_slash_commands":["doctor"]}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let req = |prompt: &str| NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: None,
+            prompt: prompt.into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            draft: None,
+        };
+        let session = create(&state, req("/foo go")).await.unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let review = create_session(
+            &state,
+            req("/foo Review pull request"),
+            SessionKind::AutoReview,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &review.id, 1).await;
+
+        let expected = vec!["bar".to_owned(), "foo".to_owned()];
+        assert_eq!(
+            state.db.agent_slash_commands(&session.id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            state
+                .db
+                .repo_slash_commands("owner/name", AgentBackend::Claude)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        let listed =
+            crate::slash_commands::list(&state, "owner/name", AgentBackend::Claude, None).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|c| (c.name.as_str(), c.uses))
+                .collect::<Vec<_>>(),
+            [("bar", 0), ("foo", 1)]
+        );
+    }
+
+    /// Waits until the session's status is `status`.
+    async fn wait_for_status(state: &State, id: &str, status: AgentStatus) {
+        for _ in 0..1500 {
+            if state.db.agent(id).unwrap().unwrap().status == status {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{id} never became {status:?}");
+    }
+
+    /// A claude that goes on after its answer, for a background task,
+    /// shows as waiting on it, and as working again when the task wakes it
+    /// up. A prompt sent meanwhile waits for the process to exit.
+    #[tokio::test]
+    async fn shows_a_wait_for_a_background_task() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count");
+        let script = format!(
+            r#"#!/bin/sh
+{READ_PROMPT}
+echo x >> {count}
+if [ "$prompt" != go ]; then
+  echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Later"}}]}},"parent_tool_use_id":null}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
+  exit
+fi
+echo '{{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_1","is_backgrounded":true}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Started"}}]}},"parent_tool_use_id":null}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}}'
+sleep 1
+echo '{{"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"toolu_2","is_backgrounded":true}}'
+sleep 2
+echo '{{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_1","status":"completed"}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Done"}}]}},"parent_tool_use_id":null}}'
+sleep 1
+echo '{{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5}}'
+sleep 3
+"#,
+            count = count.display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        let id = &session.id;
+        wait_for_status(&state, id, AgentStatus::Background).await;
+        send(
+            &state,
+            id,
+            "next".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        wait_for_status(&state, id, AgentStatus::Running).await;
+        wait_for_status(&state, id, AgentStatus::Background).await;
+        // The prompt is still waiting for the first process.
+        assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        let transcript = wait_for_turns(&state, id, 3).await;
+
+        let ended = |cost| AgentEventKind::TurnEnded {
+            error: None,
+            cost: Some(cost),
+        };
+        assert_eq!(
+            transcript,
+            [
+                AgentEventKind::Prompt("go".into()),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                },
+                AgentEventKind::Text("Started".into()),
+                ended(0.25),
+                AgentEventKind::TaskStarted {
+                    id: "toolu_2".into(),
+                    task: "b2".into(),
+                },
+                AgentEventKind::TaskEnded {
+                    id: "toolu_1".into(),
+                    task: "b1".into(),
+                    status: grenadine_core::api::TaskStatus::Completed,
+                },
+                AgentEventKind::Text("Done".into()),
+                ended(0.5),
+                AgentEventKind::Prompt("next".into()),
+                AgentEventKind::Text("Later".into()),
+                ended(0.25),
+            ]
+        );
+        assert_eq!(
+            state.db.agent(id).unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
+    }
+
+    /// A permission request during the wait on a background task, as a
+    /// subagent in the background makes, shows while it waits and goes
+    /// back to the wait once it's answered, also when it came first.
+    #[tokio::test]
+    async fn an_approval_returns_to_the_background_wait() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_claude(&fx, dir.path(), "#!/bin/sh\n");
+        let id = "s";
+        state
+            .db
+            .create_agent(&AgentSession {
+                status: AgentStatus::Running,
+                ..AgentSession::fixture(id, "owner/name")
+            })
+            .unwrap();
+        let status = || state.db.agent(id).unwrap().unwrap().status;
+        let ask = |tool_use: &str| {
+            request_approval(&state, id, tool_use, "Bash", &json!({}), Vec::new()).unwrap()
+        };
+        let allow = |tool_use: &str| {
+            let decision = Decision {
+                allow: true,
+                ..Default::default()
+            };
+            assert!(approve(&state, id, tool_use, decision).unwrap());
+        };
+        let mut sink = TurnSink::new(&state, id, "owner/name");
+        sink.event(AgentEventKind::TurnEnded {
+            error: None,
+            cost: None,
+        })
+        .unwrap();
+
+        sink.background();
+        assert_eq!(status(), AgentStatus::Background);
+        let _rx = ask("t1");
+        assert_eq!(status(), AgentStatus::AwaitingApproval);
+        allow("t1");
+        assert_eq!(status(), AgentStatus::Background);
+
+        // A request from before the wait keeps its status.
+        let mut sink = TurnSink::new(&state, id, "owner/name");
+        state.agents.with_live(id, |l| l.background = false);
+        sink.event(AgentEventKind::TurnEnded {
+            error: None,
+            cost: None,
+        })
+        .unwrap();
+        let _rx = ask("t2");
+        sink.background();
+        assert_eq!(status(), AgentStatus::AwaitingApproval);
+        allow("t2");
+        assert_eq!(status(), AgentStatus::Background);
+
+        // The agent's next event ends the wait.
+        sink.event(AgentEventKind::Text("Done".into())).unwrap();
+        assert_eq!(status(), AgentStatus::Running);
+        assert!(!state.agents.with_live(id, |l| l.background));
+
+        // So does a message that only reports usage, unlike a result's
+        // window.
+        sink.background();
+        assert_eq!(status(), AgentStatus::Background);
+        sink.event(AgentEventKind::Usage {
+            tokens: None,
+            window: Some(200_000),
+        })
+        .unwrap();
+        assert_eq!(status(), AgentStatus::Background);
+        sink.event(AgentEventKind::Usage {
+            tokens: Some(10),
+            window: None,
+        })
+        .unwrap();
+        assert_eq!(status(), AgentStatus::Running);
+    }
+
+    /// Lines the transcript skips, like a background subagent's, don't
+    /// keep a session that has answered from showing the wait.
+    #[tokio::test]
+    async fn skipped_lines_dont_put_off_the_background_wait() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Started"}]},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_1"}'
+  sleep 0.5
+done
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Claude,
+                repo: "owner/name".into(),
+                pr: None,
+                prompt: "go".into(),
+                permission_mode: PermissionMode::from("auto"),
+                model: None,
+                images: Vec::new(),
+                attachments: Vec::new(),
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_status(&state, &session.id, AgentStatus::Background).await;
+        // The subagent's lines are still coming.
+        assert!(state.agents.with_live(&session.id, |l| l.running));
+        wait_for_turns(&state, &session.id, 1).await;
+        assert_eq!(
+            state.db.agent(&session.id).unwrap().unwrap().status,
+            AgentStatus::Idle
+        );
+    }
+
     /// A general session runs in an empty directory of its own, outside any
     /// clone, has nothing to land, and takes its directory when deleted.
     #[tokio::test]
@@ -4935,6 +5708,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"","total_
             permission_mode: PermissionMode::from("auto"),
             model: None,
             images: Vec::new(),
+            attachments: Vec::new(),
             draft: None,
         };
         let err = create(&state, new(Some(1))).await.unwrap_err().to_string();
@@ -5037,6 +5811,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5076,6 +5851,62 @@ esac
             "{input}"
         );
         wait_for_turns(&state, &session.id, 1).await;
+    }
+
+    /// The summary job is also told the title of the PR the session
+    /// started from.
+    #[tokio::test]
+    async fn summarizes_with_the_starting_prs_title() {
+        use crate::git::tests::run;
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+case " $* " in
+*" --json-schema "*)
+  cat > {dir}/summary_input
+  echo '{{"type":"result","is_error":false,"structured_output":{{"summary":"Write a note"}}}}'
+  ;;
+*" --no-session-persistence "*)
+  read -r request
+  echo '{{"type":"control_response","response":{{"request_id":"models","response":{{"models":[{{"value":"claude-test","displayName":"Test","description":""}}]}}}}}}'
+  ;;
+*)
+  cat > /dev/null
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
+  ;;
+esac
+"#,
+            dir = dir.path().display()
+        );
+        let state = state_with_claude(&fx, dir.path(), &script);
+        state
+            .agents
+            .summaries
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let head = run(&fx.upstream, &["rev-parse", "HEAD"]).trim().to_owned();
+        run(&fx.upstream, &["branch", "pr-branch", &head]);
+        store_pr(&state, &fx, 5, "pr-branch", &head);
+
+        let session = start_from_pr(&state, "/fix-it", 5).await;
+        for _ in 0..300 {
+            if state
+                .db
+                .agent(&session.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let input = std::fs::read_to_string(dir.path().join("summary_input")).unwrap();
+        assert!(
+            input.ends_with("\n\n# Pull request\n\nt\n\n# Request\n\n/fix-it\n"),
+            "{input}"
+        );
     }
 
     /// A session whose fake claude starts a container, and answers scans
@@ -5123,6 +5954,7 @@ esac
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5381,6 +6213,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5566,6 +6399,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5602,6 +6436,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5761,6 +6596,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -5857,6 +6693,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
                 permission_mode: PermissionMode::from("auto"),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -7807,6 +8644,40 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"ok"}}'
         }
     }
 
+    /// A prompt sent while a handoff is being written waits for it, and
+    /// starts once it's written.
+    #[tokio::test]
+    async fn prompts_wait_for_the_handoff_being_written() {
+        let state = crate::sync::test_state();
+        let id = uuid();
+        assert!(begin_handoff(&state, &id));
+        send(
+            &state,
+            &id,
+            "go on".into(),
+            PermissionMode::from("auto"),
+            None,
+        );
+        let live = |state: &State| state.agents.with_live(&id, |l| (l.running, l.queue.len()));
+        assert_eq!(live(&state), (false, 1));
+        assert!(!begin_handoff(&state, &id));
+        // The turn's task doesn't get to run before the next await.
+        end_handoff(&state, &id);
+        assert_eq!(live(&state), (true, 1));
+    }
+
+    /// The end of a deleted session's handoff doesn't bring its entry
+    /// back.
+    #[test]
+    fn ending_a_deleted_sessions_handoff_leaves_no_entry() {
+        let state = crate::sync::test_state();
+        let id = uuid();
+        assert!(begin_handoff(&state, &id));
+        state.agents.live.lock().unwrap().remove(&id);
+        end_handoff(&state, &id);
+        assert!(!state.agents.live.lock().unwrap().contains_key(&id));
+    }
+
     /// One landing at a time: a second call fails while a landing's guard
     /// lives, and a dropped guard doesn't bring back a deleted session's
     /// entry.
@@ -8410,6 +9281,7 @@ pub(crate) mod devin_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -8630,6 +9502,71 @@ pub(crate) mod devin_tests {
             assert_eq!(ended, [Some(cost)]);
             assert_eq!(state.db.agent(&session.id).unwrap().unwrap().cost, cost);
         }
+    }
+
+    /// A Devin session's first prompt claims its uploads, and Devin is
+    /// told where the files are in a block before the prompt's text.
+    #[tokio::test]
+    async fn a_devin_prompt_lists_its_attachments() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let devin = fake(
+            dir.path(),
+            scenario("turn-files", vec![json!({"end": "end_turn"})]),
+        );
+        let state = state_with_devin(&fx, dir.path(), devin);
+        let bytes = futures::stream::iter([Ok::<_, std::io::Error>(
+            axum::body::Bytes::from_static(b"a,b\n"),
+        )]);
+        let up = crate::attachments::store(state.agents.uploads(), "data.csv", bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = create(
+            &state,
+            NewAgent {
+                backend: AgentBackend::Devin,
+                repo: fx.clone.slug.clone(),
+                pr: None,
+                prompt: "hi".into(),
+                permission_mode: "accept-edits".into(),
+                model: None,
+                images: Vec::new(),
+                attachments: vec![up.id.clone()],
+                draft: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        assert!(crate::attachments::upload(state.agents.uploads(), &up.id).is_none());
+        let path = state
+            .agents
+            .attachments()
+            .join(&session.id)
+            .join(&up.id)
+            .join("data.csv");
+        assert_eq!(std::fs::read(&path).unwrap(), b"a,b\n");
+        let prompt = fake_log(dir.path())
+            .into_iter()
+            .find(|m| m["method"] == "session/prompt")
+            .unwrap();
+        let blocks = prompt["params"]["prompt"].as_array().unwrap();
+        let texts: Vec<_> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
+        // The notes come first.
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(
+            texts[1..],
+            [
+                format!(
+                    "The user attached these files to this message. Read them with your tools \
+                     as needed:\n- {} (4 B)",
+                    path.display()
+                )
+                .as_str(),
+                "hi"
+            ]
+        );
     }
 
     /// A Devin session's turn goes over ACP: the session id is stored,
@@ -8860,6 +9797,7 @@ mod devin_job_tests {
                 permission_mode: "accept-edits".into(),
                 model: None,
                 images: Vec::new(),
+                attachments: Vec::new(),
                 draft: None,
             },
         )
@@ -9017,6 +9955,7 @@ esac
                     permission_mode: "accept-edits".into(),
                     model: None,
                     images: Vec::new(),
+                    attachments: Vec::new(),
                     draft: None,
                 },
             )

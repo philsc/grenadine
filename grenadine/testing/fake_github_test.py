@@ -112,11 +112,12 @@ query($owner: String!, $name: String!, $number: Int!) {
 fragment Who on Actor { login avatarUrl ... on User { name } }
 
 fragment Checks on StatusCheckRollup {
+  state
   contexts(first: 100) {
     nodes {
       ... on CheckRun {
         name status conclusion detailsUrl startedAt
-        checkSuite { workflowRun { workflow { name } } }
+        checkSuite { workflowRun { databaseId workflow { name } } }
       }
       ... on StatusContext { context state targetUrl }
     }
@@ -252,8 +253,14 @@ class FakeGitHubTest(unittest.TestCase):
         # Like GitHub's, the state counts the run that a later one
         # superseded.
         pr.check_runs = [
-            CheckRun("test", conclusion="CANCELLED", started_at=1, workflow="Test"),
-            CheckRun("test", started_at=2, workflow="Test"),
+            CheckRun(
+                "test",
+                conclusion="CANCELLED",
+                started_at=1,
+                workflow="Test",
+                run_id=7,
+            ),
+            CheckRun("test", started_at=2, workflow="Test", run_id=8),
         ]
         out = self.query(
             SEARCH_QUERY, q0=f"is:pr {pr.title}", q1="is:pr Wait for reviewers"
@@ -275,6 +282,12 @@ class FakeGitHubTest(unittest.TestCase):
         self.assertEqual(
             other["commits"], {"nodes": [{"commit": {"statusCheckRollup": None}}]}
         )
+        # Re-running the cancelled run makes it pass.
+        self.assertEqual(pr.checks(), "FAILURE")
+        route = "/repos/test/test/actions/runs/{}/rerun-failed-jobs"
+        self.assertEqual(self.gh._route("POST", route.format(9), {}, b"", None)[0], 404)
+        self.assertEqual(self.gh._route("POST", route.format(7), {}, b"", None)[0], 201)
+        self.assertEqual(pr.checks(), "SUCCESS")
 
     def test_pr_query_reports_force_pushes(self) -> None:
         pr = self.inboxes.prs["Wait for reviewers"]
@@ -373,7 +386,7 @@ class FakeGitHubTest(unittest.TestCase):
                     "COMPLETED",
                     "SUCCESS",
                     "1970-01-01T00:00:01Z",
-                    {"workflowRun": {"workflow": {"name": "Lint"}}},
+                    {"workflowRun": {"databaseId": None, "workflow": {"name": "Lint"}}},
                 ),
                 ("test", "COMPLETED", "FAILURE", None, {"workflowRun": None}),
                 ("deploy", "IN_PROGRESS", None, None, {"workflowRun": None}),

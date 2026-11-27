@@ -10,7 +10,9 @@ use std::process::Stdio;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
-use grenadine_core::api::{AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk};
+use grenadine_core::api::{
+    AgentBackend, AgentEventKind, AgentModelInfo, AgentSession, AgentStatus, PatchHunk, TaskStatus,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -29,6 +31,17 @@ const MCP_TOOL_TIMEOUT_MS: &str = "2147483647";
 /// servers by default, which would cut off a person who's away from the
 /// page. 0 turns the check off.
 const MCP_TOOL_IDLE_TIMEOUT_MS: &str = "0";
+
+/// How long Claude Code may go on after an answer before the session
+/// shows as waiting on a background task. Without a background task, it
+/// exits right after the answer.
+const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What every turn is told beyond the session's own notes. The Bash tool's
+/// `description` is optional, and Claude tends to leave it out of a whole
+/// session once it left it out of the first call.
+pub(crate) const DESCRIPTION_NOTE: &str = "Give every Bash call a `description`, even a simple \
+    one. The user may see it in the transcript in place of the command.";
 
 /// The `initialize` control request the Agent SDK starts with. Claude Code
 /// answers it without calling a model.
@@ -136,9 +149,15 @@ fn parse_models(line: &str) -> Option<Vec<AgentModelInfo>> {
 }
 
 /// The stream-json user message that gives Claude `prompt` with the images
-/// in `dir` named `images`. The text goes last: Claude Code only takes a
-/// prompt for a slash command when its last block is the command.
-async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<String> {
+/// in `dir` named `images`, and `attached`, what it's told about the
+/// files attached to the prompt. The text goes last: Claude Code only
+/// takes a prompt for a slash command when its last block is the command.
+async fn user_message(
+    prompt: &str,
+    dir: &Path,
+    images: &[String],
+    attached: Option<&str>,
+) -> Result<String> {
     let mut content = Vec::new();
     for name in images {
         let bytes = tokio::fs::read(dir.join(name))
@@ -156,6 +175,9 @@ async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<Str
             },
         }));
     }
+    if let Some(attached) = attached {
+        content.push(json!({"type": "text", "text": attached}));
+    }
     if !prompt.trim().is_empty() {
         content.push(json!({"type": "text", "text": prompt}));
     }
@@ -165,6 +187,13 @@ async fn user_message(prompt: &str, dir: &Path, images: &[String]) -> Result<Str
         "parent_tool_use_id": null,
     });
     Ok(format!("{message}\n"))
+}
+
+/// What a turn with `notes` appends to Claude Code's system prompt.
+fn system_prompt(notes: &[String]) -> String {
+    let mut parts: Vec<&str> = notes.iter().map(String::as_str).collect();
+    parts.push(DESCRIPTION_NOTE);
+    parts.join("\n\n")
 }
 
 /// Runs `t` as a `claude -p` turn of `session` and returns the status the
@@ -180,6 +209,7 @@ async fn turn(
     let Turn {
         prompt,
         images,
+        attached,
         mode,
         model,
         mcp_url,
@@ -218,12 +248,8 @@ async fn turn(
     .args(crate::mcp::ALLOWED_TOOLS)
     .arg("--mcp-config")
     .arg(mcp.to_string())
-    .args(
-        (!notes.is_empty())
-            .then(|| notes.join("\n\n"))
-            .into_iter()
-            .flat_map(|note| ["--append-system-prompt".to_owned(), note]),
-    )
+    .arg("--append-system-prompt")
+    .arg(system_prompt(notes))
     .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
     .env(
         "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT",
@@ -232,7 +258,14 @@ async fn turn(
     if let Some(model) = model.filter(|m| m != "default") {
         cmd.arg("--model").arg(model);
     }
-    let input = user_message(prompt, &state.agents.images().join(id), images).await?;
+    // The files attached to this prompt or earlier ones are read without
+    // asking for permission. Only read: they're what the transcript
+    // serves as the files sent, so changing them still asks.
+    let attachments = state.agents.attachments().join(id);
+    if attachments.is_dir() {
+        cmd.arg("--allowedTools").arg(read_rule(&attachments));
+    }
+    let input = user_message(prompt, &state.agents.images().join(id), images, attached).await?;
     let mut child = cmd
         .spawn()
         .with_context(|| format!("can't run {}", claude.display()))?;
@@ -251,10 +284,40 @@ async fn turn(
 
     let stderr = crate::agent::stderr_tail(child.stderr.take().unwrap());
     let mut lines = OutputLines::new(child.stdout.take().unwrap(), stopper);
-    while let Some(line) = lines.next(state).await? {
+    // When a process still running after its answer shows as waiting on
+    // a background task. The short grace keeps a process that's just
+    // exiting from showing as one. Lines the transcript skips, like a
+    // background subagent's, don't put the deadline off.
+    let mut deadline = None;
+    loop {
+        let line = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, lines.next(state)).await {
+                Ok(line) => line?,
+                Err(_) => {
+                    sink.background();
+                    deadline = None;
+                    continue;
+                }
+            },
+            None => lines.next(state).await?,
+        };
+        let Some(line) = line else {
+            break;
+        };
         match parse_line(&line) {
-            Parsed::Started { model } => sink.started(id, model)?,
+            Parsed::Started { model, commands } => {
+                sink.started(id, model)?;
+                if let Some(commands) = commands {
+                    sink.commands(AgentBackend::Claude, &commands)?;
+                }
+            }
             Parsed::Events(events) => {
+                // A task starting or ending isn't the agent working, so
+                // it leaves the deadline alone.
+                if let Some(last) = events.last().filter(|e| !e.is_task()) {
+                    deadline = matches!(last, AgentEventKind::TurnEnded { error: None, .. })
+                        .then(|| tokio::time::Instant::now() + BACKGROUND_GRACE);
+                }
                 for kind in events {
                     sink.event(kind)?;
                 }
@@ -272,14 +335,68 @@ async fn turn(
     })
 }
 
+/// Claude Code's config directory: `$CLAUDE_CONFIG_DIR`, or `~/.claude`.
+pub(crate) fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
+        })
+}
+
+/// The commands that an init line says a prompt can start with: its
+/// skills and slash commands, sorted, without the ones bound to the
+/// terminal, which don't work under `-p`.
+fn init_commands(init: &Value) -> Option<Vec<String>> {
+    let names = |key: &str| {
+        init[key]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+    };
+    let (skills, commands) = (names("skills"), names("slash_commands"));
+    if skills.is_none() && commands.is_none() {
+        return None;
+    }
+    let terminal = names("terminal_slash_commands").unwrap_or_default();
+    let all: std::collections::BTreeSet<&str> = skills
+        .into_iter()
+        .chain(commands)
+        .flatten()
+        .filter(|n| !terminal.contains(n))
+        .collect();
+    Some(all.into_iter().map(str::to_owned).collect())
+}
+
 /// What one line of `--output-format stream-json` means for the transcript.
 #[derive(Debug, PartialEq)]
 enum Parsed {
     /// Claude Code created (or resumed) its session with `model`.
     Started {
         model: Option<String>,
+        /// The commands a prompt can start with; `None` when the line
+        /// doesn't list them.
+        commands: Option<Vec<String>>,
     },
     Events(Vec<AgentEventKind>),
+}
+
+/// What a `task_started` or `task_notification` line says about the tool
+/// call that started the task. `None` for a task without a tool call, or
+/// a status that isn't an end.
+fn task_event(v: &Value) -> Option<AgentEventKind> {
+    let id = v["tool_use_id"].as_str()?.to_owned();
+    let task = v["task_id"].as_str()?.to_owned();
+    if v["subtype"] == "task_started" {
+        return Some(AgentEventKind::TaskStarted { id, task });
+    }
+    let status = match v["status"].as_str()? {
+        "completed" => TaskStatus::Completed,
+        "failed" => TaskStatus::Failed,
+        "stopped" | "killed" => TaskStatus::Stopped,
+        _ => return None,
+    };
+    Some(AgentEventKind::TaskEnded { id, task, status })
 }
 
 /// The text of a tool result, whose content is a string or a list of blocks.
@@ -370,7 +487,18 @@ fn parse_line(line: &str) -> Parsed {
             let model = v["model"].as_str().unwrap_or_default();
             return Parsed::Started {
                 model: (!model.is_empty()).then(|| model.to_owned()),
+                commands: init_commands(&v),
             };
+        }
+        // A task of the session's own agent, by the tool call that
+        // started it. Tasks of subagents have no row to show on.
+        Some("system")
+            if matches!(
+                v["subtype"].as_str(),
+                Some("task_started" | "task_notification")
+            ) && v["owned_by_subagent"].as_bool() != Some(true) =>
+        {
+            task_event(&v).into_iter().collect()
         }
         Some("stream_event") => {
             let delta = &v["event"]["delta"];
@@ -475,7 +603,7 @@ fn bash_hook_settings() -> Result<Value> {
 fn job_model(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Summary | JobKind::Scan => "haiku",
-        JobKind::Prune => "sonnet",
+        JobKind::Prune | JobKind::Handoff => "sonnet",
     }
 }
 
@@ -548,6 +676,12 @@ pub fn structured_output(name: &str, stdout: &[u8]) -> Result<Value> {
     Ok(result["structured_output"].take())
 }
 
+/// The permission rule that lets Claude Code read the files under `dir`,
+/// an absolute path, which rules write with a leading `//`.
+fn read_rule(dir: &Path) -> String {
+    format!("Read(/{}/**)", dir.display())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use grenadine_core::api::AgentBackend;
@@ -575,7 +709,22 @@ pub(crate) mod tests {
                 r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s","tools":[],"model":"claude-opus-4-6"}"#
             ),
             Parsed::Started {
-                model: Some("claude-opus-4-6".into())
+                model: Some("claude-opus-4-6".into()),
+                commands: None,
+            }
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"m","slash_commands":["foo","doctor","compact","baz"],"terminal_slash_commands":["doctor"],"skills":["foo","bar"]}"#
+            ),
+            Parsed::Started {
+                model: Some("m".into()),
+                commands: Some(vec![
+                    "bar".into(),
+                    "baz".into(),
+                    "compact".into(),
+                    "foo".into()
+                ]),
             }
         );
         assert_eq!(
@@ -583,7 +732,8 @@ pub(crate) mod tests {
                 r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-4-6[1m]"}"#
             ),
             Parsed::Started {
-                model: Some("claude-opus-4-6[1m]".into())
+                model: Some("claude-opus-4-6[1m]".into()),
+                commands: None,
             }
         );
         assert_eq!(
@@ -682,6 +832,45 @@ pub(crate) mod tests {
         assert_eq!(
             events(
                 r#"{"type":"assistant","message":{"content":[{"type":"text","text":"sub"}]},"parent_tool_use_id":"toolu_9"}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_4","description":"Sleep","is_backgrounded":true,"task_type":"local_bash"}"#
+            ),
+            [AgentEventKind::TaskStarted {
+                id: "toolu_4".into(),
+                task: "b1".into(),
+            }]
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_4","status":"failed","output_file":"/tmp/o","summary":"exit code 1"}"#
+            ),
+            [AgentEventKind::TaskEnded {
+                id: "toolu_4".into(),
+                task: "b1".into(),
+                status: TaskStatus::Failed,
+            }]
+        );
+        // A subagent's task, one without a tool call, and the patch that
+        // comes before a notification have no row to change.
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_started","task_id":"b2","tool_use_id":"toolu_5","owned_by_subagent":true}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_notification","task_id":"b3","status":"completed"}"#
+            ),
+            []
+        );
+        assert_eq!(
+            events(
+                r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed"}}"#
             ),
             []
         );

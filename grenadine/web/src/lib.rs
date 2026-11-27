@@ -10,6 +10,7 @@ mod debug;
 mod diffview;
 mod drafts;
 mod events;
+mod files;
 mod global_settings;
 mod highlight;
 mod image_drafts;
@@ -17,13 +18,19 @@ mod images;
 mod inboxes;
 mod markdown;
 mod memlog;
+mod navigate;
 mod pr;
 mod pr_agents;
+mod pr_threads;
+mod processes;
 mod review;
 mod settings;
+mod sidebar;
+mod slash;
 mod tabs;
 mod terminal;
 mod theme;
+mod tool_summaries;
 mod topbar;
 
 use grenadine_core::api::{GENERAL, PrKey, ServerEvent, SyncStatus};
@@ -75,6 +82,9 @@ pub enum Route {
     AutoReviews,
     /// `#/auto-reviews/<id>`: the session doing one of them.
     AutoReview(String),
+    /// `#/auto-reviews/review/<id>`: one of them, by its own id, with
+    /// its session while it has one and its transcript once it's gone.
+    AutoReviewPage(i64),
     /// `#/debug`: what the server spends on GitHub.
     Debug,
 }
@@ -114,6 +124,7 @@ fn route_from_hash(hash: &str) -> Route {
         ["agents", "cleanup"] => Some(Route::Cleanup),
         ["agents", id] if !id.is_empty() => Some(Route::Agent(id.to_owned())),
         ["auto-reviews"] => Some(Route::AutoReviews),
+        ["auto-reviews", "review", id] => id.parse().ok().map(Route::AutoReviewPage),
         ["auto-reviews", id] if !id.is_empty() => Some(Route::AutoReview(id.to_owned())),
         ["debug"] => Some(Route::Debug),
         [owner, name, number] => pr_key(owner, name, number).map(Route::Pr),
@@ -158,7 +169,7 @@ fn open_draft(route: Route, drafts: drafts::Drafts) -> Route {
         return route;
     };
     let id = drafts.create(repo, pr);
-    let _ = window().location().replace(&drafts::hash(&id));
+    navigate::replace_quietly(&drafts::hash(&id));
     Route::Draft(id)
 }
 
@@ -266,13 +277,18 @@ fn App() -> impl IntoView {
     let drafts = drafts::Drafts::load(open.as_deref());
     // Drop image drafts whose text draft is gone; the `agent.*` ones stay
     // like their text drafts do.
-    image_drafts::sweep(move |key| {
-        key.starts_with("agent.")
-            || drafts
-                .listed(open.as_deref())
-                .iter()
-                .any(|(_, id)| key == image_drafts::new_session_key(id))
-    });
+    let kept = {
+        let open = open.clone();
+        move |key: &str| {
+            key.starts_with("agent.")
+                || drafts
+                    .listed(open.as_deref())
+                    .iter()
+                    .any(|(_, id)| key == image_drafts::new_session_key(id))
+        }
+    };
+    files::sweep(kept.clone());
+    image_drafts::sweep(kept);
     provide_context(drafts);
     provide_context(global_settings::provide());
     provide_context(LocalResource::new(api::agent_backends));
@@ -300,6 +316,7 @@ fn App() -> impl IntoView {
         route.set(r);
     });
     on_cleanup(move || handle.remove());
+    navigate::follow_links();
     let on_inboxes = Memo::new(move |_| route.with(|r| *r == Route::Inboxes));
     let selected = Memo::new(move |_| route.with(pr_of));
     let agents = Memo::new(move |_| {
@@ -312,7 +329,7 @@ fn App() -> impl IntoView {
     let on_agents = Memo::new(move |_| agents.with(Option::is_some));
     let reviews = Memo::new(move |_| {
         route.with(|r| match r {
-            Route::AutoReviews | Route::AutoReview(_) => Some(r.clone()),
+            Route::AutoReviews | Route::AutoReview(_) | Route::AutoReviewPage(_) => Some(r.clone()),
             _ => None,
         })
     });
@@ -348,7 +365,7 @@ fn App() -> impl IntoView {
                 <inboxes::Inboxes last=last />
             </main>
             {move || selected.get().map(|key| view! {
-                <div class="pr-page"><pr::PrView key=key /></div>
+                <pr::PrView key=key />
             })}
             {move || on_agents.get().then(|| view! {
                 <div class="agents-page">
@@ -369,6 +386,7 @@ fn App() -> impl IntoView {
                     <auto_reviews::Sidebar route=route.into() />
                     {move || reviews.get().map(|r| match r {
                         Route::AutoReview(id) => view! { <agents::AgentView id=id read_only=true /> }.into_any(),
+                        Route::AutoReviewPage(id) => view! { <auto_reviews::ReviewPage id=id /> }.into_any(),
                         _ => view! { <main class="main"><auto_reviews::Overview /></main> }.into_any(),
                     })}
                 </div>
@@ -415,6 +433,181 @@ pub(crate) fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// Days since 1970-01-01 for `y`-`m`-`d` (Howard Hinnant's
+/// days-from-civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m + 9).rem_euclid(12);
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The inverse of `days_from_civil`: (year, month, day).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `secs` (Unix seconds) as UTC "YYYY-MM-DDTHH:MM:SSZ", for a `<time>`
+/// element's `datetime` attribute.
+pub(crate) fn iso_datetime(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    let t = secs.rem_euclid(86400);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        t / 3600,
+        t / 60 % 60,
+        t % 60
+    )
+}
+
+/// (year, month, day, hour, minute) in local time under wasm, in UTC in
+/// the non-wasm tests.
+fn local_fields(secs: i64) -> (i64, i64, i64, i64, i64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+        (
+            d.get_full_year() as i64,
+            (d.get_month() + 1) as i64,
+            d.get_date() as i64,
+            d.get_hours() as i64,
+            d.get_minutes() as i64,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let t = secs.rem_euclid(86400);
+        (y, m, d, t / 3600, t / 60 % 60)
+    }
+}
+
+/// A compact local "10:34" for `then_secs`, prefixed with the date when
+/// it isn't on `now_secs`' local day: "Nov 9, 10:34" in the same year,
+/// "2025-11-09 10:34" in a different one.
+pub(crate) fn short_local_time(now_secs: i64, then_secs: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (now_y, now_m, now_d, ..) = local_fields(now_secs);
+    let (y, m, d, h, min) = local_fields(then_secs);
+    if (y, m, d) == (now_y, now_m, now_d) {
+        format!("{h:02}:{min:02}")
+    } else if y == now_y {
+        format!("{} {}, {:02}:{:02}", MONTHS[(m - 1) as usize], d, h, min)
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}")
+    }
+}
+
+/// An RFC 3339 timestamp like "2026-01-02T03:04:05Z" or
+/// "2026-01-02T03:04:05.123-08:00" as Unix seconds, or `None` when `ts`
+/// isn't one.
+pub(crate) fn rfc3339_secs(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let year: i64 = ts.get(0..4)?.parse().ok()?;
+    let month: i64 = ts.get(5..7)?.parse().ok()?;
+    let day: i64 = ts.get(8..10)?.parse().ok()?;
+    let hour: i64 = ts.get(11..13)?.parse().ok()?;
+    let min: i64 = ts.get(14..16)?.parse().ok()?;
+    let sec: i64 = ts.get(17..19)?.parse().ok()?;
+    let mut rest = &ts[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(frac.len());
+        if digits == 0 {
+            return None;
+        }
+        rest = &frac[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let b = rest.as_bytes();
+            if b.len() != 6 || b[3] != b':' {
+                return None;
+            }
+            let sign = match b[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let h: i64 = rest[1..3].parse().ok()?;
+            let m: i64 = rest[4..6].parse().ok()?;
+            sign * (h * 3600 + m * 60)
+        }
+    };
+    Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec - offset)
+}
+
+/// `secs` (Unix seconds) as local "YYYY-MM-DD HH:MM:SS UTC±HH:MM".
+pub(crate) fn local_datetime(secs: i64) -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+        // JavaScript's offset is minutes to add to local time to get
+        // UTC, the opposite of the "UTC±HH:MM" sign.
+        let offset = -d.get_timezone_offset() as i64;
+        let (sign, abs) = if offset < 0 {
+            ('-', -offset)
+        } else {
+            ('+', offset)
+        };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC{}{:02}:{:02}",
+            d.get_full_year(),
+            d.get_month() + 1,
+            d.get_date(),
+            d.get_hours(),
+            d.get_minutes(),
+            d.get_seconds(),
+            sign,
+            abs / 60,
+            abs % 60
+        )
+    }
+    // The tests don't run under wasm; UTC is close enough there.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let t = secs.rem_euclid(86400);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC+00:00",
+            y,
+            m,
+            d,
+            t / 3600,
+            t / 60 % 60,
+            t % 60
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +622,73 @@ mod tests {
         assert_eq!(ago(3660, 60), "1h ago");
         assert_eq!(ago(86400 + 60, 60), "1d ago");
         assert_eq!(ago(86400 * 5 + 60, 60), "5d ago");
+    }
+
+    #[test]
+    fn iso_datetime_utc() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(iso_datetime(secs), "2026-11-10T18:34:06Z");
+        assert_eq!(iso_datetime(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_datetime(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn short_local_time_utc() {
+        let now = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        // The same day is a bare time.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2026-11-10T10:34:00Z").unwrap()),
+            "10:34"
+        );
+        // An earlier day in the same year gets a short date.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2026-11-09T10:34:00Z").unwrap()),
+            "Nov 9, 10:34"
+        );
+        // A different year gets the full ISO date.
+        assert_eq!(
+            short_local_time(now, rfc3339_secs("2025-12-31T10:34:00Z").unwrap()),
+            "2025-12-31 10:34"
+        );
+        // Right across a day boundary the date still shows.
+        assert_eq!(
+            short_local_time(
+                rfc3339_secs("2026-11-10T00:01:00Z").unwrap(),
+                rfc3339_secs("2026-11-09T23:59:00Z").unwrap()
+            ),
+            "Nov 9, 23:59"
+        );
+        // Right across a year boundary the year shows.
+        assert_eq!(
+            short_local_time(
+                rfc3339_secs("2026-01-01T00:01:00Z").unwrap(),
+                rfc3339_secs("2025-12-31T23:59:00Z").unwrap()
+            ),
+            "2025-12-31 23:59"
+        );
+    }
+
+    #[test]
+    fn rfc3339_secs_parses() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06+00:00"), Some(secs));
+        assert_eq!(rfc3339_secs("2026-11-10T10:34:06-08:00"), Some(secs));
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06.987Z"), Some(secs));
+        assert_eq!(rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_secs("1969-12-31T16:00:00-08:00"), Some(0));
+        assert_eq!(rfc3339_secs(""), None);
+        assert_eq!(rfc3339_secs("garbage"), None);
+        assert_eq!(rfc3339_secs("2026-11-10 18:34:06Z"), None);
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06"), None);
+        assert_eq!(rfc3339_secs("2026-11-10T18:34:06."), None);
+    }
+
+    #[test]
+    fn local_datetime_utc() {
+        let secs = rfc3339_secs("2026-11-10T18:34:06Z").unwrap();
+        assert_eq!(local_datetime(secs), "2026-11-10 18:34:06 UTC+00:00");
+        assert_eq!(local_datetime(0), "1970-01-01 00:00:00 UTC+00:00");
+        assert_eq!(local_datetime(-1), "1969-12-31 23:59:59 UTC+00:00");
     }
 
     fn key(repo: &str, number: u64) -> PrKey {
@@ -484,6 +744,11 @@ mod tests {
             route_from_hash("#/auto-reviews/abc"),
             Route::AutoReview("abc".into())
         );
+        assert_eq!(
+            route_from_hash("#/auto-reviews/review/7"),
+            Route::AutoReviewPage(7)
+        );
+        assert_eq!(route_from_hash("#/auto-reviews/review/x"), Route::Inboxes);
         assert_eq!(route_from_hash("#/auto-reviews/"), Route::Inboxes);
         assert_eq!(route_from_hash("#/debug"), Route::Debug);
         // An owner called "agents" still has PRs.

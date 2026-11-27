@@ -42,11 +42,11 @@ DRAFTS = "Drafts"
 MERGING = "Merging"
 DRAFTS_FROM_OTHERS = "Drafts from others"
 WAITING_FOR_AUTHOR = "Waiting for author"
-ALL_MY_OPEN = "All my open PRs"
+ALL_YOUR_OPEN = "All your open PRs"
 ALL_OPEN = "All open PRs"
-MERGED_BY_ME = "Merged by me"
-MERGED_BY_OTHERS = "Merged by others"
-UNMERGED_ON_MINE = "Unmerged PRs on mine"
+YOUR_MERGED = "Your merged PRs"
+MERGED_FROM_OTHERS = "Merged PRs from others"
+YOUR_UNMERGED = "Your unmerged PRs"
 
 TEAM_NAME = "grenadine-test-reviewers"
 # A required status check that nothing ever reports on merge groups. It keeps
@@ -748,9 +748,8 @@ def inbox_cases(fx: Fixture) -> None:
         fx,
         "inbox-unmerged",
         "Get closed",
-        expected_inbox=UNMERGED_ON_MINE,
-        notes="Mine, and closed without merging. It's in Unmerged PRs on mine "
-        "and Merged by me.",
+        expected_inbox=YOUR_UNMERGED,
+        notes="Mine, and closed without merging. It's in Your unmerged PRs.",
     )
     fx.repo_api("PATCH", f"pulls/{pr.number}", {"state": "closed"})
 
@@ -758,8 +757,8 @@ def inbox_cases(fx: Fixture) -> None:
         fx,
         "inbox-merged",
         "Get merged",
-        expected_inbox=MERGED_BY_ME,
-        notes="Mine, and merged. It's in Merged by me.",
+        expected_inbox=YOUR_MERGED,
+        notes="Mine, and merged. It's in Your merged PRs.",
     )
     fx.repo_api("PUT", f"pulls/{pr.number}/merge", {"merge_method": "merge"})
 
@@ -1148,6 +1147,19 @@ SYNTAX_FILES: dict[str, tuple[str, list[tuple[str, str]]]] = {
         "all:\n\techo building\n",
         [("building", "building everything")],
     ),
+    "syntax/top.sls": (
+        (
+            "{% set port = pillar.get('web:port', 8080) %}\n"
+            "web:\n"
+            "  pkg.installed:\n"
+            "    - name: {{ pillar.get('web:package', 'nginx') }}\n"
+            "{%- if grains['os'] == 'Debian' %}\n"
+            "  service.running:\n"
+            "    - enable: True\n"
+            "{%- endif %}\n"
+        ),
+        [("8080", "8443")],
+    ),
     "syntax/notes.unknownext": (
         "Plain text in a file whose extension nothing recognizes.\n",
         [("Plain", "Unhighlighted")],
@@ -1175,7 +1187,8 @@ def diff_syntax(fx: Fixture) -> None:
     fx.push_branch(f"case/{case}")
     notes = (
         "One small edit per language. BUILD.bazel and .bzl files highlight as "
-        "Python, and .ts/.tsx as JavaScript. notes.unknownext has no "
+        "Python, .ts/.tsx as JavaScript, and top.sls as YAML with Jinja tags. "
+        "notes.unknownext has no "
         "highlighting. huge.py is over 20,000 lines, so it isn't highlighted."
     )
     fx.open_pr(
@@ -1257,7 +1270,8 @@ def comments(fx: Fixture) -> None:
         "comment, a multi-line comment (lines 26-29), a comment on a removed "
         "line (left side, old line 10), a file-level comment on notes.md, and a "
         "comment with markdown. I reply to the single-line comment. There's also "
-        "a general PR comment, which grenadine doesn't show yet."
+        "a general PR comment, which the conversation shows as written on "
+        "version 2."
     )
     pr = fx.open_pr(
         case, "Collect review comments", notes, expected_inbox=RETURNED, notes=notes
@@ -1448,12 +1462,12 @@ def write_manifest(fx: Fixture, path: Path) -> None:
             DRAFTS,
             DRAFTS_FROM_OTHERS,
             WAITING_FOR_REVIEWERS,
-            ALL_MY_OPEN,
+            ALL_YOUR_OPEN,
             WAITING_FOR_AUTHOR,
-            MERGED_BY_ME,
-            MERGED_BY_OTHERS,
+            YOUR_MERGED,
+            MERGED_FROM_OTHERS,
             ALL_OPEN,
-            UNMERGED_ON_MINE,
+            YOUR_UNMERGED,
         ],
         "cases": [dataclasses.asdict(pr) for pr in fx.prs.values()],
     }

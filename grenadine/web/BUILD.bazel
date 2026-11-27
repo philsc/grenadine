@@ -1,15 +1,37 @@
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_shared_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library", "rust_test")
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
 load("//tools/opt:opt.bzl", "opt_files")
 
 exports_files(["Cargo.toml"])
 
+# syntect's default syntaxes plus the ones in src/syntaxes/, linked into one
+# set at build time: linking at runtime would add ~100ms to every highlight
+# worker's start.
+rust_binary(
+    name = "syntax_dump",
+    srcs = ["syntax_dump.rs"],
+    compile_data = glob(["src/syntaxes/*.sublime-syntax"]),
+    deps = ["@crates//:syntect"],
+)
+
+genrule(
+    name = "syntaxes_dump",
+    outs = ["syntaxes.packdump"],
+    cmd = "$(execpath :syntax_dump) $@",
+    tools = [":syntax_dump"],
+)
+
+# rules_rust makes this absolute, which include_bytes! needs.
+SYNTAXES_ENV = {"SYNTAXES_DUMP": "$(execpath :syntaxes_dump)"}
+
 rust_shared_library(
     name = "web_lib",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = [":syntaxes_dump"],
     crate_name = "grenadine_web",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = SYNTAXES_ENV,
     target_compatible_with = ["@platforms//cpu:wasm32"],
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],
 )
@@ -19,9 +41,13 @@ rust_test(
     name = "web_test",
     size = "small",
     srcs = glob(["src/**/*.rs"]),
-    compile_data = ["static/style.css"],
+    compile_data = [
+        "static/style.css",
+        ":syntaxes_dump",
+    ],
     crate_name = "grenadine_web",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = SYNTAXES_ENV,
     deps = all_crate_deps(normal = True) + ["//grenadine/core"],
 )
 

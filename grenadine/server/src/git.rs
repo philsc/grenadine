@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use grenadine_core::api::{Blob, ChangeStatus, FileChange, WorktreeFile};
+use grenadine_core::file_order;
 use grenadine_core::versions::CommitGraph;
 
 /// Refs that grenadine writes into the clone live under this prefix.
@@ -279,6 +280,27 @@ impl Repo {
         Ok(found)
     }
 
+    /// The commits that those of `branches` that exist on the GitHub
+    /// repository are at, by branch.
+    pub fn remote_heads(&self, branches: &[String]) -> Result<BTreeMap<String, String>> {
+        let mut found = BTreeMap::new();
+        if branches.is_empty() {
+            return Ok(found);
+        }
+        let mut args = vec!["ls-remote".to_owned(), "--heads".into(), self.fetch_url()];
+        args.extend(branches.iter().map(|b| format!("refs/heads/{b}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        for line in self.git(&args)?.lines() {
+            if let Some((sha, branch)) = line
+                .split_once('\t')
+                .and_then(|(sha, r)| Some((sha, r.strip_prefix("refs/heads/")?)))
+            {
+                found.insert(branch.to_owned(), sha.to_owned());
+            }
+        }
+        Ok(found)
+    }
+
     /// Whether `name` is a valid git branch name.
     pub fn valid_branch_name(&self, name: &str) -> bool {
         self.git_ok(&["check-ref-format", "--branch", name])
@@ -378,7 +400,8 @@ impl Repo {
 
     /// The unstaged changes in the worktree at `path`: the files whose
     /// working copy differs from the index, and the untracked files that
-    /// aren't ignored, as additions. Symlinks and submodules are left out.
+    /// aren't ignored, as additions, in the order diffs list them. Symlinks
+    /// and submodules are left out.
     pub fn worktree_changes(&self, path: &Path) -> Result<Vec<WorktreeFile>> {
         // Without optional locks, git doesn't take the index's lock to
         // refresh it, which could make the agent's own git commands fail.
@@ -406,6 +429,7 @@ impl Repo {
                     new_blob: None,
                 }),
         );
+        changes.sort_by(|a, b| file_order::cmp(a.path(), b.path()));
         let ids: Vec<String> = changes.iter().filter_map(|c| c.old_blob.clone()).collect();
         let mut olds = self.blobs(&ids)?;
         let mut files = Vec::new();
@@ -455,6 +479,39 @@ impl Repo {
             .filter(|p| !p.is_empty())
             .collect();
         Ok(paths.len())
+    }
+
+    /// How many files in the worktree at `path` differ from its commit:
+    /// changed, staged or not, or untracked.
+    pub fn worktree_uncommitted_count(&self, path: &Path) -> Result<usize> {
+        let status = self.git_in(
+            path,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+        )?;
+        Ok(status.lines().filter(|l| !l.is_empty()).count())
+    }
+
+    /// How many commits the worktree at `path` has that none of `known`
+    /// has. Commits of `known` the clone doesn't have are left out.
+    pub fn worktree_commits_beyond(&self, path: &Path, known: &[String]) -> Result<usize> {
+        let mut args = vec!["rev-list", "--count", "HEAD", "--not"];
+        args.extend(
+            known
+                .iter()
+                .filter(|sha| self.has_commit(sha))
+                .map(String::as_str),
+        );
+        let count = self.git_in(path, &args)?;
+        count
+            .trim()
+            .parse()
+            .with_context(|| format!("git rev-list --count printed {count:?}"))
     }
 
     /// Rebases the commits after `upstream` in the worktree at `path` onto
@@ -581,8 +638,9 @@ impl Repo {
         Ok(())
     }
 
-    /// The files that differ between the trees of two commits. Only trees
-    /// are compared here; the page diffs the contents.
+    /// The files that differ between the trees of two commits, in the
+    /// order diffs list them. Only trees are compared here; the page diffs
+    /// the contents.
     pub fn changed_files(&self, from: &str, to: &str) -> Result<Vec<FileChange>> {
         let out = self.git(&[
             "diff-tree",
@@ -594,7 +652,9 @@ impl Repo {
             from,
             to,
         ])?;
-        parse_raw_diff(&out)
+        let mut files = parse_raw_diff(&out)?;
+        files.sort_by(|a, b| file_order::cmp(a.path(), b.path()));
+        Ok(files)
     }
 
     /// The contents of blobs.
@@ -1057,7 +1117,14 @@ pub(crate) mod tests {
         let s = |t: &str| Some(Some(t.to_owned()));
         assert_eq!(
             summary,
+            // Untracked files are listed among the others, in path order.
             [
+                (
+                    ChangeStatus::Added,
+                    ".gitignore".to_owned(),
+                    None,
+                    s("ignored\n")
+                ),
                 (
                     ChangeStatus::Modified,
                     "a".to_owned(),
@@ -1065,19 +1132,13 @@ pub(crate) mod tests {
                     s("1\n2\n")
                 ),
                 (ChangeStatus::Deleted, "b".to_owned(), s("b\n"), None),
+                (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
                 (
                     ChangeStatus::Modified,
                     "c".to_owned(),
                     s("c\nstaged\n"),
                     s("c\nstaged\nunstaged\n")
                 ),
-                (
-                    ChangeStatus::Added,
-                    ".gitignore".to_owned(),
-                    None,
-                    s("ignored\n")
-                ),
-                (ChangeStatus::Added, "bin".to_owned(), None, Some(None)),
                 (ChangeStatus::Added, "new".to_owned(), None, s("new\n")),
             ]
         );
@@ -1086,5 +1147,38 @@ pub(crate) mod tests {
                 .iter()
                 .all(|w| w.change.old_blob.is_none() && w.change.new_blob.is_none())
         );
+    }
+
+    #[test]
+    fn worktree_changes_list_headers_before_their_sources() {
+        let f = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt");
+        f.clone.worktree_add(&path, "x", "HEAD").unwrap();
+        commit(&path, "foo.cpp", "int x;\n");
+        std::fs::write(path.join("foo.cpp"), "int y;\n").unwrap();
+        // Untracked, so git lists it after the tracked foo.cpp.
+        std::fs::write(path.join("foo.h"), "int y;\n").unwrap();
+
+        let files = f.clone.worktree_changes(&path).unwrap();
+        let paths: Vec<_> = files.iter().map(|w| w.change.path()).collect();
+        assert_eq!(paths, ["foo.h", "foo.cpp"]);
+    }
+
+    #[test]
+    fn changed_files_list_headers_before_their_sources() {
+        let f = fixture();
+        let base = run(&f.upstream, &["rev-parse", "HEAD"]);
+        for name in ["foo.cpp", "foo.h", "foo_test.cpp", "main.cpp"] {
+            std::fs::write(f.upstream.join(name), "x\n").unwrap();
+        }
+        run(&f.upstream, &["add", "."]);
+        run(&f.upstream, &["commit", "-q", "-m", "x"]);
+        let head = run(&f.upstream, &["rev-parse", "HEAD"]);
+        f.clone.fetch_commits(std::slice::from_ref(&head));
+
+        let files = f.clone.changed_files(&base, &head).unwrap();
+        let paths: Vec<_> = files.iter().map(FileChange::path).collect();
+        assert_eq!(paths, ["foo.h", "foo.cpp", "foo_test.cpp", "main.cpp"]);
     }
 }

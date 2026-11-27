@@ -1,8 +1,10 @@
 //! The machine's and the sessions' resource use for `/api/debug/system`:
 //! /proc, statvfs, and each session's cgroup under `grenadine-agent.slice`.
+//! Also the processes in one session's cgroup, for its Processes tab.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -11,8 +13,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use grenadine_core::api::{
-    AgentSession, DiskUsage, LeftoverResources, LoadStats, MemoryStats, PressureStats, ServerStats,
-    SessionResources, SystemStats,
+    AgentSession, DiskUsage, LeftoverResources, LoadStats, MemoryStats, PressureStats, ProcessInfo,
+    ServerStats, SessionProcesses, SessionResources, SystemStats,
 };
 
 use crate::sync::State;
@@ -398,9 +400,188 @@ fn session_usage(
     rendered
 }
 
+/// How much of a process's command line pages get, in bytes. Claude's
+/// holds its whole system prompt.
+const COMMAND_CAP: usize = 4096;
+
+/// What runs in the session's slice. `cgroup` is what `agent_cgroup`
+/// resolved; until some session runs something there is none.
+pub fn session_processes(state: &State, id: &str, cgroup: Option<&Path>) -> SessionProcesses {
+    let Some(slice) = state.agents.slice_of(id) else {
+        return SessionProcesses::default();
+    };
+    let shells = state.agents.terminals.shells(id);
+    let mut pids = BTreeSet::new();
+    if let Some(dir) = cgroup {
+        cgroup_pids(&dir.join(slice), &mut pids);
+    }
+    let now_ms = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| parse_uptime_ms(&s))
+        .unwrap_or(0);
+    let processes = pids
+        .into_iter()
+        .filter_map(|pid| {
+            Some(ProcessInfo {
+                terminal: shells.get(&pid).copied(),
+                ..process(pid)?
+            })
+        })
+        .collect();
+    SessionProcesses {
+        now_ms,
+        processes: Some(processes),
+    }
+}
+
+/// Adds the processes in the cgroup `dir` and the ones below it.
+fn cgroup_pids(dir: &Path, pids: &mut BTreeSet<u32>) {
+    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+    pids.extend(procs.lines().filter_map(|l| l.parse::<u32>().ok()));
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            cgroup_pids(&entry.path(), pids);
+        }
+    }
+}
+
+/// `None` once the process is gone.
+fn process(pid: u32) -> Option<ProcessInfo> {
+    // A process's name needn't be UTF-8.
+    let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let stat = parse_stat(&String::from_utf8_lossy(&stat))?;
+    let mut cmdline = Vec::new();
+    // One byte more than the cap shows whether there is more.
+    let _ = std::fs::File::open(format!("/proc/{pid}/cmdline"))
+        .and_then(|f| f.take(COMMAND_CAP as u64 + 1).read_to_end(&mut cmdline));
+    // SAFETY: sysconf has no preconditions.
+    let (hz, page) = unsafe {
+        (
+            libc::sysconf(libc::_SC_CLK_TCK),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let ms = |ticks: u64| ticks * 1000 / hz.max(1) as u64;
+    Some(ProcessInfo {
+        pid,
+        ppid: stat.ppid,
+        started_ms: ms(stat.started),
+        cpu_ms: ms(stat.cpu),
+        rss_bytes: stat.rss_pages * page.max(0) as u64,
+        command: command(&cmdline).unwrap_or_else(|| format!("[{}]", stat.name)),
+        terminal: None,
+    })
+}
+
+/// What /proc/<pid>/stat says, with times in clock ticks.
+#[derive(Debug, PartialEq)]
+struct Stat {
+    name: String,
+    ppid: u32,
+    cpu: u64,
+    started: u64,
+    rss_pages: u64,
+}
+
+fn parse_stat(s: &str) -> Option<Stat> {
+    // The name can contain anything, even `)`.
+    let (head, tail) = s.rsplit_once(')')?;
+    let (_, name) = head.split_once('(')?;
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let field = |i: usize| fields.get(i)?.parse::<u64>().ok();
+    Some(Stat {
+        name: name.to_owned(),
+        ppid: field(1)? as u32,
+        cpu: field(11)? + field(12)?,
+        started: field(19)?,
+        rss_pages: field(21)?,
+    })
+}
+
+/// The first field of /proc/uptime.
+fn parse_uptime_ms(s: &str) -> Option<u64> {
+    let secs: f64 = s.split_whitespace().next()?.parse().ok()?;
+    Some((secs * 1000.0) as u64)
+}
+
+/// A /proc/<pid>/cmdline's arguments on one line; `None` without any.
+fn command(cmdline: &[u8]) -> Option<String> {
+    let cut = cmdline.len() > COMMAND_CAP;
+    let cmdline = &cmdline[..cmdline.len().min(COMMAND_CAP)];
+    let mut line = String::from_utf8_lossy(cmdline).replace(char::is_control, " ");
+    line.truncate(line.trim_end().len());
+    if line.is_empty() {
+        return None;
+    }
+    if cut {
+        // Where a character was cut in two.
+        line.truncate(line.trim_end_matches('\u{fffd}').len());
+        line.push('…');
+    }
+    Some(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_with_odd_names() {
+        let s = "42 (a ) (b) c) S 7 42 42 0 -1 4194304 100 0 0 0 30 12 5 6 20 0 1 0 \
+                 9000 123456 250 18446744073709551615 1 1";
+        assert_eq!(
+            parse_stat(s),
+            Some(Stat {
+                name: "a ) (b) c".into(),
+                ppid: 7,
+                cpu: 42,
+                started: 9000,
+                rss_pages: 250,
+            })
+        );
+        assert_eq!(parse_stat("42 (cut) S 7"), None);
+        assert_eq!(parse_uptime_ms("12.34 56.78\n"), Some(12340));
+    }
+
+    #[test]
+    fn commands_are_one_capped_line() {
+        assert_eq!(command(b"sh\0-c\0a\nb\0"), Some("sh -c a b".to_owned()));
+        assert_eq!(command(b""), None);
+        assert_eq!(command(b"\0\0"), None);
+        let exact = "x".repeat(COMMAND_CAP);
+        assert_eq!(command(exact.as_bytes()), Some(exact));
+        // The cap falls in the middle of the é.
+        let long = format!("{}é", "x".repeat(COMMAND_CAP - 1));
+        assert_eq!(
+            command(long.as_bytes()),
+            Some(format!("{}…", "x".repeat(COMMAND_CAP - 1)))
+        );
+    }
+
+    #[test]
+    fn cgroup_pids_come_from_all_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a.scope/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        std::fs::write(dir.path().join("a.scope/cgroup.procs"), "3\n1\n").unwrap();
+        std::fs::write(nested.join("cgroup.procs"), "2\n3\n").unwrap();
+        let mut pids = BTreeSet::new();
+        cgroup_pids(dir.path(), &mut pids);
+        assert_eq!(pids, BTreeSet::from([1, 2, 3]));
+        // A slice that doesn't exist has none.
+        cgroup_pids(&dir.path().join("gone"), &mut pids);
+        assert_eq!(pids.len(), 3);
+    }
+
+    #[test]
+    fn reads_a_live_process() {
+        let me = process(std::process::id()).unwrap();
+        assert_eq!(me.pid, std::process::id());
+        assert!(me.started_ms > 0 && me.rss_bytes > 0, "{me:?}");
+        assert!(!me.command.is_empty());
+        assert_eq!(process(u32::MAX), None);
+    }
     use grenadine_core::api::AgentStatus;
 
     #[test]
