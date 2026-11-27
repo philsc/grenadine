@@ -1475,8 +1475,17 @@ class InboxTest(ServerTestCase):
             "Review required"
         )
         status = self.page.locator(".merge-box .merge-status")
+        # Its first `test` run was cancelled for the one that passed, and
+        # GitHub still counts it, but `test` isn't required: the review is
+        # the reason.
         expect(status).to_have_text("Merging is blocked: it needs an approving review.")
         expect(status).to_have_class(re.compile(r"\bbad\b"))
+        # It's not an Actions run that could be re-run from here.
+        expect(
+            self.page.locator(".merge-box").get_by_role(
+                "button", name="Re-run the replaced runs"
+            )
+        ).to_have_count(0)
 
     def test_pr_page_of_a_conflicting_pr(self) -> None:
         pr = self.cases.prs["Leave me out of it"]
@@ -3658,6 +3667,40 @@ class StackMergeTest(ServerTestCase):
         expect(self.page.locator(".pr-header .state")).to_have_text("merged")
         self.assertEqual(top.state, "MERGED")
         self.assertEqual(low.state, "MERGED")
+
+    def test_rerunning_a_cancelled_twin_unblocks_the_stack(self) -> None:
+        low = self.prs[scenarios.GH_TWIN_LOW]
+        top = self.prs[scenarios.GH_TWIN]
+        self.open(scenarios.GH_TWIN)
+        box = self.merge_box()
+        status = box.locator(".merge-status")
+        # The checks that count passed, so the reason is the run GitHub
+        # still counts.
+        expect(status).to_have_text(
+            "Merging is blocked: GitHub still counts a replaced run of test"
+            " that didn't pass."
+        )
+        rows = box.locator(".merge-stack li")
+        expect(rows.nth(0)).to_contain_text(
+            "Blocked by a replaced run that didn't pass"
+        )
+        box.get_by_role("button", name="Re-run the replaced runs").click()
+        expect(status).to_have_text("Ready to merge.")
+        expect(rows.nth(0)).to_contain_text("Ready")
+        expect(
+            box.get_by_role("button", name="Re-run the replaced runs")
+        ).to_have_count(0)
+        # Both PRs' cancelled runs were re-run, and nothing else.
+        reruns = [r for r in self.gh.requests if r.endswith("/rerun-failed-jobs")]
+        self.assertEqual(
+            sorted(reruns),
+            [
+                f"POST /repos/{scenarios.GHSTACK_REPO}/actions/runs/{run}/rerun-failed-jobs"
+                for run in (500, 501)
+            ],
+        )
+        self.assertEqual(low.merge_state_status(), "CLEAN")
+        self.assertEqual(top.merge_state_status(), "CLEAN")
 
     def test_a_merge_failing_at_run_time_shows_the_error(self) -> None:
         low = self.prs[scenarios.GH_FAIL_LOW]

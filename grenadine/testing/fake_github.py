@@ -117,6 +117,8 @@ class CheckRun:
     started_at: int | None = None
     # The workflow the run belongs to; None for a run outside Actions.
     workflow: str | None = None
+    # The workflow run it belongs to, which the re-run endpoint takes.
+    run_id: int | None = None
 
 
 @dataclasses.dataclass
@@ -196,6 +198,8 @@ class PullRequest:
     comments: list[Comment] = dataclasses.field(default_factory=list)
     # The check runs on the head, including ones later runs superseded.
     check_runs: list[CheckRun] = dataclasses.field(default_factory=list)
+    # The base branch requires the checks to pass.
+    required_checks: bool = False
     issue_comments: list[IssueComment] = dataclasses.field(default_factory=list)
     # GitHub's MergeStateStatus; None works it out from the PR.
     merge_state: str | None = None
@@ -277,7 +281,7 @@ class PullRequest:
         ):
             return "BLOCKED"
         if self.checks() == "FAILURE":
-            return "UNSTABLE"
+            return "BLOCKED" if self.required_checks else "UNSTABLE"
         return "CLEAN"
 
 
@@ -766,7 +770,32 @@ class FakeGitHub:
             )
         ):
             return self._merge_async_status(m[1], int(m[2]), m[3], api_version)
+        if method == "POST" and (
+            m := re.fullmatch(
+                r"/repos/([^/]+/[^/]+)/actions/runs/(\d+)/rerun-failed-jobs", path
+            )
+        ):
+            return self._rerun(m[1], int(m[2]))
         return 404, {"message": "Not Found"}
+
+    def _rerun(self, slug: str, run_id: int) -> tuple[int, Any]:
+        """The endpoint that re-runs a workflow run's failed and cancelled
+        jobs: their check runs start over, and here pass at once."""
+        repo = self.repos.get(slug)
+        prs = list(repo.prs.values()) if repo else []
+        found = False
+        for pr in prs:
+            for run in pr.check_runs:
+                if run.run_id != run_id:
+                    continue
+                found = True
+                if run.conclusion != "SUCCESS":
+                    run.status, run.conclusion = "COMPLETED", "SUCCESS"
+                    run.started_at = self.tick()
+                    pr.touch()
+        if not found:
+            return 404, {"message": "Not Found"}
+        return 201, {}
 
     def _reviewers(
         self, slug: str, number: int, req: dict[str, Any], *, add: bool
@@ -1735,7 +1764,12 @@ class FakeGitHub:
             "statusCheckRollup": (
                 {
                     "state": pr.checks(),
-                    "contexts": lambda info, **_: {
+                    "contexts": lambda info, first=None, **_: {
+                        "pageInfo": {
+                            "hasNextPage": first is not None
+                            and len(pr.check_runs) > first,
+                            "endCursor": None,
+                        },
                         "nodes": [
                             {
                                 "__typename": "CheckRun",
@@ -1750,11 +1784,14 @@ class FakeGitHub:
                                 ),
                                 "checkSuite": {
                                     "workflowRun": r.workflow
-                                    and {"workflow": {"name": r.workflow}}
+                                    and {
+                                        "databaseId": r.run_id,
+                                        "workflow": {"name": r.workflow},
+                                    }
                                 },
                             }
-                            for r in pr.check_runs
-                        ]
+                            for r in pr.check_runs[:first]
+                        ],
                     },
                 }
                 if pr and pr.check_runs

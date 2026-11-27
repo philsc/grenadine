@@ -701,6 +701,18 @@ pub async fn dequeue(key: &PrKey) -> Result<()> {
     .map(|_| ())
 }
 
+/// Re-runs the replaced runs that GitHub still counts against the PR's
+/// checks and those of the PRs below it in its stack.
+pub async fn rerun_checks(key: &PrKey) -> Result<()> {
+    check(
+        Request::post(&format!("{}/rerun-checks", pr_url(key)))
+            .send()
+            .await,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Changes who's asked to review the PR: what the picker's ticks added
 /// and removed, or a re-request's add of one user.
 pub async fn change_reviewers(key: &PrKey, change: &ReviewerChange) -> Result<()> {

@@ -674,6 +674,20 @@ pub struct Check {
     pub url: Option<String>,
 }
 
+/// A run of a check on the PR's head that didn't pass and that a later
+/// run of the same check replaced, e.g. one a workflow's concurrency
+/// group cancelled. Grenadine's checks leave it out, but GitHub can keep
+/// counting it, and then it fails the head's checks until it's re-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRun {
+    /// The check's name.
+    pub name: String,
+    pub url: Option<String>,
+    /// The GitHub Actions workflow run it belongs to, which can be
+    /// re-run; `None` for another app's check.
+    pub run_id: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MergeMethod {
     Merge,
@@ -760,6 +774,10 @@ pub struct MergeInfo {
     /// resolved before merging.
     #[serde(default)]
     pub requires_conversation_resolution: bool,
+    /// The replaced runs that fail the head's checks for GitHub while
+    /// every check that counts for grenadine passed or still runs.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
     /// `Some` when the base branch requires merging through a merge
     /// queue.
     #[serde(default)]
@@ -794,6 +812,12 @@ pub struct StackMergePr {
     pub state: MergeState,
     /// The combined state of its head's checks.
     pub ci: Option<CiStatus>,
+    /// Like `MergeInfo::stale_runs`, for its head.
+    #[serde(default)]
+    pub stale_runs: Vec<StaleRun>,
+    /// Whether its reviews let it merge, like `ReviewInfo::decision`.
+    #[serde(default)]
+    pub decision: Option<ReviewDecision>,
 }
 
 /// A team asked to review a PR, as GitHub names and addresses it.

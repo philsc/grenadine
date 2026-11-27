@@ -884,6 +884,7 @@ GH_TOP = "Cap the stack"
 GH_DRAFT = "Sit on a draft"
 GH_BLOCKED = "Sit on a blocked PR"
 GH_FAIL = "Fail at merge time"
+GH_TWIN = "Sit on a cancelled twin"
 GHQ_LOW = "Queue from the stack's bottom"
 GHQ_TOP = "Queue the whole stack"
 # The PRs whose page the tests open, and the PR below each.
@@ -893,10 +894,12 @@ GHSTACK_CASES = [
     (GH_DRAFT, "Draft at the stack's bottom"),
     (GH_BLOCKED, "Blocked at the stack's bottom"),
     (GH_FAIL, "Fragile at the stack's bottom"),
+    (GH_TWIN, "Cancelled twin at the stack's bottom"),
 ]
 GH_DRAFT_LOW = "Draft at the stack's bottom"
 GH_BLOCKED_LOW = "Blocked at the stack's bottom"
 GH_FAIL_LOW = "Fragile at the stack's bottom"
+GH_TWIN_LOW = "Cancelled twin at the stack's bottom"
 
 
 def _gh_stack(
@@ -919,9 +922,10 @@ def _gh_stack(
 
 def stack_merge_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     """GitHub stacks to merge through: a plain one, one on a draft, one
-    on a blocked PR the viewer may bypass, and one whose bottom turns
-    unmergeable while the merge runs. A last stack lives on the merge
-    queue repository."""
+    on a blocked PR the viewer may bypass, one whose bottom turns
+    unmergeable while the merge runs, and one whose PRs' required check
+    ran twice, the first run having been cancelled for the second.
+    A last stack lives on the merge queue repository."""
     repo = gh.repo(GHSTACK_REPO)
     repo.checkout("main")
     repo.commit("Seed the repo", {"README.md": "# stacked\n"})
@@ -937,6 +941,20 @@ def stack_merge_cases(gh: FakeGitHub) -> dict[str, PullRequest]:
     prs[GH_BLOCKED_LOW].merge_state = "BLOCKED"
     for title in (GH_BLOCKED_LOW, GH_BLOCKED):
         prs[title].can_merge_as_admin = True
+    for run_id, title in enumerate((GH_TWIN_LOW, GH_TWIN), start=500):
+        # The run that passed started last, but GitHub still counts the
+        # cancelled one.
+        prs[title].check_runs = [
+            CheckRun(
+                "test",
+                conclusion="CANCELLED",
+                started_at=1,
+                workflow="Test",
+                run_id=run_id,
+            ),
+            CheckRun("test", started_at=2, workflow="Test", run_id=run_id + 10),
+        ]
+        prs[title].required_checks = True
 
     queue = gh.repo(QUEUE_REPO)
     if queue.merge_queue is None:
