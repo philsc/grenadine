@@ -1968,6 +1968,28 @@ fn deny_unattended(
     tool_name: &str,
     input: &Value,
 ) -> Decision {
+    answer_unasked(
+        state,
+        id,
+        tool_use,
+        tool_name,
+        input,
+        false,
+        UNATTENDED_DENIAL,
+    )
+}
+
+/// Answers a request without asking the user, showing the request and
+/// `allow` with `message` in the transcript as if the user had answered.
+pub fn answer_unasked(
+    state: &State,
+    id: &str,
+    tool_use: &str,
+    tool_name: &str,
+    input: &Value,
+    allow: bool,
+    message: &str,
+) -> Decision {
     for kind in [
         AgentEventKind::ApprovalRequested {
             id: tool_use.to_owned(),
@@ -1977,8 +1999,8 @@ fn deny_unattended(
         },
         AgentEventKind::ApprovalResolved {
             id: tool_use.to_owned(),
-            allow: false,
-            message: Some(UNATTENDED_DENIAL.to_owned()),
+            allow,
+            message: Some(message.to_owned()),
             answers: None,
             expired: false,
         },
@@ -1988,8 +2010,8 @@ fn deny_unattended(
         }
     }
     Decision {
-        allow: false,
-        message: Some(UNATTENDED_DENIAL.to_owned()),
+        allow,
+        message: Some(message.to_owned()),
         ..Decision::default()
     }
 }

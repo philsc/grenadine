@@ -2040,7 +2040,9 @@ class InboxTest(ServerTestCase):
         ).to_be_visible()
         expect(self.page.locator(".debug")).to_contain_text("of 5,000 points left")
         expect(
-            self.page.locator(".usage-table:not(.usage-reports):not(.usage-sessions)")
+            self.page.locator(
+                ".usage-table:not(.usage-reports):not(.usage-sessions):not(.page-memory)"
+            )
         ).to_contain_text("Inbox search")
         expect(self.page.locator(".usage-reports")).to_contain_text(scenarios.REPO)
 
@@ -2058,6 +2060,41 @@ class InboxTest(ServerTestCase):
                 ".usage-sessions, .debug p.muted:has-text('systemd user manager')"
             ).first
         ).to_be_visible()
+
+    def test_debug_tab_shows_page_memory(self) -> None:
+        pr = self.cases.prs["Get approved"]
+        self.page.goto(self.url)
+        # A real link click, so the router's hash navigation logs a `nav`
+        # entry for the PR page.
+        self.row(pr.title).locator("a.pr-item").click()
+        expect(self.page).to_have_url(re.compile(f"#/{scenarios.REPO}/{pr.number}$"))
+        self.page.get_by_role("link", name="Debug", exact=True).click()
+        expect(self.page.locator(".debug h2", has_text="Page memory")).to_be_visible()
+        for row in (
+            "Wasm memory",
+            "DOM elements",
+            "Blobs",
+            "Changes",
+            "Highlight cache",
+            "Shapes",
+            "Log entries",
+        ):
+            expect(self.page.locator(".debug .page-memory")).to_contain_text(row)
+        with self.page.expect_download() as download:
+            self.page.get_by_role("button", name="Download log").click()
+        log = json.loads(download.value.path().read_text())
+        entries = log["current"]
+        self.assertTrue(entries)
+        nav_routes = [e["route"] for e in entries if e["kind"] == "nav"]
+        self.assertTrue(
+            any(f"#/{scenarios.REPO}/{pr.number}" in r for r in nav_routes),
+            f"no nav entry for the PR page: {nav_routes}",
+        )
+        entry = entries[0]
+        for key in ("at", "kind", "route", "wasm_bytes", "dom_elements", "caches"):
+            self.assertIn(key, entry)
+        for cache in ("blobs", "changes", "highlight", "shapes"):
+            self.assertIn(cache, entry["caches"])
 
     def test_a_slow_sync_status_fetch_does_not_undo_a_newer_event(self) -> None:
         # The page refetches the sync status on InboxesChanged, which a
@@ -8494,13 +8531,13 @@ class AgentTest(ServerTestCase):
         self.assertEqual(a.state, "MERGED")
         self.assertEqual(a.issue_comments, [])
 
-    def _foreign_pr(self, repo, name: str, base: str):
-        """An open PR `name`, made and pushed by someone else on `base`,
-        waited on until the server has synced it."""
+    def _foreign_pr(self, repo, name: str, base: str, author: str = VIEWER):
+        """An open PR `name` by `author` on `base`, made and pushed outside
+        a session, waited on until the server has synced it."""
         repo.checkout(name, base)
         repo.commit(name, {name + ".txt": name})
         repo.push(name)
-        pr = repo.open_pr(f"Add {name}", head=name, base=base)
+        pr = repo.open_pr(f"Add {name}", head=name, base=base, author=author)
         for _ in range(40):
             try:
                 out = json.loads(
@@ -8536,6 +8573,58 @@ class AgentTest(ServerTestCase):
         approval = transcript.locator(".approval.pending")
         expect(approval).to_contain_text("update_prs")
         approval.get_by_role("button", name="Allow").click()
+
+    def _set_approve_pr_pushes(self, label: str, value: str) -> None:
+        """Picks `label` for "Approve PR pushes" in the Settings dialog and
+        waits until the server has saved it as `value`."""
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        dialog.get_by_label("Approve PR pushes").select_option(label=label)
+        for _ in range(40):
+            saved = json.loads(urllib.request.urlopen(self.url + "api/settings").read())
+            if saved["approve_pr_pushes"] == value:
+                break
+            time.sleep(0.25)
+        else:
+            self.fail(f"approve_pr_pushes never became {value}")
+        dialog.get_by_role("button", name="Close").click()
+
+    def test_update_prs_approval_follows_the_setting(self) -> None:
+        repo = self.gh.repo(self.OTHER_REPO)
+        mine = self._foreign_pr(repo, "s", "main")
+        theirs = self._foreign_pr(repo, "t", "main", author="other")
+        self.page.goto(self.url)
+        self._set_approve_pr_pushes("Ask unless my PR", "unless_mine")
+
+        # The viewer's own PR takes the pushes without a card.
+        transcript, done, follow_up = self._session_from_pr(mine.number)
+        follow_up.fill("update prs stack-a")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
+        a = next(pr for pr in repo.prs.values() if pr.title == "Add stack-a")
+        self.assertEqual(a.base, mine.head)
+
+        # Someone else's still asks.
+        transcript, done, follow_up = self._session_from_pr(theirs.number)
+        follow_up.fill("update prs stack-a")
+        follow_up.press("Enter")
+        self._allow(transcript)
+        expect(done).to_have_count(2)
+
+        # "Never ask" doesn't ask for theirs either, and the page that
+        # opens the dialog again shows what was saved.
+        self._set_approve_pr_pushes("Never ask", "never_ask")
+        self.page.reload()
+        self.page.get_by_role("button", name="Settings", exact=True).click()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        expect(dialog.get_by_label("Approve PR pushes")).to_have_value("never_ask")
+        dialog.get_by_role("button", name="Close").click()
+        transcript, done, follow_up = self._session_from_pr(theirs.number)
+        follow_up.fill("update prs stack-a")
+        follow_up.press("Enter")
+        expect(done).to_have_count(2)
+        expect(transcript.locator(".approval.pending")).to_have_count(0)
 
     def test_update_prs_joins_a_foreign_stack(self) -> None:
         repo = self.gh.repo(self.OTHER_REPO)

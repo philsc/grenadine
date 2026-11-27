@@ -17,6 +17,7 @@ mod image_drafts;
 mod images;
 mod inboxes;
 mod markdown;
+mod memlog;
 mod navigate;
 mod pr;
 mod pr_agents;
@@ -56,6 +57,9 @@ pub struct Updates {
     pub repo_settings: RwSignal<u64>,
     /// Bumped when a review of the viewer's PRs started or ended.
     pub auto_reviews: RwSignal<u64>,
+    /// Bumped when the settings kept on the server for every repository
+    /// changed.
+    pub global_settings: RwSignal<u64>,
     /// Bumped when the server's update to a newer version went on.
     pub update: RwSignal<u64>,
 }
@@ -218,6 +222,7 @@ fn listen(updates: Updates, url: Signal<String>) {
         Ok(ServerEvent::TerminalsChanged(_)) => updates.terminals.update(|n| *n += 1),
         Ok(ServerEvent::RepoSettingsChanged(_)) => updates.repo_settings.update(|n| *n += 1),
         Ok(ServerEvent::AutoReviewsChanged) => updates.auto_reviews.update(|n| *n += 1),
+        Ok(ServerEvent::GlobalSettingsChanged) => updates.global_settings.update(|n| *n += 1),
         Ok(ServerEvent::UpdateChanged) => updates.update.update(|n| *n += 1),
         Err(_) => {}
     };
@@ -234,6 +239,7 @@ fn listen(updates: Updates, url: Signal<String>) {
         updates.terminals.update(|n| *n += 1);
         updates.repo_settings.update(|n| *n += 1);
         updates.auto_reviews.update(|n| *n += 1);
+        updates.global_settings.update(|n| *n += 1);
         updates.update.update(|n| *n += 1);
         refetch_sync(updates, sync_events);
     };
@@ -270,6 +276,7 @@ fn App() -> impl IntoView {
         terminals: RwSignal::new(0),
         repo_settings: RwSignal::new(0),
         auto_reviews: RwSignal::new(0),
+        global_settings: RwSignal::new(0),
         update: RwSignal::new(0),
     };
     provide_context(updates);
@@ -423,6 +430,7 @@ pub fn start() {
     }
     leptos::mount::mount_to_body(App);
     highlight::warm();
+    memlog::start();
 }
 
 /// A relative timestamp like "5m ago" for a status.

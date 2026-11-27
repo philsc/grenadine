@@ -1,5 +1,5 @@
 {
-  "checksum": "b991e28dd74a5245f6c842226ee55d7dcd6d0261e63e541632a114ff23531ad3",
+  "checksum": "57adeffa294b4738db8b9262cb7c145a56a39a218133b84b4b17cdf19289a760",
   "conditions": {
     "aarch64-linux-android": [],
     "aarch64-pc-windows-gnullvm": [],
@@ -16548,6 +16548,7 @@
             "BeforeUnloadEvent",
             "BinaryType",
             "Blob",
+            "BlobPropertyBag",
             "CanvasRenderingContext2d",
             "CharacterData",
             "ClipboardEvent",
@@ -16736,7 +16737,6 @@
           ],
           "selects": {
             "wasm32-unknown-unknown": [
-              "BlobPropertyBag",
               "ServiceWorkerGlobalScope"
             ]
           }

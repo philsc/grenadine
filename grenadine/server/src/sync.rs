@@ -166,6 +166,10 @@ pub struct State {
     pub started_at: i64,
     /// What /api/debug/system samples through.
     pub system: crate::system::Sampler,
+    /// The viewer's GitHub login once `viewer_login` looked it up or an
+    /// inbox search returned it. Each search replaces it, so a token for
+    /// another account takes effect with the next poll.
+    pub viewer: std::sync::Mutex<Option<String>>,
     /// Updates the server to a newer version.
     pub update: crate::update::Updater,
     pub shutdown: tokio_util::sync::CancellationToken,
@@ -175,6 +179,26 @@ impl State {
     pub fn send(&self, event: ServerEvent) {
         // Failing only means that no page is listening.
         let _ = self.events.send(event);
+    }
+
+    /// The viewer's GitHub login, looked up unless an earlier lookup or
+    /// inbox search already returned it. A failed lookup is tried again
+    /// on the next call.
+    pub async fn viewer_login(&self) -> anyhow::Result<String> {
+        if let Some(login) = self.viewer.lock().unwrap().clone() {
+            return Ok(login);
+        }
+        let login = self.github.viewer_login().await?;
+        self.set_viewer(&login);
+        Ok(login)
+    }
+
+    /// Remembers `login` as the viewer's, unless it's empty, as from a
+    /// poll that searched no inbox.
+    pub fn set_viewer(&self, login: &str) {
+        if !login.is_empty() {
+            *self.viewer.lock().unwrap() = Some(login.to_owned());
+        }
     }
 
     /// The clone for `owner/name`, for callers that only read from it.
@@ -521,7 +545,10 @@ async fn poll(state: &Arc<State>, sync_all: bool) -> Result<()> {
             RequestPriority::Search,
             inbox_search::run(&state.github, &prepared, &repos),
         ) => match r {
-            Ok(r) => r.1,
+            Ok((viewer, results)) => {
+                state.set_viewer(&viewer);
+                results
+            }
             // The taken requests wait for the next poll.
             Err(e) => {
                 let mut searches = state.inbox_searches.lock().unwrap();
@@ -1137,6 +1164,7 @@ pub fn test_state_with_agents(
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
+        viewer: std::sync::Mutex::new(None),
         update: crate::update::Updater::new(None, None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         dictation: crate::dictation::Dictation::off(),
@@ -1148,6 +1176,19 @@ mod tests {
     use grenadine_core::api::Side;
 
     use super::*;
+
+    /// An inbox search's login replaces the one kept, e.g. after the
+    /// token changed accounts, and a poll without searches keeps it.
+    #[tokio::test]
+    async fn the_viewer_follows_the_inbox_searches() {
+        let state = test_state();
+        state.set_viewer("me");
+        assert_eq!(state.viewer_login().await.unwrap(), "me");
+        state.set_viewer("");
+        assert_eq!(state.viewer_login().await.unwrap(), "me");
+        state.set_viewer("other");
+        assert_eq!(state.viewer_login().await.unwrap(), "other");
+    }
 
     fn key() -> PrKey {
         PrKey {

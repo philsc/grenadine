@@ -22,8 +22,8 @@ use axum::extract::{Path, State as AxState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use grenadine_core::api::{
-    AgentBackend, AgentEventKind, AgentSession, GENERAL, Landed, NewAgent, PermissionMode, PrKey,
-    SessionKind, WrapUpTarget,
+    AgentBackend, AgentEventKind, AgentSession, ApprovePrPushes, GENERAL, Landed, NewAgent,
+    PermissionMode, PrKey, SessionKind, WrapUpTarget,
 };
 use serde_json::{Value, json};
 
@@ -562,10 +562,21 @@ async fn update_prs(
                 "stack": format!("Joins #{number}'s GitHub stack when #{number} is its top or in no stack."),
             }),
         };
-        let allowed = matches!(
-            agent::await_approval(state, id, tool_use, "update_prs", &input, Vec::new()).await,
-            Some(Decision { allow: true, .. })
-        );
+        let decision = match skips_approval(state, &session, pr.as_ref()).await {
+            Some(message) => Some(agent::answer_unasked(
+                state,
+                id,
+                tool_use,
+                "update_prs",
+                &input,
+                true,
+                message,
+            )),
+            None => {
+                agent::await_approval(state, id, tool_use, "update_prs", &input, Vec::new()).await
+            }
+        };
+        let allowed = matches!(decision, Some(Decision { allow: true, .. }));
         if !allowed {
             bail!("The user didn't allow opening or updating pull requests onto #{number}.");
         }
@@ -582,6 +593,44 @@ async fn update_prs(
         out += &format!("\n{note}");
     }
     Ok(out)
+}
+
+/// Why the global settings let `update_prs` push onto the session's
+/// source PR `pr` without asking; `None` when the user is asked.
+/// Unattended reviews are never let through, and a PR or viewer that
+/// isn't known is asked about.
+async fn skips_approval(
+    state: &State,
+    session: &AgentSession,
+    pr: Option<&grenadine_core::api::PrDetail>,
+) -> Option<&'static str> {
+    if session.kind == SessionKind::AutoReview {
+        return None;
+    }
+    let setting = match state.db.global_settings() {
+        Ok(s) => s.approve_pr_pushes,
+        Err(e) => {
+            tracing::warn!("can't read the global settings: {e:#}");
+            return None;
+        }
+    };
+    match setting {
+        ApprovePrPushes::AlwaysAsk => None,
+        ApprovePrPushes::NeverAsk => Some("Allowed by the Approve PR pushes setting."),
+        ApprovePrPushes::UnlessMine => {
+            let author = &pr?.summary.author;
+            match state.viewer_login().await {
+                Ok(me) if me == *author => {
+                    Some("Allowed by the Approve PR pushes setting: the PR is yours.")
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("can't look up the viewer's login: {e:#}");
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Takes over the pull requests `args.prs` names, asking the user first
@@ -1904,6 +1953,159 @@ mod tests {
         assert!(agent::approve(&state, ID, &tool_use, decision).unwrap());
         let (_, failed) = call_task.await.unwrap();
         assert!(failed);
+    }
+
+    /// Sets the global "Approve PR pushes" setting.
+    fn set_approve_pr_pushes(state: &State, approve_pr_pushes: ApprovePrPushes) {
+        state
+            .db
+            .set_global_settings(&grenadine_core::api::GlobalSettings { approve_pr_pushes })
+            .unwrap();
+    }
+
+    /// The source PR #24, written by `me`.
+    fn store_source_pr(state: &Arc<State>) {
+        let stack = Stack {
+            base_ref: "main".into(),
+            prs: Vec::new(),
+            more_ancestors: false,
+            more_descendants: false,
+        };
+        store(state, 24, "pr24", &"2".repeat(40), &stack);
+    }
+
+    /// The approval answers in the session's transcript: whether and
+    /// why each request was allowed.
+    fn resolved(state: &State) -> Vec<(bool, Option<String>)> {
+        state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                AgentEventKind::ApprovalResolved { allow, message, .. } => Some((allow, message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Calls `update_prs` and answers its approval card with a denial;
+    /// whether a card showed.
+    async fn asks(state: &Arc<State>) -> bool {
+        let call_task = tokio::spawn({
+            let state = state.clone();
+            async move { tool(&state, "update_prs", json!({})).await }
+        });
+        for _ in 0..1500 {
+            if call_task.is_finished() {
+                return false;
+            }
+            let events = state.db.agent_events(ID).unwrap();
+            let open = events.iter().find_map(|e| match &e.kind {
+                AgentEventKind::ApprovalRequested { id, .. }
+                    if !events.iter().any(|r| {
+                        matches!(&r.kind, AgentEventKind::ApprovalResolved { id: rid, .. } if rid == id)
+                    }) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            });
+            if let Some(tool_use) = open {
+                let decision = Decision::default();
+                assert!(agent::approve(state, ID, &tool_use, decision).unwrap());
+                let (_, failed) = call_task.await.unwrap();
+                assert!(failed);
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("update_prs neither asked nor finished");
+    }
+
+    /// "Never ask" lets the push onto the source PR through without a
+    /// card, but the transcript still shows what it was allowed to do.
+    #[tokio::test]
+    async fn update_prs_never_asks_when_set_so() {
+        let state = state_with(|s| s.pr = Some(24));
+        set_approve_pr_pushes(&state, ApprovePrPushes::NeverAsk);
+        let (text, failed) = tool(&state, "update_prs", json!({})).await;
+        // It got past the approval to the landing, which fails on the
+        // unconfigured repo.
+        assert!(failed, "{text}");
+        assert!(text.contains("is not a configured repository"), "{text}");
+        assert_eq!(
+            resolved(&state),
+            [(
+                true,
+                Some("Allowed by the Approve PR pushes setting.".to_owned())
+            )]
+        );
+        let requested = state
+            .db
+            .agent_events(ID)
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.kind {
+                AgentEventKind::ApprovalRequested { input, .. } => Some(input),
+                _ => None,
+            });
+        assert!(requested.unwrap().contains("\"pr\":24"));
+    }
+
+    /// "Ask unless my PR" asks only when the source PR isn't the viewer's
+    /// or it can't tell.
+    #[tokio::test]
+    async fn update_prs_asks_unless_the_pr_is_mine() {
+        // The viewer can't be looked up: GitHub is a dead port here.
+        let state = state_with(|s| s.pr = Some(24));
+        store_source_pr(&state);
+        set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
+        assert!(asks(&state).await);
+
+        let state = state_with(|s| s.pr = Some(24));
+        store_source_pr(&state);
+        set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
+        state.set_viewer("someone");
+        assert!(asks(&state).await);
+
+        // A PR that isn't synced has no known author.
+        let state = state_with(|s| s.pr = Some(24));
+        set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
+        state.set_viewer("me");
+        assert!(asks(&state).await);
+
+        let state = state_with(|s| s.pr = Some(24));
+        store_source_pr(&state);
+        set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
+        state.set_viewer("me");
+        assert!(!asks(&state).await);
+        assert_eq!(
+            resolved(&state),
+            [(
+                true,
+                Some("Allowed by the Approve PR pushes setting: the PR is yours.".to_owned())
+            )]
+        );
+    }
+
+    /// "Always ask", the default, asks as before, and unattended reviews
+    /// are refused whatever the setting.
+    #[tokio::test]
+    async fn update_prs_asks_by_default_and_refuses_reviews() {
+        let state = state_with(|s| s.pr = Some(24));
+        assert!(asks(&state).await);
+        set_approve_pr_pushes(&state, ApprovePrPushes::AlwaysAsk);
+        assert!(asks(&state).await);
+
+        let state = state_with(|s| {
+            s.pr = Some(24);
+            s.kind = SessionKind::AutoReview;
+        });
+        set_approve_pr_pushes(&state, ApprovePrPushes::NeverAsk);
+        let (_, failed) = tool(&state, "update_prs", json!({})).await;
+        assert!(failed);
+        assert!(resolved(&state).iter().all(|(allow, _)| !allow));
     }
 
     /// Without a PR to push onto, `update_prs` doesn't ask; it fails here
