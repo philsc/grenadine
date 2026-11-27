@@ -26,8 +26,71 @@ const REMOTE_REF: &str = "refs/remotes/origin/main";
 const TARGET: &str = "//grenadine/server";
 
 /// Set for the server that went on after it couldn't run its new build:
-/// why it couldn't.
+/// `<running> <old> <target> <error>`, see [`Restart::failed`].
 pub const FAILED_ENV: &str = "GRENADINE_UPDATE_FAILED";
+
+/// Takes [`FAILED_ENV`] out of the environment, so that the sessions,
+/// terminals and builds this server starts don't inherit it.
+///
+/// # Safety
+///
+/// No other thread may be running.
+pub unsafe fn take_failed() -> Option<Failed> {
+    let value = std::env::var(FAILED_ENV).ok();
+    // SAFETY: the caller guarantees that no other thread runs.
+    unsafe { std::env::remove_var(FAILED_ENV) };
+    value.map(Failed::parse)
+}
+
+/// The restart that an update is ready for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Restart {
+    /// The new build, to exec.
+    pub binary: PathBuf,
+    /// The commit the server that restarts was built from.
+    running: String,
+    /// The commit the clone was at before the update moved it to `target`.
+    old: String,
+    target: String,
+}
+
+impl Restart {
+    /// The value of [`FAILED_ENV`] for the server that goes on when
+    /// `binary` can't run, for `error`.
+    pub fn failed(&self, error: &str) -> String {
+        format!("{} {} {} {error}", self.running, self.old, self.target)
+    }
+}
+
+/// Why the restart of the last update couldn't run its build, for the
+/// server that went on instead.
+#[derive(Debug)]
+pub struct Failed {
+    error: String,
+    /// The restart's `running`, `old` and `target`, unless the value was
+    /// malformed.
+    restart: Option<(String, String, String)>,
+}
+
+impl Failed {
+    fn parse(value: String) -> Failed {
+        let is_sha = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let mut parts = value.splitn(4, ' ');
+        if let (Some(running), Some(old), Some(target), Some(error)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+            && [running, old, target].into_iter().all(is_sha)
+        {
+            return Failed {
+                restart: Some((running.to_owned(), old.to_owned(), target.to_owned())),
+                error: error.to_owned(),
+            };
+        }
+        Failed {
+            error: value,
+            restart: None,
+        }
+    }
+}
 
 /// The argument that has the server binary act as `install`.
 pub const INSTALL_ARG: &str = "install-update";
@@ -58,28 +121,47 @@ pub struct Build {
 
 impl Build {
     /// `None` when the server wasn't started through `bazel run`.
-    pub fn detect(token: &str, dir: PathBuf) -> Option<Build> {
+    /// `failed` is set if this server went on after the last update's
+    /// restart couldn't run its build.
+    pub fn detect(token: &str, dir: PathBuf, failed: Option<&Failed>) -> Option<Build> {
         let workspace = PathBuf::from(std::env::var_os("BUILD_WORKSPACE_DIRECTORY")?);
         let exe = std::env::current_exe().unwrap_or_default();
-        let build = Repo::open(&workspace, "origin").and_then(|repo| {
-            let repo = repo.with_token(token);
-            let (rev, mode) = match installed_from(&exe, &dir) {
-                Some((sha, mode)) => (sha, mode),
-                None => ("HEAD".to_owned(), compilation_mode(&exe)),
-            };
-            Ok(Build {
-                running: commit(&repo, &rev)?,
-                repo,
-                mode,
-                bazel: "bazel".into(),
-                dir,
-            })
-        });
-        build
+        Build::open(&workspace, &exe, token, dir, failed)
             .inspect_err(|e| {
                 tracing::warn!("can't update from {}: {e:#}", workspace.display());
             })
             .ok()
+    }
+
+    fn open(
+        workspace: &Path,
+        exe: &Path,
+        token: &str,
+        dir: PathBuf,
+        failed: Option<&Failed>,
+    ) -> Result<Build> {
+        let repo = Repo::open(workspace, "origin")?.with_token(token);
+        let (mut rev, mode) = match installed_from(exe, &dir) {
+            Some((sha, mode)) => (sha, mode),
+            None => ("HEAD".to_owned(), compilation_mode(exe)),
+        };
+        let mut build = Build {
+            running: commit(&repo, "HEAD")?,
+            repo,
+            mode,
+            bazel: "bazel".into(),
+            dir,
+        };
+        // The update left the clone at its target: the restart was to
+        // follow. This is still the server that ran before it.
+        if let Some((running, old, target)) = failed.and_then(|f| f.restart.as_ref()) {
+            rev = running.clone();
+            if let Err(e) = build.restore(old, target) {
+                tracing::warn!("can't move the clone back: {e:#}");
+            }
+        }
+        build.running = commit(&build.repo, &rev)?;
+        Ok(build)
     }
 
     /// Fetches the branch and returns its tip.
@@ -329,8 +411,8 @@ struct Inner {
     /// Whether the wait is over and the clone is being put back. The phase
     /// only changes after that, and no decision is taken anymore.
     ending: bool,
-    /// The binary to restart into, once the restart is due.
-    restart_into: Option<PathBuf>,
+    /// The restart, once it's due.
+    restart_into: Option<Restart>,
 }
 
 pub struct Updater {
@@ -347,10 +429,10 @@ pub struct Updater {
 impl Updater {
     /// `failed` is why the restart of the last update couldn't run its
     /// build, if this server is what went on instead.
-    pub fn new(build: Option<Build>, failed: Option<String>) -> Updater {
+    pub fn new(build: Option<Build>, failed: Option<Failed>) -> Updater {
         let inner = Inner {
             phase: match failed {
-                Some(error) => UpdatePhase::Failed { error },
+                Some(f) => UpdatePhase::Failed { error: f.error },
                 None => UpdatePhase::Idle,
             },
             ..Inner::default()
@@ -381,9 +463,8 @@ impl Updater {
         }
     }
 
-    /// Waits until an update is ready to restart, and returns the binary
-    /// to exec.
-    pub async fn restart_requested(&self) -> PathBuf {
+    /// Waits until an update is ready to restart, and returns the restart.
+    pub async fn restart_requested(&self) -> Restart {
         self.restart.notified().await;
         let inner = self.inner.lock().unwrap();
         inner.restart_into.clone().expect("the restart is due")
@@ -421,6 +502,15 @@ fn set_phase(state: &State, phase: UpdatePhase) {
     inner.phase = phase;
     drop(inner);
     state.send(ServerEvent::UpdateChanged);
+}
+
+/// Puts the clone back if an update was ready to restart when the server
+/// stopped instead.
+pub async fn abandon(state: &Arc<State>) {
+    let restart = state.update.inner.lock().unwrap().restart_into.take();
+    if let Some(r) = restart {
+        restore(state, r.old, r.target).await;
+    }
 }
 
 /// Stops building or waiting to restart, or dismisses a failure.
@@ -576,6 +666,11 @@ async fn build_cancelled(state: &State) {
 /// a copy that is gone and the server shutting down.
 async fn wait(state: &Arc<State>, old: String, target: String, binary: PathBuf) {
     loop {
+        // `select!` below may have taken another branch in the same wakeup.
+        if state.shutdown.is_cancelled() {
+            restore(state, old, target).await;
+            return;
+        }
         let sessions = agent::busy_sessions(state);
         let merges = crate::api::busy_merges(state);
         let terminals = state.agents.terminals.count();
@@ -602,7 +697,13 @@ async fn wait(state: &Arc<State>, old: String, target: String, binary: PathBuf) 
                 Err(_) => inner.ending = true,
                 Ok(next) => {
                     if *next == UpdatePhase::Restarting {
-                        inner.restart_into = Some(binary.clone());
+                        let build = state.update.build.as_ref().expect("it's building");
+                        inner.restart_into = Some(Restart {
+                            binary: binary.clone(),
+                            running: build.running.sha.clone(),
+                            old: old.clone(),
+                            target: target.clone(),
+                        });
                     }
                     let changed = inner.phase != *next;
                     inner.phase = next.clone();
@@ -776,7 +877,13 @@ chmod 755 "$script"
         let restart = state.update.restart_requested();
         let got = tokio::time::timeout(Duration::from_secs(30), restart).await;
         let binary = dir.join(&target).join("opt/grenadine");
-        assert_eq!(got.unwrap(), binary);
+        let got = got.unwrap();
+        assert_eq!(got.binary, binary);
+        assert_eq!(
+            got.failed("x"),
+            format!("{first} {first} {target} x"),
+            "what the server that goes on is told"
+        );
         assert!(binary.exists());
         assert_eq!(state.update.status().phase, UpdatePhase::Restarting);
         assert!(!start(&state), "one at a time");
@@ -860,7 +967,7 @@ chmod 755 "$script"
         std::fs::remove_file(dir.join("launch.sh")).unwrap();
         drop(busy);
         let got = state.update.restart_requested().await;
-        assert_eq!(got, dir.join(target).join("opt/grenadine"));
+        assert_eq!(got.binary, dir.join(target).join("opt/grenadine"));
     }
 
     #[tokio::test]
@@ -957,11 +1064,63 @@ chmod 755 "$script"
     #[tokio::test]
     async fn shows_a_restart_that_could_not_run_its_build() {
         let mut state = crate::sync::test_state();
-        Arc::get_mut(&mut state).unwrap().update = Updater::new(None, Some("can't run x".into()));
+        let failed = Failed::parse("can't run x".into());
+        Arc::get_mut(&mut state).unwrap().update = Updater::new(None, Some(failed));
         let error = "can't run x".to_owned();
         assert_eq!(state.update.status().phase, UpdatePhase::Failed { error });
         assert!(cancel(&state));
         assert_eq!(state.update.status().phase, UpdatePhase::Idle);
+    }
+
+    #[test]
+    fn reads_what_a_failed_restart_left() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let f = Failed::parse(format!("{a} {b} {c} can't run x: gone"));
+        assert_eq!(f.error, "can't run x: gone");
+        assert_eq!(f.restart, Some((a.clone(), b, c)));
+        let f = Failed::parse(format!("{a} can't run x"));
+        assert_eq!(f.error, format!("{a} can't run x"));
+        assert_eq!(f.restart, None);
+    }
+
+    #[test]
+    fn the_server_that_goes_on_reports_its_own_commit() {
+        let f = fixture();
+        let b = build(&f, "");
+        let old = b.running.sha.clone();
+        let target = add_commit(&f.upstream, "b", "1\n");
+        b.check_out().unwrap();
+        assert_eq!(head(&f), target);
+        let restart = Restart {
+            binary: "/gone".into(),
+            running: old.clone(),
+            old: old.clone(),
+            target: target.clone(),
+        };
+        let failed = Failed::parse(restart.failed("can't run /gone"));
+        // Run by `bazel run`, not as a copy.
+        let exe = Path::new("/x/bazel-out/k8-opt/bin/grenadine/server/grenadine");
+        let b = Build::open(&f.clone.path, exe, "", b.dir.clone(), Some(&failed)).unwrap();
+        assert_eq!(b.running.sha, old);
+        assert_eq!(head(&f), old, "the clone is put back");
+        let updater = Updater::new(Some(b), Some(failed));
+        assert_eq!(updater.status().running.unwrap().sha, old);
+        let error = "can't run /gone".to_owned();
+        assert_eq!(updater.status().phase, UpdatePhase::Failed { error });
+    }
+
+    #[tokio::test]
+    async fn stopping_instead_of_restarting_puts_the_clone_back() {
+        let f = fixture();
+        let b = build(&f, BAZEL);
+        let old = b.running.sha.clone();
+        let state = state(Some(b));
+        let target = add_commit(&f.upstream, "b", "1\n");
+        assert!(start(&state));
+        until(&state, |p| *p == UpdatePhase::Restarting).await;
+        assert_eq!(head(&f), target);
+        abandon(&state).await;
+        assert_eq!(head(&f), old);
     }
 
     #[tokio::test]

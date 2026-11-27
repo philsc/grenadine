@@ -1,12 +1,11 @@
 //! The grenadine binary: the server with the web UI's files embedded.
 
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use grenadine_server::assets::{self, Asset};
-use grenadine_server::{Exit, UPDATE_FAILED_ENV as FAILED_ENV};
+use grenadine_server::{Exit, Restart, UPDATE_FAILED_ENV as FAILED_ENV};
 
 /// How long a restart waits for blocking work, and then for killed child
 /// processes, to end.
@@ -62,19 +61,21 @@ const ASSETS: &[Asset] = &[
 
 fn main() -> Result<()> {
     assets::set(ASSETS);
+    // SAFETY: the runtime, and with it any other thread, doesn't exist yet.
+    let failed = unsafe { grenadine_server::take_update_failure() };
     // Not #[tokio::main]: a restart may only exec once the runtime is gone,
     // since dropping its tasks kills the processes they run.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    match runtime.block_on(grenadine_server::run())? {
+    match runtime.block_on(grenadine_server::run(failed))? {
         Exit::Stop => Ok(()),
-        Exit::Restart(binary) => {
+        Exit::Restart(restart) => {
             // Nothing reads tokio's signal handlers anymore.
             reset_signals();
             runtime.shutdown_timeout(RESTART_GRACE);
             reap_children();
-            exec(&binary)
+            exec(&restart)
         }
     }
 }
@@ -101,14 +102,13 @@ fn reap_children() {
     }
 }
 
-/// Replaces this process with `binary`, run with the same arguments. If
-/// that fails, it runs this version again instead, which shows the failure.
-fn exec(binary: &Path) -> Result<()> {
+/// Replaces this process with the new version, run with the same
+/// arguments. If that fails, it runs this version again instead, which
+/// shows the failure and puts the clone back.
+fn exec(restart: &Restart) -> Result<()> {
+    let binary = &restart.binary;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let error = std::process::Command::new(binary)
-        .args(&args)
-        .env_remove(FAILED_ENV)
-        .exec();
+    let error = std::process::Command::new(binary).args(&args).exec();
     let error = format!("can't run {}: {error}", binary.display());
     eprintln!("{error}; going on with the version that ran");
     // Rather than its path: an update may have removed the file since.
@@ -116,6 +116,9 @@ fn exec(binary: &Path) -> Result<()> {
     if let Some(name) = std::env::args_os().next() {
         again.arg0(name);
     }
-    let again = again.args(&args).env(FAILED_ENV, &error).exec();
+    let again = again
+        .args(&args)
+        .env(FAILED_ENV, restart.failed(&error))
+        .exec();
     Err(again).context(error)
 }

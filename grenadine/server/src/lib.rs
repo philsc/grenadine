@@ -227,18 +227,29 @@ impl Signals {
     }
 }
 
-pub use update::FAILED_ENV as UPDATE_FAILED_ENV;
+pub use update::{FAILED_ENV as UPDATE_FAILED_ENV, Failed as UpdateFailed, Restart};
+
+/// Takes what a failed restart left in the environment, see
+/// [`update::take_failed`].
+///
+/// # Safety
+///
+/// No other thread may be running.
+pub unsafe fn take_update_failure() -> Option<UpdateFailed> {
+    // SAFETY: passed on to the caller.
+    unsafe { update::take_failed() }
+}
 
 /// What to do once the server has shut down.
 pub enum Exit {
     Stop,
-    /// Exec this binary, the new version, with this process's arguments.
-    Restart(PathBuf),
+    /// Exec the new version with this process's arguments.
+    Restart(Restart),
 }
 
 /// Runs the server with the command line's arguments. [`assets::set`] must
-/// have been called before.
-pub async fn run() -> Result<Exit> {
+/// have been called before. `failed` is what [`take_update_failure`] took.
+pub async fn run(failed: Option<UpdateFailed>) -> Result<Exit> {
     // Claude Code runs the server's binary as the cleanup jobs' hook.
     if std::env::args().nth(1).as_deref() == Some(cleanup::BASH_HOOK_ARG) {
         std::process::exit(cleanup::bash_hook());
@@ -266,8 +277,8 @@ pub async fn run() -> Result<Exit> {
     let mut update_dir = db_path.clone().into_os_string();
     update_dir.push("-update");
     let update = update::Updater::new(
-        update::Build::detect(&token, update_dir.into()),
-        std::env::var(update::FAILED_ENV).ok(),
+        update::Build::detect(&token, update_dir.into(), failed.as_ref()),
+        failed,
     );
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
@@ -408,7 +419,7 @@ pub async fn run() -> Result<Exit> {
     let mut exit = Exit::Stop;
     tokio::select! {
         _ = signals.wait() => {}
-        binary = updating.update.restart_requested() => exit = Exit::Restart(binary),
+        restart = updating.update.restart_requested() => exit = Exit::Restart(restart),
         r = &mut server_task => return r.context("server task panicked")?.context("can't serve").map(|()| Exit::Stop),
     }
     tracing::info!("shutting down");
@@ -419,6 +430,10 @@ pub async fn run() -> Result<Exit> {
             let synced = sync_task.await.context("sync task panicked");
             // An update that was building or waiting puts the clone back.
             updating.update.finished().await;
+            // One that was ready to restart too, if a signal came first.
+            if matches!(exit, Exit::Stop) {
+                update::abandon(&updating).await;
+            }
             served??;
             synced
         } => match r {

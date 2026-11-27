@@ -875,7 +875,8 @@ _Why:_ the clone may hold someone's work.
 build must leave it running, show why the build failed, and put the clone
 back unless someone has changed it meanwhile. The user must be able to
 cancel the build, which must put the clone back likewise. So must stopping
-the server while it builds or waits to restart.
+the server while it builds or waits to restart, and a restart that can't run
+the new build, after which the server must report the commit it really runs.
 _Why:_ a clone left at the new commit would have the next `bazel run` start
 the new version, which nobody chose.
 
