@@ -3,6 +3,7 @@
 //! requests and a box for follow-up prompts.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -4906,6 +4907,14 @@ fn writes_handoff(events: &[Arc<AgentEvent>]) -> bool {
     !writing.is_empty()
 }
 
+thread_local! {
+    /// The follow-up box on the page for each session that has one, so
+    /// that a send that outlives its box can empty the one that took its
+    /// place; see `Composer`'s `send`.
+    static COMPOSERS: RefCell<HashMap<String, (RwSignal<String>, Attached)>> =
+        RefCell::default();
+}
+
 #[component]
 fn Composer(
     session: Signal<AgentSession>,
@@ -4926,6 +4935,23 @@ fn Composer(
     let images = id.with_value(|id| image_drafts::draft_images(image_drafts::agent_key(id)));
     let files = id.with_value(|id| Files::draft(image_drafts::agent_key(id)));
     let attached = Attached { images, files };
+    let session_id = id.get_value();
+    COMPOSERS.with(|c| {
+        c.borrow_mut()
+            .insert(session_id.clone(), (prompt, attached))
+    });
+    on_cleanup(move || {
+        COMPOSERS.with(|c| {
+            let mut composers = c.borrow_mut();
+            // Unless the session's next box is on the page already.
+            if composers
+                .get(&session_id)
+                .is_some_and(|(p, _)| *p == prompt)
+            {
+                composers.remove(&session_id);
+            }
+        });
+    });
     let error = RwSignal::new(None::<String>);
     let blank = move || prompt.with(|p| p.trim().is_empty()) && attached.is_empty();
     let working = move || {
@@ -4954,17 +4980,24 @@ fn Composer(
         spawn_local(async move {
             match api::send_agent_message(&id, text, sent_images, ids.clone(), mode, model).await {
                 Ok(()) => {
-                    // The session may have been left by now. The signals
-                    // are gone then, and with them what keeps the draft
-                    // in step, so the kept draft is emptied here as well.
+                    // The session may have been left by now. This box's
+                    // signals are gone then, and with them what keeps the
+                    // draft in step, so the kept draft is emptied here as
+                    // well. If the session was come back to meanwhile,
+                    // its new box read the draft before it was emptied,
+                    // and would send it a second time: that box is the
+                    // one to empty.
+                    let (prompt, attached) = COMPOSERS
+                        .with(|c| c.borrow().get(&id).copied())
+                        .unwrap_or((prompt, attached));
                     prompt.set(String::new());
                     if let Some(s) = storage() {
                         let _ = s.remove_item(&draft_key(&id));
                     }
-                    images.set(Vec::new());
+                    attached.images.set(Vec::new());
                     let key = image_drafts::agent_key(&id);
                     image_drafts::forget(&key);
-                    files.sent(&key, &ids);
+                    attached.files.sent(&key, &ids);
                     error.set(None);
                 }
                 Err(e) => error.set(Some(e)),
