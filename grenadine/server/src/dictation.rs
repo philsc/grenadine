@@ -5,7 +5,7 @@
 //! transcribed again about every second, so the page can preview it.
 //! Transcription runs locally with whisper.cpp; see `--whisper-model`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -257,15 +257,14 @@ unsafe impl Send for Whisper {}
 unsafe impl Sync for Whisper {}
 
 impl Whisper {
-    fn load(path: &Path) -> Result<Whisper> {
+    /// Loads the model at `path`, to transcribe with `threads` threads.
+    fn load(path: &Path, threads: usize) -> Result<Whisper> {
         let c_path = CString::new(path.as_os_str().as_encoded_bytes())?;
         // SAFETY: c_path is a valid C string for the call.
         let raw = unsafe { gr_whisper_load(c_path.as_ptr(), log_error) };
         if raw.is_null() {
             bail!("can't load the Whisper model {}", path.display());
         }
-        // Whisper gains little beyond 8 threads.
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
         Ok(Whisper {
             raw: Mutex::new(raw),
             threads: threads as c_int,
@@ -308,6 +307,11 @@ impl Drop for Whisper {
         // SAFETY: loaded by gr_whisper_load and freed only here.
         unsafe { gr_whisper_free(raw) };
     }
+}
+
+/// The threads a model transcribes with. Whisper gains little beyond 8.
+fn whisper_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(8))
 }
 
 /// The transcribers of the finished phrases and of the previews.
@@ -371,17 +375,22 @@ impl Dictation {
     }
 
     async fn transcribers(&self) -> Result<Transcribers> {
-        let load = |path: PathBuf| async move {
+        let load = |path: PathBuf, threads: usize| async move {
             tracing::info!("loading the Whisper model {}", path.display());
-            let whisper = tokio::task::spawn_blocking(move || Whisper::load(&path)).await??;
+            let whisper =
+                tokio::task::spawn_blocking(move || Whisper::load(&path, threads)).await??;
             Ok::<_, anyhow::Error>(Arc::new(whisper) as Arc<dyn Transcriber>)
         };
         self.transcribers
             .get_or_try_init(|| async {
                 let models = self.models.as_ref().context("dictation is off")?;
-                let finals = load(models.finals.clone()).await?;
+                let threads = whisper_threads();
+                let finals = load(models.finals.clone(), threads).await?;
+                // A preview runs alongside a phrase's final transcription,
+                // which is what the user waits for: the preview model gets
+                // fewer threads so that it takes few of the final's cores.
                 let previews = match &models.previews {
-                    Some(p) => load(p.clone()).await?,
+                    Some(p) => load(p.clone(), (threads / 4).max(1)).await?,
                     None => finals.clone(),
                 };
                 Ok::<_, anyhow::Error>(Transcribers { finals, previews })
@@ -493,6 +502,16 @@ async fn finish(job: &mut Option<Job>) -> Result<(usize, Option<String>)> {
     Ok((phrase, clean(&text)))
 }
 
+/// The interim text of the previews in `shown`, in order.
+fn interim(shown: &BTreeMap<usize, String>) -> String {
+    let texts: Vec<&str> = shown
+        .values()
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .collect();
+    texts.join(" ")
+}
+
 async fn run<I, E, O>(dictation: &Dictation, incoming: &mut I, out: &mut O) -> Result<()>
 where
     I: Stream<Item = Result<Message, E>> + Unpin,
@@ -516,8 +535,11 @@ where
     let mut cut = 0;
     // The pending phrase's length at its last preview.
     let mut previewed = 0;
-    // The phrase whose preview the page shows, if any.
-    let mut shown = None;
+    // The last preview of each phrase that the page shows and that has no
+    // final text yet, by phrase. With a preview model, the next phrase's
+    // preview can come before this phrase's text; the page then shows
+    // both, so that the earlier phrase's words don't disappear meanwhile.
+    let mut shown: BTreeMap<usize, String> = BTreeMap::new();
     let mut preview_due = false;
     let mut stopping = false;
     // A phrase's final transcription and a preview run side by side,
@@ -594,9 +616,11 @@ where
                 }
                 send(out, &DictationEvent::Final { text }).await?;
                 // The phrase's preview gives way to its text.
-                if shown.is_some_and(|s| s <= phrase) {
-                    shown = None;
-                    send(out, &DictationEvent::Interim { text: String::new() }).await?;
+                let before = shown.len();
+                shown.retain(|&p, _| p > phrase);
+                if shown.len() != before {
+                    let text = interim(&shown);
+                    send(out, &DictationEvent::Interim { text }).await?;
                 }
             }
             done = finish(&mut preview_job), if preview_job.is_some() => {
@@ -611,8 +635,8 @@ where
                 };
                 // A preview of a phrase that was cut meanwhile is stale.
                 if phrase == cut && !stopping {
-                    shown = Some(phrase);
-                    let text = text.unwrap_or_default();
+                    shown.insert(phrase, text.unwrap_or_default());
+                    let text = interim(&shown);
                     send(out, &DictationEvent::Interim { text }).await?;
                 }
             }
@@ -748,7 +772,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .finish();
-        let loaded = tracing::subscriber::with_default(subscriber, || Whisper::load(&path));
+        let loaded = tracing::subscriber::with_default(subscriber, || Whisper::load(&path, 1));
         assert!(loaded.is_err());
         let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         assert!(log.contains("bad magic"), "{log}");
@@ -953,6 +977,112 @@ mod tests {
         served.unwrap();
     }
 
+    /// Finishes a phrase only once the test lets it, and numbers its
+    /// phrases like `FakeTranscriber`.
+    struct HeldFinals {
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+        finals: FakeTranscriber,
+    }
+
+    impl Transcriber for HeldFinals {
+        fn transcribe(&self, audio: &[f32], prompt: &str, pass: Pass) -> Result<String> {
+            self.go.lock().unwrap().recv()?;
+            self.finals.transcribe(audio, prompt, pass)
+        }
+    }
+
+    /// Numbers its previews: "p1", "p2" and so on.
+    #[derive(Default)]
+    struct CountedPreviews(Mutex<usize>);
+
+    impl Transcriber for CountedPreviews {
+        fn transcribe(&self, _audio: &[f32], _prompt: &str, _pass: Pass) -> Result<String> {
+            let mut n = self.0.lock().unwrap();
+            *n += 1;
+            Ok(format!("p{n}"))
+        }
+    }
+
+    /// With a preview model, the next phrase's preview can come while the
+    /// phrase before it is still being transcribed. The page then shows
+    /// both previews, and the earlier one only gives way to its text.
+    #[tokio::test]
+    async fn session_keeps_an_earlier_preview_until_its_text_comes() {
+        let (go, held) = std::sync::mpsc::channel();
+        let finals = HeldFinals {
+            go: Mutex::new(held),
+            finals: FakeTranscriber::default(),
+        };
+        let dictation = Dictation {
+            models: None,
+            transcribers: tokio::sync::OnceCell::new_with(Some(Transcribers {
+                finals: Arc::new(finals),
+                previews: Arc::new(CountedPreviews::default()),
+            })),
+        };
+        let (to_server, from_page) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (mut out, mut from_server) = futures::channel::mpsc::unbounded::<Message>();
+        let mut incoming = tokio_stream::wrappers::UnboundedReceiverStream::new(from_page)
+            .map(Ok::<_, std::convert::Infallible>);
+        let server = async move { run(&dictation, &mut incoming, &mut out).await };
+        let page = async move {
+            let mut next = async || -> DictationEvent {
+                match from_server.next().await.unwrap() {
+                    Message::Text(t) => serde_json::from_str(&t).unwrap(),
+                    m => panic!("unexpected {m:?}"),
+                }
+            };
+            let interim = |e: DictationEvent| match e {
+                DictationEvent::Interim { text } => text,
+                e => panic!("unexpected {e:?}"),
+            };
+            let start = DictationCommand::Start {
+                prompt: String::new(),
+            };
+            to_server.send(command(&start)).unwrap();
+            to_server.send(pcm(&silence(300))).unwrap();
+            to_server.send(pcm(&tone(600))).unwrap();
+            let first = interim(next().await);
+            assert_eq!(first, "p1");
+            // The first phrase is cut and waits for its text while the
+            // second one is spoken.
+            to_server.send(pcm(&silence(600))).unwrap();
+            to_server.send(pcm(&tone(600))).unwrap();
+            let second = interim(next().await);
+            assert_eq!(second, "p1 p2");
+            go.send(()).unwrap();
+            assert_eq!(
+                next().await,
+                DictationEvent::Final {
+                    text: "phrase 1.".into()
+                }
+            );
+            assert_eq!(interim(next().await), "p2");
+            go.send(()).unwrap();
+            to_server.send(command(&DictationCommand::Stop)).unwrap();
+            let mut rest = Vec::new();
+            loop {
+                match next().await {
+                    DictationEvent::Done => break,
+                    e => rest.push(e),
+                }
+            }
+            assert_eq!(
+                rest,
+                vec![
+                    DictationEvent::Final {
+                        text: "phrase 2.".into()
+                    },
+                    DictationEvent::Interim {
+                        text: String::new()
+                    },
+                ]
+            );
+        };
+        let (served, ()) = tokio::join!(server, page);
+        served.unwrap();
+    }
+
     #[tokio::test]
     async fn session_without_a_model_fails() {
         let dictation = Dictation::off();
@@ -971,7 +1101,7 @@ mod tests {
         let model = std::env::var("WHISPER_MODEL").unwrap();
         let wav = std::fs::read(std::env::var("WHISPER_WAV").unwrap()).unwrap();
         let start = std::time::Instant::now();
-        let whisper = Whisper::load(Path::new(&model)).unwrap();
+        let whisper = Whisper::load(Path::new(&model), whisper_threads()).unwrap();
         println!("loaded in {:?}", start.elapsed());
         let mut s = Segmenter::default();
         let mut phrases = s.push(&samples(&wav[44..]));
