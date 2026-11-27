@@ -600,7 +600,15 @@ where
                 }
             }
             done = finish(&mut preview_job), if preview_job.is_some() => {
-                let (phrase, text) = done?;
+                // A preview is only a hint until the phrase's text comes,
+                // so a failed one mustn't end the recording.
+                let (phrase, text) = match done {
+                    Ok(done) => done,
+                    Err(e) => {
+                        tracing::warn!("dictation preview: {e:#}");
+                        continue;
+                    }
+                };
                 // A preview of a phrase that was cut meanwhile is stale.
                 if phrase == cut && !stopping {
                     shown = Some(phrase);
@@ -879,6 +887,66 @@ mod tests {
                 vec![DictationEvent::Final {
                     text: "phrase 2.".into()
                 }]
+            );
+        };
+        let (served, ()) = tokio::join!(server, page);
+        served.unwrap();
+    }
+
+    /// Fails every preview, like a model that can't take a short chunk.
+    #[derive(Default)]
+    struct FailingPreviews(FakeTranscriber);
+
+    impl Transcriber for FailingPreviews {
+        fn transcribe(&self, audio: &[f32], prompt: &str, pass: Pass) -> Result<String> {
+            match pass {
+                Pass::Interim => Err(anyhow!("whisper_full failed")),
+                Pass::Final => self.0.transcribe(audio, prompt, pass),
+            }
+        }
+    }
+
+    /// A failed preview is dropped, and the phrases still come.
+    #[tokio::test]
+    async fn session_survives_failed_previews() {
+        let dictation = Dictation::with(Arc::new(FailingPreviews::default()));
+        let (to_server, from_page) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let (mut out, mut from_server) = futures::channel::mpsc::unbounded::<Message>();
+        let mut incoming = tokio_stream::wrappers::UnboundedReceiverStream::new(from_page)
+            .map(Ok::<_, std::convert::Infallible>);
+        let server = async move { run(&dictation, &mut incoming, &mut out).await };
+        let page = async move {
+            let start = DictationCommand::Start {
+                prompt: String::new(),
+            };
+            to_server.send(command(&start)).unwrap();
+            to_server.send(pcm(&silence(300))).unwrap();
+            to_server.send(pcm(&tone(600))).unwrap();
+            // Long enough for previews of the phrase to fail.
+            tokio::time::sleep(INTERIM_EVERY * 2).await;
+            to_server.send(pcm(&silence(600))).unwrap();
+            to_server.send(pcm(&tone(300))).unwrap();
+            to_server.send(command(&DictationCommand::Stop)).unwrap();
+            let mut events = Vec::new();
+            while let Some(Message::Text(t)) = from_server.next().await {
+                let event: DictationEvent = serde_json::from_str(&t).unwrap();
+                let done = event == DictationEvent::Done;
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(
+                events,
+                vec![
+                    DictationEvent::Final {
+                        text: "phrase 1.".into()
+                    },
+                    DictationEvent::Final {
+                        text: "phrase 2.".into()
+                    },
+                    DictationEvent::Done,
+                ]
             );
         };
         let (served, ()) = tokio::join!(server, page);
