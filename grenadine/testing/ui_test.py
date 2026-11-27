@@ -6911,8 +6911,9 @@ class AgentTest(ServerTestCase):
         expect(follow_up).to_have_value("say later")
         held[0].continue_()
 
-        # The answer empties that box too, or Enter would send the
-        # follow-up again and a keystroke would keep it as a draft.
+        # The answer empties that box too. Otherwise it would go on
+        # offering the sent follow-up, and a keystroke would keep it as
+        # a draft again.
         expect(follow_up).to_have_value("")
         expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
             ["say first", "say later"]

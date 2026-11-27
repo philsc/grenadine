@@ -4984,9 +4984,12 @@ fn Composer(
                     // signals are gone then, and with them what keeps the
                     // draft in step, so the kept draft is emptied here as
                     // well. If the session was come back to meanwhile,
-                    // its new box read the draft before it was emptied,
-                    // and would send it a second time: that box is the
-                    // one to empty.
+                    // its new box read the draft before it was emptied
+                    // and would go on offering it: that box is the one to
+                    // empty. Like this one, it doesn't know of the send
+                    // until then, so Enter in it before the answer sends
+                    // the follow-up twice, and what's typed into it
+                    // meanwhile is emptied with the rest.
                     let (prompt, attached) = COMPOSERS
                         .with(|c| c.borrow().get(&id).copied())
                         .unwrap_or((prompt, attached));
