@@ -227,13 +227,7 @@ fn theme() -> JsValue {
 }
 
 fn socket_url(session: &str, terminal: u64) -> String {
-    let location = window().location();
-    let scheme = match location.protocol().as_deref() {
-        Ok("https:") => "wss:",
-        _ => "ws:",
-    };
-    let host = location.host().unwrap_or_default();
-    format!("{scheme}//{host}/api/agents/{session}/terminals/{terminal}/ws")
+    crate::events::socket_url(&format!("/api/agents/{session}/terminals/{terminal}/ws"))
 }
 
 /// One WebSocket to the shell and its handlers; dropping it closes it.

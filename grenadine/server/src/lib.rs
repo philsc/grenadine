@@ -23,12 +23,14 @@ mod mcp;
 mod pr_plan;
 mod ratelimit;
 mod reflow;
+mod slash_commands;
 mod stack;
 mod summary;
 mod sync;
 mod system;
 mod terminal;
 mod unstaged;
+mod update;
 
 #[cfg(test)]
 mod test_util {
@@ -242,12 +244,35 @@ impl Signals {
     }
 }
 
+pub use update::{FAILED_ENV as UPDATE_FAILED_ENV, Failed as UpdateFailed, Restart};
+
+/// Takes what a failed restart left in the environment, see
+/// [`update::take_failed`].
+///
+/// # Safety
+///
+/// No other thread may be running.
+pub unsafe fn take_update_failure() -> Option<UpdateFailed> {
+    // SAFETY: passed on to the caller.
+    unsafe { update::take_failed() }
+}
+
+/// What to do once the server has shut down.
+pub enum Exit {
+    Stop,
+    /// Exec the new version with this process's arguments.
+    Restart(Restart),
+}
+
 /// Runs the server with the command line's arguments. [`assets::set`] must
-/// have been called before.
-pub async fn run() -> Result<()> {
+/// have been called before. `failed` is what [`take_update_failure`] took.
+pub async fn run(failed: Option<UpdateFailed>) -> Result<Exit> {
     // Claude Code runs the server's binary as the cleanup jobs' hook.
     if std::env::args().nth(1).as_deref() == Some(cleanup::BASH_HOOK_ARG) {
         std::process::exit(cleanup::bash_hook());
+    }
+    if std::env::args().nth(1).as_deref() == Some(update::INSTALL_ARG) {
+        std::process::exit(update::install());
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -264,6 +289,14 @@ pub async fn run() -> Result<()> {
         Some(p) => p,
         None => default_db()?,
     };
+    // Bazel runs in another directory.
+    let db_path = std::path::absolute(db_path)?;
+    let mut update_dir = db_path.clone().into_os_string();
+    update_dir.push("-update");
+    let update = update::Updater::new(
+        update::Build::detect(&token, update_dir.into(), failed.as_ref()),
+        failed,
+    );
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
     let github = github::GitHub::new(&token, &args.github_api)?;
@@ -277,6 +310,10 @@ pub async fn run() -> Result<()> {
         tracing::warn!(
             "no systemd user manager: deleting a session only stops the processes still in its worktree"
         );
+    } else if let Err(e) = agent::lower_agents_cpu_weight() {
+        tracing::warn!("can't lower the sessions' CPU weight: {e:#}");
+    } else if let Some(why) = agent::cpu_weight_caveat() {
+        tracing::warn!("{why}");
     }
     // Before serving, since a session being created has a worktree but no
     // row yet. The output bases of what it removes go next.
@@ -355,9 +392,11 @@ pub async fn run() -> Result<()> {
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         merges: std::sync::Mutex::default(),
+        starting_merges: std::sync::Mutex::default(),
         db_dir: db_path.parent().unwrap_or(db_path.as_path()).to_owned(),
         started_at: agent::now(),
         system: system::Sampler::default(),
+        update,
         shutdown: shutdown.clone(),
         dictation,
     });
@@ -400,27 +439,49 @@ pub async fn run() -> Result<()> {
         .with_context(|| format!("can't listen on {addr}"))?;
     tracing::info!("serving on http://{addr}/");
     let serve_shutdown = shutdown.clone();
+    let updating = state.clone();
     let mut server_task = tokio::spawn(async move {
         axum::serve(listener, api::router(state))
             .with_graceful_shutdown(serve_shutdown.cancelled_owned())
             .await
     });
 
+    let mut exit = Exit::Stop;
     tokio::select! {
         _ = signals.wait() => {}
-        r = &mut server_task => return r.context("server task panicked")?.context("can't serve"),
+        restart = updating.update.restart_requested() => exit = Exit::Restart(restart),
+        r = &mut server_task => return r.context("server task panicked")?.context("can't serve").map(|()| Exit::Stop),
     }
     tracing::info!("shutting down");
     shutdown.cancel();
     tokio::select! {
         r = async {
-            server_task.await.context("server task panicked")??;
-            sync_task.await.context("sync task panicked")
-        } => r?,
+            let served = server_task.await.context("server task panicked");
+            let synced = sync_task.await.context("sync task panicked");
+            // An update that was building or waiting puts the clone back.
+            updating.update.finished().await;
+            // One that was ready to restart too, if a signal came first.
+            if matches!(exit, Exit::Stop) {
+                update::abandon(&updating).await;
+            }
+            served??;
+            synced
+        } => match r {
+            // The new version gets to serve whatever became of the tasks,
+            // which may have panicked long ago.
+            Err(e) if matches!(exit, Exit::Restart(_)) => {
+                tracing::error!("restarting anyway: {e:#}");
+            }
+            r => r?,
+        },
         // Dropping the runtime would wait forever on spawn_blocking git
         // work, so timeouts and repeated signals exit the process directly.
         _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
             tracing::warn!("shutdown timed out");
+            // main doesn't wait for that work before a restart.
+            if matches!(exit, Exit::Restart(_)) {
+                return Ok(exit);
+            }
             std::process::exit(1);
         }
         _ = signals.wait() => {
@@ -428,5 +489,5 @@ pub async fn run() -> Result<()> {
             std::process::exit(1);
         }
     }
-    Ok(())
+    Ok(exit)
 }

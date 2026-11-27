@@ -122,7 +122,7 @@ impl Repo {
     }
 
     /// Runs git and returns its stdout.
-    fn git(&self, args: &[&str]) -> Result<String> {
+    pub(crate) fn git(&self, args: &[&str]) -> Result<String> {
         let out = self
             .command()
             .args(args)
@@ -140,7 +140,7 @@ impl Repo {
     }
 
     /// Runs git and reports only whether it succeeded.
-    fn git_ok(&self, args: &[&str]) -> bool {
+    pub(crate) fn git_ok(&self, args: &[&str]) -> bool {
         self.command()
             .args(args)
             .stdin(Stdio::null())

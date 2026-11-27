@@ -976,8 +976,8 @@
           "FILE:@@//Cargo.toml 94b3c499fa49a843ecee147076a6b9c277679cdb1857afb7dffd11c912e890c5",
           "FILE:@@//grenadine/core/Cargo.toml 3e34b79a67e8e7e051c901443e9b8e0e81d86e0a672fc65c6a7d340ae6591880",
           "FILE:@@//grenadine/server/Cargo.toml e44b8f291b679dc7105f739e8cae31487391b4aa5a140ca0f876959f70c25c0f",
-          "FILE:@@//grenadine/web/Cargo.toml a0b4cbeae8970901a2f56b6d85fbe318a0a35a2a124e35d73ce57ca1db92ac94",
-          "FILE:@@//cargo-bazel-lock.json ae3f0033f1628e6ea99ce22c74743933585aa2bfe2c9edb63df516764f2e4dc4"
+          "FILE:@@//grenadine/web/Cargo.toml 50754243a1f8c61910d973d82abc6497ebab22c9d99470bfea97034d18d2bcd4",
+          "FILE:@@//cargo-bazel-lock.json 0d80ae0c0b7b3fcdac4752be299900545cb894b96a74bcb98a49368ca807c231"
         ],
         "generatedRepoSpecs": {
           "crates": {

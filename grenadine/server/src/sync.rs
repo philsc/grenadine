@@ -152,6 +152,8 @@ pub struct State {
     /// The asynchronous merges started from the merge box, by the ID
     /// GitHub's merge-async API gave them, so the page can poll them.
     pub merges: std::sync::Mutex<HashMap<String, crate::api::PendingMerge>>,
+    /// The PRs that GitHub is being asked to merge.
+    pub starting_merges: std::sync::Mutex<Vec<PrKey>>,
     /// Cancelled on shutdown. The poller then starts no new syncs and the
     /// event streams end.
     /// The Claude Code sessions started from the UI.
@@ -164,6 +166,8 @@ pub struct State {
     pub started_at: i64,
     /// What /api/debug/system samples through.
     pub system: crate::system::Sampler,
+    /// Updates the server to a newer version.
+    pub update: crate::update::Updater,
     pub shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -1129,9 +1133,11 @@ pub fn test_state_with_agents(
         following_up: std::sync::Mutex::new(BTreeSet::new()),
         review_locks: std::sync::Mutex::default(),
         merges: std::sync::Mutex::default(),
+        starting_merges: std::sync::Mutex::default(),
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
+        update: crate::update::Updater::new(None, None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         dictation: crate::dictation::Dictation::off(),
     })

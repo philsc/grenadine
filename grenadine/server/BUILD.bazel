@@ -49,6 +49,7 @@ rust_binary(
     deps = [
         ":server_lib",
         "@crates//:anyhow",
+        "@crates//:libc",
         "@crates//:tokio",
     ],
 )

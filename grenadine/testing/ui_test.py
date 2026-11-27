@@ -460,7 +460,15 @@ def result(tool_use, content, is_error=False, patch=None):
     emit(line)
 
 
-emit({"type": "system", "subtype": "init", "session_id": "s", "model": model})
+emit({
+    "type": "system",
+    "subtype": "init",
+    "session_id": "s",
+    "model": model,
+    "slash_commands": ["bar", "baz", "clear", "doctor", "foo"],
+    "skills": ["bar", "baz", "foo"],
+    "terminal_slash_commands": ["doctor"],
+})
 for word in ["Working ", "on ", "it"]:
     emit({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": word}}})
     time.sleep(0.05)
@@ -744,6 +752,14 @@ class ServerTestCase(unittest.TestCase):
         """Adds the PRs the tests expect; there are none by default."""
         gh.repo(scenarios.REPO)
 
+    # Whether the database may go on tmpfs, which can be mounted noexec.
+    DB_ON_TMPFS: ClassVar[bool] = True
+
+    @classmethod
+    def prepare(cls, tmp: Path, bin_dir: Path, env: dict[str, str]) -> None:
+        """Changes what the server is started with: the directory first on
+        its PATH, and its environment."""
+
     @classmethod
     def setUpClass(cls) -> None:
         tmp = Path(tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR")))
@@ -768,8 +784,16 @@ class ServerTestCase(unittest.TestCase):
         devin.write_text(f'#!/bin/sh\nexec {fake_devin} --scenario={scenario} "$@"\n')
         devin.chmod(0o755)
 
+        # The skills a prompt is offered before any session listed its
+        # own: the same as the fake claude lists.
+        claude_config = tmp / "claude_config"
+        for skill in ["bar", "baz", "foo"]:
+            (claude_config / "skills" / skill).mkdir(parents=True)
+            (claude_config / "skills" / skill / "SKILL.md").write_text(f"# {skill}\n")
+
         env = dict(
             cls.gh.git_env(),
+            CLAUDE_CONFIG_DIR=str(claude_config),
             PATH=f"{bin_dir}:{os.environ['PATH']}",
             # Where the fake claude posts reviews.
             FAKE_GITHUB_API=api,
@@ -796,6 +820,8 @@ class ServerTestCase(unittest.TestCase):
             )
             repo_flags.append(f"--repo={clone}")
 
+        cls.prepare(tmp, bin_dir, env)
+
         port = free_port()
         cls.url = f"http://127.0.0.1:{port}/"
         cls.devin_log = tmp / "devin_acp.log"
@@ -804,7 +830,7 @@ class ServerTestCase(unittest.TestCase):
         # is busy with other actions' inputs held the server's startup for
         # 30s. The worktrees stay where the server would put them.
         db_dir = tmp
-        if os.access("/dev/shm", os.W_OK):
+        if cls.DB_ON_TMPFS and os.access("/dev/shm", os.W_OK):
             db_dir = Path(tempfile.mkdtemp(dir="/dev/shm"))
             cls.addClassCleanup(shutil.rmtree, db_dir, ignore_errors=True)
         cls.server_args = (
@@ -4995,6 +5021,172 @@ class AgentTest(ServerTestCase):
         dialog.get_by_role("button", name="Save").click()
         expect(dialog).to_have_count(0)
 
+    def test_prompts_complete_slash_commands(self) -> None:
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        prompt = self.page.get_by_label("Prompt")
+        suggestions = self.page.get_by_role("listbox", name="Commands").get_by_role(
+            "option"
+        )
+        selected = self.page.locator(".slash-suggest li.selected")
+
+        # One match is suggested as soon as it's the only one, and Tab
+        # completes it with a space.
+        prompt.press_sequentially("/f")
+        expect(suggestions).to_have_text(["/foo"])
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/foo ")
+        expect(prompt).to_be_focused()
+
+        # Several are listed alphabetically; Tab cycles through them, and
+        # Shift+Tab back.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_text(["/bar", "/baz"])
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        expect(selected).to_have_text("/bar")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(selected).to_have_text("/baz")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/bar ")
+        prompt.press("Shift+Tab")
+        expect(prompt).to_have_value("/baz ")
+
+        # Typing goes on with the prompt and closes the list.
+        prompt.press_sequentially("go")
+        expect(prompt).to_have_value("/baz go")
+        expect(suggestions).to_have_count(0)
+
+        # Escape closes the list without changing the text; typing opens
+        # it again.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Escape")
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/b")
+        prompt.press_sequentially("a")
+        expect(suggestions).to_have_count(2)
+        # A click completes like Tab, but only with the primary button.
+        suggestions.filter(has_text="/baz").click(button="middle")
+        expect(prompt).to_have_value("/ba")
+        expect(prompt).to_be_focused()
+        suggestions.filter(has_text="/baz").click()
+        expect(prompt).to_have_value("/baz ")
+
+        # A click in the box goes on with the prompt: the list closes, and
+        # Tab no longer changes the command.
+        prompt.fill("")
+        prompt.press_sequentially("/b")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Tab")
+        prompt.press("Tab")
+        expect(prompt).to_have_value("/baz ")
+        expect(suggestions).to_have_count(2)
+        prompt.click()
+        expect(suggestions).to_have_count(0)
+        expect(prompt).to_have_value("/baz ")
+
+        # Enter sends the prompt as typed, even with the list open.
+        prompt.fill("")
+        prompt.press_sequentially("/ba")
+        expect(suggestions).to_have_count(2)
+        prompt.press("Enter")
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        transcript = self.page.locator(".transcript")
+        expect(transcript.locator(".turn-prompt").first).to_have_text("/ba")
+        expect(transcript.locator(".turn-end")).to_have_count(1)
+
+        # The follow-up box offers the session's own commands, the most
+        # used first, without the terminal's or the hidden ones.
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.press_sequentially("/baz again")
+        follow_up.press("Enter")
+        expect(transcript.locator(".turn-end")).to_have_count(2)
+
+        # Sending a bare command closes its list, even when the server only
+        # answers after the key is released.
+        held: list = []
+        self.page.route("**/api/agents/*/messages", lambda route: held.append(route))
+        follow_up.press_sequentially("/baz")
+        expect(suggestions).to_have_text(["/baz"])
+        follow_up.press("Enter")
+        expect(suggestions).to_have_text(["/baz"])
+        self.wait_held(held)
+        held.pop().continue_()
+        self.page.unroute("**/api/agents/*/messages")
+        expect(follow_up).to_have_value("")
+        expect(suggestions).to_have_count(0)
+        expect(transcript.locator(".turn-end")).to_have_count(3)
+
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/foo"])
+        follow_up.press("Tab")
+        expect(follow_up).to_have_value("/baz ")
+
+        # Hiding nothing shows the commands hidden by default too.
+        self.page.locator(".global-settings-button").click()
+        dialog = self.page.get_by_role("dialog", name="Settings")
+        # Only a changed setting is stored, so that new defaults show.
+        stored = "() => localStorage.getItem('hidden-commands')"
+        self.assertIsNone(self.page.evaluate(stored))
+        dialog.get_by_label("Hidden commands").fill("foo")
+        self.page.wait_for_function(f"({stored})() === 'foo'")
+        dialog.get_by_role("button", name="Close").click()
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_text(["/baz", "/bar", "/clear"])
+
+        # A long list scrolls to the highlighted command.
+        self.page.route(
+            "**/api/agents/*/slash-commands",
+            lambda route: route.fulfill(
+                json=[{"name": f"c{i:02}", "uses": 0} for i in range(30)]
+            ),
+        )
+        follow_up.fill("")
+        follow_up.press_sequentially("/")
+        expect(suggestions).to_have_count(30)
+        follow_up.press("Shift+Tab")
+        expect(selected).to_have_text("/c29")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+        follow_up.press("Tab")
+        expect(selected).to_have_text("/c00")
+        expect(selected).to_be_in_viewport(ratio=0.9)
+
+        # Tabbing into a box that holds a command, either way, doesn't
+        # open the list, so the next Tab moves on and leaves the text be.
+        follow_up.fill("/c")
+        expect(suggestions).to_have_count(30)
+        follow_up.evaluate("e => e.blur()")
+        expect(suggestions).to_have_count(0)
+        follow_up.focus()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        self.page.keyboard.press("Tab")
+        expect(follow_up).not_to_be_focused()
+        self.page.keyboard.press("Shift+Tab")
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(0)
+        expect(follow_up).to_have_value("/c")
+        follow_up.press_sequentially("0")
+        expect(suggestions).to_have_count(10)
+
+        # A press on the list's padding keeps the box focused and the list
+        # open.
+        self.page.locator(".slash-suggest").click(position={"x": 20, "y": 1})
+        expect(follow_up).to_be_focused()
+        expect(suggestions).to_have_count(10)
+        expect(follow_up).to_have_value("/c0")
+        self.page.unroute("**/api/agents/*/slash-commands")
+
     def start_devin_session(self, permissions: str, prompt: str) -> Locator:
         self.page.goto(self.url + "#/agents")
         self.page.get_by_label("Repository").select_option(label="General")
@@ -5031,6 +5223,33 @@ class AgentTest(ServerTestCase):
         backend.select_option(label="Devin")
         expect(model).to_have_value("swe-2-high")
 
+    def test_more_tabs_than_http_connections_all_load(self) -> None:
+        # A browser keeps six HTTP connections to a server, shared by the
+        # tabs of a context. Every tab follows two event streams; over
+        # HTTP, three tabs' streams left no connection for a fourth tab.
+        context = self.browser.new_context()
+        self.addCleanup(context.close)
+        self.page = context.new_page()
+        self.page.goto(self.url + "#/agents")
+        self.page.get_by_label("Repository").select_option(label="General")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("Count the tabs")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        for _ in range(4):
+            tab = context.new_page()
+            tab.goto(self.page.url)
+            expect(tab.locator(".transcript .turn-prompt").first).to_have_text(
+                "Count the tabs"
+            )
+            expect(tab.locator(".transcript .turn-end")).to_have_count(1)
+        # The first tab still gets what happens next.
+        self.page.get_by_label("Follow-up").fill("And again")
+        self.page.get_by_label("Follow-up").press("Enter")
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(2)
+        expect(tab.locator(".transcript .turn-end")).to_have_count(2)
+
     def test_sessions_keep_their_own_models(self) -> None:
         def start(model: str, prompt: str) -> str:
             self.page.goto(self.url + "#/agents")
@@ -5049,8 +5268,8 @@ class AgentTest(ServerTestCase):
             ) as req:
                 self.page.get_by_label("Follow-up").fill(text)
                 self.page.get_by_label("Follow-up").press("Enter")
-            # The box empties once the send is answered; text typed
-            # before then would be emptied with it.
+            # The box empties once the send is answered, unless something
+            # else was typed into it before then.
             expect(self.page.get_by_label("Follow-up")).to_have_value("")
             return req.value.post_data_json["model"]
 
@@ -6922,6 +7141,108 @@ class AgentTest(ServerTestCase):
             )
         ).to_have_count(1)
         expect(draft).to_have_count(0)
+
+    def test_leaving_a_session_while_its_follow_up_is_sent(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # The session's page is gone by the time the send is answered.
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(follow_up).to_have_count(0)
+        held[0].continue_()
+
+        # The follow-up went, so it's no draft anymore, though the box
+        # that held it is gone.
+        self.page.wait_for_function(
+            "() => !Object.values(localStorage).includes('say later')"
+        )
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        expect(follow_up).to_have_value("")
+
+    def test_returning_to_a_session_while_its_follow_up_is_sent(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # Back on the session, its new box starts out with the draft that
+        # is still being sent.
+        self.page.get_by_role("link", name="+ New session").click()
+        expect(follow_up).to_have_count(0)
+        self.section(scenarios.REPO).locator(
+            ".agent-item", has_text="say first"
+        ).click()
+        expect(follow_up).to_have_value("say later")
+        held[0].continue_()
+
+        # The answer empties that box too. Otherwise it would go on
+        # offering the sent follow-up, and a keystroke would keep it as
+        # a draft again.
+        expect(follow_up).to_have_value("")
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        self.assertNotIn("say later", self.page.evaluate("Object.values(localStorage)"))
+
+    def test_text_typed_while_a_follow_up_is_sent_stays(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say first")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+
+        held: list[Route] = []
+
+        def hold(route: Route) -> None:
+            held.append(route)
+
+        self.page.route("**/api/agents/*/messages", hold)
+        follow_up = self.page.get_by_label("Follow-up")
+        follow_up.fill("say later")
+        follow_up.press("Enter")
+        self.wait_held(held)
+        # The next follow-up is written before the first one is answered.
+        follow_up.fill("say last")
+        held[0].continue_()
+
+        # The answer takes only the sent text out of the box.
+        expect(self.page.locator(".transcript .turn-prompt")).to_have_text(
+            ["say first", "say later"]
+        )
+        expect(follow_up).to_have_value("say last")
+        self.assertIn("say last", self.page.evaluate("Object.values(localStorage)"))
 
     def test_a_session_opened_before_its_start_answers_keeps_its_mode(self) -> None:
         held = self.hold_agent_answers()
@@ -9761,6 +10082,228 @@ class DictationTest(ServerTestCase):
         conversation.get_by_role("button", name="Comment").click()
         expect(box).to_have_value("")
         expect(conversation.get_by_role("button", name="Record")).to_be_visible()
+
+
+class UpdateTest(ServerTestCase):
+    # The server runs its new build from next to the database.
+    DB_ON_TMPFS = False
+
+    @classmethod
+    def load(cls, gh: FakeGitHub) -> None:
+        repo = gh.repo(scenarios.REPO)
+        repo.commit("Seed", {"README": "hello\n"})
+        repo.push("main")
+
+    @classmethod
+    def prepare(cls, tmp: Path, bin_dir: Path, env: dict[str, str]) -> None:
+        # The clone that the server was "built" in.
+        cls.workspace = tmp / "workspace"
+        for args in (
+            ["clone", "--quiet", f"https://github.com/{scenarios.REPO}"],
+            ["-C", cls.workspace, "checkout", "--quiet", "--detach"],
+        ):
+            target = [cls.workspace] if args[0] == "clone" else []
+            subprocess.run(["git", *args, *target], env=env, check=True)
+        # Fails while the file is there.
+        cls.broken = tmp / "broken"
+        # Hangs while the file is there.
+        cls.hung = tmp / "hung"
+        server = Path(os.environ["GRENADINE_SERVER"]).absolute()
+        bazel = bin_dir / "bazel"
+        bazel.write_text(
+            f"""#!/bin/sh
+if [ -e {cls.broken} ]; then
+    echo "ERROR: it does not compile" >&2
+    exit 1
+fi
+if [ -e {cls.hung} ]; then
+    sleep 600
+fi
+for arg; do
+    case "$arg" in --script_path=*) script="${{arg#--script_path=}}" ;; esac
+done
+printf '#!/bin/sh\\nexec {server} "$@"\\n' > "$script"
+chmod 755 "$script"
+"""
+        )
+        bazel.chmod(0o755)
+        env["BUILD_WORKSPACE_DIRECTORY"] = str(cls.workspace)
+
+    def push(self, title: str) -> str:
+        """Pushes a commit to main and returns it."""
+        repo = self.gh.repo(scenarios.REPO)
+        repo.commit(title, {"README": f"{title}\n"})
+        repo.push("main")
+        return repo.tip("main")
+
+    def head(self) -> str:
+        return self.gh.git("-C", str(self.workspace), "rev-parse", "HEAD").strip()
+
+    def section(self) -> Locator:
+        return self.page.locator(".update-server")
+
+    def bar(self) -> Locator:
+        return self.page.locator(".update-bar")
+
+    def start_session(self) -> None:
+        """Starts a session that stays busy for a while."""
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Prompt").fill("sleep 600")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page).to_have_url(re.compile(r"#/agents/[0-9a-f-]{36}$"))
+
+    def end_session(self) -> None:
+        """Deletes the session, which the page shows."""
+        self.page.once("dialog", lambda dialog: dialog.accept())
+        self.page.locator(".agent-actions").get_by_role("button", name="Delete").click()
+        expect(self.page).to_have_url(re.compile(DRAFT_URL))
+
+    def test_updates_in_place(self) -> None:
+        pushed = self.push("Shiny feature")
+        pid = self.server.pid
+        self.page.goto(self.url + "#/debug")
+        # Another test's commits may be there too.
+        expect(self.section()).to_contain_text("behind origin/main:")
+        expect(self.section().locator("li").first).to_have_text("Shiny feature")
+        self.section().get_by_role("button", name="Update and restart").click()
+
+        # The page stays on the version it loaded until it's reloaded.
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.assertEqual(self.head(), pushed)
+        self.assertIsNone(self.server.poll())
+        self.assertEqual(self.server.pid, pid)
+        self.bar().get_by_role("button", name="Reload").click()
+        expect(self.section()).to_contain_text(f"Running {pushed[:8]}")
+        expect(self.section()).to_contain_text("Up to date with origin/main.")
+        expect(
+            self.section().get_by_role("button", name="Rebuild and restart")
+        ).to_be_enabled()
+        expect(self.bar()).to_have_count(0)
+
+    def test_waits_for_sessions(self) -> None:
+        self.start_session()
+        session = self.page.url
+        pushed = self.push("Waited for")
+        self.page.goto(self.url + "#/debug")
+        button = self.section().get_by_role("button", name="Update and restart")
+        button.click()
+        waiting = "Update ready, waiting for 1 session"
+        expect(self.bar()).to_contain_text(waiting)
+        expect(button).to_be_disabled()
+        # Every page shows it.
+        self.page.goto(session)
+        expect(self.bar()).to_contain_text(waiting)
+
+        # Cancelled, the server keeps running what it ran.
+        self.bar().get_by_role("button", name="Cancel").click()
+        expect(self.bar()).to_have_count(0)
+        self.page.goto(self.url + "#/debug")
+        expect(self.section()).to_contain_text("Waited for")
+        button.click()
+
+        # Forcing it names what it stops, and can be declined.
+        messages: list[str] = []
+
+        def answer(accept: bool) -> None:
+            def handle(dialog: Dialog) -> None:
+                messages.append(dialog.message)
+                if accept:
+                    dialog.accept()
+                else:
+                    dialog.dismiss()
+
+            self.page.once("dialog", handle)
+            self.bar().get_by_role("button", name="Restart now").click()
+
+        answer(False)
+        self.assertIn("• Task: sleep 600", messages[0])
+        expect(self.bar()).to_contain_text(waiting)
+        answer(True)
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.page.goto(session)
+        self.page.reload()
+        expect(self.page.locator(".agent-header")).to_contain_text("interrupted")
+        self.assertEqual(self.head(), pushed)
+        self.end_session()
+
+    def test_restarts_when_the_session_is_done(self) -> None:
+        self.start_session()
+        session = self.page.url
+        self.push("After the session")
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text("waiting for 1 session")
+        # A refused cancel's error goes once the update goes on.
+        cancel = "**/api/update/cancel"
+        self.page.route(
+            cancel, lambda route: route.fulfill(status=409, body="too late")
+        )
+        self.bar().get_by_role("button", name="Cancel").click()
+        error = self.bar().locator(".error")
+        expect(error).to_contain_text("too late")
+        self.page.unroute(cancel)
+        self.page.goto(session)
+        self.end_session()
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        expect(error).to_have_count(0)
+
+    def test_waits_for_a_terminal(self) -> None:
+        self.page.goto(self.url + f"#/agents/new/{scenarios.REPO}")
+        self.page.get_by_label("Permissions").select_option(label="Auto")
+        self.page.get_by_label("Prompt").fill("say one")
+        self.page.get_by_role("button", name="Start").click()
+        expect(self.page.locator(".transcript .turn-end")).to_have_count(1)
+        session = self.page.url
+        self.push("After the terminal")
+        self.page.get_by_role("button", name="Terminal", exact=True).click()
+        tab = self.page.get_by_role("tab", name=re.compile("^Terminal"))
+        expect(tab).to_have_attribute("aria-busy", "false")
+        screen = self.page.locator(".terminal-host:not([hidden]) .xterm-rows")
+        expect(screen).to_contain_text(re.compile(r"[$#]"))
+        self.page.keyboard.type("echo in-$((6 * 7)); sleep 600\n")
+        expect(screen).to_contain_text("in-42")
+
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text(
+            "waiting for 1 session; the restart closes 1 terminal"
+        )
+        # At its prompt again, it doesn't hold up the restart.
+        self.page.goto(session)
+        expect(tab).to_have_attribute("aria-busy", "false")
+        self.page.locator(".terminal-host:not([hidden])").click()
+        self.page.keyboard.press("Control+c")
+        expect(self.bar()).to_contain_text("Grenadine was updated.", timeout=60_000)
+        self.page.reload()
+        self.end_session()
+
+    def test_cancels_a_hung_build(self) -> None:
+        self.hung.touch()
+        self.addCleanup(self.hung.unlink)
+        before = self.head()
+        self.push("Hung")
+        self.page.goto(self.url + "#/debug")
+        button = self.section().get_by_role("button", name="Update and restart")
+        button.click()
+        expect(self.bar()).to_contain_text("Building the update…")
+        self.bar().get_by_role("button", name="Cancel").click()
+        expect(self.bar()).to_have_count(0)
+        expect(button).to_be_enabled()
+        self.assertEqual(self.head(), before)
+
+    def test_failed_build(self) -> None:
+        self.broken.touch()
+        self.addCleanup(self.broken.unlink)
+        before = self.head()
+        self.push("Broken")
+        self.page.goto(self.url + "#/debug")
+        self.section().get_by_role("button", name="Update and restart").click()
+        expect(self.bar()).to_contain_text("The update failed")
+        self.bar().locator("summary").click()
+        expect(self.bar().locator("pre")).to_contain_text("ERROR: it does not compile")
+        self.assertEqual(self.head(), before)
+        self.bar().get_by_role("button", name="Dismiss").click()
+        expect(self.bar()).to_have_count(0)
 
 
 if __name__ == "__main__":

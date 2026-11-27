@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use gloo_net::http::{Request, Response};
 use grenadine_core::api::{
-    AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval, AutoMerge,
-    AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes, CleanupState,
-    DictationInfo, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs, MergeProgress,
-    MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply, NewThread,
-    PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings, ReviewerCandidates,
-    ReviewerChange, SessionProcesses, SubmitReview, SyncStatus, SystemStats, TerminalInfo,
-    WorktreeChanges, WrapUp, WriteHandoff,
+    AgentBackend, AgentBackendInfo, AgentMessage, AgentPr, AgentSession, AnswerHandoff, Approval,
+    AutoMerge, AutoReviewDetail, AutoReviewEntry, Blob, BlobsRequest, BlobsResponse, Changes,
+    CleanupState, DictationInfo, EditPr, Enqueue, GitHubUsage, InboxEdit, InboxWithPrs,
+    MergeProgress, MergeRequest, Merged, NewAgent, NewCleanupSession, NewComment, NewReply,
+    NewThread, PermissionMode, PrDetail, PrKey, PrMissing, PromptImage, RepoSettings,
+    ReviewerCandidates, ReviewerChange, SessionProcesses, SlashCommand, SubmitReview, SyncStatus,
+    SystemStats, TerminalInfo, UpdateCheck, UpdateStatus, WorktreeChanges, WrapUp, WriteHandoff,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -206,6 +206,42 @@ pub async fn system_stats() -> Result<SystemStats> {
         .map_err(|e| e.to_string())
 }
 
+/// Where the server's update to a newer version stands.
+pub async fn update_status() -> Result<UpdateStatus> {
+    check(Request::get("/api/update").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// What an update would bring. The server fetches for it.
+pub async fn check_update() -> Result<UpdateCheck> {
+    check(Request::get("/api/update/check").send().await)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn start_update() -> Result<()> {
+    post_update("/api/update").await
+}
+
+/// Restarts into the waiting update without waiting any longer.
+pub async fn force_update() -> Result<()> {
+    post_update("/api/update/force").await
+}
+
+/// Drops the waiting update, or dismisses a failed one.
+pub async fn cancel_update() -> Result<()> {
+    post_update("/api/update/cancel").await
+}
+
+async fn post_update(url: &str) -> Result<()> {
+    check(Request::post(url).send().await).await.map(|_| ())
+}
+
 pub async fn sync_status() -> Result<SyncStatus> {
     check(Request::get("/api/sync").send().await)
         .await?
@@ -323,6 +359,33 @@ pub async fn agent(id: &str) -> Result<Option<AgentSession>> {
 pub async fn agent_changes(id: &str) -> Result<WorktreeChanges> {
     check(
         Request::get(&format!("/api/agents/{id}/changes"))
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The commands a new session's prompt in `repo` can start with.
+pub async fn slash_commands(repo: &str, backend: AgentBackend) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get("/api/slash-commands")
+            .query([("repo", repo), ("backend", backend.as_str())])
+            .send()
+            .await,
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The commands the session's next prompt can start with.
+pub async fn agent_slash_commands(id: &str) -> Result<Vec<SlashCommand>> {
+    check(
+        Request::get(&format!("/api/agents/{id}/slash-commands"))
             .send()
             .await,
     )
