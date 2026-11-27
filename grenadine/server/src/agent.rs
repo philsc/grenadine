@@ -698,6 +698,94 @@ pub fn systemd_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// The slice that holds the sessions and sits right below the user's
+/// systemd manager. It's two levels above a session's slice, since the
+/// dashes in [`slice`]'s names nest them: `grenadine.slice` holds
+/// `grenadine-agent.slice`, which holds the sessions' slices. The weight
+/// has to be on this one: `grenadine-agent.slice` has no siblings to be
+/// ranked among, and its parent would still compete at the default.
+const AGENTS_SLICE: &str = "grenadine.slice";
+
+/// The sessions' share of a busy CPU, against systemd's default of 100
+/// for what else runs under the user's systemd manager, e.g. its
+/// services and the scopes of a desktop's or tmux's programs. A few
+/// sessions building and testing at once otherwise make a server that
+/// runs there slow to answer the page. A session's terminals run in its
+/// slice too, so what the user starts in one has the same share.
+const AGENTS_CPU_WEIGHT: u32 = 20;
+
+/// Makes the sessions' processes yield the CPU to what else runs under
+/// the user's systemd manager when it is busy; with idle cores they run
+/// as fast as before. The weight is on the slice above them all because
+/// a weight only ranks a slice among its siblings: one on each session's
+/// slice or scope would rank the sessions among themselves.
+///
+/// For the same reason it doesn't reach outside the manager. A login
+/// session's scope is a sibling of the whole manager, which keeps its
+/// own weight, and the system's services are further out still, so
+/// against them the sessions still get all of the manager's share; see
+/// [`cpu_weight_caveat`].
+///
+/// The setting is the manager's, so it lasts until the manager stops, at
+/// the latest the next boot; every start of the server sets it again.
+/// That also replaces a weight the user gave the slice themselves with
+/// `systemctl --user set-property`: there is no setting yet to pick
+/// another weight or none.
+pub fn lower_agents_cpu_weight() -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "set-property", "--runtime", AGENTS_SLICE])
+        .arg(format!("CPUWeight={AGENTS_CPU_WEIGHT}"))
+        .stdin(Stdio::null())
+        .output()
+        .context("can't run systemctl")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Why [`lower_agents_cpu_weight`]'s setting doesn't put this process
+/// ahead of the sessions, if something says it doesn't.
+///
+/// A server started from a plain SSH or console login isn't under the
+/// user's systemd manager: it is in the login session's scope, beside the
+/// manager. And systemd accepts a weight that does nothing when the
+/// manager wasn't given the `cpu` controller, as older systemds' weren't by
+/// default.
+pub fn cpu_weight_caveat() -> Option<&'static str> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let Some(manager) = user_manager_cgroup(&own) else {
+        return Some(
+            "the server runs outside the systemd user manager, so busy sessions can still slow it down; start it with `systemd-run --user --scope` to put it ahead of them",
+        );
+    };
+    let controllers = Path::new("/sys/fs/cgroup")
+        .join(manager.trim_start_matches('/'))
+        .join("cgroup.controllers");
+    let controllers = std::fs::read_to_string(controllers).ok()?;
+    (!controllers.split_whitespace().any(|c| c == "cpu")).then_some(
+        "the systemd user manager doesn't control the CPU, so the sessions' lower CPU weight does nothing; delegate `cpu` to user@.service to let it",
+    )
+}
+
+/// The cgroup of the systemd user manager, `user@<uid>.service`, that
+/// `/proc/<pid>/cgroup`'s text names a cgroup inside of, if it does.
+fn user_manager_cgroup(cgroups: &str) -> Option<&str> {
+    cgroups
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .find_map(|path| {
+            let mut end = 0;
+            for part in path.split('/').skip(1) {
+                end += 1 + part.len();
+                if part.starts_with("user@") && part.ends_with(".service") {
+                    return Some(&path[..end]);
+                }
+            }
+            None
+        })
+}
+
 /// The systemd user slice the session's processes run in. A cgroup holds on
 /// to daemons that leave claude's process group, like Bazel's server, so
 /// stopping the slice stops them too. Dashes nest slices, so the ID loses
@@ -4573,6 +4661,34 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn only_cgroups_below_a_user_manager_name_it() {
+        let manager = Some("/user.slice/user-1000.slice/user@1000.service");
+        // A service or scope the manager started, and a session's shell.
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/grenadine.service\n"
+            ),
+            manager
+        );
+        assert_eq!(
+            user_manager_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope\n"
+            ),
+            manager
+        );
+        // A login session is beside the manager, and so is the system's.
+        assert_eq!(
+            user_manager_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            None
+        );
+        assert_eq!(
+            user_manager_cgroup("0::/system.slice/grenadine.service\n"),
+            None
+        );
+        assert_eq!(user_manager_cgroup(""), None);
+    }
 
     #[test]
     fn uuids() {
