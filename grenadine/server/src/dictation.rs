@@ -424,8 +424,14 @@ impl Transcriber for FakeTranscriber {
 /// "[BLANK_AUDIO]" or "(wind blowing)".
 fn clean(text: &str) -> Option<String> {
     let text = text.trim();
-    let bracketed = |open, close| text.starts_with(open) && text.ends_with(close);
-    if text.is_empty() || bracketed('[', ']') || bracketed('(', ')') || bracketed('*', '*') {
+    // A single tag such as `[Music]`, not words between two tags such as
+    // `[Music] so the next step [Music]`.
+    let tag = |open, close| {
+        text.strip_prefix(open)
+            .and_then(|t| t.strip_suffix(close))
+            .is_some_and(|inside| !inside.contains([open, close]))
+    };
+    if text.is_empty() || tag('[', ']') || tag('(', ')') || tag('*', '*') {
         return None;
     }
     Some(text.to_owned())
@@ -822,6 +828,15 @@ mod tests {
         assert_eq!(clean(" (wind blowing)"), None);
         assert_eq!(clean("*sigh*"), None);
         assert_eq!(clean("  "), None);
+        assert_eq!(
+            clean("(laughs) okay, let's merge it (laughs)"),
+            Some("(laughs) okay, let's merge it (laughs)".into())
+        );
+        assert_eq!(
+            clean("[Music] so the next step [Music]"),
+            Some("[Music] so the next step [Music]".into())
+        );
+        assert_eq!(clean("*this* or *that*"), Some("*this* or *that*".into()));
     }
 
     #[test]
