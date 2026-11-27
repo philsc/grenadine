@@ -371,7 +371,7 @@ pub async fn run(failed: Option<UpdateFailed>) -> Result<Exit> {
         db_dir: db_path.parent().unwrap_or(db_path.as_path()).to_owned(),
         started_at: agent::now(),
         system: system::Sampler::default(),
-        viewer: tokio::sync::OnceCell::new(),
+        viewer: std::sync::Mutex::new(None),
         update,
         shutdown: shutdown.clone(),
     });

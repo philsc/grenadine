@@ -150,6 +150,9 @@ fn PrPushesField() -> impl IntoView {
     // What was picked last, shown until the server's answer comes back.
     let picked = RwSignal::new(None::<ApprovePrPushes>);
     let error = RwSignal::new(None::<String>);
+    // Whether a save is on its way. The dropdown waits for it, so two
+    // quick picks can't reach the server in the other order.
+    let saving = RwSignal::new(false);
     // A value saved since, here or on another page, replaces it.
     Effect::new(move || {
         if let Some(Ok(_)) = loaded.get() {
@@ -165,6 +168,7 @@ fn PrPushesField() -> impl IntoView {
     let save = move |approve_pr_pushes: ApprovePrPushes| {
         picked.set(Some(approve_pr_pushes));
         error.set(None);
+        saving.set(true);
         spawn_local(async move {
             // The other settings are kept as the server has them.
             let mut settings = match loaded.get_untracked() {
@@ -176,13 +180,14 @@ fn PrPushesField() -> impl IntoView {
                 picked.set(None);
                 error.set(Some(e));
             }
+            saving.set(false);
         });
     };
     view! {
         <label>"Approve PR pushes"
             <select
                 prop:value=move || value().map(ApprovePrPushes::as_str).unwrap_or_default()
-                prop:disabled=move || value().is_none()
+                prop:disabled=move || value().is_none() || saving.get()
                 on:change=move |ev| save(ApprovePrPushes::parse(&event_target_value(&ev)))
             >
                 <option value="always_ask">"Always ask"</option>

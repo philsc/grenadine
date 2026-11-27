@@ -620,7 +620,7 @@ async fn skips_approval(
         ApprovePrPushes::UnlessMine => {
             let author = &pr?.summary.author;
             match state.viewer_login().await {
-                Ok(me) if me == author => {
+                Ok(me) if me == *author => {
                     Some("Allowed by the Approve PR pushes setting: the PR is yours.")
                 }
                 Ok(_) => None,
@@ -2066,19 +2066,19 @@ mod tests {
         let state = state_with(|s| s.pr = Some(24));
         store_source_pr(&state);
         set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
-        state.viewer.set("someone".into()).unwrap();
+        state.set_viewer("someone");
         assert!(asks(&state).await);
 
         // A PR that isn't synced has no known author.
         let state = state_with(|s| s.pr = Some(24));
         set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
-        state.viewer.set("me".into()).unwrap();
+        state.set_viewer("me");
         assert!(asks(&state).await);
 
         let state = state_with(|s| s.pr = Some(24));
         store_source_pr(&state);
         set_approve_pr_pushes(&state, ApprovePrPushes::UnlessMine);
-        state.viewer.set("me".into()).unwrap();
+        state.set_viewer("me");
         assert!(!asks(&state).await);
         assert_eq!(
             resolved(&state),
