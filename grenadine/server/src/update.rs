@@ -25,6 +25,10 @@ const BRANCH: &str = "main";
 const REMOTE_REF: &str = "refs/remotes/origin/main";
 const TARGET: &str = "//grenadine/server";
 
+/// Set for the server that went on after it couldn't run its new build:
+/// why it couldn't.
+pub const FAILED_ENV: &str = "GRENADINE_UPDATE_FAILED";
+
 /// The argument that has the server binary act as `install`.
 pub const INSTALL_ARG: &str = "install-update";
 
@@ -322,6 +326,9 @@ struct Inner {
     phase: UpdatePhase,
     /// What the user decided about the update being built or waiting.
     decision: Option<Decision>,
+    /// Whether the wait is over and the clone is being put back. The phase
+    /// only changes after that, and no decision is taken anymore.
+    ending: bool,
     /// The binary to restart into, once the restart is due.
     restart_into: Option<PathBuf>,
 }
@@ -333,16 +340,37 @@ pub struct Updater {
     restart: Notify,
     /// Held while git works on the clone.
     git: Arc<tokio::sync::Mutex<()>>,
+    /// The update that was started last.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Updater {
-    pub fn new(build: Option<Build>) -> Updater {
+    /// `failed` is why the restart of the last update couldn't run its
+    /// build, if this server is what went on instead.
+    pub fn new(build: Option<Build>, failed: Option<String>) -> Updater {
+        let inner = Inner {
+            phase: match failed {
+                Some(error) => UpdatePhase::Failed { error },
+                None => UpdatePhase::Idle,
+            },
+            ..Inner::default()
+        };
         Updater {
             build,
-            inner: Mutex::default(),
+            inner: Mutex::new(inner),
             decided: Notify::new(),
             restart: Notify::new(),
             git: Arc::default(),
+            task: Mutex::default(),
+        }
+    }
+
+    /// Waits until the update that was started last has ended. Shutting
+    /// down ends it, once it has put the clone back.
+    pub async fn finished(&self) {
+        let task = self.task.lock().unwrap().take();
+        if let Some(task) = task {
+            let _ = task.await;
         }
     }
 
@@ -365,6 +393,9 @@ impl Updater {
     /// now. A build can only be cancelled.
     fn decide(&self, decision: Decision) -> bool {
         let mut inner = self.inner.lock().unwrap();
+        if inner.ending {
+            return false;
+        }
         match (&inner.phase, &decision) {
             (UpdatePhase::Waiting { .. }, _) => {}
             (UpdatePhase::Building, Decision::Cancel) => {}
@@ -464,15 +495,13 @@ pub fn start(state: &Arc<State>) -> bool {
         }
         inner.phase = UpdatePhase::CheckingOut;
         inner.decision = None;
+        inner.ending = false;
     }
     state.send(ServerEvent::UpdateChanged);
-    let state = state.clone();
-    tokio::spawn(async move {
-        let result = tokio::select! {
-            r = prepare(&state) => r,
-            _ = state.shutdown.cancelled() => return,
-        };
-        match result {
+    let task = state.clone();
+    let task = tokio::spawn(async move {
+        let state = task;
+        match prepare(&state).await {
             Ok(Some((old, target, binary))) => wait(&state, old, target, binary).await,
             Ok(None) => set_phase(&state, UpdatePhase::Idle),
             Err(e) => {
@@ -482,12 +511,13 @@ pub fn start(state: &Arc<State>) -> bool {
             }
         }
     });
+    *state.update.task.lock().unwrap() = Some(task);
     true
 }
 
 /// Checks out the branch's tip and builds it. Returns the commit the clone
 /// was at, the tip and the binary, or `None` if the user cancelled the
-/// build.
+/// build or the server is shutting down, which puts the clone back too.
 async fn prepare(state: &Arc<State>) -> Result<Option<(String, String, PathBuf)>> {
     let (old, target) = with_clone(state, Build::check_out).await?;
     tracing::info!("building {target}");
@@ -511,6 +541,7 @@ async fn prepare(state: &Arc<State>) -> Result<Option<(String, String, PathBuf)>
     let built = tokio::select! {
         r = built => r.map(Some),
         _ = build_cancelled(state) => Ok(None),
+        _ = state.shutdown.cancelled() => Ok(None),
     };
     if let Ok(Some(binary)) = built {
         // A Cancel that comes now is `wait`'s.
@@ -541,7 +572,8 @@ async fn build_cancelled(state: &State) {
 }
 
 /// Waits until no session is busy and no merge runs, or the user decides.
-/// A cancel puts the clone back at `old`, as one of the build does.
+/// A cancel puts the clone back at `old`, as one of the build does. So do
+/// a copy that is gone and the server shutting down.
 async fn wait(state: &Arc<State>, old: String, target: String, binary: PathBuf) {
     loop {
         let sessions = agent::busy_sessions(state);
@@ -549,53 +581,59 @@ async fn wait(state: &Arc<State>, old: String, target: String, binary: PathBuf) 
         let terminals = state.agents.terminals.count();
         let next = {
             let mut inner = state.update.inner.lock().unwrap();
+            // An `Err` ends the wait in that phase.
             let next = match inner.decision.take() {
-                // The phase stays until the clone is back, so that another
-                // update can't start meanwhile.
-                Some(Decision::Cancel) => None,
-                None if !sessions.is_empty() || !merges.is_empty() => Some(UpdatePhase::Waiting {
+                Some(Decision::Cancel) => Err(UpdatePhase::Idle),
+                None if !sessions.is_empty() || !merges.is_empty() => Ok(UpdatePhase::Waiting {
                     target: target.clone(),
                     sessions,
                     merges,
                     terminals,
                 }),
                 // While the server still runs.
-                _ if !binary.exists() => Some(UpdatePhase::Failed {
+                _ if !binary.exists() => Err(UpdatePhase::Failed {
                     error: format!("{} is gone", binary.display()),
                 }),
-                _ => Some(UpdatePhase::Restarting),
+                _ => Ok(UpdatePhase::Restarting),
             };
-            if let Some(next) = &next {
-                if *next == UpdatePhase::Restarting {
-                    inner.restart_into = Some(binary.clone());
-                }
-                let changed = inner.phase != *next;
-                inner.phase = next.clone();
-                drop(inner);
-                if changed {
-                    state.send(ServerEvent::UpdateChanged);
+            match &next {
+                // The phase stays until the clone is back, so that another
+                // update can't start meanwhile.
+                Err(_) => inner.ending = true,
+                Ok(next) => {
+                    if *next == UpdatePhase::Restarting {
+                        inner.restart_into = Some(binary.clone());
+                    }
+                    let changed = inner.phase != *next;
+                    inner.phase = next.clone();
+                    drop(inner);
+                    if changed {
+                        state.send(ServerEvent::UpdateChanged);
+                    }
                 }
             }
             next
         };
         match next {
-            None => {
+            Err(end) => {
                 restore(state, old, target).await;
-                set_phase(state, UpdatePhase::Idle);
+                set_phase(state, end);
                 return;
             }
-            Some(UpdatePhase::Waiting { .. }) => {}
-            Some(UpdatePhase::Restarting) => {
+            Ok(UpdatePhase::Restarting) => {
                 tracing::info!("restarting into {target}");
                 state.update.restart.notify_one();
                 return;
             }
-            Some(_) => return,
+            Ok(_) => {}
         }
         tokio::select! {
             _ = state.update.decided.notified() => {}
             _ = tokio::time::sleep(WAIT_POLL) => {}
-            _ = state.shutdown.cancelled() => return,
+            _ = state.shutdown.cancelled() => {
+                restore(state, old, target).await;
+                return;
+            }
         }
     }
 }
@@ -632,7 +670,7 @@ chmod 755 "$script"
 
     fn state(build: Option<Build>) -> Arc<State> {
         let mut state = crate::sync::test_state();
-        Arc::get_mut(&mut state).unwrap().update = Updater::new(build);
+        Arc::get_mut(&mut state).unwrap().update = Updater::new(build, None);
         state
     }
 
@@ -830,13 +868,100 @@ chmod 755 "$script"
         let f = fixture();
         let b = build(&f, BAZEL);
         let dir = b.dir.clone();
+        let old = b.running.sha.clone();
         let state = state(Some(b));
+        let target = add_commit(&f.upstream, "b", "1\n");
         let busy = agent::busy_for_test(&state, "busy");
         assert!(start(&state));
         until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
+        assert_eq!(head(&f), target);
         std::fs::remove_dir_all(dir).unwrap();
         drop(busy);
         until(&state, |p| matches!(p, UpdatePhase::Failed { .. })).await;
+        assert_eq!(head(&f), old, "the clone is back");
+    }
+
+    async fn finished(state: &State) {
+        tokio::time::timeout(Duration::from_secs(30), state.update.finished())
+            .await
+            .expect("the update ends");
+    }
+
+    #[tokio::test]
+    async fn shutting_down_during_the_wait_puts_the_clone_back() {
+        let f = fixture();
+        let b = build(&f, BAZEL);
+        let old = b.running.sha.clone();
+        let state = state(Some(b));
+        let target = add_commit(&f.upstream, "b", "1\n");
+        let _busy = agent::busy_for_test(&state, "busy");
+        assert!(start(&state));
+        until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
+        assert_eq!(head(&f), target);
+        state.shutdown.cancel();
+        finished(&state).await;
+        assert_eq!(head(&f), old);
+    }
+
+    #[tokio::test]
+    async fn shutting_down_during_the_build_puts_the_clone_back() {
+        let f = fixture();
+        let b = build(&f, "#!/bin/sh\ntouch started\nsleep 600\n");
+        let old = b.running.sha.clone();
+        let state = state(Some(b));
+        let target = add_commit(&f.upstream, "b", "1\n");
+        assert!(start(&state));
+        let file = f.clone.path.join("started");
+        until(&state, |_| file.exists()).await;
+        assert_eq!(head(&f), target);
+        state.shutdown.cancel();
+        finished(&state).await;
+        assert_eq!(head(&f), old);
+    }
+
+    /// Putting the clone back can take a while; a "Restart now" that comes
+    /// meanwhile is refused rather than dropped.
+    #[tokio::test]
+    async fn a_cancelled_wait_takes_no_more_decisions() {
+        let f = fixture();
+        let b = build(&f, BAZEL);
+        let old = b.running.sha.clone();
+        let repo = Arc::new(crate::sync::ClonedRepo {
+            repo: f.clone.clone(),
+            git_lock: tokio::sync::Mutex::new(()),
+        });
+        let repos = [("owner/name".to_owned(), repo.clone())].into();
+        let mut state = crate::sync::test_state_with(repos);
+        Arc::get_mut(&mut state).unwrap().update = Updater::new(Some(b), None);
+        add_commit(&f.upstream, "b", "1\n");
+        let _busy = agent::busy_for_test(&state, "busy");
+        assert!(start(&state));
+        until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
+        let held = repo.git_lock.lock().await;
+        assert!(cancel(&state));
+        until(&state, |_| state.update.inner.lock().unwrap().ending).await;
+        assert!(!state.update.force());
+        assert!(!cancel(&state));
+        assert!(!start(&state), "the clone isn't back yet");
+        drop(held);
+        until(&state, |p| *p == UpdatePhase::Idle).await;
+        assert_eq!(head(&f), old);
+        assert!(start(&state));
+        until(&state, |p| matches!(p, UpdatePhase::Waiting { .. })).await;
+        assert!(
+            state.update.force(),
+            "the next update takes decisions again"
+        );
+    }
+
+    #[tokio::test]
+    async fn shows_a_restart_that_could_not_run_its_build() {
+        let mut state = crate::sync::test_state();
+        Arc::get_mut(&mut state).unwrap().update = Updater::new(None, Some("can't run x".into()));
+        let error = "can't run x".to_owned();
+        assert_eq!(state.update.status().phase, UpdatePhase::Failed { error });
+        assert!(cancel(&state));
+        assert_eq!(state.update.status().phase, UpdatePhase::Idle);
     }
 
     #[tokio::test]
@@ -866,7 +991,7 @@ chmod 755 "$script"
         });
         let repos = [("owner/name".to_owned(), repo.clone())].into();
         let mut state = crate::sync::test_state_with(repos);
-        Arc::get_mut(&mut state).unwrap().update = Updater::new(Some(b));
+        Arc::get_mut(&mut state).unwrap().update = Updater::new(Some(b), None);
         add_commit(&f.upstream, "b", "1\n");
         let held = repo.git_lock.lock().await;
         assert!(start(&state));

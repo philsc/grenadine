@@ -1,9 +1,12 @@
 //! Serves the web UI's files, which the binary embeds at build time.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use axum::extract::State as AxState;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+
+use crate::sync::State;
 
 /// One of the web UI's files.
 pub struct Asset {
@@ -19,7 +22,15 @@ pub fn set(assets: &'static [Asset]) {
     assert!(ASSETS.set(assets).is_ok(), "the assets are already set");
 }
 
-pub async fn serve(uri: Uri) -> Response {
+/// index.html with the commit the server runs in a `<meta>`, so that the
+/// page knows which version it is whichever server answers it later.
+fn with_commit(html: &[u8], sha: &str) -> Vec<u8> {
+    let html = String::from_utf8_lossy(html);
+    let meta = format!("<meta name=\"grenadine-commit\" content=\"{sha}\" /></head>");
+    html.replacen("</head>", &meta, 1).into_bytes()
+}
+
+pub async fn serve(AxState(state): AxState<Arc<State>>, uri: Uri) -> Response {
     let path = uri.path();
     let assets: &[Asset] = ASSETS.get().copied().unwrap_or_default();
     let asset = assets
@@ -32,15 +43,36 @@ pub async fn serve(uri: Uri) -> Response {
                 .then(|| assets.first())
                 .flatten()
         });
-    match asset {
-        Some(a) => (
-            [
-                (header::CONTENT_TYPE, a.content_type),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            a.bytes,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    let Some(asset) = asset else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let running = state.update.status().running;
+    let bytes = match running {
+        Some(commit) if std::ptr::eq(asset, &assets[0]) => {
+            with_commit(asset.bytes, &commit.sha).into()
+        }
+        _ => axum::body::Bytes::from_static(asset.bytes),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, asset.content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_page_is_told_its_commit() {
+        let html = with_commit(b"<head><title>t</title></head><body></body>", "abc");
+        assert_eq!(
+            String::from_utf8(html).unwrap(),
+            "<head><title>t</title><meta name=\"grenadine-commit\" content=\"abc\" /></head><body></body>"
+        );
     }
 }

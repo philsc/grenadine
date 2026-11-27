@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use grenadine_server::Exit;
 use grenadine_server::assets::{self, Asset};
+use grenadine_server::{Exit, UPDATE_FAILED_ENV as FAILED_ENV};
 
 /// How long a restart waits for blocking work, and then for killed child
 /// processes, to end.
@@ -101,10 +101,21 @@ fn reap_children() {
     }
 }
 
-/// Replaces this process with `binary`, run with the same arguments.
+/// Replaces this process with `binary`, run with the same arguments. If
+/// that fails, it runs this version again instead, which shows the failure.
 fn exec(binary: &Path) -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
     let error = std::process::Command::new(binary)
-        .args(std::env::args_os().skip(1))
+        .args(&args)
+        .env_remove(FAILED_ENV)
         .exec();
-    Err(error).with_context(|| format!("can't run {}", binary.display()))
+    let error = format!("can't run {}: {error}", binary.display());
+    eprintln!("{error}; going on with the version that ran");
+    // Rather than its path: an update may have removed the file since.
+    let mut again = std::process::Command::new("/proc/self/exe");
+    if let Some(name) = std::env::args_os().next() {
+        again.arg0(name);
+    }
+    let again = again.args(&args).env(FAILED_ENV, &error).exec();
+    Err(again).context(error)
 }

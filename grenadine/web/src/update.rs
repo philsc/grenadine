@@ -10,15 +10,16 @@ use crate::{Updates, ago, api};
 #[derive(Clone, Copy)]
 pub struct Status {
     status: RwSignal<Option<UpdateStatus>>,
-    /// The commit the server ran when the page loaded.
-    loaded: RwSignal<Option<String>>,
+    /// The commit of the server that served the page, which says so in the
+    /// page: the first status may already be a newer server's.
+    loaded: StoredValue<Option<String>>,
 }
 
 impl Status {
     /// Follows the server's update for the life of the page.
     pub fn follow(updates: Updates) -> Status {
         let status = RwSignal::new(None);
-        let loaded = RwSignal::new(None);
+        let loaded = StoredValue::new(page_commit());
         // Answers can overtake each other; only the last request's counts.
         let requests = StoredValue::new(0u64);
         Effect::new(move |_| {
@@ -32,9 +33,6 @@ impl Status {
                 if requests.get_value() != request {
                     return;
                 }
-                if loaded.with_untracked(Option::is_none) {
-                    loaded.set(sha(&s));
-                }
                 status.set(Some(s));
             });
         });
@@ -42,8 +40,13 @@ impl Status {
     }
 }
 
-fn sha(s: &UpdateStatus) -> Option<String> {
-    s.running.as_ref().map(|c| c.sha.clone())
+/// The commit in the page's `<meta name="grenadine-commit">`; a server
+/// that can't update leaves it out.
+fn page_commit() -> Option<String> {
+    let meta = document()
+        .query_selector("meta[name=grenadine-commit]")
+        .ok()??;
+    meta.get_attribute("content")
 }
 
 /// Whether the server runs another commit than when the page loaded.
@@ -190,7 +193,7 @@ pub fn UpdateBar() -> impl IntoView {
         })
     };
     let reload = move || {
-        let loaded = loaded.get();
+        let loaded = loaded.get_value();
         status
             .with(|s| s.as_ref().is_some_and(|s| outdated(loaded.as_deref(), s)))
             .then(|| {

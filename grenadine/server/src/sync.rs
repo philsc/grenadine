@@ -1131,7 +1131,7 @@ pub fn test_state_with_agents(
         db_dir: std::env::temp_dir(),
         started_at: crate::agent::now(),
         system: crate::system::Sampler::default(),
-        update: crate::update::Updater::new(None),
+        update: crate::update::Updater::new(None, None),
         shutdown: tokio_util::sync::CancellationToken::new(),
     })
 }

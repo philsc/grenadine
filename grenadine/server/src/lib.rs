@@ -221,6 +221,8 @@ impl Signals {
     }
 }
 
+pub use update::FAILED_ENV as UPDATE_FAILED_ENV;
+
 /// What to do once the server has shut down.
 pub enum Exit {
     Stop,
@@ -257,7 +259,10 @@ pub async fn run() -> Result<Exit> {
     let db_path = std::path::absolute(db_path)?;
     let mut update_dir = db_path.clone().into_os_string();
     update_dir.push("-update");
-    let update = update::Updater::new(update::Build::detect(&token, update_dir.into()));
+    let update = update::Updater::new(
+        update::Build::detect(&token, update_dir.into()),
+        std::env::var(update::FAILED_ENV).ok(),
+    );
     let db = db::Db::open(&db_path)?;
     tracing::info!("database: {}", db_path.display());
     let github = github::GitHub::new(&token, &args.github_api)?;
@@ -395,13 +400,14 @@ pub async fn run() -> Result<Exit> {
         binary = updating.update.restart_requested() => exit = Exit::Restart(binary),
         r = &mut server_task => return r.context("server task panicked")?.context("can't serve").map(|()| Exit::Stop),
     }
-    drop(updating);
     tracing::info!("shutting down");
     shutdown.cancel();
     tokio::select! {
         r = async {
             let served = server_task.await.context("server task panicked");
             let synced = sync_task.await.context("sync task panicked");
+            // An update that was building or waiting puts the clone back.
+            updating.update.finished().await;
             served??;
             synced
         } => match r {

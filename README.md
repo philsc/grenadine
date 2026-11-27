@@ -23,6 +23,8 @@ The Debug tab's "Update and restart" button checks out the newest `origin/main` 
 git fetch origin && git checkout --detach origin/main
 ```
 
+A failed or cancelled update puts the clone back at the commit it was at, and so does stopping the server before it has restarted.
+
 The new build runs from a copy next to the database, so later builds in the clone don't affect it. It uses the running server's compilation mode, e.g. `-c opt`. Put any other Bazel flags it needs in `.bazelrc.user`. If a new version fails at startup, start the server again by hand.
 
 ## Inbox filters
