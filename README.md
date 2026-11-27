@@ -165,4 +165,4 @@ The same dialog sets what new sessions in the repository start with:
 
 The prompt names the PR, lists the other PRs in its stack, and asks the session to read the ones below and above it for context. The session is told that nobody answers it, and every tool approval it asks for is denied. It must post a comment review on GitHub before it finishes.
 
-Once grenadine sees the session's review or comment on the PR, it deletes the session. It keeps a session that didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.
+Once grenadine sees the session's review or comment on the PR, it deletes the session. If it doesn't see one once the session is done, it asks the session to post again, after one minute and then after five more. It keeps a session that still didn't post, failed or was interrupted, so you can see why. At most three reviews run at once.

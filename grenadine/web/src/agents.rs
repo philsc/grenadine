@@ -12,8 +12,8 @@ use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentPr, AgentPrs,
     AgentSession, AgentStatus, AnswerHandoff, Approval, ApprovalKind, ApprovalOption, CiStatus,
     CleanupState, CostUnit, GENERAL, Landed, NewAgent, NewCleanupSession, PatchHunk,
-    PermissionMode, PrKey, RepoSettings, SessionKind, WorktreeFile, WrapUp, WrapUpTarget,
-    WriteHandoff,
+    PermissionMode, PrKey, RepoSettings, SessionKind, TaskStatus, WorktreeFile, WrapUp,
+    WrapUpTarget, WriteHandoff,
 };
 use grenadine_core::edit::{self, Fragment};
 use leptos::prelude::*;
@@ -3329,6 +3329,113 @@ fn tool_duration(start: Option<i64>, end: Option<i64>) -> Option<i64> {
     (took >= 10_000).then_some(took)
 }
 
+/// How the task of a tool call stands, for a task that went on after the
+/// call's result came: one that runs in the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundTask {
+    /// Not over, as far as the transcript says. It only still runs while
+    /// the turn's process does. `since` is when the task started, in Unix
+    /// milliseconds: later than the call when that waited for an approval.
+    Running { since: Option<i64> },
+    /// Over; it ran from `since` to `at`, in Unix milliseconds.
+    Ended {
+        status: TaskStatus,
+        since: Option<i64>,
+        at: Option<i64>,
+    },
+    /// Its turn's process was over before the task reported an end.
+    Lost,
+}
+
+/// The tasks that run, or ran, in the background, by their tool call's
+/// id. A task that ends before its call's result is a foreground one,
+/// such as a subagent the agent waits for, and isn't listed. A prompt
+/// starts a new process, which the tasks of the one before don't outlive.
+fn background_tasks(events: &[Arc<AgentEvent>]) -> HashMap<String, BackgroundTask> {
+    // The tasks that haven't ended, with when each started.
+    let mut started = HashMap::new();
+    let mut results = HashSet::new();
+    let mut tasks = HashMap::new();
+    for e in events {
+        match &e.kind {
+            AgentEventKind::Prompt(_) => {
+                started.clear();
+                for task in tasks.values_mut() {
+                    if matches!(task, BackgroundTask::Running { .. }) {
+                        *task = BackgroundTask::Lost;
+                    }
+                }
+            }
+            AgentEventKind::TaskStarted { id, .. } => {
+                started.insert(id.as_str(), e.at);
+                if results.contains(id.as_str()) {
+                    tasks.insert(id.clone(), BackgroundTask::Running { since: e.at });
+                }
+            }
+            AgentEventKind::ToolResult { id, .. } => {
+                results.insert(id.as_str());
+                if let Some(since) = started.get(id.as_str()) {
+                    tasks.insert(id.clone(), BackgroundTask::Running { since: *since });
+                }
+            }
+            AgentEventKind::TaskEnded { id, status, .. } => {
+                started.remove(id.as_str());
+                if let Some(task) = tasks.get_mut(id)
+                    && let BackgroundTask::Running { since } = *task
+                {
+                    *task = BackgroundTask::Ended {
+                        status: *status,
+                        since,
+                        at: e.at,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    tasks
+}
+
+/// The tool calls whose tasks still run in the background, oldest first,
+/// each with when its task started.
+fn running_in_background(events: &[Arc<AgentEvent>]) -> Vec<(Arc<AgentEvent>, Option<i64>)> {
+    let tasks = background_tasks(events);
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::ToolUse {
+                id, parent: None, ..
+            } => match tasks.get(id) {
+                Some(BackgroundTask::Running { since }) => Some((e.clone(), *since)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scrolls `id`'s element to the middle of what scrolls it, clear of
+/// headers and footers that stick to the edges.
+fn scroll_to_center(id: &str) {
+    let Some(el) = document().get_element_by_id(id) else {
+        return;
+    };
+    // Called by name, as the options' types aren't among the `web-sys`
+    // features this crate builds.
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&options, &"block".into(), &"center".into());
+    if let Ok(scroll) = js_sys::Reflect::get(&el, &"scrollIntoView".into())
+        && let Some(scroll) = scroll.dyn_ref::<js_sys::Function>()
+    {
+        let _ = scroll.call1(&el, &options);
+    }
+}
+
+/// The id of a tool call's row in the transcript.
+fn tool_row_id(tool: &str) -> String {
+    format!("tool-{tool}")
+}
+
 /// What the activity bar shows the agent doing.
 #[derive(Clone, Debug, PartialEq)]
 enum Activity {
@@ -3356,7 +3463,8 @@ enum Activity {
 /// newest stored event's time. `worktree` hides a redundant leading `cd`
 /// into it in `Bash` summaries. Only calls since the latest prompt count
 /// as the turn's; a subagent's calls never get results, so they can't be
-/// unfinished `Tool`s.
+/// unfinished `Tool`s. Task events aren't the agent's doing, so the
+/// newest event is the newest other one.
 fn current_activity(
     events: &[Arc<AgentEvent>],
     streaming: bool,
@@ -3403,7 +3511,8 @@ fn current_activity(
     if streaming {
         return Activity::Writing { since: last_event };
     }
-    if let Some(e) = events.last()
+    let mut newest = events.iter().rev().filter(|e| !e.kind.is_task());
+    if let Some(e) = newest.clone().next()
         && let AgentEventKind::ToolUse {
             name,
             input,
@@ -3418,7 +3527,7 @@ fn current_activity(
         };
     }
     Activity::Thinking {
-        since: events.iter().rev().find_map(|e| e.at).or(last_event),
+        since: newest.find_map(|e| e.at).or(last_event),
     }
 }
 
@@ -3438,7 +3547,15 @@ fn ActivityBar(
     // Whether text is streaming in; a delta alone doesn't recompute the
     // activity below.
     let streaming_text = Memo::new(move |_| streaming.with(|s| !s.is_empty()));
-    let stored_at = Memo::new(move |_| events.with(|e| e.last().and_then(|e| e.at)));
+    // When the agent last did something; a task's start or end isn't that.
+    let stored_at = Memo::new(move |_| {
+        events.with(|e| {
+            e.iter()
+                .rev()
+                .find(|e| !e.kind.is_task())
+                .and_then(|e| e.at)
+        })
+    });
     let activity = Memo::new(move |_| {
         let worktree = session.with(|s| s.worktree.clone());
         events.with(|e| current_activity(e, streaming_text.get(), stored_at.get(), &worktree))
@@ -3453,6 +3570,32 @@ fn ActivityBar(
         })
     });
     let turn_at = Signal::derive(move || turn.get().and_then(|e| e.at));
+    let summary_choice = expect_context::<GlobalSettings>().tool_summaries;
+    // The calls still running in the background: each one's id, what its
+    // row says and when its task started.
+    let background = Memo::new(move |_| {
+        let worktree = session.with(|s| s.worktree.clone());
+        let describe = summary_choice.get() == ToolSummaries::Description;
+        events.with(|events| {
+            running_in_background(events)
+                .iter()
+                .filter_map(|(e, since)| {
+                    let AgentEventKind::ToolUse {
+                        id, name, input, ..
+                    } = &e.kind
+                    else {
+                        return None;
+                    };
+                    let value = serde_json::from_str(input).unwrap_or_default();
+                    let summary = tool_summaries::description(name, &value)
+                        .filter(|_| describe)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| tool_summary(name, &value, Some(&worktree)));
+                    Some((id.clone(), format!("{name} {summary}"), *since))
+                })
+                .collect::<Vec<_>>()
+        })
+    });
     let answered_at = Memo::new(move |_| {
         events.with(|events| {
             events
@@ -3483,11 +3626,39 @@ fn ActivityBar(
                     }.into_any()
                 }
                 AgentStatus::Background => {
-                    let waited = answered_at.get().map(|at| elapsed(now.get() - at));
+                    let title = "The agent has answered, and its process keeps running until a background task it started finishes. Stop ends the task too.";
+                    let running = background.get();
+                    // One task shows how long it has run, like its row;
+                    // several, or none the backend named, how long the
+                    // wait has been.
+                    let since = match running.as_slice() {
+                        [(_, _, at)] => *at,
+                        _ => answered_at.get(),
+                    };
+                    let waited = since.map(|at| elapsed(now.get() - at));
+                    let task = running.first().map(|(id, label, _)| {
+                        let (text, hint) = match running.len() {
+                            1 => (
+                                format!("Waiting on {}", label.trim_end()),
+                                "Show the tool call",
+                            ),
+                            n => (
+                                format!("Waiting on {n} background tasks"),
+                                "Show the oldest tool call",
+                            ),
+                        };
+                        let row = tool_row_id(id);
+                        view! {
+                            <button type="button" class="link activity-task" title=hint on:click=move |_| scroll_to_center(&row)>{text}</button>
+                        }
+                    });
                     view! {
-                        <p class="activity waiting" title="The agent has answered, and its process keeps running until a background task it started finishes. Stop ends the task too.">
-                            "Waiting on a background task"
-                            {waited.map(|d| format!(" · {d}"))}
+                        <p class="activity waiting" title=title>
+                            {match task {
+                                Some(task) => task.into_any(),
+                                None => "Waiting on a background task".into_any(),
+                            }}
+                            {waited.map(|d| view! { <span class="activity-time">{format!("· {d}")}</span> })}
                         </p>
                     }.into_any()
                 }
@@ -3677,6 +3848,8 @@ fn Transcript(
             })
         })
     });
+    // The calls whose tasks outlived their results.
+    let tasks = Memo::new(move |_| events.with(|e| background_tasks(e)));
     // Calls from before the current turn that have no result belong to
     // interrupted turns, so they don't get a running timer.
     let turn_start = Signal::derive(move || turn.get().and_then(|e| e.seq));
@@ -3928,6 +4101,11 @@ fn Transcript(
                             };
                             let tool = tool.clone();
                             let approval_id = tool.clone();
+                            let row_id = tool_row_id(&tool);
+                            let task = Memo::new({
+                                let tool = tool.clone();
+                                move |_| tasks.with(|t| t.get(&tool).copied())
+                            });
                             let result = Memo::new_with_compare(
                                 move |_| results.with(|r| r.get(&tool).cloned()),
                                 |prev, cur| match (prev, cur) {
@@ -3953,7 +4131,7 @@ fn Transcript(
                                 }
                             };
                             view! {
-                                <details class="tool">
+                                <details class="tool" id=row_id>
                                     <summary>
                                         {move || {
                                             let done = result.with(|r| {
@@ -3962,6 +4140,27 @@ fn Transcript(
                                                         .map(|(_, is_error, _, _)| is_error)
                                                 })
                                             });
+                                            // The call returned, but what it
+                                            // started may still run, and says
+                                            // itself how it went.
+                                            if done.is_some() && let Some(task) = task.get() {
+                                                let (class, label) = match task {
+                                                    BackgroundTask::Running { .. } if waiting.get() => {
+                                                        return view! {
+                                                            <span class="spinner background" role="img" aria-label="Running in background" title="Running in background"></span>
+                                                        }
+                                                        .into_any();
+                                                    }
+                                                    BackgroundTask::Running { .. } | BackgroundTask::Lost => ("interrupted", "Interrupted"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Completed, .. } => ("ok", "Succeeded"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Failed, .. } => ("error", "Failed"),
+                                                    BackgroundTask::Ended { status: TaskStatus::Stopped, .. } => ("interrupted", "Stopped"),
+                                                };
+                                                return view! {
+                                                    <span class=format!("tool-status {class}") role="img" aria-label=label title=label></span>
+                                                }
+                                                .into_any();
+                                            }
                                             // Still running, in this turn: a
                                             // spinner. Done or interrupted: a
                                             // dot in the same spot.
@@ -4014,6 +4213,27 @@ fn Transcript(
                                                     )
                                                 })
                                             });
+                                            // A background task's time runs
+                                            // from the task's start, not the
+                                            // call's, to its end.
+                                            if done.is_some() && let Some(task) = task.get() {
+                                                let took = match task {
+                                                    BackgroundTask::Running { since } if waiting.get() => {
+                                                        since.map(|at| now.get() - at)
+                                                    }
+                                                    BackgroundTask::Ended { since, at: Some(end), .. } => {
+                                                        since.map(|at| end - at)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                return view! {
+                                                    <span class="muted tool-background">
+                                                        " · background"
+                                                        {took.map(|d| format!(" · {}", elapsed(d)))}
+                                                    </span>
+                                                }
+                                                .into_any();
+                                            }
                                             match done {
                                                 // For a running call, how long it
                                                 // has taken when the call is timed.
@@ -4229,6 +4449,8 @@ fn Transcript(
                             <pre class="turn-error">{format!("Couldn't wrap up: {e}")}</pre>
                         }.into_any(),
                         AgentEventKind::ToolResult { .. }
+                        | AgentEventKind::TaskStarted { .. }
+                        | AgentEventKind::TaskEnded { .. }
                         | AgentEventKind::ApprovalResolved { .. }
                         | AgentEventKind::TextDelta(_)
                         | AgentEventKind::ThinkingDelta(_)
@@ -5749,6 +5971,122 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_tasks_in_the_background() {
+        let event = |seq: u64, kind| {
+            Arc::new(AgentEvent {
+                seq: Some(seq),
+                at: Some(seq as i64 * 1_000),
+                kind,
+            })
+        };
+        let prompt = |seq| event(seq, AgentEventKind::Prompt("go".into()));
+        let call = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::ToolUse {
+                    id: id.into(),
+                    name: "Bash".into(),
+                    input: "{}".into(),
+                    parent: None,
+                },
+            )
+        };
+        let started = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::TaskStarted {
+                    id: id.into(),
+                    task: format!("task-{id}"),
+                },
+            )
+        };
+        let result = |seq, id: &str| {
+            event(
+                seq,
+                AgentEventKind::ToolResult {
+                    id: id.into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    patch: Vec::new(),
+                    images: Vec::new(),
+                },
+            )
+        };
+        let ended = |seq, id: &str, status| {
+            event(
+                seq,
+                AgentEventKind::TaskEnded {
+                    id: id.into(),
+                    task: format!("task-{id}"),
+                    status,
+                },
+            )
+        };
+        let running = |events: &[Arc<AgentEvent>]| -> Vec<u64> {
+            running_in_background(events)
+                .iter()
+                .filter_map(|(e, _)| e.seq)
+                .collect()
+        };
+
+        // A call without a task, and one whose task is over before its
+        // result, such as a subagent the agent waits for: neither is in
+        // the background.
+        let mut events = vec![
+            prompt(1),
+            call(2, "plain"),
+            result(3, "plain"),
+            call(4, "sub"),
+            started(5, "sub"),
+            ended(6, "sub", TaskStatus::Completed),
+            result(7, "sub"),
+        ];
+        assert_eq!(background_tasks(&events), HashMap::new());
+
+        // A task that's still going when its call returns is. A task
+        // that hasn't returned yet isn't, whatever order they came in.
+        events.extend([
+            call(8, "a"),
+            call(9, "b"),
+            call(10, "c"),
+            started(11, "a"),
+            result(12, "a"),
+            started(13, "b"),
+            result(14, "b"),
+            started(15, "c"),
+        ]);
+        assert_eq!(running(&events), [8, 9]);
+        // Each runs since its task started, not since its call.
+        assert_eq!(
+            running_in_background(&events)
+                .iter()
+                .map(|(_, since)| *since)
+                .collect::<Vec<_>>(),
+            [Some(11_000), Some(13_000)]
+        );
+
+        events.push(ended(16, "a", TaskStatus::Failed));
+        assert_eq!(running(&events), [9]);
+        assert_eq!(
+            background_tasks(&events)["a"],
+            BackgroundTask::Ended {
+                status: TaskStatus::Failed,
+                since: Some(11_000),
+                at: Some(16_000),
+            }
+        );
+
+        // The next prompt starts a new process, so what was running is
+        // lost, and what had ended stays as it was.
+        events.push(prompt(17));
+        assert!(running(&events).is_empty());
+        let tasks = background_tasks(&events);
+        assert_eq!(tasks["b"], BackgroundTask::Lost);
+        assert!(matches!(tasks["a"], BackgroundTask::Ended { .. }));
+        assert!(!tasks.contains_key("c"));
+    }
+
+    #[test]
     fn picks_the_current_activity() {
         let prompt = || AgentEvent {
             seq: Some(1),
@@ -5854,6 +6192,31 @@ mod tests {
         assert_eq!(
             current_activity(&events.map(Arc::new), false, Some(3_000), ""),
             Activity::Thinking { since: Some(3_000) }
+        );
+
+        // A task's start or end isn't the agent's doing: it neither
+        // restarts the time spent thinking nor hides a subagent's call.
+        let task = |seq| AgentEvent {
+            seq: Some(seq),
+            at: Some(seq as i64 * 1_000),
+            kind: AgentEventKind::TaskStarted {
+                id: "a".into(),
+                task: "task-a".into(),
+            },
+        };
+        let events = [prompt(), result(3, "a"), task(4)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(3_000), ""),
+            Activity::Thinking { since: Some(3_000) }
+        );
+        let events = [prompt(), call(2, "sub", Some("task".into())), task(3)];
+        assert_eq!(
+            current_activity(&events.map(Arc::new), false, Some(2_000), ""),
+            Activity::Subagent {
+                name: "Bash".into(),
+                summary: "cmd sub".into(),
+                since: Some(2_000),
+            }
         );
 
         // Calls from before the latest prompt are finished business.

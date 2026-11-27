@@ -2768,6 +2768,7 @@ mod tests {
                 delete_branch_on_merge: true,
                 can_merge_as_admin: false,
                 requires_conversation_resolution: false,
+                stale_runs: vec![],
                 queue: None,
                 stack: None,
             },
