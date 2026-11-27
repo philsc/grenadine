@@ -133,6 +133,8 @@ def main() -> int:
         out_dir = Path(os.environ["BUILD_WORKING_DIRECTORY"]) / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Without --pid, each round looks Firefox up again, since it may have
+    # restarted (an update, a crash, the user quitting it) since the last.
     pid = args.pid or find_firefox(Path("/proc"))
     if pid is None:
         print(
@@ -146,21 +148,38 @@ def main() -> int:
     try:
         while True:
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            try:
-                capture_round(pid, out_dir, args.tmp_dir, stamp)
-            except TimeoutError as e:
+            if pid is None:
                 print(
-                    f"{e}; a snap or flatpak Firefox uses a private temp dir, "
-                    "point --tmp-dir at it",
-                    file=sys.stderr,
+                    f"{stamp}: no Firefox running; skipping this round", file=sys.stderr
                 )
-                return 1
+            else:
+                try:
+                    capture_round(pid, out_dir, args.tmp_dir, stamp)
+                except TimeoutError as e:
+                    print(
+                        f"{e}; a snap or flatpak Firefox uses a private temp dir, "
+                        "point --tmp-dir at it",
+                        file=sys.stderr,
+                    )
+                    return 1
+                except ProcessLookupError:
+                    if args.pid:
+                        print(
+                            f"Firefox pid {pid} is no longer running", file=sys.stderr
+                        )
+                        return 1
+                    print(
+                        f"{stamp}: Firefox pid {pid} exited; skipping this round",
+                        file=sys.stderr,
+                    )
             if (
                 args.hours is not None
                 and time.monotonic() - started >= args.hours * 3600
             ):
                 return 0
             time.sleep(args.every * 60)
+            if not args.pid:
+                pid = find_firefox(Path("/proc"))
     except KeyboardInterrupt:
         return 0
 
