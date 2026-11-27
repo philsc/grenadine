@@ -1764,7 +1764,12 @@ class FakeGitHub:
             "statusCheckRollup": (
                 {
                     "state": pr.checks(),
-                    "contexts": lambda info, **_: {
+                    "contexts": lambda info, first=None, **_: {
+                        "pageInfo": {
+                            "hasNextPage": first is not None
+                            and len(pr.check_runs) > first,
+                            "endCursor": None,
+                        },
                         "nodes": [
                             {
                                 "__typename": "CheckRun",
@@ -1785,8 +1790,8 @@ class FakeGitHub:
                                     }
                                 },
                             }
-                            for r in pr.check_runs
-                        ]
+                            for r in pr.check_runs[:first]
+                        ],
                     },
                 }
                 if pr and pr.check_runs

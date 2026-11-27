@@ -279,6 +279,7 @@ const CHECKS_FRAGMENT: &str = "
 fragment Checks on StatusCheckRollup {
   state
   contexts(first: 100) {
+    pageInfo { hasNextPage }
     nodes {
       ... on CheckRun {
         name status conclusion detailsUrl startedAt
@@ -673,13 +674,19 @@ fn head_checks(rollup: Option<&Value>) -> Vec<Check> {
 /// state can count a replaced run, so a push that starts a workflow twice
 /// leaves the cancelled twin failing the commit, and a required check
 /// with it, until that run is re-run. While a check still runs there's
-/// nothing to say yet: it may be the re-run that replaces one.
+/// nothing to say yet: it may be the re-run that replaces one. Nor is
+/// there when the commit has more contexts than the fragment reads: one
+/// beyond them may be what fails.
 fn stale_runs(rollup: Option<&Value>) -> Vec<StaleRun> {
     let failing = matches!(
         rollup.map(|r| str_at(r, "/state")),
         Some("FAILURE" | "ERROR")
     );
-    if !failing || combined_ci(&head_checks(rollup)) != Some(CiStatus::Passing) {
+    let truncated = rollup
+        .and_then(|r| r.pointer("/contexts/pageInfo/hasNextPage"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !failing || truncated || combined_ci(&head_checks(rollup)) != Some(CiStatus::Passing) {
         return Vec::new();
     }
     split_contexts(rollup)
@@ -3632,7 +3639,19 @@ mod tests {
         assert_eq!(rollup("FAILURE", vec![cancelled.clone(), running]), []);
         // A replaced run that passed isn't what fails the checks.
         let lint = json!({ "context": "lint", "state": "FAILURE" });
-        assert_eq!(rollup("FAILURE", vec![passed.clone(), passed, lint]), []);
+        assert_eq!(
+            rollup("FAILURE", vec![passed.clone(), passed.clone(), lint]),
+            []
+        );
+        // More contexts than were read: one of the rest may fail.
+        let truncated = json!({
+            "state": "FAILURE",
+            "contexts": {
+                "pageInfo": { "hasNextPage": true },
+                "nodes": [cancelled, passed],
+            },
+        });
+        assert_eq!(stale_runs(Some(&truncated)), []);
         assert_eq!(stale_runs(None), []);
     }
 
