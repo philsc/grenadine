@@ -19,7 +19,7 @@ use futures::future::BoxFuture;
 use grenadine_core::api::{
     AgentBackend, AgentBackendInfo, AgentEvent, AgentEventKind, AgentModelInfo, AgentSession,
     AgentStatus, ApprovalOption, Attachment, GENERAL, Landed, LandedPr, NewAgent, PermissionMode,
-    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget,
+    PrDetail, PrKey, PromptImage, ServerEvent, SessionKind, WrapUp, WrapUpTarget, leading_command,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader};
@@ -4064,6 +4064,12 @@ async fn turn(state: &Arc<State>, id: &str, queued: Queued) -> Result<AgentStatu
         .agent(id)?
         .ok_or_else(|| anyhow!("the session is gone"))?;
     emit(state, id, AgentEventKind::Prompt(prompt.clone()))?;
+    // Reviews' prompts are written by the server, not the user.
+    if session.kind != SessionKind::AutoReview
+        && let Some(name) = leading_command(&prompt)
+    {
+        state.db.add_skill_use(&session.repo, name, now())?;
+    }
     if !images.is_empty() {
         emit(state, id, AgentEventKind::Images(images.clone()))?;
     }
@@ -4188,6 +4194,13 @@ impl<'a> TurnSink<'a> {
             emit(self.state, self.id, AgentEventKind::Model(model))?;
         }
         Ok(())
+    }
+
+    /// The backend listed the commands a prompt can start with.
+    pub fn commands(&mut self, backend: AgentBackend, names: &[String]) -> Result<()> {
+        self.state
+            .db
+            .set_slash_commands(self.id, self.repo, backend, names, now())
     }
 
     /// Stores `kind` in the transcript the way a turn's events are kept:
@@ -5260,6 +5273,67 @@ echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5
         let session = state.db.agent(&session.id).unwrap().unwrap();
         assert_eq!(session.status, AgentStatus::Idle);
         assert_eq!(session.cost, 0.5);
+    }
+
+    /// A turn keeps the commands claude lists, for the session and its
+    /// repository, and counts the one its prompt starts with, unless
+    /// it's an automatic review's.
+    #[tokio::test]
+    async fn keeps_the_commands_claude_lists() {
+        let fx = crate::git::tests::fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test","slash_commands":["foo","doctor"],"skills":["foo","bar"],"terminal_slash_commands":["doctor"]}'
+echo '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.25}'
+"#;
+        let state = state_with_claude(&fx, dir.path(), script);
+
+        let req = |prompt: &str| NewAgent {
+            backend: AgentBackend::Claude,
+            repo: "owner/name".into(),
+            pr: None,
+            prompt: prompt.into(),
+            permission_mode: PermissionMode::from("auto"),
+            model: None,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            draft: None,
+        };
+        let session = create(&state, req("/foo go")).await.unwrap();
+        wait_for_turns(&state, &session.id, 1).await;
+        let review = create_session(
+            &state,
+            req("/foo Review pull request"),
+            SessionKind::AutoReview,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_turns(&state, &review.id, 1).await;
+
+        let expected = vec!["bar".to_owned(), "foo".to_owned()];
+        assert_eq!(
+            state.db.agent_slash_commands(&session.id).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            state
+                .db
+                .repo_slash_commands("owner/name", AgentBackend::Claude)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        let listed =
+            crate::slash_commands::list(&state, "owner/name", AgentBackend::Claude, None).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|c| (c.name.as_str(), c.uses))
+                .collect::<Vec<_>>(),
+            [("bar", 0), ("foo", 1)]
+        );
     }
 
     /// Waits until the session's status is `status`.
