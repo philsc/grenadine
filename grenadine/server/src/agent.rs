@@ -1459,6 +1459,42 @@ pub fn send(
     send_with_files(state, id, prompt, Vec::new(), Vec::new(), mode, model);
 }
 
+/// Sends `prompt` like `send`, but only to a session with no turn running
+/// or queued. Returns whether it sent it.
+pub fn send_if_idle(
+    state: &Arc<State>,
+    id: &str,
+    prompt: String,
+    mode: PermissionMode,
+    model: Option<String>,
+) -> bool {
+    let start = state.agents.with_live(id, |l| {
+        if l.running || !l.queue.is_empty() || l.writing_handoff {
+            return false;
+        }
+        l.queue.push_back(Queued {
+            prompt,
+            images: Vec::new(),
+            attachments: Vec::new(),
+            mode,
+            model,
+        });
+        l.running = true;
+        true
+    });
+    if start {
+        tokio::spawn(run(state.clone(), id.to_owned()));
+    }
+    start
+}
+
+/// Whether the session has a turn running or queued.
+pub fn is_busy(state: &State, id: &str) -> bool {
+    state.agents.with_live(id, |l| {
+        l.running || !l.queue.is_empty() || l.writing_handoff
+    })
+}
+
 /// Queues a prompt with the images `save_images` saved for it and the
 /// files `attachments::claim` claimed for it. While a handoff is being
 /// written, it waits for the handoff.

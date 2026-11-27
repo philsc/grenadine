@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use grenadine_core::api::{
-    AgentBackend, AgentEventKind, AgentStatus, AutoReview, AutoReviewEntry, AutoReviewState,
-    NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent, SessionKind,
+    AgentBackend, AgentEvent, AgentEventKind, AgentStatus, AutoReview, AutoReviewEntry,
+    AutoReviewState, NewAgent, PermissionMode, PrDetail, PrKey, RepoSettings, ServerEvent,
+    SessionKind,
 };
 
 use crate::agent;
@@ -712,6 +713,13 @@ async fn finish(
         }
         _ => return failed("The review's session failed."),
     };
+    // A prompt sent to the session meanwhile, e.g. through the API, runs a
+    // turn of its own, whose end calls `session_done` again. That newer
+    // `finish` goes on with the review, so this one stops.
+    let prompts = prompt_count(&events);
+    let superseded = || -> Result<bool> {
+        Ok(agent::is_busy(state, id) || prompt_count(&state.db.agent_events(id)?) != prompts)
+    };
     for &delay in &state.posted_checks {
         if !wait(state, delay).await {
             return Ok(());
@@ -725,6 +733,9 @@ async fn finish(
         .filter(|e| matches!(&e.kind, AgentEventKind::Prompt(p) if p == RETRY))
         .count();
     let Some(&delay) = state.post_retries.get(retries) else {
+        if superseded()? {
+            return Ok(());
+        }
         return state.db.finish_auto_review(
             review.id,
             AutoReviewState::Unposted,
@@ -732,7 +743,7 @@ async fn finish(
             agent::now(),
         );
     };
-    if !wait(state, delay).await || finish_if_posted(state, id, review).await? {
+    if !wait(state, delay).await || finish_if_posted(state, id, review).await? || superseded()? {
         return Ok(());
     }
     // It may have been cancelled meanwhile.
@@ -746,9 +757,17 @@ async fn finish(
             review.key.repo,
             review.key.number
         );
-        agent::send(state, id, RETRY.to_owned(), mode, model);
+        agent::send_if_idle(state, id, RETRY.to_owned(), mode, model);
     }
     Ok(())
+}
+
+/// How many prompts are among `events`.
+fn prompt_count(events: &[AgentEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, AgentEventKind::Prompt(_)))
+        .count()
 }
 
 /// Waits for `delay`. Returns false if the server is stopping.
@@ -1275,11 +1294,60 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","tot
         assert_eq!(prompts_of(&state, &id), ["Review it", RETRY]);
     }
 
+    /// A prompt sent to the session while the review waits to ask again
+    /// leaves one review going on, which asks again only once.
+    #[tokio::test]
+    async fn a_prompt_during_the_retry_wait_doesnt_ask_twice() {
+        // The third turn, the first retry, takes a while, as a real one
+        // does.
+        let script = r#"#!/bin/sh
+echo >> "$(dirname "$0")/turns"
+if [ "$(wc -l < "$(dirname "$0")/turns")" -eq 3 ]; then
+    sleep 1
+fi
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","total_cost_usd":0.5}'
+"#;
+        let retries = vec![Duration::from_secs(1)];
+        let (_fx, _dir, state, id) = review_session_with(script, retries, None).await;
+        for _ in 0..300 {
+            if prompts_of(&state, &id).len() == 1
+                && state.db.agent(&id).unwrap().unwrap().status == AgentStatus::Idle
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Lets the first turn's review start its wait, so that the prompt
+        // runs a turn of its own rather than one queued behind the first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        agent::send(
+            &state,
+            &id,
+            "And this?".into(),
+            PermissionMode::new("auto"),
+            None,
+        );
+        let review = ended(&state).await;
+        assert_eq!(review.state, AutoReviewState::Unposted);
+        assert_eq!(prompts_of(&state, &id), ["Review it", "And this?", RETRY]);
+    }
+
     /// A review that's cancelled while it waits to ask again doesn't ask.
     #[tokio::test]
     async fn a_review_cancelled_before_a_retry_isnt_asked_again() {
+        // The third turn, the first retry, takes a while, as a real one
+        // does.
+        let script = r#"#!/bin/sh
+echo >> "$(dirname "$0")/turns"
+if [ "$(wc -l < "$(dirname "$0")/turns")" -eq 3 ]; then
+    sleep 1
+fi
+echo '{"type":"system","subtype":"init","session_id":"s","model":"claude-test"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Done","total_cost_usd":0.5}'
+"#;
         let retries = vec![Duration::from_secs(1)];
-        let (_fx, _dir, state, id) = review_session_with(SUCCEED, retries, None).await;
+        let (_fx, _dir, state, id) = review_session_with(script, retries, None).await;
         for _ in 0..300 {
             if state.db.agent(&id).unwrap().unwrap().status == AgentStatus::Idle {
                 break;
