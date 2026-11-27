@@ -53,6 +53,14 @@ class CaptureTest(unittest.TestCase):
         with TemporaryDirectory() as d, self.assertRaises(TimeoutError):
             capture.wait_for_dump(Path(d), 0, timeout=0.1)
 
+    def test_alive(self) -> None:
+        self.assertTrue(capture.alive(os.getpid()))
+        child = os.fork()
+        if child == 0:
+            os._exit(0)
+        os.waitpid(child, 0)
+        self.assertFalse(capture.alive(child))
+
 
 if __name__ == "__main__":
     unittest.main()

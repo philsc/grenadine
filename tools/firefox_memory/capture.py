@@ -83,6 +83,17 @@ def wait_for_dump(tmp_dir: Path, since: float, timeout: float = 300.0) -> Path:
     raise TimeoutError(f"no memory report appeared in {tmp_dir} within {timeout:.0f}s")
 
 
+def alive(pid: int) -> bool:
+    """Whether `pid` still exists (signal 0 checks without signaling)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def capture_round(pid: int, out_dir: Path, tmp_dir: Path, stamp: str) -> list[Path]:
     """Signals `pid` for a full and a minimized report and files them."""
     saved = []
@@ -155,14 +166,21 @@ def main() -> int:
             else:
                 try:
                     capture_round(pid, out_dir, args.tmp_dir, stamp)
+                    gone = False
                 except TimeoutError as e:
-                    print(
-                        f"{e}; a snap or flatpak Firefox uses a private temp dir, "
-                        "point --tmp-dir at it",
-                        file=sys.stderr,
-                    )
-                    return 1
+                    # A Firefox that exited mid-round never writes its
+                    # report; the temp dir hint only fits a live one.
+                    gone = not alive(pid)
+                    if not gone:
+                        print(
+                            f"{e}; a snap or flatpak Firefox uses a private temp dir, "
+                            "point --tmp-dir at it",
+                            file=sys.stderr,
+                        )
+                        return 1
                 except ProcessLookupError:
+                    gone = True
+                if gone:
                     if args.pid:
                         print(
                             f"Firefox pid {pid} is no longer running", file=sys.stderr
