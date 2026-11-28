@@ -1,5 +1,6 @@
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 exports_files([
     "Cargo.toml",
@@ -52,6 +53,24 @@ rust_binary(
         "@crates//:libc",
         "@crates//:tokio",
     ],
+)
+
+# The server with dictation on, for `bazel run`, with Whisper models that
+# Bazel downloads. Manual so that other builds don't download the models.
+sh_binary(
+    name = "with_dictation",
+    srcs = ["with_dictation.sh"],
+    args = [
+        "$(rootpath :server)",
+        "$(rootpath @whisper_model_small_en//file)",
+        "$(rootpath @whisper_model_base_en//file)",
+    ],
+    data = [
+        ":server",
+        "@whisper_model_base_en//file",
+        "@whisper_model_small_en//file",
+    ],
+    tags = ["manual"],
 )
 
 rust_binary(

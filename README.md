@@ -187,20 +187,20 @@ Grenadine's text boxes have a Record button for dictating instead of typing. Age
 
 While recording, the box is read-only. Grenadine cuts the speech into phrases at pauses and inserts each finished phrase where the cursor was. The phrase being spoken shows greyed out under the box until you pause. Stop finishes the last phrase and makes the box editable again, so you can edit the text before you send it.
 
-Dictation is off unless the server gets a Whisper model. Download a model for the finished phrases and a smaller one for the preview of the phrase being spoken:
+Dictation is off unless the server gets a Whisper model. The easiest way to turn it on is to start the server with:
 
 ```sh
-mkdir -p ~/.local/share/grenadine/whisper && cd ~/.local/share/grenadine/whisper
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin
-curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin
+bazel run //grenadine/server:with_dictation -- --repo=PATH
 ```
 
-Then start the server with them:
+It takes the same flags as `//grenadine/server`. On its first run, Bazel downloads two models, about 240 MB, and keeps them in its cache: `ggml-small.en-q5_1.bin` for the finished phrases and `ggml-base.en-q5_1.bin` for the preview of the phrase being spoken.
+
+To use other models, download them from [whisper.cpp's models](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and pass them to `//grenadine/server` yourself:
 
 ```sh
 bazel run //grenadine/server -- --repo=PATH \
-  --whisper-model=$HOME/.local/share/grenadine/whisper/ggml-small.en-q5_1.bin \
-  --whisper-preview-model=$HOME/.local/share/grenadine/whisper/ggml-base.en-q5_1.bin
+  --whisper-model=PATH/TO/ggml-small.en-q5_1.bin \
+  --whisper-preview-model=PATH/TO/ggml-base.en-q5_1.bin
 ```
 
 Without `--whisper-preview-model`, the preview uses `--whisper-model` too, and updates less often. Bigger models such as `large-v3-turbo` are more accurate but too slow for live dictation on a laptop CPU. The models are loaded on the first recording.
