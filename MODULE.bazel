@@ -245,6 +245,24 @@ http_file(
     url = "https://raw.githubusercontent.com/github/docs/c6f68e2527c324d52226d7de8bc49cf8e5c0e954/src/graphql/data/fpt/schema.docs.graphql",
 )
 
+# The Whisper models that `bazel run //grenadine/server:with_dictation`
+# starts the server with: one for the finished phrases and a smaller one for
+# the previews. Only that manual target needs them, so other builds don't
+# download them.
+http_file(
+    name = "whisper_model_small_en",
+    downloaded_file_path = "ggml-small.en-q5_1.bin",
+    sha256 = "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30",
+    url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en-q5_1.bin",
+)
+
+http_file(
+    name = "whisper_model_base_en",
+    downloaded_file_path = "ggml-base.en-q5_1.bin",
+    sha256 = "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
+    url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en-q5_1.bin",
+)
+
 # whisper.cpp, which transcribes dictation in the server; see
 # //grenadine/server/whisper. The BUILD file mirrors its CMake build, so
 # check it when changing the version.
