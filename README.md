@@ -193,7 +193,7 @@ Dictation is off unless the server gets a Whisper model. The easiest way to turn
 bazel run //grenadine/server:with_dictation -- --repo=PATH
 ```
 
-It takes the same flags as `//grenadine/server`. On its first run, Bazel downloads two models, about 240 MB, and keeps them in its cache: `ggml-small.en-q5_1.bin` for the finished phrases and `ggml-base.en-q5_1.bin` for the preview of the phrase being spoken.
+It takes the same flags as `//grenadine/server`, except the model flags. On its first run, Bazel downloads two models, about 240 MB: `ggml-small.en-q5_1.bin` for the finished phrases and `ggml-base.en-q5_1.bin` for the preview of the phrase being spoken. The server uses them from `~/.local/share/grenadine/whisper`, hard-linked or copied from Bazel's cache, so that they stay when Bazel cleans its cache while the server runs and updates itself.
 
 To use other models, download them from [whisper.cpp's models](https://huggingface.co/ggerganov/whisper.cpp/tree/main) and pass them to `//grenadine/server` yourself:
 
