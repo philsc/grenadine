@@ -11,6 +11,8 @@
 # directory, hard-linked when it's on the same file system. The server's
 # path is resolved only to keep the logged command line tidy.
 set -euo pipefail
+# So that a failure in keep, which runs in $(...), stops the wrapper.
+shopt -s inherit_errexit
 
 server="$(realpath "$1")"
 dir="${XDG_DATA_HOME:-$HOME/.local/share}/grenadine/whisper"
